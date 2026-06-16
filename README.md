@@ -132,6 +132,9 @@ the smaller tangent space could not reach.
 ../.venv/bin/python make_landscape.py --config configs/landscape.yaml
 # outputs results/teacher_landscape_landscape.gif (+ .png final frame)
 ../.venv/bin/python make_landscape.py --static    # final-frame PNG only (fast)
+../.venv/bin/python make_landscape.py --3d        # 3D relief: the surface as
+#   terrain and each descent riding on it at its own loss height, with a rotating
+#   view (outputs *_landscape_3d.gif + .png)
 ```
 
 ## What it does

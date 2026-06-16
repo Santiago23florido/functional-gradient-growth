@@ -11,6 +11,7 @@ Usage
     python make_landscape.py                         # configs/landscape.yaml
     python make_landscape.py --config configs/landscape.yaml
     python make_landscape.py --static                # final-frame PNG only (fast)
+    python make_landscape.py --3d                     # 3D relief instead of 2D contour
 """
 
 from __future__ import annotations
@@ -25,13 +26,14 @@ import yaml
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from stable_tiny.experiment import run_experiment  # noqa: E402
-from stable_tiny.landscape import render_landscape  # noqa: E402
+from stable_tiny.landscape import render_landscape, render_landscape_3d  # noqa: E402
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=str(Path(__file__).parent / "configs" / "landscape.yaml"))
     parser.add_argument("--static", action="store_true", help="render only the final-frame PNG")
+    parser.add_argument("--3d", dest="three_d", action="store_true", help="render a 3D relief instead of the 2D contour map")
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -51,9 +53,11 @@ def main() -> None:
         result = run_experiment(method_cfg)
         trajectory_paths.append(result["trajectory_path"])
 
-    out_path = render_landscape(
+    renderer = render_landscape_3d if args.three_d else render_landscape
+    suffix = "_landscape_3d" if args.three_d else "_landscape"
+    out_path = renderer(
         trajectory_paths,
-        out_dir / f"{base_run_name}_landscape.gif",
+        out_dir / f"{base_run_name}{suffix}.gif",
         static_only=args.static,
     )
     print(f"Saved landscape to {out_path}")
