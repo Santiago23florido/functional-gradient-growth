@@ -19,12 +19,14 @@ _METHOD_LABELS = {
     "baseline_mlp": "MLP",
     "gromo_tiny": "Scheduled TINY + AdamW",
     "functional_triggered_tiny": "Functional certificate + TINY",
+    "functional_certified_tiny": "Certified FGD + grow-until-certified",
 }
 
 _METHOD_COLORS = {
     "baseline_mlp": "tab:green",
     "gromo_tiny": "tab:blue",
     "functional_triggered_tiny": "tab:orange",
+    "functional_certified_tiny": "tab:purple",
 }
 
 
