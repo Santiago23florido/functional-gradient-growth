@@ -92,6 +92,20 @@ def run_experiment(cfg: dict) -> dict:
         accuracy_factory=accuracy,
         device=device,
     )
+    if cfg.get("record_trajectory"):
+        n_probe = int(cfg.get("trajectory_probe_size", 256))
+        probe_x, probe_y = next(iter(train_loader))
+        # Gather a fixed probe set of the requested size from the train loader.
+        xs, ys = [probe_x], [probe_y]
+        gathered = probe_x.shape[0]
+        for bx, by in train_loader:
+            if gathered >= n_probe:
+                break
+            xs.append(bx)
+            ys.append(by)
+            gathered += bx.shape[0]
+        state.probe_x = torch.cat(xs)[:n_probe].to(device)
+        state.probe_y = torch.cat(ys)[:n_probe].to(device)
     state.log("init")
 
     t0 = time.time()
@@ -129,6 +143,23 @@ def run_experiment(cfg: dict) -> dict:
     with open(out_dir / f"{run_name}_history.json", "w") as f:
         json.dump(result, f, indent=2)
     print(f"Saved history to {out_dir / f'{run_name}_history.json'}")
+
+    if cfg.get("record_trajectory") and state.trajectory_logits:
+        import numpy as np
+
+        traj_path = out_dir / f"{run_name}_trajectory.npz"
+        np.savez_compressed(
+            traj_path,
+            logits=np.stack(state.trajectory_logits).astype("float32"),
+            probe_labels=state.probe_y.detach().cpu().numpy(),
+            eval_idx=np.array([m["eval_idx"] for m in state.trajectory_meta]),
+            epoch=np.array([m["epoch"] for m in state.trajectory_meta]),
+            params=np.array([m["params"] for m in state.trajectory_meta]),
+            phase=np.array([m["phase"] for m in state.trajectory_meta]),
+            method=np.array(method),
+        )
+        result["trajectory_path"] = str(traj_path)
+        print(f"Saved function-space trajectory to {traj_path}")
 
     return result
 
@@ -175,6 +206,32 @@ class _ExperimentState:
         self.growth_lines: list[float] = []
         self.growth_info: list[dict] = []
         self.functional_events: list[dict] = []
+        # Optional function-space trajectory recording (for the landscape viz):
+        # a fixed probe set defines the empirical output (logit) space, which has
+        # the same dimension across all network sizes.
+        self.probe_x: torch.Tensor | None = None
+        self.probe_y: torch.Tensor | None = None
+        self.trajectory_logits: list = []
+        self.trajectory_meta: list[dict] = []
+
+    @torch.no_grad()
+    def capture_trajectory(self, phase: str) -> None:
+        if self.probe_x is None:
+            return
+        was_training = self.model.training
+        self.model.eval()
+        logits = self.model(self.probe_x).detach().cpu().numpy()
+        if was_training:
+            self.model.train()
+        self.trajectory_logits.append(logits)
+        self.trajectory_meta.append(
+            {
+                "eval_idx": self.eval_idx,
+                "epoch": self.epoch,
+                "phase": phase,
+                "params": _count_params(self.model),
+            }
+        )
 
     def evaluate(self, loader: torch.utils.data.DataLoader) -> tuple[float, float]:
         loss, acc = evaluate_model(
@@ -233,6 +290,7 @@ class _ExperimentState:
             f"test_loss={te_loss:.4f} acc={te_acc:.3f} | "
             f"params={self.history['params'][-1]}{extra}"
         )
+        self.capture_trajectory(phase)
         self.eval_idx += 1
 
 
