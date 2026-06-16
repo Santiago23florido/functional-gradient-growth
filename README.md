@@ -76,6 +76,24 @@ functional steps themselves — a purer but weaker optimizer; see the config.)
 ../.venv/bin/python run.py --config configs/compare_certified.yaml
 ```
 
+## Function-space landscape visualization
+
+`make_landscape.py` renders functional gradient descent *in function space*. A
+network snapshot is its logit vector on a fixed probe set, `f = logits(probe) ∈
+ℝ^{N·C}` — a space whose dimension is independent of network width, so a tiny net
+and a grown net share one coordinate system. The runs are projected to 2D by PCA
+over all snapshots, and the **exact** functional loss `L(f) = CE(softmax(f), y)`
+is drawn as a topographic map (it depends only on `f`, not the parametrization).
+Each descent is animated as a path over the fixed landscape, with growth events
+marked as stars — growth is literally the trajectory gaining access to directions
+the smaller tangent space could not reach.
+
+```bash
+../.venv/bin/python make_landscape.py --config configs/landscape.yaml
+# outputs results/teacher_landscape_landscape.gif (+ .png final frame)
+../.venv/bin/python make_landscape.py --static    # final-frame PNG only (fast)
+```
+
 ## What it does
 
 `run.py` runs `stable_tiny.experiment.run_experiment`, which:
