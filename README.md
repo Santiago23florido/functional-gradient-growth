@@ -19,6 +19,63 @@ The `gromo` library is not modified. The functional-gradient experiment lives
 inside this harness so it can be tested as an alternative training/growth
 policy.
 
+## Theory-grounded certified growth (v2) — `functional_certified_tiny`
+
+This is the main contribution. It tightens the link between the **expressivity
+bottleneck** (GroMo/TINY) and **functional gradient descent** with adaptive
+representations (arXiv:2606.16926), and it *verifies* the theory's conditions
+instead of assuming them.
+
+**The bridge.** The function space is the empirical output (logit) space
+`ℝ^{B×C}`, where the Hilbert space equals the Banach space, so Assumptions 3.3
+(`𝓗` descends in `𝓑`, α=1) and 3.4 (gradient compatibility, β=1) hold by
+construction. The ideal functional gradient is `∇L(f) = dL/d(logits)` (computed
+exactly). The achievable gradient is its projection onto the network's tangent
+space, `g = P_T ∇L(f)`; the residual `r = ∇L(f) − g` is *exactly the expressivity
+bottleneck* — the part of the desired functional update that no parameter move of
+the current network can realize. Since `RelErr = ‖r‖/‖g‖`, the paper's
+relative-error certificate failing is identical to the expressivity bottleneck
+being too large.
+
+**What v1 verified vs what v2 adds.** v1 (`functional_triggered_tiny`) only
+checked the relative-error certificate. v2 additionally:
+
+1. **Verifies the second constraint** — the sufficient-descent condition of
+   Lemma 3.5 — with a function-space Armijo line search on the step size
+   (`L(f − ηg) ≤ L(f) − c·η·⟨∇L,g⟩`), adapting η to the unknown smoothness K.
+2. **Computes the projection exactly** (`functional_projection: exact`): for the
+   tiny models here the full output-space Jacobian fits in memory, so `g` and the
+   bottleneck `r` come from a least-squares solve instead of conjugate gradient.
+   This removes the CG conditioning pathology (CG fails to converge on trained,
+   over-parameterized nets) and makes the certificate exact.
+3. **Uses the certificate as the growth policy** — grow while the probe batch
+   fails to certify (bottleneck too large), and **stop once it certifies**. This
+   is Algorithm 1's "refine the representation until certified" realized as
+   network growth that targets the bottleneck residual (`tiny_best`).
+
+The bottleneck is essentially zero once the parameter count exceeds the
+output-space dimension `B·C` and the Jacobian is full rank — the genuine
+expressivity threshold — and strictly positive below it.
+
+**Result (`configs/compare_certified.yaml`, seed 0).** Both methods start from the
+same under-capacity student (`hidden_size=4`) and train with AdamW; the only
+difference is the growth policy (fixed schedule vs the functional certificate):
+
+| method | test loss | test acc | params | growths |
+|---|---|---|---|---|
+| `gromo_tiny` (scheduled, "tiny simple") | 0.339 | 0.551 | 338 | 5 |
+| `functional_certified_tiny` (certificate) | **0.333** | 0.541 | **269** | 7 |
+
+Certificate-triggered growth reaches a **lower test loss at ~20% fewer
+parameters**: it grows exactly to the size where the tangent space spans the
+functional gradient, then stops and trains, instead of growing on a fixed
+schedule. (`functional_train_optimizer: fgd` instead trains with the verified
+functional steps themselves — a purer but weaker optimizer; see the config.)
+
+```bash
+../.venv/bin/python run.py --config configs/compare_certified.yaml
+```
+
 ## What it does
 
 `run.py` runs `stable_tiny.experiment.run_experiment`, which:

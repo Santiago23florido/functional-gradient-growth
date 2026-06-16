@@ -30,6 +30,24 @@ class FunctionalStepInfo:
     approx_norm: float
     cg_iterations: int
     reason: str = ""
+    # --- theory-grounded diagnostics (Lemma 3.5 / expressivity bottleneck) ---
+    # ``in_tangent_norm`` = ||g||_B  (expressible part of the functional gradient)
+    # ``residual_norm``   = ||grad L - g||_B  (the *expressivity bottleneck*: the
+    #                       part of the ideal functional gradient that no parameter
+    #                       move of the current network can realize).
+    # ``bottleneck_fraction`` = ||r|| / ||grad L||  in [0, 1].
+    # ``directional_derivative`` = <grad L, g> = DL(f; g) >= 0 (descent rate).
+    # ``descent_ok`` is True when the *measured* loss decrease satisfied the
+    #   sufficient-descent (Armijo) condition derived from Lemma 3.5.
+    # ``lr_used`` is the step size accepted by the descent line search.
+    # ``loss_after`` is the batch loss after the accepted step.
+    in_tangent_norm: float = 0.0
+    residual_norm: float = 0.0
+    bottleneck_fraction: float = 0.0
+    directional_derivative: float = 0.0
+    descent_ok: bool = True
+    lr_used: float = 0.0
+    loss_after: float = float("nan")
 
 
 @dataclass
@@ -41,6 +59,9 @@ class FunctionalEpochInfo:
     failure: FunctionalStepInfo | None
     max_relative_error: float
     mean_relative_error: float
+    descent_failures: int = 0
+    mean_bottleneck_fraction: float = 0.0
+    max_bottleneck_fraction: float = 0.0
 
 
 def certified_functional_step(
@@ -57,6 +78,10 @@ def certified_functional_step(
     cg_tolerance: float,
     weight_decay: float = 0.0,
     grad_clip: float | None = None,
+    sufficient_descent_c: float | None = None,
+    lr_backtrack: float = 0.5,
+    lr_min_factor: float = 1e-3,
+    apply_step: bool = True,
 ) -> FunctionalStepInfo:
     """Apply one certified projected functional-gradient step.
 
@@ -148,9 +173,16 @@ def certified_functional_step(
     def damped_tangent_kernel_matvec(vector: torch.Tensor) -> torch.Tensor:
         return tangent_kernel_matvec(vector) + damping * vector
 
+    # Run the CG refinement schedule and keep the *best* approximation found
+    # (lowest relative error), stopping early as soon as one certifies.  Even if
+    # none certifies, g = K alpha is still a descent direction (K is PSD, so
+    # <grad L, g> >= 0): we always take the step and let the relative-error
+    # certificate act as the growth trigger.  This avoids the failure mode where
+    # an uncertified step makes no progress at all.
     best_info: FunctionalStepInfo | None = None
     accepted_solution: torch.Tensor | None = None
     accepted_iterations = 0
+    best_relative_error = float("inf")
     for max_iter in _cg_refinement_schedule(cg_min_iter, cg_max_iter):
         solution, used_iterations = _conjugate_gradient(
             damped_tangent_kernel_matvec,
@@ -166,17 +198,34 @@ def certified_functional_step(
             eps=relative_error_tolerance,
             cg_iterations=used_iterations,
         )
-        best_info = info
+        if info.relative_error < best_relative_error:
+            best_relative_error = info.relative_error
+            best_info = info
+            accepted_solution = solution
+            accepted_iterations = used_iterations
         if info.certified:
+            best_info = info
             accepted_solution = solution
             accepted_iterations = used_iterations
             break
 
-    if accepted_solution is None:
-        assert best_info is not None
+    assert best_info is not None and accepted_solution is not None
+    best_info.cg_iterations = accepted_iterations
+    if not best_info.certified and not best_info.reason:
         best_info.reason = "relative-error certificate failed"
+
+    if not apply_step:
+        # Certificate-only (dry-run): report the decomposition / certificate
+        # without modifying parameters.  Used by the grow-until-certified loop.
         return best_info
 
+    if not best_info.certified and sufficient_descent_c is None:
+        # Legacy (v1) behaviour: never step on an uncertified batch.
+        return best_info
+
+    # The parameter step that realizes the (projected) functional gradient g in
+    # output space: theta <- theta - lr * J^T alpha, whose first-order output
+    # change is -lr * J J^T alpha = -lr * g.
     parameter_gradients = torch.autograd.grad(
         output,
         parameters,
@@ -184,24 +233,220 @@ def certified_functional_step(
         retain_graph=False,
         allow_unused=True,
     )
-    for parameter, parameter_gradient in zip(parameters, parameter_gradients):
-        if parameter_gradient is not None:
-            parameter.grad = parameter_gradient.detach()
+    step_directions = tuple(
+        torch.zeros_like(parameter) if grad is None else grad.detach()
+        for parameter, grad in zip(parameters, parameter_gradients)
+    )
+    return _take_descent_step(
+        model,
+        x,
+        y,
+        loss_fn,
+        parameters,
+        step_directions,
+        best_info,
+        lr=lr,
+        weight_decay=weight_decay,
+        grad_clip=grad_clip,
+        sufficient_descent_c=sufficient_descent_c,
+        lr_backtrack=lr_backtrack,
+        lr_min_factor=lr_min_factor,
+    )
 
+
+def _take_descent_step(
+    model: torch.nn.Module,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    loss_fn: torch.nn.Module,
+    parameters: tuple[torch.Tensor, ...],
+    step_directions: tuple[torch.Tensor, ...],
+    info: FunctionalStepInfo,
+    *,
+    lr: float,
+    weight_decay: float,
+    grad_clip: float | None,
+    sufficient_descent_c: float | None,
+    lr_backtrack: float,
+    lr_min_factor: float,
+) -> FunctionalStepInfo:
+    """Apply ``theta <- theta - lr * step_directions`` with optional verified descent.
+
+    The realized output change is ``-lr * g`` where ``g`` is the projected
+    functional gradient.  When ``sufficient_descent_c`` is set, a function-space
+    Armijo line search backtracks ``lr`` until the Lemma-3.5 sufficient-descent
+    condition ``L(f - lr g) <= L(f) - c * lr * <grad L, g>`` holds.
+    """
     if grad_clip is not None:
-        torch.nn.utils.clip_grad_norm_(parameters, grad_clip)
+        total_norm = torch.linalg.norm(
+            torch.stack([torch.linalg.norm(d) for d in step_directions])
+        )
+        if float(total_norm) > grad_clip:
+            scale = grad_clip / (float(total_norm) + 1e-12)
+            step_directions = tuple(d * scale for d in step_directions)
 
-    with torch.no_grad():
-        for parameter in parameters:
-            if parameter.grad is None:
-                continue
-            if weight_decay != 0.0:
-                parameter.mul_(1.0 - lr * weight_decay)
-            parameter.add_(parameter.grad, alpha=-lr)
+    if sufficient_descent_c is None:
+        # Legacy path: a single fixed-lr step, sufficient descent not verified.
+        with torch.no_grad():
+            for parameter, direction in zip(parameters, step_directions):
+                if weight_decay != 0.0:
+                    parameter.mul_(1.0 - lr * weight_decay)
+                parameter.add_(direction, alpha=-lr)
+        info.lr_used = lr
+        return info
 
-    assert best_info is not None
-    best_info.cg_iterations = accepted_iterations
-    return best_info
+    base_params = tuple(parameter.detach().clone() for parameter in parameters)
+    base_loss = info.loss
+    directional_derivative = info.directional_derivative
+
+    def _apply(step_lr: float) -> None:
+        with torch.no_grad():
+            for parameter, base, direction in zip(parameters, base_params, step_directions):
+                parameter.copy_(base)
+                if weight_decay != 0.0:
+                    parameter.mul_(1.0 - step_lr * weight_decay)
+                parameter.add_(direction, alpha=-step_lr)
+
+    @torch.no_grad()
+    def _trial_loss() -> float:
+        return float(loss_fn(model(x), y).detach())
+
+    trial_lr = lr
+    min_lr = lr * lr_min_factor
+    accepted_lr = None
+    accepted_loss = base_loss
+    while trial_lr >= min_lr:
+        _apply(trial_lr)
+        trial_loss = _trial_loss()
+        if trial_loss <= base_loss - sufficient_descent_c * trial_lr * directional_derivative:
+            accepted_lr = trial_lr
+            accepted_loss = trial_loss
+            break
+        trial_lr *= lr_backtrack
+
+    if accepted_lr is None:
+        # No step size produced the guaranteed decrease: the current tangent
+        # space is the limiting factor.  Take the smallest tried step (still a
+        # non-ascent direction) and flag the descent failure so the caller can
+        # refine the representation (grow).
+        accepted_lr = max(trial_lr, min_lr)
+        _apply(accepted_lr)
+        accepted_loss = _trial_loss()
+        info.descent_ok = False
+        if not info.reason:
+            info.reason = "sufficient-descent line search failed"
+
+    info.lr_used = accepted_lr
+    info.loss_after = accepted_loss
+    return info
+
+
+def exact_functional_step(
+    model: torch.nn.Module,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    loss_fn: torch.nn.Module,
+    *,
+    lr: float,
+    damping: float = 0.0,
+    relative_error_tolerance: float,
+    weight_decay: float = 0.0,
+    grad_clip: float | None = None,
+    sufficient_descent_c: float | None = None,
+    lr_backtrack: float = 0.5,
+    lr_min_factor: float = 1e-3,
+    apply_step: bool = True,
+    **_ignored,
+) -> FunctionalStepInfo:
+    """Certified functional-gradient step with an *exact* tangent projection.
+
+    For the tiny models in this harness the full output-space Jacobian
+    ``J = d output / d theta`` (shape ``[B*C, P]``) fits in memory, so the
+    projection of the ideal functional gradient ``grad L`` onto the tangent space
+    can be computed exactly via least squares instead of conjugate gradient.
+
+    This removes the CG conditioning pathology (CG fails to converge on trained,
+    over-parameterized models), giving an exact expressivity-bottleneck residual
+    ``r = grad L - g``.  The bottleneck is essentially zero once the number of
+    parameters exceeds the output-space dimension and ``J`` is full rank, and is
+    strictly positive when the network is too small to represent ``grad L`` --
+    the genuine expressivity bottleneck that growth is meant to remove.
+    """
+    if functional_call is None:
+        raise RuntimeError("exact functional descent requires torch.func.functional_call")
+    from torch.func import jacrev
+
+    model.zero_grad(set_to_none=True)
+    named_parameters = OrderedDict(
+        (name, parameter)
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    )
+    parameter_names = tuple(named_parameters.keys())
+    parameters = tuple(named_parameters.values())
+    buffers = OrderedDict(model.named_buffers())
+
+    output = model(x)
+    loss = loss_fn(output, y)
+    true_gradient = torch.autograd.grad(loss, output)[0].detach().reshape(-1)
+    output_numel = true_gradient.shape[0]
+    true_norm = torch.linalg.norm(true_gradient)
+    if true_norm <= torch.finfo(true_gradient.dtype).eps:
+        return FunctionalStepInfo(
+            certified=True, loss=float(loss.detach()), relative_error=0.0,
+            error_bound=0.0, approx_norm=0.0, cg_iterations=0,
+            reason="zero functional gradient",
+        )
+
+    def call_with_parameters(parameter_values):
+        state = OrderedDict(zip(parameter_names, parameter_values))
+        state.update(buffers)
+        return functional_call(model, state, (x,)).reshape(-1)
+
+    jacobian = jacrev(call_with_parameters)(parameters)
+    columns = [jac.reshape(output_numel, -1) for jac in jacobian]
+    jacobian_matrix = torch.cat(columns, dim=1).detach()  # [B*C, P]
+
+    if damping > 0.0:
+        # Ridge / Levenberg-Marquardt: solve (J^T J + damping I) theta_dot = J^T r.
+        gram = jacobian_matrix.t() @ jacobian_matrix
+        gram.diagonal().add_(damping)
+        rhs = jacobian_matrix.t() @ true_gradient
+        flat_solution = torch.linalg.solve(gram, rhs)
+    else:
+        flat_solution = torch.linalg.lstsq(jacobian_matrix, true_gradient).solution
+
+    approx_gradient = jacobian_matrix @ flat_solution
+    info = _certificate(
+        loss=loss,
+        approx_gradient=approx_gradient,
+        true_gradient=true_gradient,
+        eps=relative_error_tolerance,
+        cg_iterations=0,
+    )
+    if not info.certified and not info.reason:
+        info.reason = "relative-error certificate failed"
+
+    if not apply_step:
+        return info
+    if not info.certified and sufficient_descent_c is None:
+        return info
+
+    # theta_dot reshaped back to the parameter shapes; step is theta -= lr * theta_dot.
+    step_directions = []
+    offset = 0
+    for parameter in parameters:
+        size = parameter.numel()
+        step_directions.append(
+            flat_solution[offset : offset + size].reshape_as(parameter).detach()
+        )
+        offset += size
+    return _take_descent_step(
+        model, x, y, loss_fn, parameters, tuple(step_directions), info,
+        lr=lr, weight_decay=weight_decay, grad_clip=grad_clip,
+        sufficient_descent_c=sufficient_descent_c, lr_backtrack=lr_backtrack,
+        lr_min_factor=lr_min_factor,
+    )
 
 
 def functional_descent_epoch(
@@ -220,11 +465,23 @@ def functional_descent_epoch(
     grad_clip: float | None = None,
     batch_limit: int | None = None,
     progress_every: int | None = None,
+    sufficient_descent_c: float | None = None,
+    lr_backtrack: float = 0.5,
+    lr_min_factor: float = 1e-3,
+    stop_on_failure: bool = True,
+    projection: str = "cg",
 ) -> FunctionalEpochInfo:
-    """Run certified functional descent until an uncertified batch is found."""
+    """Run certified functional descent over the epoch.
+
+    When ``stop_on_failure`` is True (legacy v1) the epoch stops at the first
+    uncertified batch.  When False (v2) every batch takes a verified-descent
+    step regardless of certification, and certification is only recorded (the
+    caller uses the certified fraction to decide whether to grow)."""
     model.train()
     losses: list[float] = []
     relative_errors: list[float] = []
+    bottleneck_fractions: list[float] = []
+    descent_failures = 0
     certified_batches = 0
     batches = 0
     failure = None
@@ -242,7 +499,8 @@ def functional_descent_epoch(
                     flush=True,
                 )
         x, y = x.to(device), y.to(device)
-        info = certified_functional_step(
+        step_fn = exact_functional_step if projection == "exact" else certified_functional_step
+        info = step_fn(
             model,
             x,
             y,
@@ -255,9 +513,15 @@ def functional_descent_epoch(
             cg_tolerance=cg_tolerance,
             weight_decay=weight_decay,
             grad_clip=grad_clip,
+            sufficient_descent_c=sufficient_descent_c,
+            lr_backtrack=lr_backtrack,
+            lr_min_factor=lr_min_factor,
         )
         losses.append(info.loss)
         relative_errors.append(info.relative_error)
+        bottleneck_fractions.append(info.bottleneck_fraction)
+        if not info.descent_ok:
+            descent_failures += 1
         if not info.certified:
             if progress_every is not None and progress_every > 0:
                 print(
@@ -265,8 +529,11 @@ def functional_descent_epoch(
                     f"cg={info.cg_iterations} reason={info.reason}",
                     flush=True,
                 )
-            failure = info
-            break
+            if failure is None:
+                failure = info
+            if stop_on_failure:
+                break
+            continue
         certified_batches += 1
         if progress_every is not None and progress_every > 0:
             if batch_idx % progress_every == 0:
@@ -293,6 +560,15 @@ def functional_descent_epoch(
             if relative_errors
             else 0.0
         ),
+        descent_failures=descent_failures,
+        mean_bottleneck_fraction=(
+            sum(bottleneck_fractions) / len(bottleneck_fractions)
+            if bottleneck_fractions
+            else 0.0
+        ),
+        max_bottleneck_fraction=(
+            max(bottleneck_fractions) if bottleneck_fractions else 0.0
+        ),
     )
 
 
@@ -304,8 +580,15 @@ def _certificate(
     eps: float,
     cg_iterations: int,
 ) -> FunctionalStepInfo:
-    error = torch.linalg.norm(approx_gradient - true_gradient)
+    residual = true_gradient - approx_gradient
+    error = torch.linalg.norm(residual)
     approx_norm = torch.linalg.norm(approx_gradient)
+    true_norm = torch.linalg.norm(true_gradient)
+    # DL(f; g) = <grad L, g> >= 0: the rate of functional-loss decrease.
+    directional_derivative = float(torch.dot(true_gradient, approx_gradient).detach())
+    bottleneck_fraction = float(
+        (error / true_norm).detach()
+    ) if true_norm > 0 else 0.0
     if approx_norm <= torch.finfo(approx_gradient.dtype).eps:
         return FunctionalStepInfo(
             certified=False,
@@ -315,6 +598,10 @@ def _certificate(
             approx_norm=0.0,
             cg_iterations=cg_iterations,
             reason="zero approximate gradient",
+            in_tangent_norm=0.0,
+            residual_norm=float(error.detach()),
+            bottleneck_fraction=bottleneck_fraction,
+            directional_derivative=directional_derivative,
         )
 
     relative_error = error / approx_norm
@@ -326,6 +613,10 @@ def _certificate(
         error_bound=float(error.detach()),
         approx_norm=float(approx_norm.detach()),
         cg_iterations=cg_iterations,
+        in_tangent_norm=float(approx_norm.detach()),
+        residual_norm=float(error.detach()),
+        bottleneck_fraction=bottleneck_fraction,
+        directional_derivative=directional_derivative,
     )
 
 

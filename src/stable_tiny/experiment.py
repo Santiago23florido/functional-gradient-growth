@@ -23,7 +23,12 @@ from gromo.containers.growing_mlp import GrowingMLP
 from gromo.utils.training_utils import evaluate_model, gradient_descent
 
 from .data import get_dataloaders
-from .functional_descent import FunctionalEpochInfo, functional_descent_epoch
+from .functional_descent import (
+    FunctionalEpochInfo,
+    certified_functional_step,
+    exact_functional_step,
+    functional_descent_epoch,
+)
 from .growth import grow_step, select_tiny_growth_layer
 
 
@@ -96,10 +101,12 @@ def run_experiment(cfg: dict) -> dict:
         _run_scheduled_gromo_tiny(state)
     elif method == "functional_triggered_tiny":
         _run_functional_triggered_tiny(state)
+    elif method == "functional_certified_tiny":
+        _run_functional_certified_tiny(state)
     else:
         raise ValueError(
             f"Unknown method: {method!r}. Expected baseline_mlp, gromo_tiny, "
-            "or functional_triggered_tiny."
+            "functional_triggered_tiny, or functional_certified_tiny."
         )
 
     elapsed = time.time() - t0
@@ -162,6 +169,8 @@ class _ExperimentState:
             "functional_relative_error": [],
             "functional_certified_batches": [],
             "functional_batches": [],
+            "functional_bottleneck_fraction": [],
+            "functional_descent_failures": [],
         }
         self.growth_lines: list[float] = []
         self.growth_info: list[dict] = []
@@ -198,13 +207,19 @@ class _ExperimentState:
             rel = None
             certified = None
             batches = None
+            bottleneck = None
+            descent_failures = None
         else:
             rel = functional_info.max_relative_error
             certified = functional_info.certified_batches
             batches = functional_info.batches
+            bottleneck = functional_info.max_bottleneck_fraction
+            descent_failures = functional_info.descent_failures
         self.history["functional_relative_error"].append(rel)
         self.history["functional_certified_batches"].append(certified)
         self.history["functional_batches"].append(batches)
+        self.history["functional_bottleneck_fraction"].append(bottleneck)
+        self.history["functional_descent_failures"].append(descent_failures)
 
         extra = ""
         if functional_info is not None:
@@ -385,6 +400,277 @@ def _run_functional_triggered_tiny(state: _ExperimentState) -> None:
             },
         )
         consecutive_failures = 0
+
+
+def _functional_step_kwargs(cfg: dict) -> dict:
+    """Common arguments shared by the functional step / epoch / refine loop."""
+    return dict(
+        lr=cfg.get("functional_lr", cfg["lr"]),
+        damping=cfg.get("functional_damping", 1e-4),
+        relative_error_tolerance=cfg.get("functional_relative_error_tolerance", 0.2),
+        cg_min_iter=cfg.get("functional_cg_min_iter", 1),
+        cg_max_iter=cfg.get("functional_cg_max_iter", 8),
+        cg_tolerance=cfg.get("functional_cg_tolerance", 1e-3),
+        weight_decay=cfg.get("functional_weight_decay", 0.0),
+        grad_clip=cfg.get("functional_grad_clip"),
+    )
+
+
+def _run_functional_certified_tiny(state: _ExperimentState) -> None:
+    """Theory-grounded functional descent (arXiv:2606.16926, Algorithm 1).
+
+    Differences from ``functional_triggered_tiny`` (v1):
+
+    1. Every batch takes a *verified-descent* step: g = P_T grad L(f) is always a
+       descent direction (the empirical tangent kernel is PSD), so we always step
+       and a function-space Armijo line search on the learning rate enforces the
+       sufficient-descent condition of Lemma 3.5 (the second theoretical
+       constraint, previously unchecked). v1 instead skipped uncertified steps,
+       which stalls once the growth budget is gone.
+    2. The relative-error certificate -- equivalently the expressivity bottleneck
+       ``||grad L - g|| / ||g||`` -- is used only as the *growth trigger*: when too
+       few batches certify, the representation is refined by growing the layer
+       whose TINY update best captures the bottleneck residual. Refinement is
+       incremental (grow, then keep stepping so the new neurons enter the tangent
+       space); set ``functional_grow_until_certified`` to instead run Algorithm 1's
+       tight inner loop on a frozen probe batch.
+    """
+    cfg = state.cfg
+    configured_max_epochs = cfg.get("functional_max_epochs")
+    if configured_max_epochs is None:
+        configured_max_epochs = (
+            cfg["growth_steps"] * cfg["epochs_per_step"] + cfg.get("final_epochs", 0)
+        )
+    max_epochs = int(configured_max_epochs)
+
+    configured_growth_steps = cfg.get("functional_growth_steps")
+    if configured_growth_steps is None:
+        configured_growth_steps = cfg["growth_steps"]
+    max_growth_events = int(configured_growth_steps)
+
+    warmup_epochs = int(cfg.get("functional_warmup_epochs", 0))
+    failure_patience = int(cfg.get("functional_failure_patience", 1))
+    stop_when_exhausted = bool(
+        cfg.get("functional_stop_when_growth_budget_exhausted", False)
+    )
+    if warmup_epochs < 0:
+        raise ValueError(f"functional_warmup_epochs must be >= 0, got {warmup_epochs}")
+    if failure_patience < 1:
+        raise ValueError(
+            f"functional_failure_patience must be >= 1, got {failure_patience}"
+        )
+
+    sufficient_descent_c = cfg.get("functional_sufficient_descent_c", 0.1)
+    lr_backtrack = cfg.get("functional_lr_backtrack", 0.5)
+    lr_min_factor = cfg.get("functional_lr_min_factor", 1e-3)
+    max_refines = int(cfg.get("functional_max_refines", 4))
+    certify_threshold = float(cfg.get("functional_certify_threshold", 0.5))
+    grow_until_certified = bool(cfg.get("functional_grow_until_certified", False))
+    # "fgd": train with verified-descent functional steps.
+    # "adamw": train with AdamW between growths (apples-to-apples vs gromo_tiny),
+    #          using the functional certificate *only* as the growth policy.
+    train_optimizer = cfg.get("functional_train_optimizer", "fgd")
+
+    warmup_optimizer = _build_optimizer(state.model, cfg)
+    for _ in range(min(warmup_epochs, max_epochs)):
+        state.epoch += 1
+        gradient_descent(
+            state.model,
+            state.train_loader,
+            warmup_optimizer,
+            scheduler=None,
+            loss_function=state.criterion,
+            device=state.device,
+        )
+        state.log("warmup")
+
+    # A fixed probe batch defines the empirical output space in which the
+    # certificate is measured during the grow-until-certified refine loop.
+    probe_x, probe_y = next(iter(state.train_loader))
+    probe_x, probe_y = probe_x.to(state.device), probe_y.to(state.device)
+
+    consecutive_failures = 0
+    for _ in range(max(0, max_epochs - warmup_epochs)):
+        state.epoch += 1
+        if train_optimizer == "fgd":
+            info = functional_descent_epoch(
+                state.model,
+                state.train_loader,
+                state.criterion,
+                device=state.device,
+                batch_limit=cfg.get("functional_batch_limit"),
+                progress_every=cfg.get("functional_progress_every"),
+                sufficient_descent_c=sufficient_descent_c,
+                lr_backtrack=lr_backtrack,
+                lr_min_factor=lr_min_factor,
+                stop_on_failure=False,
+                projection=cfg.get("functional_projection", "cg"),
+                **_functional_step_kwargs(cfg),
+            )
+            phase = "fgd"
+        else:
+            # Train with AdamW; the functional certificate (measured on a probe
+            # batch) is used only to decide whether the representation must grow.
+            optimizer = _build_optimizer(state.model, cfg)
+            gradient_descent(
+                state.model,
+                state.train_loader,
+                optimizer,
+                scheduler=None,
+                loss_function=state.criterion,
+                device=state.device,
+            )
+            info = _probe_certificate_info(state, probe_x, probe_y)
+            phase = "adamw_certified"
+        state.log(phase, functional_info=info)
+        state.functional_events.append(
+            {
+                "epoch": state.epoch,
+                "failed": info.failed,
+                "certified_batches": info.certified_batches,
+                "batches": info.batches,
+                "max_relative_error": info.max_relative_error,
+                "max_bottleneck_fraction": info.max_bottleneck_fraction,
+                "mean_bottleneck_fraction": info.mean_bottleneck_fraction,
+                "descent_failures": info.descent_failures,
+                "failure_reason": info.failure.reason if info.failure else None,
+            }
+        )
+
+        # The representation is insufficient when too few batches certify (the
+        # expressivity bottleneck dominates) or a step could not produce the
+        # Lemma-3.5 guaranteed descent.
+        certify_fraction = info.certified_batches / max(1, info.batches)
+        needs_refine = certify_fraction < certify_threshold or info.descent_failures > 0
+        if not needs_refine:
+            consecutive_failures = 0
+            continue
+
+        consecutive_failures += 1
+        if consecutive_failures < failure_patience:
+            print(
+                f"  >> representation insufficient (certified {info.certified_batches}"
+                f"/{info.batches}, bottleneck~{info.mean_bottleneck_fraction:.2g}) "
+                f"[{consecutive_failures}/{failure_patience}]; waiting before growth"
+            )
+            continue
+
+        if state.growth_count >= max_growth_events:
+            print("  >> representation insufficient, but growth budget is exhausted")
+            if stop_when_exhausted:
+                break
+            consecutive_failures = 0
+            continue
+
+        if grow_until_certified:
+            _grow_until_certified(
+                state,
+                probe_x,
+                probe_y,
+                eps=cfg.get("functional_relative_error_tolerance", 0.2),
+                max_refines=max_refines,
+                max_growth_events=max_growth_events,
+            )
+        else:
+            # Incremental refinement: grow the layer whose TINY optimal update
+            # best captures the bottleneck residual; subsequent FGD steps train
+            # the new neurons into the tangent space before we re-evaluate.
+            layer_to_grow, selection_info = _choose_functional_growth_layer(state)
+            _apply_growth(
+                state,
+                layer_to_grow,
+                trigger="bottleneck_refine",
+                extra={
+                    **selection_info,
+                    "certified_batches_before_growth": info.certified_batches,
+                    "mean_bottleneck_before_growth": info.mean_bottleneck_fraction,
+                },
+            )
+        consecutive_failures = 0
+
+
+def _probe_certificate_info(
+    state: _ExperimentState, x: torch.Tensor, y: torch.Tensor
+) -> FunctionalEpochInfo:
+    """Measure the functional certificate on a probe batch (no parameter change).
+
+    Returns a ``FunctionalEpochInfo`` (one "batch") so the AdamW-trained variant
+    can reuse the same growth-trigger logic as the FGD variant.
+    """
+    step_fn = (
+        exact_functional_step
+        if state.cfg.get("functional_projection", "cg") == "exact"
+        else certified_functional_step
+    )
+    info = step_fn(
+        state.model, x, y, state.criterion, apply_step=False,
+        **_functional_step_kwargs(state.cfg),
+    )
+    return FunctionalEpochInfo(
+        loss=info.loss,
+        batches=1,
+        certified_batches=1 if info.certified else 0,
+        failed=not info.certified,
+        failure=None if info.certified else info,
+        max_relative_error=info.relative_error,
+        mean_relative_error=info.relative_error,
+        descent_failures=0,
+        mean_bottleneck_fraction=info.bottleneck_fraction,
+        max_bottleneck_fraction=info.bottleneck_fraction,
+    )
+
+
+def _grow_until_certified(
+    state: _ExperimentState,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    *,
+    eps: float,
+    max_refines: int,
+    max_growth_events: int,
+):
+    """Refine the representation (grow) until the certificate passes on ``x``.
+
+    Faithful realization of the inner ``while`` loop of Algorithm 1: at each
+    iteration we measure the relative-error certificate in the probe-batch output
+    space without modifying parameters (``apply_step=False``); if it fails we add
+    the neurons that best capture the expressivity-bottleneck residual.
+    """
+    step_kwargs = _functional_step_kwargs(state.cfg)
+    step_fn = (
+        exact_functional_step
+        if state.cfg.get("functional_projection", "cg") == "exact"
+        else certified_functional_step
+    )
+    last_info = None
+    for refine in range(max_refines):
+        info = step_fn(
+            state.model, x, y, state.criterion, apply_step=False, **step_kwargs
+        )
+        last_info = info
+        print(
+            f"  refine {refine}: rel_err={info.relative_error:.3g} "
+            f"bottleneck={info.bottleneck_fraction:.3g} "
+            f"certified={info.certified}"
+        )
+        if info.certified:
+            break
+        if state.growth_count >= max_growth_events:
+            print("  >> growth budget exhausted mid-refine")
+            break
+        layer_to_grow, selection_info = _choose_functional_growth_layer(state)
+        _apply_growth(
+            state,
+            layer_to_grow,
+            trigger="certificate_refine",
+            extra={
+                **selection_info,
+                "refine_index": refine,
+                "relative_error_before": info.relative_error,
+                "bottleneck_fraction_before": info.bottleneck_fraction,
+            },
+        )
+    return last_info
 
 
 def _choose_functional_growth_layer(state: _ExperimentState) -> tuple[int, dict]:
