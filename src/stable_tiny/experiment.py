@@ -524,6 +524,13 @@ def _run_functional_certified_tiny(state: _ExperimentState) -> None:
     max_refines = int(cfg.get("functional_max_refines", 4))
     certify_threshold = float(cfg.get("functional_certify_threshold", 0.5))
     grow_until_certified = bool(cfg.get("functional_grow_until_certified", False))
+    # Growth hysteresis: the expressivity bottleneck is a *capacity* property, so
+    # once the tangent space has certified, later certificate failures are
+    # optimization noise (a flickering certificate under a high LR), not a lack of
+    # capacity. Freezing growth after the first certification stops the runaway
+    # over-growth that noise would otherwise trigger.
+    freeze_after_certified = bool(cfg.get("functional_freeze_growth_after_certified", False))
+    representation_sufficient = False
     # "fgd": train with verified-descent functional steps.
     # "adamw": train with AdamW between growths (apples-to-apples vs gromo_tiny),
     #          using the functional certificate *only* as the growth policy.
@@ -600,7 +607,14 @@ def _run_functional_certified_tiny(state: _ExperimentState) -> None:
         # Lemma-3.5 guaranteed descent.
         certify_fraction = info.certified_batches / max(1, info.batches)
         needs_refine = certify_fraction < certify_threshold or info.descent_failures > 0
+        if certify_fraction >= certify_threshold:
+            representation_sufficient = True
         if not needs_refine:
+            consecutive_failures = 0
+            continue
+
+        if freeze_after_certified and representation_sufficient:
+            # Capacity already proven sufficient; treat this as optimization noise.
             consecutive_failures = 0
             continue
 

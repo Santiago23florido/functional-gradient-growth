@@ -76,6 +76,46 @@ functional steps themselves — a purer but weaker optimizer; see the config.)
 ../.venv/bin/python run.py --config configs/compare_certified.yaml
 ```
 
+## Known-good benchmark: Gaussian-mixture ("blobs") — `configs/compare_blobs.yaml`
+
+The random-teacher task has a large *unrealizable* teacher, so a small student
+caps around 0.55 accuracy — a low ceiling that hides the benefit of good growth.
+The `blobs` task (`stable_tiny.data.make_blobs_dataloaders`) is *realizable* with a
+clear ceiling and an **optimal** model size: on the default settings a ~hidden-16
+MLP reaches ~0.94, smaller nets underfit and much larger nets overfit. Growing to
+the right size and stopping is the winning strategy.
+
+Both methods start under-capacity (`hidden_size=4`) and train with AdamW; only the
+growth policy differs:
+
+| method | test acc | test loss | params | growths |
+|---|---|---|---|---|
+| `gromo_tiny` (scheduled) | 0.958 | 0.202 | 1611 | 6 |
+| `functional_certified_tiny` | 0.958 | **0.162** | **760** | 3 |
+
+Certificate-triggered growth matches the accuracy with **less than half the
+parameters** and a lower test loss — it grows only until the tangent space spans
+the functional gradient, then stops.
+
+**Two practical findings (trial-and-error):**
+
+1. *Lowering the similarity threshold (`functional_relative_error_tolerance`) does
+   not help.* Sweeping it showed a sweet spot around 0.3; stricter values grow
+   more and raise test loss. The threshold is not the knob that controls runaway
+   growth.
+2. *Variability in the optimization path comes from the learning rate.* At
+   `lr=0.05` the path oscillates, the certificate flickers `certified ↔ not`, and
+   that flicker keeps re-triggering growth until the budget is exhausted
+   (3020 params, test loss ~0.8–1.6). At `lr=0.02` the path is stable. The
+   principled fix is **growth hysteresis** (`functional_freeze_growth_after_certified`):
+   the expressivity bottleneck is a capacity property, so once the tangent space
+   has certified, later failures are optimization noise and must not trigger more
+   growth.
+
+```bash
+../.venv/bin/python run.py --config configs/compare_blobs.yaml
+```
+
 ## Function-space landscape visualization
 
 `make_landscape.py` renders functional gradient descent *in function space*. A

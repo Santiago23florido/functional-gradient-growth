@@ -1,0 +1,74 @@
+# Known-good, *realizable* benchmark: Gaussian-mixture ("blobs") classification.
+#
+# Unlike the random-teacher task (large unrealizable teacher -> low ceiling),
+# this task has a clear achievable ceiling and an *optimal* model size: a modest
+# MLP (~hidden 16) reaches ~0.94 test accuracy, while smaller nets underfit and
+# much larger nets overfit. That makes growing to the right size -- and stopping
+# -- the winning strategy.
+#
+# Both methods start under-capacity (hidden_size=4) and train with AdamW; only
+# the growth policy differs (fixed schedule vs the functional certificate).
+
+run_name: blobs_certified_compare
+out_dir: results
+seed: 0
+device: null
+methods:
+  - gromo_tiny
+  - functional_certified_tiny
+
+# --- task -------------------------------------------------------------------
+task: blobs
+in_features: 24
+out_features: 12
+cluster_std: 2.2
+center_scale: 2.0
+n_train: 6000
+n_test: 1500
+batch_size: 64
+
+# --- student model (starts under-capacity on purpose) ------------------------
+hidden_size: 4
+number_hidden_layers: 2
+
+# --- scheduled TINY ("tiny simple") -----------------------------------------
+# lr 0.02 (not 0.05): a high LR makes the optimization path oscillate, which makes
+# the certificate flicker and the certificate-triggered method over-grow. A stable
+# LR is the real fix for that "variability" -- not lowering the similarity threshold.
+optimizer: adamw
+lr: 0.02
+momentum: 0.9
+weight_decay: 0.01
+growth_steps: 6
+epochs_per_step: 4
+final_epochs: 6
+maximum_added_neurons: 8
+line_search_factors: [0.0, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0]
+
+# --- certified functional growth (AdamW + certificate as the growth policy) --
+functional_projection: exact
+functional_train_optimizer: adamw
+functional_damping: 0.01
+functional_relative_error_tolerance: 0.3   # the "similarity" threshold
+functional_cg_min_iter: 1
+functional_cg_max_iter: 192
+functional_cg_tolerance: 0.00001
+functional_weight_decay: 0.0
+functional_grad_clip: null
+functional_progress_every: null
+functional_warmup_epochs: 1
+functional_failure_patience: 1
+functional_growth_steps: 12
+functional_max_epochs: 30
+functional_stop_when_growth_budget_exhausted: false
+functional_growth_layer_selection: tiny_best
+functional_certify_threshold: 0.6
+functional_grow_until_certified: false
+functional_freeze_growth_after_certified: true   # growth hysteresis (capacity is monotone)
+functional_max_refines: 6
+# FGD-only knobs (unused when functional_train_optimizer=adamw):
+functional_lr: 0.5
+functional_batch_limit: 16
+functional_sufficient_descent_c: 0.1
+functional_lr_backtrack: 0.5
+functional_lr_min_factor: 0.001

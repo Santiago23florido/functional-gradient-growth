@@ -98,6 +98,50 @@ def make_teacher_dataloaders(
 
 
 # --------------------------------------------------------------------------- #
+# Gaussian-mixture ("blobs") classification — a known-good, *realizable* task
+# --------------------------------------------------------------------------- #
+def make_blobs_dataloaders(
+    *,
+    in_features: int = 16,
+    out_features: int = 6,
+    cluster_std: float = 1.6,
+    center_scale: float = 6.0,
+    n_train: int = 6000,
+    n_test: int = 1500,
+    batch_size: int = 64,
+    seed: int = 0,
+) -> tuple[DataLoader, DataLoader, dict]:
+    """Build train/test loaders for a Gaussian-mixture classification task.
+
+    Each class is an isotropic Gaussian blob with a fixed random center. Unlike
+    the random-teacher task (whose labels come from a large unrealizable network),
+    this task has a clear, achievable ceiling: a modest MLP separates the blobs to
+    high accuracy, so growth that adds usable capacity visibly helps. The class
+    overlap (``cluster_std`` vs ``center_scale``) sets the difficulty.
+    """
+    center_gen = torch.Generator().manual_seed(seed)
+    centers = torch.randn(out_features, in_features, generator=center_gen) * center_scale
+
+    def _split(n: int, gen: torch.Generator) -> TensorDataset:
+        labels = torch.randint(0, out_features, (n,), generator=gen)
+        x = centers[labels] + cluster_std * torch.randn(
+            n, in_features, generator=gen
+        )
+        return TensorDataset(x, labels)
+
+    train_ds = _split(n_train, torch.Generator().manual_seed(seed + 1))
+    test_ds = _split(n_test, torch.Generator().manual_seed(seed + 2))
+
+    loader_gen = torch.Generator().manual_seed(seed + 3)
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True, generator=loader_gen
+    )
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+    meta = {"in_features": in_features, "out_features": out_features}
+    return train_loader, test_loader, meta
+
+
+# --------------------------------------------------------------------------- #
 # Optional torchvision image tasks
 # --------------------------------------------------------------------------- #
 def make_torchvision_dataloaders(
@@ -140,6 +184,17 @@ def make_torchvision_dataloaders(
 def get_dataloaders(cfg: dict) -> tuple[DataLoader, DataLoader, dict]:
     """Dispatch on ``cfg['task']``."""
     task = cfg.get("task", "teacher")
+    if task == "blobs":
+        return make_blobs_dataloaders(
+            in_features=cfg["in_features"],
+            out_features=cfg["out_features"],
+            cluster_std=cfg.get("cluster_std", 1.6),
+            center_scale=cfg.get("center_scale", 6.0),
+            n_train=cfg["n_train"],
+            n_test=cfg["n_test"],
+            batch_size=cfg["batch_size"],
+            seed=cfg["seed"],
+        )
     if task == "teacher":
         return make_teacher_dataloaders(
             in_features=cfg["in_features"],
