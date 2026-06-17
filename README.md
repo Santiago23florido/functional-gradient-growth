@@ -116,6 +116,54 @@ the functional gradient, then stops.
 ../.venv/bin/python run.py --config configs/compare_blobs.yaml
 ```
 
+## Threshold-light, certificate-driven growth — `configs/compare_blobs_stable.yaml`
+
+The mini-batch certificate above is noisy, so it needs two band-aids — a
+*fraction threshold* (`functional_certify_threshold`) and *growth hysteresis*
+(`functional_freeze_growth_after_certified`). Two changes remove that
+hyperparameter sensitivity and make the method faithful to Algorithm 1 of the
+base paper:
+
+1. **Deterministic certificate** (`functional_certificate_scope: fulldata`):
+   measure the relative-error certificate once per epoch on a *fixed* multi-batch
+   probe (norms combined in quadrature). Low-variance and deterministic → no
+   fraction threshold, no hysteresis.
+2. **Certificate-driven growth selection**
+   (`functional_growth_layer_selection: certifying`): among growth options,
+   trial-grow each candidate layer and add the one whose *post-growth certificate
+   holds* (fewest new params); if none certifies at the tolerance, add the one
+   that best advances toward the criterion. Growth is driven by certificate
+   satisfaction, **not** by minimizing the bottleneck. Stop iff certified.
+
+The only remaining knob is the paper's tolerance `eps`, which is physical:
+`rho* = eps/(1+eps)` is the maximum tolerated bottleneck fraction.
+
+**Tolerance sensitivity (blobs, mean±std over seeds 0,1,2).** Certificate-driven
+growth matches scheduled TINY's accuracy at ~40% fewer params and is far less
+`eps`-sensitive than the mini-batch heuristic:
+
+| method | test acc | params | growths |
+| --- | --- | --- | --- |
+| TINY (scheduled) | 0.958 | 1599 | 6.0 |
+| mini-batch `eps=0.1` | 0.955 | 1915 | 6.7 |
+| certifying `eps=0.2` | 0.957 | **952** | 4.3 |
+| certifying `eps=0.4` | **0.959** | **894** | 4.0 |
+
+```bash
+../.venv/bin/python run.py --config configs/compare_blobs_stable.yaml   # head-to-head
+../.venv/bin/python ablate.py --seeds 0 1 2                              # full GPU ablation
+```
+
+## Ablations and report
+
+`ablate.py` runs the multi-seed GPU ablation (tolerance sensitivity; per-dataset
+head-to-head on `blobs`/`spiral`/`teacher`) and writes LaTeX tables into
+`report/tables/`. The NeurIPS-structured writeup lives in `report/`:
+
+```bash
+cd report && make        # -> functional_growth.pdf
+```
+
 ## Function-space landscape visualization
 
 `make_landscape.py` renders functional gradient descent *in function space*. A
