@@ -1,0 +1,12 @@
+\begin{tabular}{llrrrr}
+\toprule
+Task & Method & Test acc. & Test loss & Params & Growths \\
+\midrule
+blobs & TINY (scheduled) & 0.958$\pm$0.000 & 0.218$\pm$0.028 & 1599 & 6.0 \\
+ & Certified ($\eps$=0.2) & 0.957$\pm$0.008 & 0.214$\pm$0.025 & 952 & 4.3 \\
+spiral & TINY (scheduled) & 0.973$\pm$0.007 & 0.095$\pm$0.032 & 257 & 6.0 \\
+ & Certified ($\eps$=0.2) & 0.969$\pm$0.017 & 0.111$\pm$0.065 & 310 & 8.0 \\
+teacher & TINY (scheduled) & 0.412$\pm$0.035 & 0.770$\pm$0.155 & 1436 & 6.0 \\
+ & Certified ($\eps$=0.2) & 0.417$\pm$0.024 & 0.788$\pm$0.205 & 887 & 4.3 \\
+\bottomrule
+\end{tabular}
