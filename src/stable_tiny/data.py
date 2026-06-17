@@ -142,6 +142,60 @@ def make_blobs_dataloaders(
 
 
 # --------------------------------------------------------------------------- #
+# Multi-arm spiral — a hard, *realizable*, capacity-demanding nonlinear task
+# --------------------------------------------------------------------------- #
+def make_spiral_dataloaders(
+    *,
+    out_features: int = 4,
+    points_per_class: int = 1500,
+    noise: float = 0.18,
+    revolutions: float = 1.4,
+    n_test_per_class: int | None = None,
+    batch_size: int = 64,
+    seed: int = 0,
+    **_ignored,
+) -> tuple[DataLoader, DataLoader, dict]:
+    """Build a 2-D ``out_features``-arm Archimedean-spiral classification task.
+
+    Each class is one spiral arm rotated by ``2*pi*k/C``. The arms interleave, so
+    a *linear* model is hopeless and even a small MLP underfits the inner turns:
+    accuracy rises smoothly with capacity, which makes spirals a clean stress test
+    for growth (the boundary is realizable, so the ceiling is ~100%). Input is 2-D
+    regardless of ``in_features`` (the harness reads ``in_features`` from meta).
+    """
+    in_features = 2
+
+    def _split(n_per_class: int, gen: torch.Generator) -> TensorDataset:
+        xs, ys = [], []
+        for k in range(out_features):
+            t = torch.linspace(0.0, 1.0, n_per_class)
+            radius = t
+            theta = revolutions * 2.0 * torch.pi * t + k * 2.0 * torch.pi / out_features
+            x = torch.stack([radius * torch.cos(theta), radius * torch.sin(theta)], dim=1)
+            x = x + noise * radius.unsqueeze(1) * torch.randn(
+                n_per_class, 2, generator=gen
+            )
+            xs.append(x)
+            ys.append(torch.full((n_per_class,), k, dtype=torch.long))
+        x = torch.cat(xs)
+        y = torch.cat(ys)
+        perm = torch.randperm(x.shape[0], generator=gen)
+        return TensorDataset(x[perm], y[perm])
+
+    n_test_per_class = n_test_per_class or max(1, points_per_class // 4)
+    train_ds = _split(points_per_class, torch.Generator().manual_seed(seed + 1))
+    test_ds = _split(n_test_per_class, torch.Generator().manual_seed(seed + 2))
+
+    loader_gen = torch.Generator().manual_seed(seed + 3)
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True, generator=loader_gen
+    )
+    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False)
+    meta = {"in_features": in_features, "out_features": out_features}
+    return train_loader, test_loader, meta
+
+
+# --------------------------------------------------------------------------- #
 # Optional torchvision image tasks
 # --------------------------------------------------------------------------- #
 def make_torchvision_dataloaders(
@@ -192,6 +246,15 @@ def get_dataloaders(cfg: dict) -> tuple[DataLoader, DataLoader, dict]:
             center_scale=cfg.get("center_scale", 6.0),
             n_train=cfg["n_train"],
             n_test=cfg["n_test"],
+            batch_size=cfg["batch_size"],
+            seed=cfg["seed"],
+        )
+    if task == "spiral":
+        return make_spiral_dataloaders(
+            out_features=cfg["out_features"],
+            points_per_class=cfg.get("points_per_class", 1500),
+            noise=cfg.get("noise", 0.18),
+            revolutions=cfg.get("revolutions", 1.4),
             batch_size=cfg["batch_size"],
             seed=cfg["seed"],
         )

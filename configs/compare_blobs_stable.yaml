@@ -64,7 +64,7 @@ functional_grad_clip: null
 functional_progress_every: null
 functional_warmup_epochs: 1
 functional_failure_patience: 1
-functional_growth_steps: 12
+functional_growth_steps: 8
 functional_max_epochs: 30
 functional_stop_when_growth_budget_exhausted: false
 functional_growth_layer_selection: certifying  # only add growths that make the certificate hold
