@@ -11,6 +11,7 @@ The harness supports three methods:
 
 from __future__ import annotations
 
+import copy
 import json
 import time
 from pathlib import Path
@@ -531,6 +532,30 @@ def _run_functional_certified_tiny(state: _ExperimentState) -> None:
     # over-growth that noise would otherwise trigger.
     freeze_after_certified = bool(cfg.get("functional_freeze_growth_after_certified", False))
     representation_sufficient = False
+    # Certificate scope. "minibatch" (legacy): the certificate is evaluated on the
+    # random training batches, which is noisy and therefore needs a fraction
+    # threshold + growth hysteresis to absorb the noise. "fulldata": the
+    # certificate is evaluated once per epoch on a fixed large probe, giving a
+    # low-variance deterministic estimate of the expressivity bottleneck. A single
+    # certificate then *is* the growth trigger -- no fraction threshold, no
+    # hysteresis -- so the only remaining knob is the paper's tolerance eps, which
+    # equals the maximum tolerated bottleneck fraction rho* = eps / (1 + eps).
+    certificate_scope = cfg.get("functional_certificate_scope", "minibatch")
+    certificate_probe_size = int(cfg.get("functional_certificate_probe_size", 512))
+    # Marginal-utility stop (fulldata scope). Chasing the bottleneck to rho -> 0
+    # over-capacitates and overfits, so instead of growing until the certificate
+    # passes we grow only while growth keeps *paying off*: if a growth fails to
+    # reduce the deterministic bottleneck by at least ``min_gain`` (relative), the
+    # residual is treated as irreducible and growth is frozen. This is the
+    # threshold-light stopping rule -- the default min_gain=0 means "stop as soon
+    # as a growth stops helping at all".
+    # Off by default: the growth objective is to *guarantee the certificate*
+    # (Algorithm 1), not to minimize the bottleneck. The marginal-utility stop is
+    # kept only as an ablation of a bottleneck-driven stopping rule.
+    marginal_utility_stop = bool(cfg.get("functional_marginal_utility_stop", False))
+    growth_min_gain = float(cfg.get("functional_growth_min_gain", 0.0))
+    prev_bottleneck = float("inf")
+    growth_stalled = False
     # "fgd": train with verified-descent functional steps.
     # "adamw": train with AdamW between growths (apples-to-apples vs gromo_tiny),
     #          using the functional certificate *only* as the growth policy.
@@ -549,10 +574,17 @@ def _run_functional_certified_tiny(state: _ExperimentState) -> None:
         )
         state.log("warmup")
 
-    # A fixed probe batch defines the empirical output space in which the
-    # certificate is measured during the grow-until-certified refine loop.
+    # A fixed probe defines the empirical output space in which the certificate is
+    # measured. "minibatch" scope keeps the legacy single-batch probe used by the
+    # grow-until-certified refine loop; "fulldata" additionally keeps a fixed
+    # multi-batch probe for the deterministic growth trigger.
     probe_x, probe_y = next(iter(state.train_loader))
     probe_x, probe_y = probe_x.to(state.device), probe_y.to(state.device)
+    cert_batches = (
+        _build_certificate_batches(state, certificate_probe_size)
+        if certificate_scope == "fulldata"
+        else None
+    )
 
     consecutive_failures = 0
     for _ in range(max(0, max_epochs - warmup_epochs)):
@@ -602,18 +634,38 @@ def _run_functional_certified_tiny(state: _ExperimentState) -> None:
             }
         )
 
-        # The representation is insufficient when too few batches certify (the
-        # expressivity bottleneck dominates) or a step could not produce the
-        # Lemma-3.5 guaranteed descent.
-        certify_fraction = info.certified_batches / max(1, info.batches)
-        needs_refine = certify_fraction < certify_threshold or info.descent_failures > 0
-        if certify_fraction >= certify_threshold:
-            representation_sufficient = True
+        # The representation is insufficient when the expressivity bottleneck
+        # dominates (certificate fails) or a step could not produce the Lemma-3.5
+        # guaranteed descent.
+        if certificate_scope == "fulldata":
+            # Deterministic certificate on the fixed multi-batch probe is the sole
+            # growth trigger (no fraction threshold, no hysteresis).
+            cert = _fulldata_certificate_info(
+                state, cert_batches,
+                eps=cfg.get("functional_relative_error_tolerance", 0.2),
+            )
+            info.max_bottleneck_fraction = cert.max_bottleneck_fraction
+            info.mean_bottleneck_fraction = cert.mean_bottleneck_fraction
+            info.max_relative_error = cert.max_relative_error
+            cur_bottleneck = cert.mean_bottleneck_fraction
+            # Stop iff the certificate holds (Algorithm 1): the representation is
+            # guaranteed sufficient. ``growth_stalled`` only matters under the
+            # opt-in marginal-utility ablation.
+            needs_refine = cert.failed and not (marginal_utility_stop and growth_stalled)
+            representation_sufficient = not cert.failed
+            hysteresis_skip = False  # no hysteresis needed: the estimate is stable
+        else:
+            certify_fraction = info.certified_batches / max(1, info.batches)
+            needs_refine = certify_fraction < certify_threshold or info.descent_failures > 0
+            if certify_fraction >= certify_threshold:
+                representation_sufficient = True
+            hysteresis_skip = freeze_after_certified and representation_sufficient
+
         if not needs_refine:
             consecutive_failures = 0
             continue
 
-        if freeze_after_certified and representation_sufficient:
+        if hysteresis_skip:
             # Capacity already proven sufficient; treat this as optimization noise.
             consecutive_failures = 0
             continue
@@ -634,6 +686,23 @@ def _run_functional_certified_tiny(state: _ExperimentState) -> None:
             consecutive_failures = 0
             continue
 
+        if certificate_scope == "fulldata" and marginal_utility_stop:
+            # Ablation: bottleneck-driven stop. Only grow if the previous growth
+            # reduced the deterministic bottleneck; once a growth stops paying off,
+            # the residual is treated as irreducible and growth is frozen. Disabled
+            # by default -- the certificate, not the bottleneck, is the objective.
+            improved = cur_bottleneck < prev_bottleneck * (1.0 - growth_min_gain)
+            if prev_bottleneck < float("inf") and not improved:
+                growth_stalled = True
+                print(
+                    f"  >> growth stalled: bottleneck {cur_bottleneck:.3g} did not "
+                    f"improve on {prev_bottleneck:.3g} (min_gain={growth_min_gain}); "
+                    "freezing growth"
+                )
+                consecutive_failures = 0
+                continue
+            prev_bottleneck = cur_bottleneck
+
         if grow_until_certified:
             _grow_until_certified(
                 state,
@@ -644,10 +713,15 @@ def _run_functional_certified_tiny(state: _ExperimentState) -> None:
                 max_growth_events=max_growth_events,
             )
         else:
-            # Incremental refinement: grow the layer whose TINY optimal update
-            # best captures the bottleneck residual; subsequent FGD steps train
-            # the new neurons into the tangent space before we re-evaluate.
-            layer_to_grow, selection_info = _choose_functional_growth_layer(state)
+            # Incremental refinement: grow the layer chosen by the configured
+            # policy (certifying selection only adds growths that make the
+            # criterion hold); subsequent training trains the new neurons into the
+            # tangent space before we re-evaluate.
+            layer_to_grow, selection_info = _choose_functional_growth_layer(
+                state,
+                batches=cert_batches,
+                eps=cfg.get("functional_relative_error_tolerance", 0.2),
+            )
             _apply_growth(
                 state,
                 layer_to_grow,
@@ -659,6 +733,82 @@ def _run_functional_certified_tiny(state: _ExperimentState) -> None:
                 },
             )
         consecutive_failures = 0
+
+
+def _build_certificate_batches(
+    state: _ExperimentState, size: int
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Collect a *fixed* set of train batches totalling (up to) ``size`` points.
+
+    The expressivity bottleneck ``||grad L - P_T grad L|| / ||P_T grad L||`` is a
+    property of the *function on the data distribution*, not of any one random
+    mini-batch. Estimating the certificate on a fixed, larger probe makes the
+    trigger low-variance and deterministic, which is what lets us drop the
+    mini-batch-noise band-aids (fraction threshold + growth hysteresis) and use a
+    tight tolerance. We keep the probe as a *list of mini-batches* rather than one
+    giant batch so each exact Jacobian (jacrev) stays small in memory; the batches
+    are combined in quadrature, which is exactly the certificate on their
+    concatenation in output space.
+    """
+    batches, gathered = [], 0
+    for bx, by in state.train_loader:
+        batches.append((bx.to(state.device), by.to(state.device)))
+        gathered += bx.shape[0]
+        if gathered >= size:
+            break
+    return batches
+
+
+def _fulldata_certificate_info(
+    state: _ExperimentState,
+    batches: list[tuple[torch.Tensor, torch.Tensor]],
+    *,
+    eps: float,
+    model: torch.nn.Module | None = None,
+) -> FunctionalEpochInfo:
+    """Deterministic certificate over a fixed multi-batch probe.
+
+    Each batch contributes ``||r_i||`` (residual / bottleneck) and ``||g_i||``
+    (in-tangent projected gradient) and ``||grad L_i||``. Concatenating the
+    batches in output space adds these norms in quadrature, so the certificate on
+    the whole probe is ``(1+eps) sqrt(sum ||r_i||^2) < eps sqrt(sum ||g_i||^2)``.
+    No parameters are modified (``apply_step=False``). ``model`` defaults to the
+    live model but may be a (grown) trial model, which is what lets the certifying
+    growth selector score each candidate growth by its post-growth certificate.
+    """
+    model = model if model is not None else state.model
+    step_fn = (
+        exact_functional_step
+        if state.cfg.get("functional_projection", "cg") == "exact"
+        else certified_functional_step
+    )
+    kwargs = _functional_step_kwargs(state.cfg)
+    kwargs["relative_error_tolerance"] = eps
+    sum_r2 = sum_g2 = sum_true2 = loss_sum = 0.0
+    for x, y in batches:
+        info = step_fn(model, x, y, state.criterion, apply_step=False, **kwargs)
+        sum_r2 += info.residual_norm ** 2
+        sum_g2 += info.in_tangent_norm ** 2
+        sum_true2 += (info.residual_norm ** 2 + info.in_tangent_norm ** 2)
+        loss_sum += info.loss
+    r_norm = sum_r2 ** 0.5
+    g_norm = sum_g2 ** 0.5
+    true_norm = sum_true2 ** 0.5
+    certified = bool((1.0 + eps) * r_norm < eps * g_norm)
+    rel_err = r_norm / g_norm if g_norm > 0 else float("inf")
+    bottleneck = r_norm / true_norm if true_norm > 0 else 0.0
+    return FunctionalEpochInfo(
+        loss=loss_sum / max(1, len(batches)),
+        batches=len(batches),
+        certified_batches=len(batches) if certified else 0,
+        failed=not certified,
+        failure=None,
+        max_relative_error=rel_err,
+        mean_relative_error=rel_err,
+        descent_failures=0,
+        mean_bottleneck_fraction=bottleneck,
+        max_bottleneck_fraction=bottleneck,
+    )
 
 
 def _probe_certificate_info(
@@ -745,7 +895,87 @@ def _grow_until_certified(
     return last_info
 
 
-def _choose_functional_growth_layer(state: _ExperimentState) -> tuple[int, dict]:
+def _strip_cached_tensors(model: torch.nn.Module) -> None:
+    """Drop gromo's cached forward tensors that are functorch-wrapped.
+
+    gromo's growing layers cache the layer input (``_input``) during the forward
+    pass for their growth statistics. When the forward happens inside the
+    certificate's ``jacrev`` transform, that cache is a functorch ``TensorWrapper``
+    that cannot be deep-copied (no accessible storage). The cache is recomputed by
+    ``compute_statistics`` during the actual growth, so it is safe to clear before
+    cloning a trial model.
+    """
+    for module in model.modules():
+        for name, value in list(vars(module).items()):
+            if torch.is_tensor(value):
+                try:
+                    value.untyped_storage()
+                except (NotImplementedError, RuntimeError):
+                    setattr(module, name, None)
+
+
+def _select_certifying_growth_layer(
+    state: _ExperimentState,
+    batches: list[tuple[torch.Tensor, torch.Tensor]],
+    eps: float,
+) -> tuple[int, dict]:
+    """Pick the growth option that makes the paper's certificate hold.
+
+    For each growable layer we *trial-grow* a deep copy of the model with the TINY
+    optimal update and measure the deterministic certificate on the fixed probe.
+    Among options that certify (i.e. that make the criterion of Algorithm 1 hold),
+    we add the one with the fewest new parameters -- the smallest representation
+    that guarantees the algorithm. If none certifies at this tolerance, we add the
+    option that *best advances toward* the criterion (lowest relative error), and
+    the next epoch re-evaluates. The selection is driven by certificate
+    satisfaction, not by the size of the bottleneck / first-order improvement.
+    """
+    base_params = _count_params(state.model)
+    _strip_cached_tensors(state.model)
+    trials = []
+    for layer in range(state.cfg["number_hidden_layers"]):
+        trial = copy.deepcopy(state.model)
+        grow_step(
+            trial,
+            state.train_loader,
+            layer_to_grow=layer,
+            device=state.device,
+            maximum_added_neurons=state.cfg.get("maximum_added_neurons"),
+            line_search_factors=state.cfg.get(
+                "line_search_factors", (0.0, 0.1, 0.5, 1.0)
+            ),
+        )
+        cert = _fulldata_certificate_info(state, batches, eps=eps, model=trial)
+        trials.append(
+            {
+                "layer": layer,
+                "certified": not cert.failed,
+                "relative_error": cert.max_relative_error,
+                "bottleneck_fraction": cert.mean_bottleneck_fraction,
+                "added_params": _count_params(trial) - base_params,
+            }
+        )
+        del trial
+    certifying = [t for t in trials if t["certified"]]
+    if certifying:
+        chosen = min(certifying, key=lambda t: t["added_params"])
+    else:
+        # No option certifies at eps: advance toward the criterion (Algorithm 1
+        # keeps growing); pick the option whose post-growth certificate is closest.
+        chosen = min(trials, key=lambda t: t["relative_error"])
+    return chosen["layer"], {
+        "selection": "certifying",
+        "certifying_trials": trials,
+        "chosen_certified": chosen["certified"],
+        "chosen_relative_error": chosen["relative_error"],
+    }
+
+
+def _choose_functional_growth_layer(
+    state: _ExperimentState,
+    batches: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+    eps: float | None = None,
+) -> tuple[int, dict]:
     selection = state.cfg.get("functional_growth_layer_selection", "tiny_best")
     if selection == "sequential":
         layer = state.growth_count % max(1, state.cfg["number_hidden_layers"])
@@ -757,9 +987,16 @@ def _choose_functional_growth_layer(state: _ExperimentState) -> tuple[int, dict]
             state.device,
             maximum_added_neurons=state.cfg.get("maximum_added_neurons"),
         )
+    if selection == "certifying":
+        if batches is None or eps is None:
+            raise ValueError(
+                "certifying growth selection requires a probe and tolerance "
+                "(only available under functional_certificate_scope=fulldata)."
+            )
+        return _select_certifying_growth_layer(state, batches, eps)
     raise ValueError(
         f"Unknown functional_growth_layer_selection={selection!r}. "
-        "Expected 'tiny_best' or 'sequential'."
+        "Expected 'tiny_best', 'sequential', or 'certifying'."
     )
 
 

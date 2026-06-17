@@ -1,0 +1,75 @@
+# Threshold-light certified growth on the realizable "blobs" task.
+#
+# This is the answer to "can we depend less on the thresholds?". The legacy
+# mini-batch certificate is noisy, so it needs two band-aids -- a fraction
+# threshold (how many batches must certify) and growth hysteresis (freeze growth
+# after the first certification) -- to stop runaway over-growth. Here the
+# certificate is instead measured once per epoch on a fixed large probe
+# (functional_certificate_scope: fulldata), which is deterministic and
+# low-variance. A single certificate then *is* the growth trigger:
+#
+#   * no fraction threshold  (functional_certify_threshold is unused),
+#   * no hysteresis          (functional_freeze_growth_after_certified: false),
+#   * a *tight* tolerance is now safe (eps = 0.1 => tolerate <=9% bottleneck).
+#
+# The only remaining knob is the paper's tolerance eps, which has a physical
+# meaning: rho* = eps / (1 + eps) is the maximum tolerated expressivity-
+# bottleneck fraction in [0, 1], not an arbitrary hyperparameter.
+
+run_name: blobs_stable_compare
+out_dir: results
+seed: 0
+device: null
+methods:
+  - gromo_tiny
+  - functional_certified_tiny
+
+# --- task -------------------------------------------------------------------
+task: blobs
+in_features: 24
+out_features: 12
+cluster_std: 2.2
+center_scale: 2.0
+n_train: 6000
+n_test: 1500
+batch_size: 64
+
+# --- student model (starts under-capacity on purpose) ------------------------
+hidden_size: 4
+number_hidden_layers: 2
+
+# --- scheduled TINY ("tiny simple") -----------------------------------------
+optimizer: adamw
+lr: 0.02
+momentum: 0.9
+weight_decay: 0.01
+growth_steps: 6
+epochs_per_step: 4
+final_epochs: 6
+maximum_added_neurons: 8
+line_search_factors: [0.0, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0]
+
+# --- certified functional growth: threshold-light (fulldata) -----------------
+functional_projection: exact
+functional_train_optimizer: adamw
+functional_damping: 0.01
+functional_relative_error_tolerance: 0.1   # tight: tolerate <=9% bottleneck
+functional_certificate_scope: fulldata     # deterministic certificate on a fixed probe
+functional_certificate_probe_size: 1024
+functional_cg_min_iter: 1
+functional_cg_max_iter: 192
+functional_cg_tolerance: 0.00001
+functional_weight_decay: 0.0
+functional_grad_clip: null
+functional_progress_every: null
+functional_warmup_epochs: 1
+functional_failure_patience: 1
+functional_growth_steps: 12
+functional_max_epochs: 30
+functional_stop_when_growth_budget_exhausted: false
+functional_growth_layer_selection: certifying  # only add growths that make the certificate hold
+functional_marginal_utility_stop: false        # objective is the certificate, not the bottleneck
+functional_certify_threshold: 1.0          # unused under fulldata scope
+functional_grow_until_certified: false
+functional_freeze_growth_after_certified: false   # not needed: estimate is stable
+functional_max_refines: 6
