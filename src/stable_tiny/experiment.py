@@ -472,6 +472,7 @@ def _functional_step_kwargs(cfg: dict) -> dict:
         cg_tolerance=cfg.get("functional_cg_tolerance", 1e-3),
         weight_decay=cfg.get("functional_weight_decay", 0.0),
         grad_clip=cfg.get("functional_grad_clip"),
+        metric=cfg.get("functional_certificate_metric", "euclidean"),
     )
 
 

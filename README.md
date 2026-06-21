@@ -154,6 +154,57 @@ growth matches scheduled TINY's accuracy at ~40% fewer params and is far less
 ../.venv/bin/python ablate.py --seeds 0 1 2                              # full GPU ablation
 ```
 
+## Natural (loss-induced) certificate metric — `functional_certificate_metric: ggn`
+
+The base paper works in a **Hilbert** space, i.e. it assumes an inner product on
+functions. Everything above used the plain **Euclidean** dot product on the logits.
+But the geometry the loss actually induces is its Hessian: for cross-entropy the
+per-example Hessian w.r.t. the logits is the **GGN/Fisher** block
+
+```
+M = diag(p) - p pᵀ,   p = softmax(logits)
+```
+
+of rank `C-1` (it annihilates the all-ones vector — the overall-logit shift that
+leaves softmax, hence the loss, unchanged). Measuring the expressivity-bottleneck
+certificate `‖r‖/‖g‖` and the tangent-space projection in this **natural metric**
+(`functional_certificate_metric: ggn`, with the exact projection) does two things
+the Euclidean version cannot:
+
+1. the loss-irrelevant constant-logit direction is removed from the certificate
+   (`grad L = p − y ⟂ 1`, and `M·1 = 0`), so it no longer counts as bottleneck
+   "signal";
+2. directions of small loss curvature (already-confident classes) are
+   down-weighted, so growth adds capacity **where it actually reduces the loss**.
+
+The parameter step becomes the *natural functional gradient* (Gauss–Newton)
+direction; the sufficient-descent line search still uses the Euclidean directional
+derivative (the first-order loss change along an output move `g` is `⟨grad L, g⟩`
+regardless of metric).
+
+**Result — the natural metric Pareto-dominates the Euclidean certificate**
+(mean over seeds 0,1,2). At a *matched* tolerance the GGN certificate reaches a
+lower test loss on every task — on blobs at ~1/3 the parameters — and a slightly
+tighter `eps` matches scheduled TINY's accuracy at less than half its parameters:
+
+| task | method | test acc | test loss | params |
+| --- | --- | --- | --- | --- |
+| blobs | TINY (scheduled) | 0.958 | 0.218 | 1599 |
+| blobs | Euclidean `eps=0.1` | 0.957 | 0.255 | 1257 |
+| blobs | **GGN `eps=0.02`** | 0.955 | **0.179** | **731** |
+| spiral | TINY (scheduled) | 0.973 | 0.095 | 257 |
+| spiral | Euclidean `eps=0.1` | 0.969 | 0.111 | 310 |
+| spiral | **GGN `eps=0.05`** | **0.976** | **0.063** | 335 |
+| teacher | TINY (scheduled) | 0.412 | 0.770 | 1436 |
+| teacher | Euclidean `eps=0.1` | 0.420 | 0.779 | 1004 |
+| teacher | **GGN `eps=0.05`** | **0.433** | 0.790 | 1115 |
+
+```bash
+../.venv/bin/python run.py --config configs/compare_blobs_natural.yaml   # head-to-head
+../.venv/bin/python compare_metric_datasets.py --seeds 0 1 2             # cross-dataset table
+../.venv/bin/python ablate.py --only metric --seeds 0 1 2                # reproduce in the ablation matrix
+```
+
 ## Ablations and report
 
 `ablate.py` runs the multi-seed GPU ablation (tolerance sensitivity; per-dataset

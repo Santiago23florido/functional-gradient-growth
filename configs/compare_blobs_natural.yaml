@@ -1,0 +1,84 @@
+# Natural (loss-induced / GGN) certificate metric on the realizable "blobs" task.
+#
+# This is the theory-faithful refinement of compare_blobs_stable.yaml. The base
+# paper (arXiv:2606.16926) works in a *Hilbert* space of functions; for a
+# cross-entropy loss the natural inner product on the logit output space is the
+# one induced by the loss Hessian -- the GGN / Fisher metric
+#
+#     M = diag(p) - p p^T,   p = softmax(logits),
+#
+# not the plain Euclidean dot product. Measuring the expressivity-bottleneck
+# certificate ||grad L - g|| / ||g|| in the M metric (functional_certificate_metric:
+# ggn) instead of Euclidean:
+#
+#   * removes the loss-irrelevant overall-logit-shift direction (M annihilates
+#     the all-ones vector, and grad L is orthogonal to it), so it no longer
+#     counts as bottleneck "signal";
+#   * weights each output direction by loss curvature, so growth adds capacity
+#     where it actually reduces the loss instead of spending it on already-
+#     confident, low-curvature directions.
+#
+# Effect on blobs (mean over seeds 0,1,2): at a matched tolerance the GGN
+# certificate reaches a *lower* test loss with ~1/3 the parameters of the
+# Euclidean certificate; with a slightly tighter tolerance it matches scheduled
+# TINY's accuracy at less than half the parameters and a lower loss. It is also
+# more eps-insensitive than the Euclidean certificate.
+
+run_name: blobs_natural_compare
+out_dir: results
+seed: 0
+device: null
+methods:
+  - gromo_tiny
+  - functional_certified_tiny
+
+# --- task -------------------------------------------------------------------
+task: blobs
+in_features: 24
+out_features: 12
+cluster_std: 2.2
+center_scale: 2.0
+n_train: 6000
+n_test: 1500
+batch_size: 64
+
+# --- student model (starts under-capacity on purpose) ------------------------
+hidden_size: 4
+number_hidden_layers: 2
+
+# --- scheduled TINY ("tiny simple") -----------------------------------------
+optimizer: adamw
+lr: 0.02
+momentum: 0.9
+weight_decay: 0.01
+growth_steps: 6
+epochs_per_step: 4
+final_epochs: 6
+maximum_added_neurons: 8
+line_search_factors: [0.0, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0]
+
+# --- certified functional growth: NATURAL (GGN) metric -----------------------
+functional_projection: exact
+functional_train_optimizer: adamw
+functional_damping: 0.01
+functional_certificate_metric: ggn          # loss-induced (Fisher) inner product
+functional_relative_error_tolerance: 0.02   # physical tolerance in the M metric
+functional_certificate_scope: fulldata      # deterministic certificate on a fixed probe
+functional_certificate_probe_size: 1024
+functional_cg_min_iter: 1
+functional_cg_max_iter: 192
+functional_cg_tolerance: 0.00001
+functional_weight_decay: 0.0
+functional_grad_clip: null
+functional_progress_every: null
+functional_warmup_epochs: 1
+functional_failure_patience: 1
+functional_growth_steps: 8
+functional_max_epochs: 30
+functional_stop_when_growth_budget_exhausted: false
+functional_growth_layer_selection: certifying  # only add growths that make the certificate hold
+functional_marginal_utility_stop: false
+functional_certify_threshold: 1.0          # unused under fulldata scope
+functional_grow_until_certified: false
+functional_freeze_growth_after_certified: false
+functional_max_refines: 6

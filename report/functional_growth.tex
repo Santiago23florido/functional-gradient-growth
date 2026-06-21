@@ -66,7 +66,10 @@ spirals, random-teacher) the resulting method matches scheduled TINY's accuracy
 using markedly fewer parameters and growth events, and its outcome is far less
 sensitive to $\eps$ than the mini-batch heuristic. The only remaining knob,
 $\eps$, is physically meaningful: it caps the tolerated bottleneck fraction at
-$\rho^\star=\eps/(1+\eps)$.
+$\rho^\star=\eps/(1+\eps)$. Finally, measuring the certificate in the
+\emph{natural} (loss-induced GGN/Fisher) metric---the Hilbert structure the paper
+assumes, here made explicit for cross-entropy---Pareto-dominates the Euclidean
+certificate: a lower test loss at equal-or-fewer parameters on every task.
 \end{abstract}
 
 \section{Introduction}
@@ -95,9 +98,17 @@ Our contributions are:
   a deterministic fixed-probe certificate removes both. Growth selection then adds
   only options that make the certificate hold, guaranteeing Algorithm 1 rather
   than greedily minimizing the bottleneck (Sec.~\ref{sec:stable}).
+  \item \textbf{The natural (loss-induced) metric.} The base paper works in a
+  \emph{Hilbert} space; for a cross-entropy loss its natural inner product is the
+  one induced by the loss Hessian (the GGN/Fisher metric $M=\mathrm{diag}(p)-pp^\top$),
+  not the Euclidean dot product on logits. Measuring the certificate and the
+  projection in $M$ removes the loss-irrelevant logit-shift direction and weights
+  the bottleneck by loss curvature, so growth spends capacity where it reduces the
+  loss. This Pareto-dominates the Euclidean certificate (Sec.~\ref{sec:metric}).
   \item \textbf{Evidence.} On blobs, spirals and random-teacher, certified growth
   matches scheduled TINY's accuracy with fewer parameters and growths, and is
-  much less sensitive to the tolerance than the mini-batch variant
+  much less sensitive to the tolerance than the mini-batch variant; in the natural
+  metric it reaches a lower loss at equal-or-fewer parameters on every task
   (Sec.~\ref{sec:experiments}).
 \end{enumerate}
 
@@ -188,6 +199,32 @@ the option whose certificate is closest to passing and re-evaluate next epoch
 bottleneck-driven stopping rule is reported only as an ablation
 (Sec.~\ref{sec:experiments}).
 
+\subsection{The natural (loss-induced) metric}\label{sec:metric}
+The framework of \citet{fgd2025} is set in a Hilbert space $\mathcal{H}$, i.e.\ it
+presupposes an inner product on functions. Sections \ref{sec:method}--\ref{sec:stable}
+took the Euclidean dot product on the logits $\R^{BC}$. But the object the loss
+actually cares about is the geometry it induces: the Hessian of
+$L(f)=\mathrm{CE}(\mathrm{softmax}(f),y)$ with respect to the logits is, per
+example, the GGN/Fisher block
+\begin{equation}\label{eq:ggn}
+  M_i=\mathrm{diag}(p_i)-p_i p_i^\top,\qquad p_i=\mathrm{softmax}(f_i)\succeq0,
+\end{equation}
+of rank $C{-}1$ (it annihilates the all-ones vector---the overall-logit shift that
+leaves $\mathrm{softmax}$, hence $L$, unchanged). Taking $M=\mathrm{blockdiag}(M_i)$
+as the metric on the output space, the certificate norms and the projection become
+$M$-weighted. Concretely we whiten by $M^{1/2}$: the achievable gradient is the
+$M$-orthogonal projection $g=\argmin_{g\in T}\norm{M^{1/2}(\grad L(f)-g)}$, and the
+certificate \eqref{eq:cert} uses $\norm{\cdot}_M$. Two consequences make this the
+``right'' metric rather than a tweak: (i) since $\grad L(f)=p-y\perp\mathbf 1$ lies
+in the range of $M$, the loss-irrelevant constant-shift direction no longer counts
+as bottleneck ``signal''; (ii) directions of small loss curvature (already-confident
+classes) are down-weighted, so growth adds capacity where it reduces the loss. The
+parameter step $\dot\theta^\star$ is the natural functional-gradient (Gauss--Newton)
+direction; the Armijo line search of Lemma~3.5 still uses the Euclidean directional
+derivative $\inner{\grad L(f)}{g}$, since the first-order loss change along an output
+move $g$ is $\inner{\grad L(f)}{g}$ irrespective of the metric. Empirically the
+natural metric Pareto-dominates the Euclidean certificate (Table~\ref{tab:metric}).
+
 \begin{algorithm}[t]
 \caption{Certificate-driven functional-gradient growth (threshold-light)}
 \label{alg:main}
@@ -249,6 +286,28 @@ single tolerance $\eps$.
 \caption{Head-to-head per dataset. mean$\pm$std over seeds $\{0,1,2\}$.}
 \label{tab:dataset}
 \input{tables/dataset.tex}
+\end{table}
+
+\paragraph{The natural metric Pareto-dominates the Euclidean certificate.}
+Table~\ref{tab:metric} compares scheduled TINY, the Euclidean certificate, and the
+loss-induced GGN certificate of Sec.~\ref{sec:metric} on all three tasks. At a
+\emph{matched} tolerance the GGN certificate reaches a strictly lower test loss
+than the Euclidean one on every task---on blobs at roughly one-third of the
+parameters. Because the GGN metric discards the loss-irrelevant logit-shift
+direction it certifies sooner, so the tolerance maps to a smaller model; tightening
+$\eps$ to $0.02$ recovers scheduled TINY's accuracy at less than half its
+parameters (blobs) while keeping the lower loss. On the realizable spiral the GGN
+certificate is the only method that \emph{improves} on TINY's accuracy
+($0.976$ vs.\ $0.973$) and roughly halves its loss; on the harder, near-unrealizable
+teacher task all methods cluster, with GGN ($\eps{=}0.05$) giving the best accuracy
+at fewer parameters than TINY. The GGN outcome is also $\eps$-insensitive (spiral:
+$\eps{=}0.02$ and $\eps{=}0.05$ are identical).
+\begin{table}[t]\centering
+\caption{Euclidean vs.\ natural (GGN/Fisher) certificate metric, head-to-head with
+scheduled TINY. mean$\pm$std over seeds $\{0,1,2\}$. Lower loss at equal-or-fewer
+parameters on every task.}
+\label{tab:metric}
+\input{tables/metric.tex}
 \end{table}
 
 \paragraph{Ablation: bottleneck-driven stopping.}

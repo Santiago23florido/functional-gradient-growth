@@ -110,6 +110,11 @@ def _certifying(eps: float, **extra) -> dict:
     }
 
 
+def _certifying_ggn(eps: float, **extra) -> dict:
+    """Our method in the natural (loss-induced GGN/Fisher) metric."""
+    return _certifying(eps, functional_certificate_metric="ggn", **extra)
+
+
 def _minibatch_tiny(eps: float, **extra) -> dict:
     """Legacy noisy variant: mini-batch certificate + fraction threshold + hysteresis."""
     return {
@@ -147,7 +152,24 @@ DATASET_BLOCK = {
     ],
 }
 
-ABLATIONS = {"tolerance": TOLERANCE_BLOCK, "dataset": DATASET_BLOCK}
+# Block: Euclidean vs natural (GGN/Fisher) certificate metric, per dataset. Tests
+# whether measuring the expressivity-bottleneck certificate in the loss-induced
+# Hilbert metric improves the accuracy/parameter Pareto frontier (Sec. 4.x).
+METRIC_BLOCK = {
+    "tasks": ["blobs", "spiral", "teacher"],
+    "variants": [
+        ("TINY (scheduled)", {"method": "gromo_tiny"}),
+        ("Euclidean $\\eps$=0.1", _certifying(0.1)),
+        ("\\textbf{GGN} $\\eps$=0.05", _certifying_ggn(0.05)),
+        ("\\textbf{GGN} $\\eps$=0.02", _certifying_ggn(0.02)),
+    ],
+}
+
+ABLATIONS = {
+    "tolerance": TOLERANCE_BLOCK,
+    "dataset": DATASET_BLOCK,
+    "metric": METRIC_BLOCK,
+}
 
 
 def _run_one(base: dict, overrides: dict, seed: int) -> dict:
