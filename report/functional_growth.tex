@@ -344,7 +344,13 @@ The exact projection forms $J\in\R^{BC\times P}$, fine for the small models here
 but quadratic to scale; the conjugate-gradient variant avoids this but is
 ill-conditioned on heavily over-parameterized networks. Near convergence
 $\norm{\grad L(f)}\!\to\!0$ can make $\rho$ numerically noisy; the growth budget
-bounds any resulting over-growth. Within these limits, certified functional
+bounds any resulting over-growth. The natural-metric advantage is also
+task-dependent: on tasks that are essentially unrealizable for the student
+(random-teacher, and a real-image CIFAR-10 control on a tiny MLP) the softmax
+stays near-uniform, so $M=\mathrm{diag}(p)-pp^\top$ collapses to a scaled
+projection and the GGN certificate $\approx$ the Euclidean one; the gain shows up
+on realizable tasks where the model becomes confident and loss curvature
+discriminates directions. Within these limits, certified functional
 growth turns ``when/where to grow'' into a single physically meaningful
 tolerance and matches a tuned schedule at lower parameter cost.
 

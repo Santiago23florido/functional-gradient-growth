@@ -205,6 +205,35 @@ tighter `eps` matches scheduled TINY's accuracy at less than half its parameters
 ../.venv/bin/python ablate.py --only metric --seeds 0 1 2                # reproduce in the ablation matrix
 ```
 
+### Real-image control: CIFAR-10 (`task: cifar10`)
+
+CIFAR-10 is read directly from the standard `cifar-10-batches-py` pickles (no
+`torchvision`), averaged to grayscale and subsampled for speed
+(`configs/compare_cifar_natural.yaml`). A tiny MLP does *not* solve CIFAR-10 — the
+point is to test the **growth policy** on real images, not to chase accuracy.
+
+| method | test acc | test loss | params | growths |
+| --- | --- | --- | --- | --- |
+| TINY (scheduled) | 0.263 | 2.43 | 25590 | 6 |
+| Euclidean `eps=0.1` | **0.297** | **2.32** | **13046** | 5 |
+| GGN `eps=0.05` | 0.287 | 2.45 | 17598 | 7 |
+
+*(seed 0; the certificate runs take ~20–40 min each on a laptop RTX 4070 because the
+exact Jacobian over 1024 features is large.)* Both certificate-driven variants beat
+scheduled TINY — higher accuracy at roughly **half the parameters** — so the
+core value proposition holds on real data. But here GGN does **not** beat the
+Euclidean certificate: CIFAR-10 is essentially *unrealizable* for a tiny MLP
+(~28% accuracy, near-uniform softmax), and when `p` is near-uniform
+`M = diag(p) − ppᵀ` collapses to a scaled projection, so the GGN metric ≈ the
+Euclidean one. This mirrors the `teacher` task: **the natural metric's distinct
+advantage is on *realizable* tasks** (blobs, spiral), where the model becomes
+confident and loss curvature actually discriminates directions; on hard,
+near-unrealizable tasks all methods cluster.
+
+```bash
+../.venv/bin/python run.py --config configs/compare_cifar_natural.yaml
+```
+
 ## Ablations and report
 
 `ablate.py` runs the multi-seed GPU ablation (tolerance sensitivity; per-dataset

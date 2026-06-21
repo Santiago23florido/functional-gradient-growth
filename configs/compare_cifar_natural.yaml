@@ -1,0 +1,64 @@
+# Natural (GGN) vs Euclidean certificate vs scheduled TINY on real CIFAR-10.
+#
+# A hard real-image control: a tiny MLP does not "solve" CIFAR-10, but the
+# comparison of interest is the growth *policy* (certificate-driven vs scheduled),
+# not the absolute accuracy. CIFAR-10 is read directly from the standard
+# cifar-10-batches-py pickles (no torchvision). Images are averaged to grayscale
+# (1024 features) and the train set is subsampled so the exact-Jacobian
+# certificate stays fast.
+
+run_name: cifar_natural_compare
+out_dir: results
+seed: 0
+device: null
+methods:
+  - gromo_tiny
+  - functional_certified_tiny
+
+# --- task -------------------------------------------------------------------
+task: cifar10
+cifar_grayscale: true        # 1024 features (RGB-averaged); set false for 3072
+n_train: 5000
+n_test: 1000
+batch_size: 64
+
+# --- student model (starts under-capacity on purpose) ------------------------
+hidden_size: 4
+number_hidden_layers: 2
+
+# --- scheduled TINY ----------------------------------------------------------
+optimizer: adamw
+lr: 0.01
+momentum: 0.9
+weight_decay: 0.01
+growth_steps: 6
+epochs_per_step: 4
+final_epochs: 6
+maximum_added_neurons: 8
+line_search_factors: [0.0, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0]
+
+# --- certified functional growth: NATURAL (GGN) metric -----------------------
+functional_projection: exact
+functional_train_optimizer: adamw
+functional_damping: 0.01
+functional_certificate_metric: ggn
+functional_relative_error_tolerance: 0.05
+functional_certificate_scope: fulldata
+functional_certificate_probe_size: 512
+functional_cg_min_iter: 1
+functional_cg_max_iter: 192
+functional_cg_tolerance: 0.00001
+functional_weight_decay: 0.0
+functional_grad_clip: null
+functional_progress_every: null
+functional_warmup_epochs: 1
+functional_failure_patience: 1
+functional_growth_steps: 8
+functional_max_epochs: 24
+functional_stop_when_growth_budget_exhausted: false
+functional_growth_layer_selection: certifying
+functional_marginal_utility_stop: false
+functional_certify_threshold: 1.0
+functional_grow_until_certified: false
+functional_freeze_growth_after_certified: false
+functional_max_refines: 6

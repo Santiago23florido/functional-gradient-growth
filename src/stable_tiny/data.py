@@ -235,6 +235,87 @@ def make_torchvision_dataloaders(
     return train_loader, test_loader, meta
 
 
+def make_cifar10_dataloaders(
+    *,
+    data_dir: str | None = None,
+    n_train: int | None = 5000,
+    n_test: int | None = 1000,
+    batch_size: int = 64,
+    grayscale: bool = False,
+    seed: int = 0,
+) -> tuple[DataLoader, DataLoader, dict]:
+    """Build train/test loaders from the standard CIFAR-10 python pickle batches.
+
+    Reads the official ``cifar-10-batches-py`` files directly with ``pickle`` (no
+    torchvision dependency), flattens each image to a vector, and standardizes by
+    the *train* per-feature mean/std. CIFAR-10 on a tiny MLP is a deliberately hard
+    real-image control: it is not solved by an MLP, but the comparison of interest
+    is the *growth policy* (certificate-driven vs scheduled), not the absolute
+    accuracy. ``n_train``/``n_test`` subsample to keep the exact-Jacobian
+    certificate fast; ``grayscale`` averages the RGB channels (1024 features) to
+    shrink the model further.
+    """
+    import pickle
+    from pathlib import Path
+
+    if data_dir is None:
+        # Default to the locally cached keras download if present.
+        cached = Path.home() / ".keras/datasets/cifar-10-batches-py-target/cifar-10-batches-py"
+        data_dir = str(cached if cached.exists() else "./data/cifar-10-batches-py")
+    root = Path(data_dir)
+    if not root.exists():
+        raise FileNotFoundError(
+            f"CIFAR-10 batches not found at {root}. Point cfg['data_dir'] at a "
+            "'cifar-10-batches-py' directory (the standard python pickle format)."
+        )
+
+    def _load(fname: str):
+        with open(root / fname, "rb") as f:
+            d = pickle.load(f, encoding="bytes")
+        return d[b"data"], d[b"labels"]
+
+    train_parts = [_load(f"data_batch_{i}") for i in range(1, 6)]
+    train_x = torch.from_numpy(
+        __import__("numpy").concatenate([p[0] for p in train_parts])
+    ).float()
+    train_y = torch.tensor(sum((list(p[1]) for p in train_parts), []), dtype=torch.long)
+    test_raw = _load("test_batch")
+    test_x = torch.from_numpy(test_raw[0].copy()).float()
+    test_y = torch.tensor(list(test_raw[1]), dtype=torch.long)
+
+    if grayscale:
+        # [N, 3072] = [N, 3, 1024]; average channels -> [N, 1024].
+        train_x = train_x.view(-1, 3, 1024).mean(dim=1)
+        test_x = test_x.view(-1, 3, 1024).mean(dim=1)
+
+    # Standardize by train statistics (per feature).
+    mean = train_x.mean(dim=0, keepdim=True)
+    std = train_x.std(dim=0, keepdim=True).clamp_min(1e-6)
+    train_x = (train_x - mean) / std
+    test_x = (test_x - mean) / std
+
+    g = torch.Generator().manual_seed(seed)
+    if n_train is not None and n_train < train_x.shape[0]:
+        idx = torch.randperm(train_x.shape[0], generator=g)[:n_train]
+        train_x, train_y = train_x[idx], train_y[idx]
+    if n_test is not None and n_test < test_x.shape[0]:
+        idx = torch.randperm(test_x.shape[0], generator=g)[:n_test]
+        test_x, test_y = test_x[idx], test_y[idx]
+
+    loader_gen = torch.Generator().manual_seed(seed + 3)
+    train_loader = DataLoader(
+        TensorDataset(train_x, train_y),
+        batch_size=batch_size,
+        shuffle=True,
+        generator=loader_gen,
+    )
+    test_loader = DataLoader(
+        TensorDataset(test_x, test_y), batch_size=batch_size, shuffle=False
+    )
+    meta = {"in_features": train_x.shape[1], "out_features": 10}
+    return train_loader, test_loader, meta
+
+
 def get_dataloaders(cfg: dict) -> tuple[DataLoader, DataLoader, dict]:
     """Dispatch on ``cfg['task']``."""
     task = cfg.get("task", "teacher")
@@ -267,6 +348,15 @@ def get_dataloaders(cfg: dict) -> tuple[DataLoader, DataLoader, dict]:
             n_test=cfg["n_test"],
             label_noise=cfg["label_noise"],
             batch_size=cfg["batch_size"],
+            seed=cfg["seed"],
+        )
+    if task == "cifar10":
+        return make_cifar10_dataloaders(
+            data_dir=cfg.get("data_dir"),
+            n_train=cfg.get("n_train", 5000),
+            n_test=cfg.get("n_test", 1000),
+            batch_size=cfg["batch_size"],
+            grayscale=cfg.get("cifar_grayscale", False),
             seed=cfg["seed"],
         )
     if task in ("mnist", "fashion_mnist"):
