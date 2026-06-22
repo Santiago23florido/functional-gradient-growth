@@ -557,6 +557,22 @@ def _run_functional_certified_tiny(state: _ExperimentState) -> None:
     growth_min_gain = float(cfg.get("functional_growth_min_gain", 0.0))
     prev_bottleneck = float("inf")
     growth_stalled = False
+    # Stopping rule (fulldata scope). The tolerance ``eps`` is a real knob under the
+    # default "certificate" rule: it sets how small the bottleneck must get before
+    # growth stops, and therefore the final model size. The "plateau" rule removes
+    # that knob: it grows while each growth keeps reducing the *deterministic*
+    # expressivity bottleneck and stops at the plateau (the elbow of the
+    # bottleneck-vs-capacity curve, where the residual becomes irreducible). The
+    # stopping point is then a property of the data+model, not of eps -- eps no
+    # longer enters the stop decision at all (pair it with an eps-free growth
+    # selection such as ``tiny_best`` for a fully eps-free pipeline).
+    stop_rule = cfg.get("functional_stop_rule", "certificate")
+    if stop_rule not in ("certificate", "plateau"):
+        raise ValueError(
+            f"Unknown functional_stop_rule={stop_rule!r}; expected "
+            "'certificate' or 'plateau'."
+        )
+    plateau_mode = stop_rule == "plateau"
     # "fgd": train with verified-descent functional steps.
     # "adamw": train with AdamW between growths (apples-to-apples vs gromo_tiny),
     #          using the functional certificate *only* as the growth policy.
@@ -649,11 +665,19 @@ def _run_functional_certified_tiny(state: _ExperimentState) -> None:
             info.mean_bottleneck_fraction = cert.mean_bottleneck_fraction
             info.max_relative_error = cert.max_relative_error
             cur_bottleneck = cert.mean_bottleneck_fraction
-            # Stop iff the certificate holds (Algorithm 1): the representation is
-            # guaranteed sufficient. ``growth_stalled`` only matters under the
-            # opt-in marginal-utility ablation.
-            needs_refine = cert.failed and not (marginal_utility_stop and growth_stalled)
-            representation_sufficient = not cert.failed
+            if plateau_mode:
+                # eps-free: grow while the deterministic bottleneck keeps
+                # decreasing; the certificate threshold (hence eps) plays no role
+                # in the stop decision. The freeze block below sets growth_stalled
+                # once a growth stops reducing the bottleneck.
+                needs_refine = not growth_stalled
+                representation_sufficient = growth_stalled
+            else:
+                # Stop iff the certificate holds (Algorithm 1): the representation
+                # is guaranteed sufficient. ``growth_stalled`` only matters under
+                # the opt-in marginal-utility ablation.
+                needs_refine = cert.failed and not (marginal_utility_stop and growth_stalled)
+                representation_sufficient = not cert.failed
             hysteresis_skip = False  # no hysteresis needed: the estimate is stable
         else:
             certify_fraction = info.certified_batches / max(1, info.batches)
@@ -687,11 +711,12 @@ def _run_functional_certified_tiny(state: _ExperimentState) -> None:
             consecutive_failures = 0
             continue
 
-        if certificate_scope == "fulldata" and marginal_utility_stop:
-            # Ablation: bottleneck-driven stop. Only grow if the previous growth
-            # reduced the deterministic bottleneck; once a growth stops paying off,
-            # the residual is treated as irreducible and growth is frozen. Disabled
-            # by default -- the certificate, not the bottleneck, is the objective.
+        if certificate_scope == "fulldata" and (marginal_utility_stop or plateau_mode):
+            # Bottleneck-plateau stop. Only grow if the previous growth reduced the
+            # deterministic bottleneck; once a growth stops paying off, the residual
+            # is treated as irreducible and growth is frozen. Under the "plateau"
+            # stop rule this is the *sole* stopping criterion (eps-free); under the
+            # legacy marginal-utility ablation it gates the certificate rule.
             improved = cur_bottleneck < prev_bottleneck * (1.0 - growth_min_gain)
             if prev_bottleneck < float("inf") and not improved:
                 growth_stalled = True
