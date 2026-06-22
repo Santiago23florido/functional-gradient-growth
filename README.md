@@ -234,6 +234,21 @@ near-unrealizable tasks all methods cluster.
 ../.venv/bin/python run.py --config configs/compare_cifar_natural.yaml
 ```
 
+## Controlled starting point (fair comparison)
+
+Every method is an ablation of the **growth policy only**: scheduled TINY and the
+certificate-driven method begin from a *bitwise-identical* base network and the
+same data, and both train with the same AdamW (lr 0.02) between growths. This holds
+because `run_experiment` re-seeds the global RNG with the shared seed before
+building the dataloaders and the model, and the data/architecture config is shared
+across methods. `verify_init.py` checks the invariant directly (identical initial
+weights + first batch, on CPU and CUDA):
+
+```bash
+../.venv/bin/python verify_init.py
+# -> same_init_weights=True same_first_x=True same_first_y=True ... OK for every config
+```
+
 ## Ablations and report
 
 `ablate.py` runs the multi-seed GPU ablation (tolerance sensitivity; per-dataset
