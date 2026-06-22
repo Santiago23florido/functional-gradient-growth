@@ -259,6 +259,18 @@ seeds $\{0,1,2\}$. Tasks: \textbf{blobs} (Gaussian-mixture, $C{=}12$, $d{=}24$),
 (random-teacher labels, $C{=}10$, $d{=}20$). All three are realizable, so adding
 the right capacity---and stopping---is the winning strategy.
 
+\paragraph{Controlled starting point.} The comparison is an ablation of the growth
+policy alone, so every method must begin from \emph{exactly} the same base network
+and the same data. Each run re-seeds the global RNG with the shared seed before
+constructing the dataloaders and the model, and the data/architecture
+configuration is identical across methods; hence for a fixed seed the initial
+parameters are \emph{bitwise-equal} and the first training batch is identical. We
+verify this invariant directly (script \texttt{verify\_init.py}): for every
+config, \texttt{gromo\_tiny} and \texttt{functional\_certified\_tiny} produce
+identical initial weights and first batch on both CPU and CUDA. Thus any
+difference in the final metrics is attributable to the growth policy, not to a
+lucky initialization.
+
 \paragraph{Parameter efficiency and tolerance-sensitivity (blobs).}
 Table~\ref{tab:tolerance} contrasts scheduled TINY, the legacy mini-batch
 heuristic (certificate + fraction threshold + hysteresis), and our
