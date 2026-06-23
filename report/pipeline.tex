@@ -1,0 +1,428 @@
+% Mathematical pipeline + guarantees for tangent-kernel functional-gradient
+% growth, in IEEE (IEEEtran) format. This document contains the full derivation
+% and the proofs that the implemented pipeline realizes the assumptions and
+% lemmas of the base paper (Csillag et al., "Functional Gradient Descent with
+% Adaptive Representations", arXiv:2606.16926). No experimental results are
+% included here by design: the purpose is an exact, auditable specification of
+% what the code computes and why it is theoretically justified, so that both the
+% implementation and (separately) the experiments can be re-validated against it.
+\documentclass[conference]{IEEEtran}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{bm}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage[colorlinks=true,allcolors=blue]{hyperref}
+
+\newtheorem{assumption}{Assumption}
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollary}
+\newtheorem{definition}{Definition}
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}
+
+\DeclareMathOperator{\range}{range}
+\DeclareMathOperator{\spn}{span}
+\DeclareMathOperator*{\argmin}{arg\,min}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\inner}[2]{\langle #1,\, #2\rangle}
+\newcommand{\norm}[1]{\lVert #1\rVert}
+\newcommand{\grad}{\nabla}
+\newcommand{\PT}{\mathsf{P}_{T}}
+\newcommand{\eps}{\varepsilon}
+\newcommand{\J}{\mathbf{J}}
+\newcommand{\K}{\mathbf{K}}
+\newcommand{\f}{\bm{f}}
+\newcommand{\g}{\bm{g}}
+\newcommand{\rerr}{\mathrm{RelErr}}
+\newcommand{\transpose}{^{\!\top}}
+
+\begin{document}
+
+\title{Tangent--Kernel Functional Gradient Descent with Growth:\\
+A Faithful Realization of Adaptive--Representation FGD\\
+\large Mathematical Pipeline and Convergence Guarantees}
+
+\author{\IEEEauthorblockN{stable-tiny technical note}}
+
+\maketitle
+
+\begin{abstract}
+We give an exact, auditable specification of the functional-gradient growth
+pipeline implemented in \texttt{stable-tiny}, and we prove that it realizes the
+assumptions and lemmas of the adaptive-representation functional gradient descent
+(FGD) framework of Csillag \emph{et al.}~\cite{fgd}. The function space is the
+finite-dimensional empirical output (logit) space with the Euclidean inner
+product; the gradient approximation is the orthogonal projection of the functional
+gradient onto the network's parameter tangent space, computed through the tangent
+(neural-tangent) kernel; and the projection residual is identified \emph{exactly}
+with the expressivity bottleneck and with the error term $e_t=\grad L(f_t)-g_t$ of
+the base paper. Under this identification we show that the bridging assumptions
+(\cite{fgd}, Asm.~3.3--3.4) hold with constants $\alpha=\beta=1$, that the exact
+projection furnishes a \emph{tight} error certificate, that the certificate
+implies the relative-error bound of \cite{fgd}, Thm.~3.10(i), and that growth
+strictly reduces the bottleneck and hence terminates the inner refinement loop.
+Consequently the sufficient-descent lemma (\cite{fgd}, Lem.~3.5) and the
+convergence results (\cite{fgd}, Prop.~3.6, 3.8) apply verbatim to the implemented
+iterates. No experimental results are reported here: this note is the
+specification against which the implementation and the experiments are to be
+re-validated. We close with a precise statement of which variants are inside the
+theory (exact Euclidean projection with functional-gradient steps) and which are
+out-of-theory heuristics (the natural/GGN-metric variant).
+\end{abstract}
+
+% ===================================================================
+\section{Setup: the empirical function space}
+% ===================================================================
+We work with a classifier $h_\theta$ with parameters $\theta\in\R^{P}$ producing
+logits in $\R^{C}$. Fix a \emph{probe} of $n_p$ inputs $\{x_i\}_{i=1}^{n_p}$ (a
+fixed minibatch or a fixed multi-batch set). A \emph{snapshot} of the network is
+its stacked logit vector
+\begin{equation}
+\f(\theta)\;=\;\big(h_\theta(x_1),\dots,h_\theta(x_{n_p})\big)\;\in\;\R^{m},
+\qquad m=n_p C .
+\end{equation}
+Crucially $\dim\R^m=m$ is independent of the network width, so a small network and
+a grown network share one coordinate system. The empirical loss is a function of
+the snapshot alone,
+\begin{equation}
+L(\f)\;=\;\frac1{n_p}\sum_{i=1}^{n_p}\ell\big(\f_i,\,y_i\big),
+\end{equation}
+with $\ell$ the cross-entropy on the softmax. We take the function space to be the
+Euclidean space
+\begin{equation}
+\mathcal H=\mathcal B=\big(\R^{m},\ \inner{\cdot}{\cdot}\big),\qquad
+\inner{a}{b}=a\transpose b,\quad \norm{a}=\sqrt{a\transpose a}.
+\end{equation}
+
+\begin{proposition}[Trivial Hilbert/Banach bridge]\label{prop:bridge}
+With $\mathcal H=\mathcal B=\R^m$ Euclidean, the extension assumption
+(\cite{fgd}, Asm.~3.1) holds with the identity extension, and the bridging
+assumptions ``$\mathcal H$ descends in $\mathcal B$'' (\cite{fgd}, Asm.~3.3) and
+``gradient compatibility'' (\cite{fgd}, Asm.~3.4) hold with constants
+$\alpha=\beta=1$.
+\end{proposition}
+\begin{proof}
+Since $\mathcal B=\mathcal H$ as normed spaces, every functional and operator on
+$\mathcal H$ is its own extension, giving Asm.~3.1. For any $\f$, the directional
+derivative is $DL(\f;v)=\inner{\grad L(\f)}{v}$ for all $v$ (Riesz representation
+in a Euclidean space is the identity). Hence
+$DL(\f;\grad L(\f))=\inner{\grad L(\f)}{\grad L(\f)}=\norm{\grad L(\f)}^2$, which is
+Asm.~3.3 with $\alpha=1$; and the dual norm satisfies
+$\norm{DL(\f;\cdot)}_{\mathcal B^\ast}=\sup_{\norm v\le1}\inner{\grad L(\f)}{v}
+=\norm{\grad L(\f)}$, which is Asm.~3.4 with $\beta=1$.
+\end{proof}
+
+The functional gradient is the ordinary gradient of $L$ in logit space,
+$\grad L(\f)=\partial L/\partial \f\in\R^m$. For the cross-entropy,
+\begin{equation}\label{eq:cegrad}
+\big[\grad L(\f)\big]_i=\tfrac1{n_p}\big(\mathrm{softmax}(\f_i)-\bm e_{y_i}\big)
+\in\R^{C},
+\end{equation}
+where $\bm e_{y_i}$ is the one-hot label. In the code this is
+\texttt{torch.autograd.grad(loss, output)}.
+
+% ===================================================================
+\section{The tangent representation and its kernel}
+% ===================================================================
+A parameter move $\dot\theta\in\R^P$ changes the snapshot, to first order, by
+$\J\dot\theta$, where
+\begin{equation}
+\J=\frac{\partial \f}{\partial\theta}\in\R^{m\times P}
+\end{equation}
+is the output-space Jacobian. The set of \emph{realizable} first-order function
+changes is therefore the \emph{tangent space}
+\begin{equation}
+T \;=\; \range(\J)\;=\;\{\J\dot\theta:\dot\theta\in\R^P\}\subseteq\R^m .
+\end{equation}
+This is the current finite-dimensional \emph{representation} $\mathcal B_\theta$ in
+the sense of \cite{fgd}: the family of gradient directions the present
+architecture can express. Growth (adding neurons) enlarges $T$.
+
+\begin{definition}[Tangent kernel]
+The tangent (neural-tangent) kernel on the probe is the Gram operator in output
+space
+\begin{equation}
+\K \;=\; \J\J\transpose \;\in\;\R^{m\times m}.
+\end{equation}
+\end{definition}
+
+\begin{lemma}[Basic properties of $\K$]\label{lem:kernel}
+$\K=\J\J\transpose$ is symmetric positive semidefinite, and $\range(\K)=\range(\J)=T$.
+\end{lemma}
+\begin{proof}
+Symmetry is immediate and $v\transpose\K v=\norm{\J\transpose v}^2\ge0$, so
+$\K\succeq0$. For the range: $\range(\K)\subseteq\range(\J)$ trivially; conversely
+$\ker(\K)=\ker(\J\transpose)$ because $\K v=0\Rightarrow v\transpose\K v
+=\norm{\J\transpose v}^2=0\Rightarrow\J\transpose v=0$, and taking orthogonal
+complements gives $\range(\K)=\range(\J)$ since $\K$ is symmetric and
+$\range(\J)=\range(\J\J\transpose)$ for the same kernel reason.
+\end{proof}
+
+% ===================================================================
+\section{The approximation $g$, the residual $e$, and the bottleneck}
+% ===================================================================
+The implemented gradient approximation is the orthogonal projection of the
+functional gradient onto the realizable tangent space,
+\begin{equation}\label{eq:proj}
+\g \;=\; \PT\,\grad L(\f),\qquad
+\PT=\text{orthogonal projector onto }T .
+\end{equation}
+Two equivalent computations are used.
+
+\emph{(i) Exact (least squares).} Solve
+$\dot\theta^\star=\argmin_{\dot\theta}\norm{\J\dot\theta-\grad L(\f)}$ and set
+$\g=\J\dot\theta^\star$; equivalently the normal equations
+$\J\transpose\J\,\dot\theta^\star=\J\transpose\grad L(\f)$ (optionally
+Levenberg--Marquardt damped, $(\J\transpose\J+\lambda I)\dot\theta^\star
+=\J\transpose\grad L(\f)$). The parameter step is
+$\theta\leftarrow\theta-\eta\,\dot\theta^\star$, whose first-order effect on the
+snapshot is $-\eta\,\J\dot\theta^\star=-\eta\,\g$. This is the code path
+\texttt{functional\_projection: exact}.
+
+\emph{(ii) Tangent-kernel conjugate gradients.} Solve $(\K+\lambda I)\alpha
+=\grad L(\f)$ for $\alpha\in\R^m$ and set $\g=\K\alpha$; the parameter step is
+$\theta\leftarrow\theta-\eta\,\J\transpose\alpha$, whose first-order snapshot
+effect is $-\eta\,\J\J\transpose\alpha=-\eta\,\g$. This is the code path
+\texttt{functional\_projection: cg}.
+
+\begin{lemma}[Both computations yield the projection]\label{lem:proj}
+As $\lambda\downarrow0$, the exact and tangent-kernel computations both produce
+$\g=\PT\grad L(\f)$, the unique closest point of $T$ to $\grad L(\f)$.
+\end{lemma}
+\begin{proof}
+(i) is the definition of orthogonal projection onto $\range(\J)$ via least squares.
+For (ii), $\g=\K(\K+\lambda I)^{-1}\grad L(\f)\to \K\K^{+}\grad L(\f)$ as
+$\lambda\downarrow0$, where $\K^{+}$ is the pseudoinverse; and $\K\K^{+}$ is the
+orthogonal projector onto $\range(\K)=T$ by Lemma~\ref{lem:kernel}.
+\end{proof}
+
+\begin{definition}[Residual / expressivity bottleneck]
+\begin{equation}\label{eq:residual}
+e \;:=\; \grad L(\f)-\g \;=\; \grad L(\f)-\PT\grad L(\f)\;=\;(I-\PT)\grad L(\f).
+\end{equation}
+\end{definition}
+
+\begin{proposition}[$e$ is exactly the bottleneck and the paper's error term]
+\label{prop:e}
+The vector $e$ of \eqref{eq:residual} is the orthogonal complement of $\g$ in the
+decomposition of $\grad L(\f)$, satisfies $e\perp T$, and equals the distance from
+the functional gradient to the realizable space:
+\begin{equation}
+\norm{e}=\min_{v\in T}\norm{\grad L(\f)-v}=\operatorname{dist}\!\big(\grad L(\f),\,T\big).
+\end{equation}
+It is identical to the error term $e_t=\grad L(f_t)-g_t$ of \cite{fgd} (proof of
+Lem.~3.5), and to the \emph{expressivity bottleneck}: the component of the ideal
+functional update that no parameter move of the current network can realize. In
+the code, $e=$ \texttt{true\_gradient} $-$ \texttt{approx\_gradient}.
+\end{proposition}
+\begin{proof}
+$\PT$ is the orthogonal projector onto $T$, so $I-\PT$ is the projector onto
+$T^{\perp}$; thus $e=(I-\PT)\grad L(\f)\in T^\perp$ and, for any $v=\J\dot\theta\in
+T$, $\norm{\grad L(\f)-v}^2=\norm{e}^2+\norm{\g-v}^2\ge\norm{e}^2$ by Pythagoras,
+with equality iff $v=\g$. The identification with $e_t$ is the definition
+$g_t=\grad L(f_t)-(\grad L(f_t)-g_t)=:\grad L(f_t)-e_t$ used in \cite{fgd}.
+\end{proof}
+
+We define the scale-free quantities used as the certificate and the diagnostic,
+exactly as in the code ($\texttt{relative\_error}$ and
+$\texttt{bottleneck\_fraction}$):
+\begin{equation}\label{eq:relerr}
+\rerr(\g,\grad L(\f))=\frac{\norm{e}}{\norm{\g}},\qquad
+\rho=\frac{\norm{e}}{\norm{\grad L(\f)}}\in[0,1].
+\end{equation}
+Equation~\eqref{eq:relerr}-left is precisely Eq.~(4) of \cite{fgd}.
+
+% ===================================================================
+\section{Verification of the paper's assumptions and lemmas}
+% ===================================================================
+
+\begin{proposition}[$\g$ is a descent direction; tight certificate]\label{prop:descent}
+With $\g=\PT\grad L(\f)$,
+\begin{equation}
+\inner{\grad L(\f)}{\g}=\norm{\g}^2\ge0 ,
+\end{equation}
+i.e.\ the realized direction never increases the loss to first order. Moreover the
+exact projection furnishes a \emph{tight} error upper bound $U=\norm{e}$ in the
+sense of \cite{fgd}, Eq.~(5): $\norm{\g-\grad L(\f)}\le U$ holds with equality.
+\end{proposition}
+\begin{proof}
+$\PT$ is self-adjoint and idempotent, so
+$\inner{\grad L(\f)}{\g}=\inner{\grad L(\f)}{\PT\grad L(\f)}
+=\inner{\PT\grad L(\f)}{\PT\grad L(\f)}=\norm{\g}^2$. The bound is an equality
+because we compute $\norm{e}$ itself (least squares / pseudoinverse), not a proxy.
+\end{proof}
+
+\begin{theorem}[Certificate $\Rightarrow$ relative-error bound]\label{thm:cert}
+Fix a tolerance $\eps\in(0,1)$. If the implemented certificate
+\begin{equation}\label{eq:cert}
+(1+\eps)\,\norm{e}\;<\;\eps\,\norm{\g}
+\end{equation}
+holds, then $\rerr(\g,\grad L(\f))<\dfrac{\eps}{1+\eps}<\dfrac12$, matching
+\cite{fgd}, Thm.~3.10(i).
+\end{theorem}
+\begin{proof}
+Dividing \eqref{eq:cert} by $(1+\eps)\norm{\g}>0$ gives
+$\norm{e}/\norm{\g}<\eps/(1+\eps)$, which is $\rerr<\eps/(1+\eps)$ by
+\eqref{eq:relerr}. Since $\eps<1$, $\eps/(1+\eps)<1/2$. As $U=\norm{e}$ is exact
+(Prop.~\ref{prop:descent}), \eqref{eq:cert} is exactly the test
+$(1+\eps)U<\eps\norm{\g}$ of \cite{fgd}, Alg.~1.
+\end{proof}
+
+\begin{corollary}[Sufficient descent and convergence are inherited]\label{cor:descent}
+Assume $L$ is $K$-smooth on $\mathcal B$ (\cite{fgd}, Asm.~3.2). At any iterate
+whose step $\g$ satisfies the certificate \eqref{eq:cert}, the sufficient-descent
+lemma (\cite{fgd}, Lem.~3.5) applies with $\alpha=\beta=1$
+(Prop.~\ref{prop:bridge}) and $\rerr\le\eps/(1+\eps)$
+(Thm.~\ref{thm:cert}); hence for $0<\eta<2(1-2\eps)/\big(K(2\eps+1)\big)$,
+\begin{equation}
+L(\f-\eta\g)\le L(\f)-\eta\,r\,\norm{\grad L(\f)}^2,\quad
+r=1-\tfrac{K\eta}{2}-\big(1+\tfrac32 K\eta\big)\tfrac{\eps}{1-\eps}>0 .
+\end{equation}
+Telescoping yields convergence to a stationary point (\cite{fgd}, Prop.~3.6), and
+under a Polyak--{\L}ojasiewicz condition, linear convergence to the global
+minimizer (\cite{fgd}, Prop.~3.8).
+\end{corollary}
+
+\begin{remark}[Adaptive step size]
+The base lemma fixes $\eta\le 1/K$ with $K$ unknown. The implementation instead
+performs a function-space Armijo backtracking line search, accepting the largest
+$\eta\in\{\eta_0\beta_{\mathrm{bt}}^k\}$ with
+$L(\f-\eta\g)\le L(\f)-c\,\eta\,\inner{\grad L(\f)}{\g}$. By
+Prop.~\ref{prop:descent} the slope $\inner{\grad L(\f)}{\g}=\norm{\g}^2>0$ whenever
+$\g\neq0$, so the search succeeds for small enough $\eta$ by $K$-smoothness; this
+realizes Lem.~3.5 without knowing $K$. A failed search certifies that the tangent
+space itself, not the step size, is limiting, and is used as a secondary growth
+signal.
+\end{remark}
+
+% ===================================================================
+\section{Growth as representation refinement}
+% ===================================================================
+When the certificate \eqref{eq:cert} fails, the representation is refined by
+growing the network, which appends columns to $\J$ and hence enlarges $T$. Let
+$T\subsetneq T'$ be the tangent space after a growth step, with projectors
+$\PT,\PT'$ and residuals $e=(I-\PT)\grad L(\f)$, $e'=(I-\PT')\grad L(\f)$.
+
+\begin{proposition}[Growth never increases, and generically decreases, the bottleneck]
+\label{prop:growth}
+If $T\subseteq T'$ then $\norm{e'}\le\norm{e}$. The decrease is strict,
+$\norm{e'}<\norm{e}$, iff the newly added directions $T'\ominus T$ have nonzero
+inner product with the current residual $e$.
+\end{proposition}
+\begin{proof}
+$T\subseteq T'$ implies $\operatorname{dist}(\grad L(\f),T')\le
+\operatorname{dist}(\grad L(\f),T)$, i.e.\ $\norm{e'}\le\norm{e}$ by
+Prop.~\ref{prop:e}. Decompose $\grad L(\f)=\g+e$ with $e\perp T$. Writing the
+$T'$-projection in an orthonormal basis that extends one of $T$, the extra
+reduction is $\norm{e}^2-\norm{e'}^2=\norm{\mathsf P_{T'\ominus T}\,e}^2$, which is
+positive iff $e$ is not orthogonal to the added subspace $T'\ominus T$.
+\end{proof}
+
+\begin{corollary}[Termination of the inner loop]\label{cor:term}
+If the growth operator can, by adding sufficiently many neurons, make $T'$ dense
+enough that $\operatorname{dist}(\grad L(\f),T')\to0$, then $U=\norm{e'}\to0$ and
+the inner refinement loop of \cite{fgd}, Alg.~1 terminates: by Lem.~3.9 of
+\cite{fgd} there exists a finite refinement at which \eqref{eq:cert} holds (unless
+$\grad L(\f)=0$ already, in which case the step is skipped).
+\end{corollary}
+
+Proposition~\ref{prop:growth} also explains why the growth \emph{target} is the
+residual $e$: the TINY/GroMo optimal-neuron update is chosen to maximize the
+first-order loss decrease, i.e.\ to align the new tangent directions with $e$,
+which by the proposition is exactly the move that reduces the bottleneck the most.
+
+% ===================================================================
+\section{The complete pipeline}
+% ===================================================================
+Algorithm~\ref{alg:pipeline} states the executed procedure and its exact
+correspondence with \cite{fgd}, Alg.~1. This is the \emph{faithful} configuration:
+exact Euclidean projection, functional-gradient steps, certificate-triggered
+growth.
+
+\begin{algorithm}[t]
+\caption{Tangent-kernel FGD with growth (faithful pipeline)}
+\label{alg:pipeline}
+\begin{algorithmic}[1]
+\Require network $h_\theta$, probe $\{(x_i,y_i)\}$, tolerance $\eps\in(0,1)$,
+growth budget $G$, line-search constant $c$
+\For{$t=0,1,\dots$}
+  \State $\f\gets$ logits on the probe;\quad
+         $\grad L(\f)\gets\partial L/\partial\f$ \Comment{Eq.~\eqref{eq:cegrad}}
+  \While{true} \Comment{refine representation; \cite{fgd} Alg.~1 inner loop}
+    \State $\g\gets\PT\grad L(\f)$ via \eqref{eq:proj}
+           \Comment{tangent-kernel / lstsq, Lem.~\ref{lem:proj}}
+    \State $e\gets\grad L(\f)-\g$;\quad $U\gets\norm{e}$
+           \Comment{exact, tight (Prop.~\ref{prop:descent})}
+    \If{$(1+\eps)U<\eps\norm{\g}$} \textbf{break}
+           \Comment{certificate \eqref{eq:cert}, Thm.~\ref{thm:cert}}
+    \ElsIf{budget $G$ left} grow (TINY); enlarge $T$
+           \Comment{Prop.~\ref{prop:growth}}; $G\gets G-1$
+    \Else{} \textbf{break} \Comment{budget exhausted}
+    \EndIf
+  \EndWhile
+  \State choose $\eta$ by Armijo:
+         $L(\f-\eta\g)\le L(\f)-c\,\eta\,\norm{\g}^2$
+  \State $\theta\gets\theta-\eta\,\dot\theta^\star$
+         \Comment{realizes $\f\gets\f-\eta\g$ (Sec.~III)}
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\begin{table}[t]
+\centering
+\caption{Correspondence with \cite{fgd}.}
+\label{tab:map}
+\begin{tabular}{ll}
+\hline
+Paper object & This pipeline \\
+\hline
+Hilbert/Banach space $\mathcal H{=}\mathcal B$ & $(\R^{m},\inner\cdot\cdot)$, $m{=}n_pC$ \\
+functional gradient $\grad L(f)$ & $\partial L/\partial\f$, Eq.~\eqref{eq:cegrad} \\
+representation $\mathcal B_\theta$ & tangent space $T=\range(\J)$ \\
+approximation $g_t$ & $\g=\PT\grad L(\f)$ \\
+error $e_t=\grad L{-}g_t$ & residual $e=(I-\PT)\grad L(\f)$ \\
+bound $U_t$ on $\norm{e_t}$ & $U=\norm{e}$ (exact, tight) \\
+certificate $(1{+}\eps)U_t{<}\eps\norm{g_t}$ & Eq.~\eqref{eq:cert} \\
+$\rerr$, Eq.~(4) & $\norm{e}/\norm{\g}$, Eq.~\eqref{eq:relerr} \\
+refine representation & grow network (enlarge $T$) \\
+step $f_{t+1}{=}f_t{-}\eta g_t$ & $\theta\,{-}{=}\,\eta\dot\theta^\star$ \\
+\hline
+\end{tabular}
+\end{table}
+
+% ===================================================================
+\section{Scope: which variants are inside the theory}
+% ===================================================================
+The guarantees above hold for the \emph{Euclidean} instance with the exact
+projection and functional-gradient steps (Algorithm~\ref{alg:pipeline}). Two
+implemented variants deviate and are therefore reported as practical heuristics,
+\emph{outside} the present guarantees:
+
+\emph{(a) AdamW between growths.} Replacing the step on line~10 by AdamW updates
+keeps the certificate \eqref{eq:cert} as the growth trigger but no longer performs
+$\f\gets\f-\eta\g$; Cor.~\ref{cor:descent} then does not certify the optimizer's
+steps (only the growth decisions remain theory-grounded).
+
+\emph{(b) Natural/GGN metric.} Replacing the Euclidean inner product by the
+loss-induced metric $M=\mathrm{diag}(p)-pp\transpose$ in the projection and the
+certificate \emph{does not}, as implemented, coincide with FGD in the $M$-Hilbert
+space. Indeed the $M$-orthogonal projection of the \emph{$M$-gradient}
+$\grad_M L=M^{-1}\partial L/\partial\f$ is
+$\J(\J\transpose M\J)^{-1}\J\transpose\,\partial L/\partial\f$, whereas the code
+computes $\J(\J\transpose M\J)^{-1}\J\transpose M\,\partial L/\partial\f$
+(projection of the \emph{Euclidean} gradient under the $M$-norm), a
+Gauss--Newton-style preconditioning. Since the two differ by the factor $M$, the
+GGN variant is not an instance of \cite{fgd} with $\mathcal H=\mathcal B=(\R^m,M)$,
+and its convergence is not covered by Cor.~\ref{cor:descent}. It is retained only
+as an exploratory preconditioner and is not the canonical pipeline.
+
+\begin{thebibliography}{1}
+\bibitem{fgd}
+D.~Csillag, R.~Schuller, P.~Dall'Antonia, L.~Guibas, L.~Velho, and T.~Novello,
+``Functional Gradient Descent with Adaptive Representations,''
+arXiv:2606.16926, 2026.
+\end{thebibliography}
+
+\end{document}

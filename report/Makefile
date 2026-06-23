@@ -3,13 +3,18 @@
 # repo, so `make` here only typesets.
 PAPER = functional_growth
 
-all: $(PAPER).pdf
+all: $(PAPER).pdf pipeline.pdf
 
 $(PAPER).pdf: $(PAPER).tex tables/tolerance.tex tables/dataset.tex
 	pdflatex -interaction=nonstopmode $(PAPER).tex
 	pdflatex -interaction=nonstopmode $(PAPER).tex
 
+# Mathematical pipeline + proofs (IEEE format, no experimental results).
+pipeline.pdf: pipeline.tex
+	pdflatex -interaction=nonstopmode pipeline.tex
+	pdflatex -interaction=nonstopmode pipeline.tex
+
 clean:
-	rm -f $(PAPER).aux $(PAPER).log $(PAPER).out
+	rm -f $(PAPER).aux $(PAPER).log $(PAPER).out pipeline.aux pipeline.log pipeline.out
 
 .PHONY: all clean
