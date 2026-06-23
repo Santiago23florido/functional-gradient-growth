@@ -473,6 +473,7 @@ def _functional_step_kwargs(cfg: dict) -> dict:
         weight_decay=cfg.get("functional_weight_decay", 0.0),
         grad_clip=cfg.get("functional_grad_clip"),
         metric=cfg.get("functional_certificate_metric", "euclidean"),
+        metric_damping=cfg.get("functional_metric_damping", 1e-3),
     )
 
 

@@ -94,6 +94,32 @@ def _ggn_half(output: torch.Tensor) -> torch.Tensor:
     return half.to(device=output.device, dtype=output.dtype)
 
 
+def _metric_factors(output: torch.Tensor, tau: float) -> tuple[torch.Tensor, torch.Tensor]:
+    """Square root and inverse of the SPD metric ``A = M + tau I`` per example.
+
+    The GGN/Fisher Hessian ``M = diag(p) - p p^T`` is only positive *semi*definite
+    (it annihilates the all-ones vector), so it is not a genuine inner product and
+    cannot, by itself, define a Hilbert space in the sense the base paper requires.
+    Regularizing to ``A = M + tau I`` with ``tau > 0`` makes it SPD, hence a bona
+    fide inner product, while keeping the loss-relevant geometry (the gradient
+    ``p - y`` is orthogonal to the all-ones direction, so it lives in the range of
+    ``M`` and ``A^{-1}(p-y)`` stays bounded as ``tau -> 0``). We return ``A^{1/2}``
+    and ``A^{-1}`` as ``[B, C, C]`` batches, computed from one eigendecomposition.
+    """
+    p = torch.softmax(output.detach(), dim=-1)
+    M = torch.diag_embed(p) - p.unsqueeze(-1) * p.unsqueeze(-2)
+    M64 = M.double().cpu()
+    M64.diagonal(dim1=-2, dim2=-1).add_(1e-9)
+    evals, evecs = torch.linalg.eigh(M64)
+    a = evals.clamp_min(0.0) + float(tau)  # eigenvalues of A = M + tau I
+    half = (evecs * a.sqrt().unsqueeze(-2)) @ evecs.transpose(-1, -2)
+    inv = (evecs * a.reciprocal().unsqueeze(-2)) @ evecs.transpose(-1, -2)
+    return (
+        half.to(device=output.device, dtype=output.dtype),
+        inv.to(device=output.device, dtype=output.dtype),
+    )
+
+
 def _whiten_vector(flat: torch.Tensor, half: torch.Tensor) -> torch.Tensor:
     """Apply the block-diagonal ``M^{1/2}`` to a flat ``[B*C]`` output vector."""
     B, C, _ = half.shape
@@ -127,6 +153,7 @@ def certified_functional_step(
     lr_min_factor: float = 1e-3,
     apply_step: bool = True,
     metric: str = "euclidean",
+    metric_damping: float = 1e-3,
 ) -> FunctionalStepInfo:
     """Apply one certified projected functional-gradient step.
 
@@ -150,13 +177,15 @@ def certified_functional_step(
             f"Expected 1 <= cg_min_iter <= cg_max_iter, got "
             f"{cg_min_iter=} and {cg_max_iter=}"
         )
-    if metric not in ("euclidean", "ggn"):
-        raise ValueError(f"Unknown metric {metric!r}; expected 'euclidean' or 'ggn'.")
-    if metric == "ggn":
-        # The GGN/Fisher metric requires the explicit output-space Jacobian to
+    if metric not in ("euclidean", "ggn", "natural"):
+        raise ValueError(
+            f"Unknown metric {metric!r}; expected 'euclidean', 'ggn' or 'natural'."
+        )
+    if metric in ("ggn", "natural"):
+        # The non-Euclidean metrics require the explicit output-space Jacobian to
         # whiten; use functional_projection=exact instead of the CG approximation.
         raise NotImplementedError(
-            "metric='ggn' is only implemented for the exact projection "
+            f"metric={metric!r} is only implemented for the exact projection "
             "(functional_projection=exact), not the CG matvec path."
         )
 
@@ -411,6 +440,7 @@ def exact_functional_step(
     lr_min_factor: float = 1e-3,
     apply_step: bool = True,
     metric: str = "euclidean",
+    metric_damping: float = 1e-3,
     **_ignored,
 ) -> FunctionalStepInfo:
     """Certified functional-gradient step with an *exact* tangent projection.
@@ -458,53 +488,95 @@ def exact_functional_step(
         state.update(buffers)
         return functional_call(model, state, (x,)).reshape(-1)
 
-    if metric not in ("euclidean", "ggn"):
-        raise ValueError(f"Unknown metric {metric!r}; expected 'euclidean' or 'ggn'.")
+    if metric not in ("euclidean", "ggn", "natural"):
+        raise ValueError(
+            f"Unknown metric {metric!r}; expected 'euclidean', 'ggn' or 'natural'."
+        )
 
     jacobian = jacrev(call_with_parameters)(parameters)
     columns = [jac.reshape(output_numel, -1) for jac in jacobian]
     jacobian_matrix = torch.cat(columns, dim=1).detach()  # [B*C, P]
 
-    # The projection / certificate is computed in the chosen output-space metric.
-    # For the GGN/Fisher metric we whiten both the Jacobian and the ideal
-    # functional gradient by M^{1/2}; lstsq in whitened space is then the
-    # M-orthogonal projection (natural functional gradient), and the certificate
-    # norms become M-norms. The parameter step theta_dot is unchanged by the
-    # whitening of the *measurement* -- it is still the least-squares solution.
-    if metric == "ggn":
-        half = _ggn_half(output)
-        solve_jac = _whiten_jacobian(jacobian_matrix, half)
-        solve_rhs = _whiten_vector(true_gradient, half)
+    if metric == "natural":
+        # FAITHFUL natural-metric FGD. Work in the genuine Hilbert space
+        # H = B = (R^m, <.,.>_A) with A = M + tau I SPD (M the softmax-CE Hessian).
+        # The functional gradient is then the Riesz representer grad_A L = A^{-1} dL/df,
+        # and the approximation is its A-orthogonal projection onto the tangent
+        # space, which simplifies to the Gauss-Newton / natural-gradient step
+        #     theta_dot = (J^T A J + lambda I)^{-1} J^T (dL/df),     g = J theta_dot.
+        # All certificate norms are A-norms; <grad_A L, g>_A = ||g||_A^2 >= 0, so g
+        # is a descent direction and Asm. 3.3/3.4 hold with alpha=beta=1 (B=H).
+        A_half, A_inv = _metric_factors(output, metric_damping)
+        whitened_jac = _whiten_jacobian(jacobian_matrix, A_half)  # (A^{1/2} J)
+        rhs = jacobian_matrix.t() @ true_gradient                 # J^T dL/df (no metric!)
+        gram = whitened_jac.t() @ whitened_jac                    # J^T A J
+        if damping > 0.0:
+            gram.diagonal().add_(damping)
+        flat_solution = torch.linalg.solve(gram, rhs)             # theta_dot
+        g_norm_sq = float(torch.dot(flat_solution, rhs).clamp_min(0.0))  # ||g||_A^2
+        a_inv_grad = _whiten_vector(true_gradient, A_inv)         # A^{-1} dL/df
+        grad_norm_sq = float(torch.dot(true_gradient, a_inv_grad).clamp_min(0.0))  # ||grad_A L||_A^2
+        e_norm = (max(grad_norm_sq - g_norm_sq, 0.0)) ** 0.5      # Pythagoras in A
+        g_norm = g_norm_sq ** 0.5
+        true_norm_A = grad_norm_sq ** 0.5
+        certified = bool((1.0 + relative_error_tolerance) * e_norm
+                         < relative_error_tolerance * g_norm)
+        info = FunctionalStepInfo(
+            certified=certified,
+            loss=float(loss.detach()),
+            relative_error=(e_norm / g_norm) if g_norm > 0 else float("inf"),
+            error_bound=e_norm,
+            approx_norm=g_norm,
+            cg_iterations=0,
+            in_tangent_norm=g_norm,
+            residual_norm=e_norm,
+            bottleneck_fraction=(e_norm / true_norm_A) if true_norm_A > 0 else 0.0,
+            # Euclidean loss slope along g equals <dL/df, g> = theta_dot^T J^T dL/df
+            # = ||g||_A^2, so the Armijo model is consistent with the actual loss.
+            directional_derivative=g_norm_sq,
+        )
+        if not certified:
+            info.reason = "relative-error certificate failed"
     else:
-        solve_jac = jacobian_matrix
-        solve_rhs = true_gradient
+        # The projection / certificate is computed in the chosen output-space metric.
+        # For the (heuristic) GGN metric we whiten both the Jacobian and the ideal
+        # functional gradient by M^{1/2}; lstsq in whitened space then projects the
+        # *Euclidean* gradient under the M-norm (a Gauss-Newton preconditioner --
+        # NOT FGD in the M-Hilbert space; use metric='natural' for the faithful one).
+        if metric == "ggn":
+            half = _ggn_half(output)
+            solve_jac = _whiten_jacobian(jacobian_matrix, half)
+            solve_rhs = _whiten_vector(true_gradient, half)
+        else:
+            solve_jac = jacobian_matrix
+            solve_rhs = true_gradient
 
-    if damping > 0.0:
-        # Ridge / Levenberg-Marquardt: solve (J^T M J + damping I) theta_dot = J^T M r.
-        gram = solve_jac.t() @ solve_jac
-        gram.diagonal().add_(damping)
-        rhs = solve_jac.t() @ solve_rhs
-        flat_solution = torch.linalg.solve(gram, rhs)
-    else:
-        flat_solution = torch.linalg.lstsq(solve_jac, solve_rhs).solution
+        if damping > 0.0:
+            # Ridge / Levenberg-Marquardt: solve (J^T M J + damping I) theta_dot = J^T M r.
+            gram = solve_jac.t() @ solve_jac
+            gram.diagonal().add_(damping)
+            rhs = solve_jac.t() @ solve_rhs
+            flat_solution = torch.linalg.solve(gram, rhs)
+        else:
+            flat_solution = torch.linalg.lstsq(solve_jac, solve_rhs).solution
 
-    # Certificate / bottleneck measured in the chosen metric (whitened space).
-    approx_in_metric = solve_jac @ flat_solution
-    info = _certificate(
-        loss=loss,
-        approx_gradient=approx_in_metric,
-        true_gradient=solve_rhs,
-        eps=relative_error_tolerance,
-        cg_iterations=0,
-    )
-    if metric == "ggn":
-        # The Armijo sufficient-descent model uses the *Euclidean* directional
-        # derivative <grad L, g>, since the first-order loss change along the
-        # output move g = J theta_dot is dL = <grad L, g> regardless of metric.
-        euclid_g = jacobian_matrix @ flat_solution
-        info.directional_derivative = float(torch.dot(true_gradient, euclid_g).detach())
-    if not info.certified and not info.reason:
-        info.reason = "relative-error certificate failed"
+        # Certificate / bottleneck measured in the chosen metric (whitened space).
+        approx_in_metric = solve_jac @ flat_solution
+        info = _certificate(
+            loss=loss,
+            approx_gradient=approx_in_metric,
+            true_gradient=solve_rhs,
+            eps=relative_error_tolerance,
+            cg_iterations=0,
+        )
+        if metric == "ggn":
+            # The Armijo sufficient-descent model uses the *Euclidean* directional
+            # derivative <grad L, g>, since the first-order loss change along the
+            # output move g = J theta_dot is dL = <grad L, g> regardless of metric.
+            euclid_g = jacobian_matrix @ flat_solution
+            info.directional_derivative = float(torch.dot(true_gradient, euclid_g).detach())
+        if not info.certified and not info.reason:
+            info.reason = "relative-error certificate failed"
 
     if not apply_step:
         return info
@@ -550,6 +622,7 @@ def functional_descent_epoch(
     stop_on_failure: bool = True,
     projection: str = "cg",
     metric: str = "euclidean",
+    metric_damping: float = 1e-3,
 ) -> FunctionalEpochInfo:
     """Run certified functional descent over the epoch.
 
@@ -597,6 +670,7 @@ def functional_descent_epoch(
             lr_backtrack=lr_backtrack,
             lr_min_factor=lr_min_factor,
             metric=metric,
+            metric_damping=metric_damping,
         )
         losses.append(info.loss)
         relative_errors.append(info.relative_error)

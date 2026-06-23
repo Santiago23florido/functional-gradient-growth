@@ -1,0 +1,74 @@
+# Faithful realization of Algorithm 1 of arXiv:2606.16926, as specified and
+# proved in report/pipeline.tex. This is the canonical, theory-grounded pipeline:
+# every choice here is the one covered by the convergence guarantees.
+#
+#   * Euclidean function space  H = B = (R^{n_p*C}, <.,.>)   -> Asm. 3.3/3.4 with
+#     alpha = beta = 1 (report/pipeline.tex, Prop. 1).
+#   * Exact tangent-space projection g = P_T grad L(f) via least squares on the
+#     explicit Jacobian (functional_projection: exact) -> the residual
+#     e = grad L(f) - g is the EXACT expressivity bottleneck and U = ||e|| is a
+#     tight error bound (Prop. 4), so the certificate equals Alg. 1's test.
+#   * Functional-gradient STEPS f <- f - eta g (functional_train_optimizer: fgd)
+#     with an Armijo line search realizing the sufficient-descent Lemma 3.5.
+#   * Growth (TINY) refines the representation when the certificate fails, and
+#     stops once it holds (certificate stop rule). eps is the paper's tolerance.
+#
+# NOTE: this is deliberately the "pure" optimizer (FGD steps), which is weaker as a
+# trainer than AdamW but is the configuration whose convergence is proved. The
+# This uses the FAITHFUL natural metric (metric: natural), proved in-theory in
+# report/pipeline.tex, Prop. 6 (A = M + tau I SPD Hilbert space, Gauss-Newton step).
+
+run_name: faithful_natural_fgd
+out_dir: results
+seed: 0
+device: null
+methods:
+  - gromo_tiny                 # scheduled baseline (same controlled start)
+  - functional_certified_tiny  # the faithful pipeline
+
+# --- task (realizable; "grow to the right size and stop" is meaningful) -------
+task: blobs
+in_features: 24
+out_features: 12
+cluster_std: 2.2
+center_scale: 2.0
+n_train: 6000
+n_test: 1500
+batch_size: 64
+
+# --- student model (starts under-capacity on purpose) ------------------------
+hidden_size: 4
+number_hidden_layers: 2
+
+# --- scheduled TINY baseline -------------------------------------------------
+optimizer: adamw
+lr: 0.02
+momentum: 0.9
+weight_decay: 0.01
+growth_steps: 6
+epochs_per_step: 4
+final_epochs: 6
+maximum_added_neurons: 8
+line_search_factors: [0.0, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0]
+
+# --- faithful functional-gradient growth (Algorithm 1) -----------------------
+functional_train_optimizer: fgd            # take the actual f <- f - eta g steps
+functional_projection: exact               # exact P_T grad L; tight U = ||e||
+functional_certificate_metric: natural    # A = M + tau I Hilbert space (alpha=beta=1)
+functional_metric_damping: 0.001            # tau: makes the Fisher metric SPD (a true inner product)
+functional_stop_rule: certificate          # grow until certified, then stop
+functional_certificate_scope: fulldata     # deterministic certificate on a fixed probe
+functional_certificate_probe_size: 1024
+functional_growth_layer_selection: tiny_best   # TINY refines toward the residual e
+functional_relative_error_tolerance: 0.2   # the paper's tolerance eps
+functional_damping: 0.01                   # Levenberg-Marquardt ridge for the solve
+functional_lr: 0.5                          # base step; Armijo backtracks from here
+functional_sufficient_descent_c: 0.1        # Armijo constant c (Lemma 3.5)
+functional_lr_backtrack: 0.5
+functional_lr_min_factor: 0.001
+functional_warmup_epochs: 1
+functional_failure_patience: 1
+functional_growth_steps: 8
+functional_max_epochs: 30
+functional_batch_limit: 16
+functional_marginal_utility_stop: false

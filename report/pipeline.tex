@@ -67,9 +67,13 @@ Consequently the sufficient-descent lemma (\cite{fgd}, Lem.~3.5) and the
 convergence results (\cite{fgd}, Prop.~3.6, 3.8) apply verbatim to the implemented
 iterates. No experimental results are reported here: this note is the
 specification against which the implementation and the experiments are to be
-re-validated. We close with a precise statement of which variants are inside the
-theory (exact Euclidean projection with functional-gradient steps) and which are
-out-of-theory heuristics (the natural/GGN-metric variant).
+re-validated. We further show that a loss-aware metric can be brought \emph{inside}
+the theory: with a regularized, positive-definite metric $A=M+\tau I$ and the
+Riesz (natural) gradient, the resulting Gauss--Newton step is genuine FGD in the
+$A$-Hilbert space and inherits all guarantees with $\alpha=\beta=1$. We close by
+delimiting precisely which variants comply (exact Euclidean, and the faithful
+natural metric) and which cannot (the earlier heuristic GGN projection, and
+training with a non-FGD optimizer such as AdamW between growths).
 \end{abstract}
 
 % ===================================================================
@@ -393,30 +397,95 @@ step $f_{t+1}{=}f_t{-}\eta g_t$ & $\theta\,{-}{=}\,\eta\dot\theta^\star$ \\
 \end{table}
 
 % ===================================================================
-\section{Scope: which variants are inside the theory}
+\section{A faithful preconditioned (natural) metric}\label{sec:natural}
 % ===================================================================
-The guarantees above hold for the \emph{Euclidean} instance with the exact
-projection and functional-gradient steps (Algorithm~\ref{alg:pipeline}). Two
-implemented variants deviate and are therefore reported as practical heuristics,
-\emph{outside} the present guarantees:
+The Euclidean pipeline is not the only one covered by the theory. One may change
+the inner product on the function space to a loss-aware one, \emph{provided it is
+done consistently}. Let $p_i=\mathrm{softmax}(\f_i)$, let
+$M_i=\mathrm{diag}(p_i)-p_ip_i\transpose\succeq0$ be the per-example
+cross-entropy (GGN/Fisher) Hessian, and fix $\tau>0$. Define the
+block-diagonal, \emph{symmetric positive definite} metric
+\begin{equation}
+A=\mathrm{blkdiag}(A_i),\qquad A_i=M_i+\tau I_C\succ0,
+\end{equation}
+and the Hilbert space $\mathcal H=\mathcal B=(\R^m,\inner{\cdot}{\cdot}_A)$ with
+$\inner{a}{b}_A=a\transpose A b$. ($M$ alone is only PSD --- it annihilates the
+per-example all-ones direction --- so the regularization $\tau I$ is what makes it
+a genuine inner product; since $\partial L/\partial\f=p-y\perp\mathbf 1$ lies in
+$\range(M)$, the geometry on the loss-relevant subspace is preserved as
+$\tau\downarrow0$.)
 
-\emph{(a) AdamW between growths.} Replacing the step on line~10 by AdamW updates
-keeps the certificate \eqref{eq:cert} as the growth trigger but no longer performs
-$\f\gets\f-\eta\g$; Cor.~\ref{cor:descent} then does not certify the optimizer's
-steps (only the growth decisions remain theory-grounded).
+\begin{proposition}[Faithful natural-metric FGD]\label{prop:natural}
+In the Hilbert space $(\R^m,\inner\cdot\cdot_A)$:
+\begin{enumerate}
+\item Assumptions 3.1/3.3/3.4 of \cite{fgd} hold with $\alpha=\beta=1$ (as
+$\mathcal B=\mathcal H$);
+\item the functional gradient is the Riesz representer
+$\grad_A L=A^{-1}\,\partial L/\partial\f$;
+\item its $A$-orthogonal projection onto $T=\range(\J)$ is $\g=\J\dot\theta^\star$
+with the \emph{natural-gradient / Gauss--Newton} step
+\begin{equation}\label{eq:nat}
+\dot\theta^\star=\big(\J\transpose A\,\J+\lambda I\big)^{-1}\J\transpose\,
+\tfrac{\partial L}{\partial\f};
+\end{equation}
+\item $\inner{\grad_A L}{\g}_A=\norm{\g}_A^2\ge0$, so $\g$ is a descent direction,
+and $\norm{e}_A^2=\norm{\grad_A L}_A^2-\norm{\g}_A^2$ with
+$\norm{\grad_A L}_A^2=(\partial L/\partial\f)\transpose A^{-1}(\partial L/\partial\f)$;
+\item with the certificate $(1+\eps)\norm{e}_A<\eps\norm{\g}_A$, Theorem~\ref{thm:cert},
+Corollary~\ref{cor:descent} and Proposition~\ref{prop:growth} hold verbatim with
+all norms taken in $A$.
+\end{enumerate}
+\end{proposition}
+\begin{proof}
+(1) is Prop.~\ref{prop:bridge} with the $A$-inner product. (2): for all $v$,
+$DL(\f;v)=(\partial L/\partial\f)\transpose v=\inner{\grad_A L}{v}_A
+=(\grad_A L)\transpose A v$, so $A\,\grad_A L=\partial L/\partial\f$. (3): the
+$A$-orthogonal projector onto $\range(\J)$ is
+$\mathsf P_T^A=\J(\J\transpose A\J)^{-1}\J\transpose A$; applying it to
+$\grad_A L=A^{-1}\partial L/\partial\f$ cancels one $A$ and gives \eqref{eq:nat}
+(the ridge $\lambda$ is the usual Levenberg--Marquardt regularization). (4): by
+self-adjointness and idempotency of $\mathsf P_T^A$ in the $A$-inner product, as in
+Prop.~\ref{prop:descent}; the Pythagorean identity is \eqref{eq:residual} in $A$.
+Note the \emph{Euclidean} loss slope coincides,
+$DL(\f;-\eta\g)=-\eta(\partial L/\partial\f)\transpose\g
+=-\eta\,\dot\theta^{\star\top}\J\transpose\partial L/\partial\f=-\eta\norm{\g}_A^2$,
+so the Armijo line search remains exact. (5) repeats Sec.~IV/V in the $A$-norm.
+\end{proof}
 
-\emph{(b) Natural/GGN metric.} Replacing the Euclidean inner product by the
-loss-induced metric $M=\mathrm{diag}(p)-pp\transpose$ in the projection and the
-certificate \emph{does not}, as implemented, coincide with FGD in the $M$-Hilbert
-space. Indeed the $M$-orthogonal projection of the \emph{$M$-gradient}
-$\grad_M L=M^{-1}\partial L/\partial\f$ is
-$\J(\J\transpose M\J)^{-1}\J\transpose\,\partial L/\partial\f$, whereas the code
-computes $\J(\J\transpose M\J)^{-1}\J\transpose M\,\partial L/\partial\f$
-(projection of the \emph{Euclidean} gradient under the $M$-norm), a
-Gauss--Newton-style preconditioning. Since the two differ by the factor $M$, the
-GGN variant is not an instance of \cite{fgd} with $\mathcal H=\mathcal B=(\R^m,M)$,
-and its convergence is not covered by Cor.~\ref{cor:descent}. It is retained only
-as an exploratory preconditioner and is not the canonical pipeline.
+Equation~\eqref{eq:nat} is the implemented \texttt{metric: natural} path: it solves
+$(\J\transpose A\J)\dot\theta=\J\transpose\partial L/\partial\f$ (note the
+right-hand side carries \emph{no} metric factor) and measures the certificate in
+the $A$-norm. This answers directly the question ``can the metric variant be made
+to comply?'': \textbf{yes} --- by (i) regularizing $M$ to the SPD $A=M+\tau I$ so
+it is a true inner product, and (ii) projecting the \emph{Riesz} gradient
+$A^{-1}\partial L/\partial\f$ rather than $\partial L/\partial\f$, i.e.\ removing
+the spurious factor identified below.
+
+% ===================================================================
+\section{Variants outside the present guarantees}
+% ===================================================================
+\emph{(a) Heuristic GGN metric (\texttt{metric: ggn}).} This earlier variant
+projects the \emph{Euclidean} gradient under the $M$-norm, yielding
+$\J(\J\transpose M\J)^{-1}\J\transpose M\,\partial L/\partial\f$, whereas the
+faithful $A$-projection of the $M$-gradient is
+$\J(\J\transpose M\J)^{-1}\J\transpose\,\partial L/\partial\f$ (Prop.~\ref{prop:natural}(3)).
+The two differ by the spurious factor $M$ in the right-hand side, so
+\texttt{ggn} is \emph{not} an instance of \cite{fgd}; it is a Gauss--Newton-style
+preconditioner kept only for comparison. The fix is exactly
+\texttt{metric: natural}.
+
+\emph{(b) AdamW between growths.} Replacing the step on line~10 of
+Algorithm~\ref{alg:pipeline} by AdamW keeps the certificate \eqref{eq:cert} as a
+valid growth trigger (it is a property of the representation, metric- and
+optimizer-independent), but it no longer performs $\f\gets\f-\eta\g$. The
+sufficient-descent lemma (\cite{fgd}, Lem.~3.5) and hence
+Corollary~\ref{cor:descent} are statements \emph{about the FGD step itself}, so
+they cannot be transferred to a different update rule: \textbf{this variant cannot
+be made to comply within the present framework} (any convergence claim for AdamW
+would have to come from a separate analysis). To inherit the guarantees one must
+take the functional-gradient steps \eqref{eq:nat} (or their Euclidean
+counterpart); the certificate-driven \emph{growth} remains theory-grounded in
+either case.
 
 \begin{thebibliography}{1}
 \bibitem{fgd}
