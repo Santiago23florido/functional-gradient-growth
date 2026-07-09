@@ -10,7 +10,11 @@ from typing import Protocol
 class HistoryEntryLike(Protocol):
     step: int
     step_type: str
+    train_loss: float
     test_loss: float
+    train_accuracy: float
+    test_accuracy: float
+    learning_rate: float
     num_params: int
 
 
@@ -19,70 +23,78 @@ def plot_history(
     output_path: str | Path | None = None,
     show: bool = False,
 ) -> Path | None:
-    """Plot test loss and parameter count over training/growth steps."""
+    """Plot temporal metric evolution without point markers."""
     import matplotlib.pyplot as plt
 
     steps = [entry.step for entry in history]
-    losses = [entry.test_loss for entry in history]
-    params = [entry.num_params for entry in history]
-    sgd_indices = [
-        i for i, entry in enumerate(history) if entry.step_type in {"INIT", "SGD"}
-    ]
-    gro_indices = [i for i, entry in enumerate(history) if entry.step_type == "GRO"]
+    train_losses = [entry.train_loss for entry in history]
+    test_losses = [entry.test_loss for entry in history]
+    train_accuracies = [entry.train_accuracy for entry in history]
+    test_accuracies = [entry.test_accuracy for entry in history]
+    learning_rates = [entry.learning_rate for entry in history]
 
-    fig, ax1 = plt.subplots(figsize=(10, 6))
+    fig, axes = plt.subplots(2, 2, figsize=(14, 8), sharex=True)
+    loss_ax, train_acc_ax, test_acc_ax, lr_ax = axes.ravel()
 
-    ax1.set_xlabel("Step")
-    ax1.set_ylabel("Test Loss", color="tab:blue")
-    ax1.plot(steps, losses, color="tab:blue", alpha=0.5, linewidth=1)
-    ax1.scatter(
-        [steps[i] for i in sgd_indices],
-        [losses[i] for i in sgd_indices],
-        color="tab:blue",
-        marker="o",
-        s=70,
-        label="SGD Loss",
-        zorder=3,
-    )
-    ax1.scatter(
-        [steps[i] for i in gro_indices],
-        [losses[i] for i in gro_indices],
-        color="tab:blue",
-        marker="*",
-        s=170,
-        label="Growth Loss",
-        zorder=3,
-    )
-    ax1.tick_params(axis="y", labelcolor="tab:blue")
+    loss_ax.plot(steps, train_losses, linewidth=1.8, label="Train Loss")
+    loss_ax.plot(steps, test_losses, linewidth=1.8, label="Test Loss")
+    loss_ax.set_title("Loss")
+    loss_ax.set_ylabel("MSE")
+    loss_ax.legend(loc="best")
 
-    ax2 = ax1.twinx()
-    ax2.set_ylabel("Trainable Parameters", color="tab:orange")
-    ax2.plot(steps, params, color="tab:orange", alpha=0.5, linewidth=1)
-    ax2.scatter(
-        [steps[i] for i in sgd_indices],
-        [params[i] for i in sgd_indices],
-        color="tab:orange",
-        marker="o",
-        s=70,
-        label="SGD Params",
-        zorder=3,
-    )
-    ax2.scatter(
-        [steps[i] for i in gro_indices],
-        [params[i] for i in gro_indices],
-        color="tab:orange",
-        marker="*",
-        s=170,
-        label="Growth Params",
-        zorder=3,
-    )
-    ax2.tick_params(axis="y", labelcolor="tab:orange")
+    train_acc_ax.plot(steps, train_accuracies, linewidth=1.8, color="tab:green")
+    train_acc_ax.set_title("Train Accuracy")
+    train_acc_ax.set_ylabel("Tolerance Accuracy")
+    train_acc_ax.set_ylim(0.0, 1.0)
 
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper right")
-    ax1.set_title("Model Performance and Capacity Evolution")
+    test_acc_ax.plot(steps, test_accuracies, linewidth=1.8, color="tab:purple")
+    test_acc_ax.set_title("Test Accuracy")
+    test_acc_ax.set_xlabel("Epoch")
+    test_acc_ax.set_ylabel("Tolerance Accuracy")
+    test_acc_ax.set_ylim(0.0, 1.0)
 
+    lr_ax.plot(steps, learning_rates, linewidth=1.8, color="tab:red")
+    lr_ax.set_title("Learning Rate")
+    lr_ax.set_xlabel("Epoch")
+    lr_ax.set_ylabel("LR")
+
+    for ax in axes.ravel():
+        ax.grid(True, alpha=0.25)
+
+    fig.suptitle("GroMo Baseline Metrics", fontsize=14)
+    fig.tight_layout()
+
+    saved_path = None
+    if output_path is not None:
+        saved_path = Path(output_path)
+        saved_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(saved_path, dpi=160)
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return saved_path
+
+
+def plot_parameters(
+    history: Sequence[HistoryEntryLike],
+    output_path: str | Path | None = None,
+    show: bool = False,
+) -> Path | None:
+    """Plot trainable parameter count over time."""
+    import matplotlib.pyplot as plt
+
+    steps = [entry.step for entry in history]
+    num_params = [entry.num_params for entry in history]
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(steps, num_params, linewidth=1.8, color="tab:orange")
+    ax.set_title("Trainable Parameters")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Parameters")
+    ax.grid(True, alpha=0.25)
     fig.tight_layout()
 
     saved_path = None

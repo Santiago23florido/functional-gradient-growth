@@ -61,4 +61,67 @@ class MultiSinDataLoader(SyntheticDataLoader):
         return x, y
 
 
+class SmoothSinDataLoader(SyntheticDataLoader):
+    r"""Generate a smoother sinusoidal regression task.
+
+    The target uses only the first ``active_features`` inputs and normalizes the
+    result. It is smoother than ``MultiSinDataLoader`` but still includes
+    moderate frequencies and pairwise interactions.
+    """
+
+    def __init__(
+        self,
+        nb_sample: int = 1,
+        batch_size: int = 100,
+        seed: int = 0,
+        device: torch.device | None = None,
+        in_features: int = 3,
+        out_features: int = 1,
+        active_features: int = 2,
+        frequency: float = 1.0,
+        phase_shift: float = 0.5,
+        interaction_strength: float = 0.25,
+        linear_strength: float = 0.1,
+    ) -> None:
+        super().__init__(
+            nb_sample=nb_sample,
+            batch_size=batch_size,
+            seed=seed,
+            device=device,
+            in_features=in_features,
+            out_features=out_features,
+        )
+        self.active_features = max(1, min(active_features, in_features))
+        self.frequency = frequency
+        self.phase_shift = phase_shift
+        self.interaction_strength = interaction_strength
+        self.linear_strength = linear_strength
+
+    def __next__(self) -> tuple[torch.Tensor, torch.Tensor]:
+        super().__next__()
+        x = torch.randn(self.batch_size, self.in_features, device=self.device)
+        y = torch.empty(self.batch_size, self.out_features, device=self.device)
+
+        active_x = x[:, : self.active_features]
+        feature_weights = torch.linspace(
+            1.0,
+            2.0,
+            self.active_features,
+            device=self.device,
+        )
+        for d in range(self.out_features):
+            sinusoidal = torch.sin(
+                self.frequency * feature_weights * active_x + self.phase_shift * d
+            ).mean(dim=1)
+            interaction = torch.sin(active_x[:, 0] * active_x[:, -1] + d)
+            linear = active_x.mean(dim=1)
+            y[:, d] = (
+                sinusoidal
+                + self.interaction_strength * interaction
+                + self.linear_strength * linear
+            )
+
+        return x, y
+
+
 MultiSinDataloader = MultiSinDataLoader
