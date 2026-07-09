@@ -11,6 +11,11 @@ from typing import Any, Literal
 import yaml
 
 from stable_tiny.data import MultiSinDataLoader, SmoothSinDataLoader
+from stable_tiny.fgd_approx import (
+    FGDApproxConfig,
+    should_trigger_fgd_growth,
+    train_one_epoch_fgd_approx,
+)
 from stable_tiny.gromo_setup import ensure_gromo_importable
 from stable_tiny.grow import GrowthResult, ScalingLineSearchConfig, grow_layer
 from stable_tiny.growth_schedule import (
@@ -39,7 +44,8 @@ from gromo.containers.growing_mlp import GrowingMLP
 
 
 ProgressFn = Callable[[str], None]
-StepType = Literal["INIT", "SGD", "GRO"]
+TrainingMethod = Literal["normal", "fgd_approx"]
+StepType = Literal["INIT", "SGD", "FGD", "GRO"]
 DataKind = Literal["multi_sin", "smooth_sin"]
 
 
@@ -69,6 +75,7 @@ class ModelConfig:
 
 @dataclass(frozen=True)
 class TrainingConfig:
+    method: TrainingMethod = "normal"
     epochs: int = 200
     accuracy_tolerance: float = 1.0
     gradient_clip_norm: float | None = 1.0
@@ -91,6 +98,7 @@ class PipelineConfig:
     training: TrainingConfig = field(default_factory=TrainingConfig)
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     lr_scheduler: LRSchedulerConfig = field(default_factory=LRSchedulerConfig)
+    fgd_approx: FGDApproxConfig = field(default_factory=FGDApproxConfig)
     scaling_line_search: ScalingLineSearchConfig = field(
         default_factory=ScalingLineSearchConfig
     )
@@ -110,6 +118,7 @@ class HistoryEntry:
     num_params: int
     layer_index: int | None = None
     scaling_factor: float | None = None
+    rel_error: float | None = None
 
 
 @dataclass
@@ -158,6 +167,7 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         "training",
         "optimizer",
         "lr_scheduler",
+        "fgd_approx",
         "scaling_line_search",
         "growth_schedule",
         "run",
@@ -173,6 +183,7 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         training=_section_dataclass("training", TrainingConfig, raw),
         optimizer=_section_dataclass("optimizer", OptimizerConfig, raw),
         lr_scheduler=_section_dataclass("lr_scheduler", LRSchedulerConfig, raw),
+        fgd_approx=_section_dataclass("fgd_approx", FGDApproxConfig, raw),
         scaling_line_search=_section_dataclass(
             "scaling_line_search",
             ScalingLineSearchConfig,
@@ -279,7 +290,11 @@ def should_log_epoch(epoch: int, config: PipelineConfig) -> bool:
     )
 
 
-def scheduled_learning_rate(config: PipelineConfig, epoch: int) -> float:
+def scheduled_learning_rate(
+    config: PipelineConfig,
+    epoch: int,
+    cycle_start_epoch: int,
+) -> float:
     return learning_rate_for_epoch(
         config.lr_scheduler,
         base_learning_rate=config.optimizer.learning_rate,
@@ -287,6 +302,7 @@ def scheduled_learning_rate(config: PipelineConfig, epoch: int) -> float:
         total_epochs=config.training.epochs,
         growth_every=config.growth_schedule.every,
         first_growth_epoch=config.growth_schedule.first_epoch,
+        cycle_start_epoch=cycle_start_epoch,
     )
 
 
@@ -300,13 +316,22 @@ def run_pipeline(
     model = build_model(config, device)
     loss_function = torch.nn.MSELoss()
     optimizer = build_optimizer(model, config.optimizer)
-    apply_learning_rate(optimizer, scheduled_learning_rate(config, epoch=0))
+    lr_cycle_start_epoch = 0
+    apply_learning_rate(
+        optimizer,
+        scheduled_learning_rate(
+            config,
+            epoch=0,
+            cycle_start_epoch=lr_cycle_start_epoch,
+        ),
+    )
 
     history: list[HistoryEntry] = []
     growth_events: list[GrowthResult] = []
 
     if progress is not None:
         progress(f"Using device: {device}")
+        progress(f"Training method: {config.training.method}")
         progress("Original model:")
         progress(str(model))
 
@@ -346,44 +371,94 @@ def run_pipeline(
         )
 
     growth_count = 0
+    last_growth_epoch: int | None = None
     for epoch in range(1, config.training.epochs + 1):
-        apply_learning_rate(optimizer, scheduled_learning_rate(config, epoch=epoch))
-
-        epoch_result = train_one_epoch(
-            model=model,
-            train_loader=train_loader,
-            test_loader=test_loader,
-            optimizer=optimizer,
-            loss_function=loss_function,
-            device=device,
-            accuracy_tolerance=config.training.accuracy_tolerance,
-            gradient_clip_norm=config.training.gradient_clip_norm,
+        learning_rate = scheduled_learning_rate(
+            config,
+            epoch=epoch,
+            cycle_start_epoch=lr_cycle_start_epoch,
         )
+        apply_learning_rate(optimizer, learning_rate)
+
+        rel_error: float | None = None
+        if config.training.method == "normal":
+            epoch_result = train_one_epoch(
+                model=model,
+                train_loader=train_loader,
+                test_loader=test_loader,
+                optimizer=optimizer,
+                loss_function=loss_function,
+                device=device,
+                accuracy_tolerance=config.training.accuracy_tolerance,
+                gradient_clip_norm=config.training.gradient_clip_norm,
+            )
+            step_type: StepType = "SGD"
+        elif config.training.method == "fgd_approx":
+            fgd_epoch_result = train_one_epoch_fgd_approx(
+                model=model,
+                train_loader=train_loader,
+                test_loader=test_loader,
+                optimizer=optimizer,
+                loss_function=loss_function,
+                device=device,
+                learning_rate=learning_rate,
+                accuracy_tolerance=config.training.accuracy_tolerance,
+                gradient_clip_norm=config.training.gradient_clip_norm,
+                config=config.fgd_approx,
+            )
+            epoch_result = fgd_epoch_result
+            rel_error = fgd_epoch_result.relative_error
+            step_type = "FGD"
+        else:
+            raise ValueError(
+                f"Unsupported training method '{config.training.method}'. "
+                "Use one of: normal, fgd_approx."
+            )
+
         history.append(
             HistoryEntry(
                 step=epoch,
-                step_type="SGD",
+                step_type=step_type,
                 train_loss=epoch_result.train_loss,
                 test_loss=epoch_result.test_loss,
                 train_accuracy=epoch_result.train_accuracy,
                 test_accuracy=epoch_result.test_accuracy,
                 learning_rate=current_learning_rate(optimizer),
                 num_params=count_parameters(model),
+                rel_error=rel_error,
             )
         )
 
         if progress is not None and should_log_epoch(epoch, config):
             delta = epoch_result.test_loss - last_test_loss
+            rel_error_msg = (
+                f", rel_err={rel_error:.3f}" if rel_error is not None else ""
+            )
             progress(
-                f"[SGD] Epoch {epoch}, train_loss={epoch_result.train_loss:.4f}, "
+                f"[{step_type}] Epoch {epoch}, "
+                f"train_loss={epoch_result.train_loss:.4f}, "
                 f"test_loss={epoch_result.test_loss:.4f} ({delta:+.4f}), "
                 f"train_acc={epoch_result.train_accuracy:.3f}, "
                 f"test_acc={epoch_result.test_accuracy:.3f}, "
                 f"lr={current_learning_rate(optimizer):.4g}"
+                f"{rel_error_msg}"
             )
         last_test_loss = epoch_result.test_loss
 
-        if should_grow(epoch, config.growth_schedule):
+        if config.training.method == "normal":
+            growth_triggered = should_grow(epoch, config.growth_schedule)
+        else:
+            growth_triggered = config.growth_schedule.enabled and (
+                rel_error is not None
+                and should_trigger_fgd_growth(
+                    relative_error=rel_error,
+                    epoch=epoch,
+                    last_growth_epoch=last_growth_epoch,
+                    config=config.fgd_approx,
+                )
+            )
+
+        if growth_triggered:
             layer_index = layer_index_for_growth(
                 growth_count=growth_count,
                 number_hidden_layers=config.model.number_hidden_layers,
@@ -402,11 +477,16 @@ def run_pipeline(
             )
             growth_events.append(growth_result)
             growth_count += 1
+            last_growth_epoch = epoch
+            lr_cycle_start_epoch = epoch
             optimizer = build_optimizer(model, config.optimizer)
-            reset_epoch = 0 if config.lr_scheduler.restart_on_growth else epoch
             apply_learning_rate(
                 optimizer,
-                scheduled_learning_rate(config, epoch=reset_epoch),
+                scheduled_learning_rate(
+                    config,
+                    epoch=epoch,
+                    cycle_start_epoch=lr_cycle_start_epoch,
+                ),
             )
 
             train_metrics = evaluate_regression_metrics(
@@ -435,6 +515,7 @@ def run_pipeline(
                     num_params=count_parameters(model),
                     layer_index=layer_index,
                     scaling_factor=growth_result.best_scaling_factor,
+                    rel_error=rel_error,
                 )
             )
 
@@ -491,7 +572,11 @@ def write_outputs(result: PipelineResult) -> dict[str, Path]:
     output_paths["history"] = save_result_json(result, history_path)
 
     if run_config.save_plot:
-        from stable_tiny.plotting import plot_history, plot_parameters
+        from stable_tiny.plotting import (
+            plot_history,
+            plot_parameters,
+            plot_relative_error,
+        )
 
         plot_path = run_config.results_dir / f"{run_config.name}_metrics.png"
         saved_plot = plot_history(
@@ -510,5 +595,15 @@ def write_outputs(result: PipelineResult) -> dict[str, Path]:
         )
         if saved_parameters_plot is not None:
             output_paths["parameters_plot"] = saved_parameters_plot
+
+        rel_error_path = run_config.results_dir / f"{run_config.name}_rel_error.png"
+        saved_rel_error_plot = plot_relative_error(
+            result.history,
+            output_path=rel_error_path,
+            show=run_config.show_plot,
+            threshold=result.config.fgd_approx.rel_error_threshold,
+        )
+        if saved_rel_error_plot is not None:
+            output_paths["rel_error_plot"] = saved_rel_error_plot
 
     return output_paths

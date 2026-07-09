@@ -1,5 +1,5 @@
 run:
-  name: gromo_base_200e_grow50
+  name: fgd_approx_growth_baseline
   results_dir: results
   save_plot: true
   show_plot: false
@@ -20,11 +20,12 @@ data:
   linear_strength: 0.1
 
 model:
-  hidden_size: 64
+  hidden_size: 2
   number_hidden_layers: 3
   model_seed: 0
 
 training:
+  method: fgd_approx
   epochs: 1000
   accuracy_tolerance: 0.1
   gradient_clip_norm: 1.0
@@ -45,6 +46,12 @@ lr_scheduler:
   t_max: 50
   eta_min: 0.0
   restart_on_growth: true
+
+fgd_approx:
+  rel_error_threshold: 0.5
+  start_epoch: 1
+  min_epochs_between_growth: 1
+  eps: 1.0e-12
 
 scaling_line_search:
   method: golden_section

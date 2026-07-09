@@ -36,6 +36,7 @@ def learning_rate_for_epoch(
     total_epochs: int,
     growth_every: int | None = None,
     first_growth_epoch: int | None = None,
+    cycle_start_epoch: int = 0,
 ) -> float:
     """Return the learning rate for an epoch.
 
@@ -50,18 +51,12 @@ def learning_rate_for_epoch(
         cycle_position = max(0, epoch)
         default_t_max = total_epochs
 
-        if (
-            config.restart_on_growth
-            and growth_every is not None
-            and growth_every > 0
-            and first_growth_epoch is not None
-        ):
-            default_t_max = growth_every
-            if epoch > first_growth_epoch:
-                relative_epoch = epoch - first_growth_epoch
-                cycle_position = relative_epoch % growth_every
-                if cycle_position == 0:
-                    cycle_position = growth_every
+        if config.restart_on_growth:
+            cycle_position = max(0, epoch - cycle_start_epoch)
+            if growth_every is not None and growth_every > 0:
+                default_t_max = growth_every
+            elif first_growth_epoch is not None and first_growth_epoch > 0:
+                default_t_max = first_growth_epoch
 
         t_max = config.t_max if config.t_max is not None else default_t_max
         t_max = max(1, t_max)

@@ -16,6 +16,7 @@ class HistoryEntryLike(Protocol):
     test_accuracy: float
     learning_rate: float
     num_params: int
+    rel_error: float | None
 
 
 def plot_history(
@@ -94,6 +95,57 @@ def plot_parameters(
     ax.set_title("Trainable Parameters")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Parameters")
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+
+    saved_path = None
+    if output_path is not None:
+        saved_path = Path(output_path)
+        saved_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(saved_path, dpi=160)
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return saved_path
+
+
+def plot_relative_error(
+    history: Sequence[HistoryEntryLike],
+    output_path: str | Path | None = None,
+    show: bool = False,
+    threshold: float | None = None,
+) -> Path | None:
+    """Plot FGD approximation relative error when available."""
+    import matplotlib.pyplot as plt
+
+    points = [
+        (entry.step, entry.rel_error)
+        for entry in history
+        if entry.rel_error is not None
+    ]
+    if not points:
+        return None
+
+    steps = [step for step, _ in points]
+    rel_errors = [float(rel_error) for _, rel_error in points if rel_error is not None]
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(steps, rel_errors, linewidth=1.8, color="tab:cyan")
+    if threshold is not None:
+        ax.axhline(
+            threshold,
+            color="tab:red",
+            linestyle="--",
+            linewidth=1.2,
+            label="Growth threshold",
+        )
+        ax.legend(loc="best")
+    ax.set_title("FGD Approximation Relative Error")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Relative Error")
     ax.grid(True, alpha=0.25)
     fig.tight_layout()
 
