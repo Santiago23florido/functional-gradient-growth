@@ -10,12 +10,22 @@ from typing import Any, Literal
 
 import yaml
 
-from stable_tiny.data import MultiSinDataLoader
+from stable_tiny.data import MultiSinDataLoader, SmoothSinDataLoader
 from stable_tiny.gromo_setup import ensure_gromo_importable
-from stable_tiny.grow import GrowthResult, grow_layer
+from stable_tiny.grow import GrowthResult, ScalingLineSearchConfig, grow_layer
+from stable_tiny.growth_schedule import (
+    GrowthScheduleConfig,
+    layer_index_for_growth,
+    should_grow,
+)
+from stable_tiny.lr_scheduler import (
+    LRSchedulerConfig,
+    apply_learning_rate,
+    learning_rate_for_epoch,
+)
+from stable_tiny.optim import OptimizerConfig, build_optimizer, current_learning_rate
 from stable_tiny.train import (
     count_parameters,
-    current_learning_rate,
     evaluate_regression_metrics,
     train_one_epoch,
 )
@@ -30,10 +40,12 @@ from gromo.containers.growing_mlp import GrowingMLP
 
 ProgressFn = Callable[[str], None]
 StepType = Literal["INIT", "SGD", "GRO"]
+DataKind = Literal["multi_sin", "smooth_sin"]
 
 
 @dataclass(frozen=True)
 class DataConfig:
+    kind: DataKind = "smooth_sin"
     in_features: int = 10
     out_features: int = 3
     train_batches: int = 10
@@ -41,6 +53,11 @@ class DataConfig:
     batch_size: int = 1_000
     train_seed: int = 0
     test_seed: int = 1
+    active_features: int = 2
+    frequency: float = 1.0
+    phase_shift: float = 0.5
+    interaction_strength: float = 0.25
+    linear_strength: float = 0.1
 
 
 @dataclass(frozen=True)
@@ -53,10 +70,8 @@ class ModelConfig:
 @dataclass(frozen=True)
 class TrainingConfig:
     epochs: int = 200
-    grow_every: int = 50
-    learning_rate: float = 0.01
-    scaling_factors: tuple[float, ...] = (0.0, 0.1, 0.5, 1.0)
     accuracy_tolerance: float = 1.0
+    gradient_clip_norm: float | None = 1.0
     log_every: int = 10
     device: str = "auto"
 
@@ -74,6 +89,12 @@ class PipelineConfig:
     data: DataConfig = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
+    optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
+    lr_scheduler: LRSchedulerConfig = field(default_factory=LRSchedulerConfig)
+    scaling_line_search: ScalingLineSearchConfig = field(
+        default_factory=ScalingLineSearchConfig
+    )
+    growth_schedule: GrowthScheduleConfig = field(default_factory=GrowthScheduleConfig)
     run: RunConfig = field(default_factory=RunConfig)
 
 
@@ -112,10 +133,11 @@ def _section_dataclass(
         joined = ", ".join(unknown_keys)
         raise ValueError(f"Unknown keys in config section '{section_name}': {joined}")
 
-    if section_type is TrainingConfig and "scaling_factors" in values:
-        values["scaling_factors"] = tuple(
-            float(value) for value in values["scaling_factors"]
-        )
+    if section_type is OptimizerConfig and "betas" in values:
+        betas = tuple(float(value) for value in values["betas"])
+        if len(betas) != 2:
+            raise ValueError("optimizer.betas must contain exactly two values")
+        values["betas"] = betas
 
     if section_type is RunConfig and "results_dir" in values:
         values["results_dir"] = Path(values["results_dir"])
@@ -130,7 +152,16 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
     if not isinstance(raw, Mapping):
         raise TypeError(f"Expected a YAML mapping in {config_path}")
 
-    known_sections = {"data", "model", "training", "run"}
+    known_sections = {
+        "data",
+        "model",
+        "training",
+        "optimizer",
+        "lr_scheduler",
+        "scaling_line_search",
+        "growth_schedule",
+        "run",
+    }
     unknown_sections = sorted(set(raw) - known_sections)
     if unknown_sections:
         joined = ", ".join(unknown_sections)
@@ -140,6 +171,18 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         data=_section_dataclass("data", DataConfig, raw),
         model=_section_dataclass("model", ModelConfig, raw),
         training=_section_dataclass("training", TrainingConfig, raw),
+        optimizer=_section_dataclass("optimizer", OptimizerConfig, raw),
+        lr_scheduler=_section_dataclass("lr_scheduler", LRSchedulerConfig, raw),
+        scaling_line_search=_section_dataclass(
+            "scaling_line_search",
+            ScalingLineSearchConfig,
+            raw,
+        ),
+        growth_schedule=_section_dataclass(
+            "growth_schedule",
+            GrowthScheduleConfig,
+            raw,
+        ),
         run=_section_dataclass("run", RunConfig, raw),
     )
 
@@ -174,23 +217,44 @@ def select_device(device: str) -> torch.device:
 def build_dataloaders(
     config: PipelineConfig,
     device: torch.device,
-) -> tuple[MultiSinDataLoader, MultiSinDataLoader]:
+) -> tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
     data_config = config.data
-    train_loader = MultiSinDataLoader(
+
+    if data_config.kind == "multi_sin":
+        loader_class = MultiSinDataLoader
+        extra_kwargs: dict[str, Any] = {}
+    elif data_config.kind == "smooth_sin":
+        loader_class = SmoothSinDataLoader
+        extra_kwargs = {
+            "active_features": data_config.active_features,
+            "frequency": data_config.frequency,
+            "phase_shift": data_config.phase_shift,
+            "interaction_strength": data_config.interaction_strength,
+            "linear_strength": data_config.linear_strength,
+        }
+    else:
+        raise ValueError(
+            f"Unsupported data kind '{data_config.kind}'. "
+            "Use one of: multi_sin, smooth_sin."
+        )
+
+    train_loader = loader_class(
         nb_sample=data_config.train_batches,
         batch_size=data_config.batch_size,
         in_features=data_config.in_features,
         out_features=data_config.out_features,
         seed=data_config.train_seed,
         device=device,
+        **extra_kwargs,
     )
-    test_loader = MultiSinDataLoader(
+    test_loader = loader_class(
         nb_sample=data_config.test_batches,
         batch_size=data_config.batch_size,
         in_features=data_config.in_features,
         out_features=data_config.out_features,
         seed=data_config.test_seed,
         device=device,
+        **extra_kwargs,
     )
     return train_loader, test_loader
 
@@ -208,24 +272,21 @@ def build_model(config: PipelineConfig, device: torch.device) -> GrowingMLP:
     )
 
 
-def build_optimizer(
-    model: torch.nn.Module,
-    config: PipelineConfig,
-) -> torch.optim.Optimizer:
-    return torch.optim.SGD(
-        model.parameters(),
-        lr=config.training.learning_rate,
-    )
-
-
-def should_grow(epoch: int, config: PipelineConfig) -> bool:
-    return config.training.grow_every > 0 and epoch % config.training.grow_every == 0
-
-
 def should_log_epoch(epoch: int, config: PipelineConfig) -> bool:
     log_every = config.training.log_every
     return epoch == 1 or epoch == config.training.epochs or (
         log_every > 0 and epoch % log_every == 0
+    )
+
+
+def scheduled_learning_rate(config: PipelineConfig, epoch: int) -> float:
+    return learning_rate_for_epoch(
+        config.lr_scheduler,
+        base_learning_rate=config.optimizer.learning_rate,
+        epoch=epoch,
+        total_epochs=config.training.epochs,
+        growth_every=config.growth_schedule.every,
+        first_growth_epoch=config.growth_schedule.first_epoch,
     )
 
 
@@ -238,7 +299,8 @@ def run_pipeline(
     train_loader, test_loader = build_dataloaders(config, device)
     model = build_model(config, device)
     loss_function = torch.nn.MSELoss()
-    optimizer = build_optimizer(model, config)
+    optimizer = build_optimizer(model, config.optimizer)
+    apply_learning_rate(optimizer, scheduled_learning_rate(config, epoch=0))
 
     history: list[HistoryEntry] = []
     growth_events: list[GrowthResult] = []
@@ -285,6 +347,8 @@ def run_pipeline(
 
     growth_count = 0
     for epoch in range(1, config.training.epochs + 1):
+        apply_learning_rate(optimizer, scheduled_learning_rate(config, epoch=epoch))
+
         epoch_result = train_one_epoch(
             model=model,
             train_loader=train_loader,
@@ -293,6 +357,7 @@ def run_pipeline(
             loss_function=loss_function,
             device=device,
             accuracy_tolerance=config.training.accuracy_tolerance,
+            gradient_clip_norm=config.training.gradient_clip_norm,
         )
         history.append(
             HistoryEntry(
@@ -318,8 +383,12 @@ def run_pipeline(
             )
         last_test_loss = epoch_result.test_loss
 
-        if should_grow(epoch, config):
-            layer_index = growth_count % max(1, config.model.number_hidden_layers)
+        if should_grow(epoch, config.growth_schedule):
+            layer_index = layer_index_for_growth(
+                growth_count=growth_count,
+                number_hidden_layers=config.model.number_hidden_layers,
+                config=config.growth_schedule,
+            )
             if progress is not None:
                 progress(f"[GRO] Growing layer {layer_index} at epoch {epoch}")
 
@@ -328,11 +397,17 @@ def run_pipeline(
                 train_loader=train_loader,
                 layer_index=layer_index,
                 device=device,
-                scaling_factors=config.training.scaling_factors,
+                line_search_config=config.scaling_line_search,
                 progress=progress,
             )
             growth_events.append(growth_result)
             growth_count += 1
+            optimizer = build_optimizer(model, config.optimizer)
+            reset_epoch = 0 if config.lr_scheduler.restart_on_growth else epoch
+            apply_learning_rate(
+                optimizer,
+                scheduled_learning_rate(config, epoch=reset_epoch),
+            )
 
             train_metrics = evaluate_regression_metrics(
                 model,
@@ -375,7 +450,6 @@ def run_pipeline(
                 progress("Model after growing:")
                 progress(str(model))
             last_test_loss = test_metrics.loss
-            optimizer = build_optimizer(model, config)
 
     return PipelineResult(
         config=config,
@@ -417,7 +491,7 @@ def write_outputs(result: PipelineResult) -> dict[str, Path]:
     output_paths["history"] = save_result_json(result, history_path)
 
     if run_config.save_plot:
-        from stable_tiny.plotting import plot_history
+        from stable_tiny.plotting import plot_history, plot_parameters
 
         plot_path = run_config.results_dir / f"{run_config.name}_metrics.png"
         saved_plot = plot_history(
@@ -426,6 +500,15 @@ def write_outputs(result: PipelineResult) -> dict[str, Path]:
             show=run_config.show_plot,
         )
         if saved_plot is not None:
-            output_paths["plot"] = saved_plot
+            output_paths["metrics_plot"] = saved_plot
+
+        parameters_path = run_config.results_dir / f"{run_config.name}_parameters.png"
+        saved_parameters_plot = plot_parameters(
+            result.history,
+            output_path=parameters_path,
+            show=run_config.show_plot,
+        )
+        if saved_parameters_plot is not None:
+            output_paths["parameters_plot"] = saved_parameters_plot
 
     return output_paths

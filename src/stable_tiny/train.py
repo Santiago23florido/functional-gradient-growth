@@ -11,7 +11,7 @@ ensure_gromo_importable()
 
 import torch
 
-from gromo.utils.training_utils import evaluate_model, gradient_descent
+from gromo.utils.training_utils import evaluate_model
 
 
 @dataclass(frozen=True)
@@ -95,16 +95,30 @@ def train_one_epoch(
     loss_function: torch.nn.Module,
     device: torch.device,
     accuracy_tolerance: float,
+    gradient_clip_norm: float | None = None,
 ) -> TrainEpochResult:
     """Run one gradient-descent epoch and evaluate on the test loader."""
-    gradient_descent(
-        model,
-        train_loader,
-        optimizer,
-        scheduler=None,
-        loss_function=loss_function,
-        device=device,
-    )
+    model.train()
+    for batch_index, (x, y) in enumerate(train_loader):
+        x = x.to(device)
+        y = y.to(device)
+
+        optimizer.zero_grad()
+        y_pred = model(x)
+        loss = loss_function(y_pred, y)
+        if not torch.isfinite(loss).all():
+            raise RuntimeError(
+                "Non-finite training loss detected "
+                f"(loss={loss.item()}, batch_index={batch_index}). "
+                "Try lowering optimizer.learning_rate, optimizer.momentum, "
+                "optimizer.weight_decay, or training.gradient_clip_norm."
+            )
+
+        loss.backward()
+        if gradient_clip_norm is not None and gradient_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
+        optimizer.step()
+
     train_metrics = evaluate_regression_metrics(
         model,
         train_loader,
@@ -125,8 +139,3 @@ def train_one_epoch(
         test_loss=test_metrics.loss,
         test_accuracy=test_metrics.accuracy,
     )
-
-
-def current_learning_rate(optimizer: torch.optim.Optimizer) -> float:
-    """Return the first parameter group's learning rate."""
-    return float(optimizer.param_groups[0]["lr"])

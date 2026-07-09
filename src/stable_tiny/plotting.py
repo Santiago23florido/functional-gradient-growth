@@ -76,3 +76,36 @@ def plot_history(
         plt.close(fig)
 
     return saved_path
+
+
+def plot_parameters(
+    history: Sequence[HistoryEntryLike],
+    output_path: str | Path | None = None,
+    show: bool = False,
+) -> Path | None:
+    """Plot trainable parameter count over time."""
+    import matplotlib.pyplot as plt
+
+    steps = [entry.step for entry in history]
+    num_params = [entry.num_params for entry in history]
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(steps, num_params, linewidth=1.8, color="tab:orange")
+    ax.set_title("Trainable Parameters")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Parameters")
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+
+    saved_path = None
+    if output_path is not None:
+        saved_path = Path(output_path)
+        saved_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(saved_path, dpi=160)
+
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return saved_path
