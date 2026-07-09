@@ -1,7 +1,7 @@
 run:
   name: fgd_approx_growth_baseline
   results_dir: results
-  save_plot: true
+  save_plot: false
   show_plot: false
 
 data:
@@ -65,3 +65,16 @@ growth_schedule:
   every: 100
   first_epoch: 50
   layer_policy: round_robin
+
+wandb:
+  enabled: true
+  project: stable-tiny
+  entity:
+  run_name:
+  group: fgd
+  job_type: train
+  tags: [fgd_approx, gromo]
+  notes:
+  mode: online
+  dir: results
+  log_code: false

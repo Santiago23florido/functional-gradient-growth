@@ -6,4 +6,9 @@ venv/
 
 results/*.json
 results/*.png
+results/wandb/
+wandb/
 !results/.gitkeep
+
+.env
+.env.*
