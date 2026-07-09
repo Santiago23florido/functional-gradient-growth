@@ -1,5 +1,5 @@
 run:
-  name: gromo_tutorial_baseline
+  name: gromo_base_200e_grow50
   results_dir: results
   save_plot: true
   show_plot: false
@@ -19,8 +19,10 @@ model:
   model_seed: 0
 
 training:
-  growth_steps: 4
-  intermediate_epochs: 3
+  epochs: 200
+  grow_every: 50
   learning_rate: 0.01
   scaling_factors: [0.0, 0.1, 0.5, 1.0]
+  accuracy_tolerance: 1.0
+  log_every: 10
   device: auto

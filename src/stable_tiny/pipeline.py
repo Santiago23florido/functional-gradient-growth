@@ -13,7 +13,12 @@ import yaml
 from stable_tiny.data import MultiSinDataLoader
 from stable_tiny.gromo_setup import ensure_gromo_importable
 from stable_tiny.grow import GrowthResult, grow_layer
-from stable_tiny.train import count_parameters, evaluate_loss, train_one_epoch
+from stable_tiny.train import (
+    count_parameters,
+    current_learning_rate,
+    evaluate_regression_metrics,
+    train_one_epoch,
+)
 
 
 ensure_gromo_importable()
@@ -47,10 +52,12 @@ class ModelConfig:
 
 @dataclass(frozen=True)
 class TrainingConfig:
-    growth_steps: int = 4
-    intermediate_epochs: int = 3
+    epochs: int = 200
+    grow_every: int = 50
     learning_rate: float = 0.01
     scaling_factors: tuple[float, ...] = (0.0, 0.1, 0.5, 1.0)
+    accuracy_tolerance: float = 1.0
+    log_every: int = 10
     device: str = "auto"
 
 
@@ -74,9 +81,12 @@ class PipelineConfig:
 class HistoryEntry:
     step: int
     step_type: StepType
+    train_loss: float
     test_loss: float
+    train_accuracy: float
+    test_accuracy: float
+    learning_rate: float
     num_params: int
-    train_loss: float | None = None
     layer_index: int | None = None
     scaling_factor: float | None = None
 
@@ -103,7 +113,9 @@ def _section_dataclass(
         raise ValueError(f"Unknown keys in config section '{section_name}': {joined}")
 
     if section_type is TrainingConfig and "scaling_factors" in values:
-        values["scaling_factors"] = tuple(float(value) for value in values["scaling_factors"])
+        values["scaling_factors"] = tuple(
+            float(value) for value in values["scaling_factors"]
+        )
 
     if section_type is RunConfig and "results_dir" in values:
         values["results_dir"] = Path(values["results_dir"])
@@ -196,6 +208,27 @@ def build_model(config: PipelineConfig, device: torch.device) -> GrowingMLP:
     )
 
 
+def build_optimizer(
+    model: torch.nn.Module,
+    config: PipelineConfig,
+) -> torch.optim.Optimizer:
+    return torch.optim.SGD(
+        model.parameters(),
+        lr=config.training.learning_rate,
+    )
+
+
+def should_grow(epoch: int, config: PipelineConfig) -> bool:
+    return config.training.grow_every > 0 and epoch % config.training.grow_every == 0
+
+
+def should_log_epoch(epoch: int, config: PipelineConfig) -> bool:
+    log_every = config.training.log_every
+    return epoch == 1 or epoch == config.training.epochs or (
+        log_every > 0 and epoch % log_every == 0
+    )
+
+
 def run_pipeline(
     config: PipelineConfig,
     progress: ProgressFn | None = print,
@@ -205,6 +238,7 @@ def run_pipeline(
     train_loader, test_loader = build_dataloaders(config, device)
     model = build_model(config, device)
     loss_function = torch.nn.MSELoss()
+    optimizer = build_optimizer(model, config)
 
     history: list[HistoryEntry] = []
     growth_events: list[GrowthResult] = []
@@ -214,91 +248,134 @@ def run_pipeline(
         progress("Original model:")
         progress(str(model))
 
-    last_test_loss = evaluate_loss(model, test_loader, loss_function, device=device)
+    train_metrics = evaluate_regression_metrics(
+        model,
+        train_loader,
+        loss_function,
+        device=device,
+        accuracy_tolerance=config.training.accuracy_tolerance,
+    )
+    test_metrics = evaluate_regression_metrics(
+        model,
+        test_loader,
+        loss_function,
+        device=device,
+        accuracy_tolerance=config.training.accuracy_tolerance,
+    )
+    last_test_loss = test_metrics.loss
     history.append(
         HistoryEntry(
             step=0,
             step_type="INIT",
-            test_loss=last_test_loss,
+            train_loss=train_metrics.loss,
+            test_loss=test_metrics.loss,
+            train_accuracy=train_metrics.accuracy,
+            test_accuracy=test_metrics.accuracy,
+            learning_rate=current_learning_rate(optimizer),
             num_params=count_parameters(model),
         )
     )
     if progress is not None:
-        progress(f"[INIT] Step 0, test_loss={last_test_loss:.4f}")
-
-    for growth_step in range(config.training.growth_steps):
-        optimizer = torch.optim.SGD(
-            model.parameters(),
-            lr=config.training.learning_rate,
+        progress(
+            f"[INIT] Epoch 0, train_loss={train_metrics.loss:.4f}, "
+            f"test_loss={test_metrics.loss:.4f}, "
+            f"train_acc={train_metrics.accuracy:.3f}, "
+            f"test_acc={test_metrics.accuracy:.3f}"
         )
 
-        for epoch in range(1, config.training.intermediate_epochs + 1):
-            epoch_result = train_one_epoch(
+    growth_count = 0
+    for epoch in range(1, config.training.epochs + 1):
+        epoch_result = train_one_epoch(
+            model=model,
+            train_loader=train_loader,
+            test_loader=test_loader,
+            optimizer=optimizer,
+            loss_function=loss_function,
+            device=device,
+            accuracy_tolerance=config.training.accuracy_tolerance,
+        )
+        history.append(
+            HistoryEntry(
+                step=epoch,
+                step_type="SGD",
+                train_loss=epoch_result.train_loss,
+                test_loss=epoch_result.test_loss,
+                train_accuracy=epoch_result.train_accuracy,
+                test_accuracy=epoch_result.test_accuracy,
+                learning_rate=current_learning_rate(optimizer),
+                num_params=count_parameters(model),
+            )
+        )
+
+        if progress is not None and should_log_epoch(epoch, config):
+            delta = epoch_result.test_loss - last_test_loss
+            progress(
+                f"[SGD] Epoch {epoch}, train_loss={epoch_result.train_loss:.4f}, "
+                f"test_loss={epoch_result.test_loss:.4f} ({delta:+.4f}), "
+                f"train_acc={epoch_result.train_accuracy:.3f}, "
+                f"test_acc={epoch_result.test_accuracy:.3f}, "
+                f"lr={current_learning_rate(optimizer):.4g}"
+            )
+        last_test_loss = epoch_result.test_loss
+
+        if should_grow(epoch, config):
+            layer_index = growth_count % max(1, config.model.number_hidden_layers)
+            if progress is not None:
+                progress(f"[GRO] Growing layer {layer_index} at epoch {epoch}")
+
+            growth_result = grow_layer(
                 model=model,
                 train_loader=train_loader,
-                test_loader=test_loader,
-                optimizer=optimizer,
-                loss_function=loss_function,
+                layer_index=layer_index,
                 device=device,
+                scaling_factors=config.training.scaling_factors,
+                progress=progress,
             )
-            current_step = epoch + growth_step * (
-                config.training.intermediate_epochs + 1
+            growth_events.append(growth_result)
+            growth_count += 1
+
+            train_metrics = evaluate_regression_metrics(
+                model,
+                train_loader,
+                loss_function,
+                device=device,
+                accuracy_tolerance=config.training.accuracy_tolerance,
+            )
+            test_metrics = evaluate_regression_metrics(
+                model,
+                test_loader,
+                loss_function,
+                device=device,
+                accuracy_tolerance=config.training.accuracy_tolerance,
             )
             history.append(
                 HistoryEntry(
-                    step=current_step,
-                    step_type="SGD",
-                    train_loss=epoch_result.train_loss,
-                    test_loss=epoch_result.test_loss,
+                    step=epoch,
+                    step_type="GRO",
+                    train_loss=train_metrics.loss,
+                    test_loss=test_metrics.loss,
+                    train_accuracy=train_metrics.accuracy,
+                    test_accuracy=test_metrics.accuracy,
+                    learning_rate=current_learning_rate(optimizer),
                     num_params=count_parameters(model),
+                    layer_index=layer_index,
+                    scaling_factor=growth_result.best_scaling_factor,
                 )
             )
 
             if progress is not None:
-                delta = epoch_result.test_loss - last_test_loss
+                delta = test_metrics.loss - last_test_loss
                 progress(
-                    f"[SGD] Step {current_step}, "
-                    f"test_loss={epoch_result.test_loss:.4f} ({delta:+.4f})"
+                    f"[GRO] Epoch {epoch}, train_loss={train_metrics.loss:.4f}, "
+                    f"test_loss={test_metrics.loss:.4f} ({delta:+.4f}), "
+                    f"train_acc={train_metrics.accuracy:.3f}, "
+                    f"test_acc={test_metrics.accuracy:.3f}, "
+                    f"scaling={growth_result.best_scaling_factor:.4g}"
                 )
-            last_test_loss = epoch_result.test_loss
-
-        layer_index = growth_step % max(1, config.model.number_hidden_layers)
-        if progress is not None:
-            progress(f"[GRO] Growing layer {layer_index}")
-
-        growth_result = grow_layer(
-            model=model,
-            train_loader=train_loader,
-            layer_index=layer_index,
-            device=device,
-            scaling_factors=config.training.scaling_factors,
-            progress=progress,
-        )
-        growth_events.append(growth_result)
-
-        test_loss = evaluate_loss(model, test_loader, loss_function, device=device)
-        current_step = (growth_step + 1) * (config.training.intermediate_epochs + 1)
-        history.append(
-            HistoryEntry(
-                step=current_step,
-                step_type="GRO",
-                train_loss=growth_result.best_train_loss,
-                test_loss=test_loss,
-                num_params=count_parameters(model),
-                layer_index=layer_index,
-                scaling_factor=growth_result.best_scaling_factor,
-            )
-        )
-
-        if progress is not None:
-            delta = test_loss - last_test_loss
-            progress(
-                f"[GRO] Step {current_step}, test_loss={test_loss:.4f} "
-                f"({delta:+.4f}), scaling={growth_result.best_scaling_factor:.4g}"
-            )
-            progress("Model after growing:")
-            progress(str(model))
-        last_test_loss = test_loss
+                progress("Model after growing:")
+                progress(str(model))
+            last_test_loss = test_metrics.loss
+            optimizer = build_optimizer(model, config)
 
     return PipelineResult(
         config=config,
@@ -342,7 +419,7 @@ def write_outputs(result: PipelineResult) -> dict[str, Path]:
     if run_config.save_plot:
         from stable_tiny.plotting import plot_history
 
-        plot_path = run_config.results_dir / f"{run_config.name}_progress.png"
+        plot_path = run_config.results_dir / f"{run_config.name}_metrics.png"
         saved_plot = plot_history(
             result.history,
             output_path=plot_path,
