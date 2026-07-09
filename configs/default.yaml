@@ -1,53 +1,26 @@
-# Default experiment: observe post-growth loss spikes on a small GPU task.
-# Designed to finish in well under 25 min on a single GPU (typically seconds).
+run:
+  name: gromo_tutorial_baseline
+  results_dir: results
+  save_plot: true
+  show_plot: false
 
-run_name: teacher_default
-out_dir: results
-seed: 0
-device: null            # null -> cuda if available, else cpu
-method: gromo_tiny      # baseline_mlp | gromo_tiny | functional_triggered_tiny
+data:
+  in_features: 10
+  out_features: 3
+  train_batches: 10
+  test_batches: 1
+  batch_size: 1000
+  train_seed: 0
+  test_seed: 1
 
-# --- task -------------------------------------------------------------------
-task: teacher           # teacher | mnist | fashion_mnist
-in_features: 20         # (teacher) input dimension
-out_features: 10        # number of classes
-teacher_hidden: 128     # (teacher) hidden width of the fixed labelling network
-n_train: 20000
-n_test: 4000
-label_noise: 0.0
-batch_size: 256
-# data_dir: ./data      # (mnist/fashion_mnist) download location
+model:
+  hidden_size: 2
+  number_hidden_layers: 2
+  model_seed: 0
 
-# --- student model (the GrowingMLP we train & grow) -------------------------
-hidden_size: 8          # start small on purpose, so growth matters
-number_hidden_layers: 2
-
-# --- training / growth schedule ---------------------------------------------
-optimizer: sgd          # sgd | adam | adamw
-lr: 0.05
-momentum: 0.9
-weight_decay: 0.0       # used by adam/adamw
-growth_steps: 8         # number of growth events
-epochs_per_step: 5      # SGD epochs between growth events
-final_epochs: 10        # extra SGD after the last growth
-maximum_added_neurons: 64   # cap neurons added per growth (controls perturbation); null = no cap
-line_search_factors: [0.0, 0.1, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0]
-
-# --- functional-triggered TINY ----------------------------------------------
-# Used only when method=functional_triggered_tiny.
-functional_lr: 0.05
-functional_damping: 0.0001
-functional_relative_error_tolerance: 0.5
-functional_cg_min_iter: 1
-functional_cg_max_iter: 128
-functional_cg_tolerance: 0.0001
-functional_weight_decay: 0.0
-functional_grad_clip: null
-functional_batch_limit: null
-functional_progress_every: null
-functional_warmup_epochs: 0
-functional_failure_patience: 1
-functional_growth_steps: null
-functional_max_epochs: null
-functional_stop_when_growth_budget_exhausted: false
-functional_growth_layer_selection: tiny_best  # tiny_best | sequential
+training:
+  growth_steps: 4
+  intermediate_epochs: 3
+  learning_rate: 0.01
+  scaling_factors: [0.0, 0.1, 0.5, 1.0]
+  device: auto
