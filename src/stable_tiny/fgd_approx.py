@@ -24,8 +24,15 @@ from gromo.utils.training_utils import compute_statistics
 
 RelErrorMode = Literal["tangent_projection"]
 LayerSelection = Literal["certifying", "tiny_best", "min_rel_error"]
-ProjectionSolver = Literal["gromo_layer", "cg", "exact"]
+ProjectionSolver = Literal[
+    "gromo_layer",
+    "cg",
+    "exact",
+    "exact_svd",
+    "exact_kernel_eigh",
+]
 LearningRatePolicy = Literal["scheduler", "theory_interval"]
+GlobalBoundAction = Literal["lr_then_growth", "grow", "ignore"]
 
 
 @dataclass(frozen=True)
@@ -50,6 +57,8 @@ class FGDApproxConfig:
     sufficient_descent_c: float | None = 0.1
     lr_backtrack: float = 0.5
     lr_min_factor: float = 1e-3
+    global_bound_action: GlobalBoundAction = "lr_then_growth"
+    global_bound_lr_patience: int = 5
     rel_error_compute_delta: bool = True
     growth_compute_delta: bool = False
     start_epoch: int = 1
@@ -117,6 +126,7 @@ class FGDApproxEpochResult:
 @dataclass(frozen=True)
 class FGDValidationCertificate:
     learning_rate_upper_bound: float | None
+    max_valid_learning_rate: float | None
     learning_rate_interval_valid: bool | None
     skipped_batches: int
     relative_error_condition_valid: bool | None
@@ -439,47 +449,43 @@ def _flatten_parameter_tensors(tensors: tuple[torch.Tensor, ...]) -> torch.Tenso
     return torch.cat([tensor.reshape(-1) for tensor in tensors])
 
 
-def _solve_tangent_projection(
+def _zero_tangent_projection(
+    jacobian_matrix: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    output_numel, parameter_numel = jacobian_matrix.shape
+    original_dtype = jacobian_matrix.dtype
+    return (
+        torch.zeros(
+            parameter_numel,
+            device=jacobian_matrix.device,
+            dtype=original_dtype,
+        ),
+        torch.zeros(
+            output_numel,
+            device=jacobian_matrix.device,
+            dtype=original_dtype,
+        ),
+    )
+
+
+def _solve_tangent_projection_svd(
     jacobian_matrix: torch.Tensor,
     target: torch.Tensor,
     damping: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return parameter update and projected output gradient."""
+    """Solve the damped tangent projection with a float64 SVD of J."""
     output_numel, parameter_numel = jacobian_matrix.shape
     damping = max(float(damping), 0.0)
     original_dtype = jacobian_matrix.dtype
     work_dtype = torch.float64
     jacobian_work = jacobian_matrix.to(dtype=work_dtype)
     target_work = target.reshape(-1).to(dtype=work_dtype)
-
     if output_numel == 0 or parameter_numel == 0:
-        return (
-            torch.zeros(
-                parameter_numel,
-                device=jacobian_matrix.device,
-                dtype=original_dtype,
-            ),
-            torch.zeros(
-                output_numel,
-                device=jacobian_matrix.device,
-                dtype=original_dtype,
-            ),
-        )
+        return _zero_tangent_projection(jacobian_matrix)
 
     u, singular_values, vh = torch.linalg.svd(jacobian_work, full_matrices=False)
     if singular_values.numel() == 0:
-        return (
-            torch.zeros(
-                parameter_numel,
-                device=jacobian_matrix.device,
-                dtype=original_dtype,
-            ),
-            torch.zeros(
-                output_numel,
-                device=jacobian_matrix.device,
-                dtype=original_dtype,
-            ),
-        )
+        return _zero_tangent_projection(jacobian_matrix)
 
     coefficients = u.t() @ target_work
     eigenvalues = singular_values.square()
@@ -512,6 +518,86 @@ def _solve_tangent_projection(
     return (
         flat_update_work.to(dtype=original_dtype),
         approximation_work.to(dtype=original_dtype),
+    )
+
+
+def _solve_tangent_projection_kernel_eigh(
+    jacobian_matrix: torch.Tensor,
+    target: torch.Tensor,
+    damping: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Solve the damped tangent projection with a float64 eigendecomposition of K."""
+    output_numel, parameter_numel = jacobian_matrix.shape
+    damping = max(float(damping), 0.0)
+    original_dtype = jacobian_matrix.dtype
+    work_dtype = torch.float64
+    jacobian_work = jacobian_matrix.to(dtype=work_dtype)
+    target_work = target.reshape(-1).to(dtype=work_dtype)
+    if output_numel == 0 or parameter_numel == 0:
+        return _zero_tangent_projection(jacobian_matrix)
+
+    kernel = jacobian_work @ jacobian_work.t()
+    kernel = 0.5 * (kernel + kernel.t())
+    eigenvalues, eigenvectors = torch.linalg.eigh(kernel)
+    eigenvalues = eigenvalues.clamp_min(0.0)
+    if eigenvalues.numel() == 0:
+        return _zero_tangent_projection(jacobian_matrix)
+
+    coefficients = eigenvectors.t() @ target_work
+    if damping > 0.0:
+        denominator = eigenvalues + damping
+        output_factors = eigenvalues / denominator
+        dual_factors = denominator.reciprocal()
+    else:
+        max_eigenvalue = torch.max(eigenvalues)
+        threshold = (
+            torch.finfo(work_dtype).eps
+            * output_numel
+            * max(float(max_eigenvalue.detach().item()), 1.0)
+        )
+        nonzero = eigenvalues > threshold
+        output_factors = torch.where(
+            nonzero,
+            torch.ones_like(eigenvalues),
+            torch.zeros_like(eigenvalues),
+        )
+        dual_factors = torch.where(
+            nonzero,
+            eigenvalues.reciprocal(),
+            torch.zeros_like(eigenvalues),
+        )
+
+    dual_solution_work = eigenvectors @ (dual_factors * coefficients)
+    approximation_work = eigenvectors @ (output_factors * coefficients)
+    flat_update_work = jacobian_work.t() @ dual_solution_work
+    return (
+        flat_update_work.to(dtype=original_dtype),
+        approximation_work.to(dtype=original_dtype),
+    )
+
+
+def _solve_tangent_projection(
+    jacobian_matrix: torch.Tensor,
+    target: torch.Tensor,
+    damping: float,
+    solver: ProjectionSolver = "exact",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return parameter update and projected output gradient."""
+    if solver in {"exact", "exact_svd"}:
+        return _solve_tangent_projection_svd(
+            jacobian_matrix=jacobian_matrix,
+            target=target,
+            damping=damping,
+        )
+    if solver == "exact_kernel_eigh":
+        return _solve_tangent_projection_kernel_eigh(
+            jacobian_matrix=jacobian_matrix,
+            target=target,
+            damping=damping,
+        )
+    raise ValueError(
+        f"Unsupported exact projection solver '{solver}'. "
+        "Use one of: exact, exact_svd, exact_kernel_eigh."
     )
 
 
@@ -613,6 +699,7 @@ def _compute_exact_tangent_projection_step(
         jacobian_matrix=jacobian_matrix,
         target=target,
         damping=config.projection_damping,
+        solver=config.projection_solver,
     )
     if not torch.isfinite(flat_update).all() or not torch.isfinite(approximation).all():
         raise RuntimeError("Non-finite FGD tangent projection update detected.")
@@ -811,7 +898,7 @@ def _compute_tangent_projection_step(
     config: FGDApproxConfig,
 ) -> _TangentProjectionStep:
     """Compute g = P_T grad L and the parameter update that realizes it."""
-    if config.projection_solver == "exact":
+    if config.projection_solver in {"exact", "exact_svd", "exact_kernel_eigh"}:
         return _compute_exact_tangent_projection_step(
             model=model,
             x=x,
@@ -829,7 +916,7 @@ def _compute_tangent_projection_step(
 
     raise ValueError(
         f"Unsupported fgd_approx.projection_solver '{config.projection_solver}'. "
-        "Use one of: cg, exact."
+        "Use one of: cg, exact, exact_svd, exact_kernel_eigh."
     )
 
 
@@ -1392,7 +1479,8 @@ def evaluate_fgd_validation_certificate(
         )
     if config.projection_solver == "gromo_layer":
         raise ValueError(
-            "Validation certificates require projection_solver to be cg or exact."
+            "Validation certificates require projection_solver to be cg, exact, "
+            "exact_svd, or exact_kernel_eigh."
         )
 
     model.eval()
@@ -1401,6 +1489,8 @@ def evaluate_fgd_validation_certificate(
     target_sq_norm = 0.0
     upper_bound_sum = 0.0
     upper_bound_count = 0
+    max_valid_learning_rate: float | None = None
+    learning_rate_interval_possible = True
     skipped_batches = 0
     sensor_invalid_batches = 0
     valid_projection_batches = 0
@@ -1437,10 +1527,19 @@ def evaluate_fgd_validation_certificate(
             upper_bound_count += 1
             if upper_bound is None:
                 learning_rate_interval_valid = False
+                learning_rate_interval_possible = False
                 skipped_batches += 1
             else:
                 safe_upper_bound = config.theory_lr_safety * upper_bound
                 interval_ok = safe_upper_bound > config.theory_lr_min + config.eps
+                if interval_ok:
+                    max_valid_learning_rate = (
+                        safe_upper_bound
+                        if max_valid_learning_rate is None
+                        else min(max_valid_learning_rate, safe_upper_bound)
+                    )
+                else:
+                    learning_rate_interval_possible = False
                 if learning_rate is not None and learning_rate > config.eps:
                     interval_ok = (
                         interval_ok
@@ -1475,6 +1574,7 @@ def evaluate_fgd_validation_certificate(
         learning_rate_interval_valid = None
         return FGDValidationCertificate(
             learning_rate_upper_bound=None,
+            max_valid_learning_rate=None,
             learning_rate_interval_valid=learning_rate_interval_valid,
             skipped_batches=skipped_batches,
             relative_error_condition_valid=relative_error_condition_valid,
@@ -1512,6 +1612,11 @@ def evaluate_fgd_validation_certificate(
     return FGDValidationCertificate(
         learning_rate_upper_bound=(
             upper_bound_sum / upper_bound_count if upper_bound_count > 0 else None
+        ),
+        max_valid_learning_rate=(
+            max_valid_learning_rate
+            if learning_rate_interval_possible
+            else None
         ),
         learning_rate_interval_valid=learning_rate_interval_valid,
         skipped_batches=skipped_batches,

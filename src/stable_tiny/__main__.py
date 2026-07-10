@@ -8,6 +8,7 @@ from pathlib import Path
 from stable_tiny.pipeline import (
     load_pipeline_config,
     run_pipeline,
+    with_fgd_overrides,
     with_growth_overrides,
     with_run_overrides,
     with_wandb_overrides,
@@ -33,6 +34,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-growth",
         action="store_true",
         help="Disable GroMo growth and anneal LR across all epochs.",
+    )
+    parser.add_argument(
+        "--projection-solver",
+        choices=("exact", "exact_svd", "exact_kernel_eigh", "cg", "gromo_layer"),
+        help="Override fgd_approx.projection_solver.",
+    )
+    parser.add_argument(
+        "--global-bound-action",
+        choices=("lr_then_growth", "grow", "ignore"),
+        help=(
+            "Override what to do when only the FGD global-convergence bound fails."
+        ),
     )
     wandb_toggle = parser.add_mutually_exclusive_group()
     wandb_toggle.add_argument(
@@ -70,6 +83,11 @@ def main() -> None:
     config = with_growth_overrides(
         config,
         enabled=False if args.no_growth else None,
+    )
+    config = with_fgd_overrides(
+        config,
+        projection_solver=args.projection_solver,
+        global_bound_action=args.global_bound_action,
     )
     config = with_wandb_overrides(
         config,

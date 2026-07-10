@@ -303,6 +303,21 @@ def with_growth_overrides(
     return replace(config, growth_schedule=growth_schedule, lr_scheduler=lr_scheduler)
 
 
+def with_fgd_overrides(
+    config: PipelineConfig,
+    *,
+    projection_solver: str | None = None,
+    global_bound_action: str | None = None,
+) -> PipelineConfig:
+    """Return a config with FGD-specific CLI overrides applied."""
+    fgd_config = config.fgd_approx
+    if projection_solver is not None:
+        fgd_config = replace(fgd_config, projection_solver=projection_solver)
+    if global_bound_action is not None:
+        fgd_config = replace(fgd_config, global_bound_action=global_bound_action)
+    return replace(config, fgd_approx=fgd_config)
+
+
 def select_device(device: str) -> torch.device:
     if device == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -514,6 +529,7 @@ def run_pipeline(
         fgd_min_positive_learning_rate: float | None = None
         fgd_min_descent_coefficient: float | None = None
         fgd_global_contraction_product = 1.0
+        fgd_global_bound_only_failed_epochs = 0
         fgd_previous_train_loss: float | None = None
         fgd_stalled_epochs = 0
         projection_group_limit = max(
@@ -530,9 +546,11 @@ def run_pipeline(
         def reset_fgd_certificate() -> None:
             """Re-anchor the per-mode FGD bounds at the current loss."""
             nonlocal initial_functional_gap, fgd_epoch_count
+            nonlocal fgd_min_gradient_sq_norm
             nonlocal fgd_min_positive_learning_rate
             nonlocal fgd_min_descent_coefficient
             nonlocal fgd_global_contraction_product
+            nonlocal fgd_global_bound_only_failed_epochs
             nonlocal fgd_previous_train_loss, fgd_stalled_epochs
             initial_functional_gap = max(
                 evaluate_functional_loss(model, validation_loader, device)
@@ -540,9 +558,11 @@ def run_pipeline(
                 0.0,
             )
             fgd_epoch_count = 0
+            fgd_min_gradient_sq_norm = None
             fgd_min_positive_learning_rate = None
             fgd_min_descent_coefficient = None
             fgd_global_contraction_product = 1.0
+            fgd_global_bound_only_failed_epochs = 0
             fgd_previous_train_loss = None
             fgd_stalled_epochs = 0
         init_entry = HistoryEntry(
@@ -592,6 +612,7 @@ def run_pipeline(
             fgd_layer_rel_errors: list[FGDLayerRelError] = []
             fgd_output_rel_error: FGDOutputRelError | None = None
             fgd_learning_rate_upper_bound: float | None = None
+            fgd_max_valid_learning_rate: float | None = None
             fgd_learning_rate_interval_valid: bool | None = None
             fgd_learning_rate_clipped_batches = 0
             fgd_skipped_batches = 0
@@ -663,6 +684,9 @@ def run_pipeline(
                 fgd_output_rel_error = validation_certificate.output_relative_error
                 fgd_learning_rate_upper_bound = (
                     validation_certificate.learning_rate_upper_bound
+                )
+                fgd_max_valid_learning_rate = (
+                    validation_certificate.max_valid_learning_rate
                 )
                 fgd_learning_rate_interval_valid = (
                     validation_certificate.learning_rate_interval_valid
@@ -780,19 +804,97 @@ def run_pipeline(
                     or fgd_stationary_bound_valid is False
                     or fgd_global_bound_valid is False
                 )
-                fgd_growth_requested = (
-                    config.growth_schedule.enabled
-                    and fgd_conditions_failed
-                    and should_trigger_fgd_growth(
-                        relative_error=config.fgd_approx.rel_error_threshold,
-                        epoch=epoch,
-                        last_growth_epoch=last_growth_epoch,
-                        config=config.fgd_approx,
-                    )
+                only_global_bound_failed = (
+                    fgd_global_bound_valid is False
+                    and fgd_relative_error_condition_valid is not False
+                    and fgd_stationary_bound_valid is not False
+                    and fgd_sensor_valid is not False
                 )
+                if only_global_bound_failed:
+                    fgd_global_bound_only_failed_epochs += 1
+                    if config.fgd_approx.global_bound_action == "ignore":
+                        fgd_growth_requested = False
+                    elif config.fgd_approx.global_bound_action == "grow":
+                        fgd_growth_requested = (
+                            config.growth_schedule.enabled
+                            and fgd_conditions_failed
+                            and should_trigger_fgd_growth(
+                                relative_error=config.fgd_approx.rel_error_threshold,
+                                epoch=epoch,
+                                last_growth_epoch=last_growth_epoch,
+                                config=config.fgd_approx,
+                            )
+                        )
+                    else:
+                        global_bound_patience_reached = (
+                            fgd_global_bound_only_failed_epochs
+                            >= max(1, config.fgd_approx.global_bound_lr_patience)
+                        )
+                        if (
+                            use_fgd_theory_learning_rate
+                            and global_bound_patience_reached
+                            and fgd_max_valid_learning_rate is not None
+                            and fgd_max_valid_learning_rate
+                            > config.fgd_approx.theory_lr_min + config.fgd_approx.eps
+                        ):
+                            adjusted_learning_rate = min(
+                                current_fgd_learning_rate
+                                * config.fgd_approx.lr_backtrack,
+                                fgd_max_valid_learning_rate,
+                            )
+                            if (
+                                adjusted_learning_rate
+                                > config.fgd_approx.theory_lr_min
+                                + config.fgd_approx.eps
+                                and adjusted_learning_rate
+                                < current_fgd_learning_rate - config.fgd_approx.eps
+                            ):
+                                current_fgd_learning_rate = adjusted_learning_rate
+                                apply_learning_rate(optimizer, current_fgd_learning_rate)
+                                fgd_theory_learning_rate_adjusted = True
+                                reset_fgd_certificate()
+                            else:
+                                fgd_growth_requested = (
+                                    config.growth_schedule.enabled
+                                    and fgd_conditions_failed
+                                    and should_trigger_fgd_growth(
+                                        relative_error=(
+                                            config.fgd_approx.rel_error_threshold
+                                        ),
+                                        epoch=epoch,
+                                        last_growth_epoch=last_growth_epoch,
+                                        config=config.fgd_approx,
+                                    )
+                                )
+                        elif not global_bound_patience_reached:
+                            fgd_growth_requested = False
+                        else:
+                            fgd_growth_requested = (
+                                config.growth_schedule.enabled
+                                and fgd_conditions_failed
+                                and should_trigger_fgd_growth(
+                                    relative_error=config.fgd_approx.rel_error_threshold,
+                                    epoch=epoch,
+                                    last_growth_epoch=last_growth_epoch,
+                                    config=config.fgd_approx,
+                                )
+                            )
+                else:
+                    fgd_global_bound_only_failed_epochs = 0
+                    fgd_growth_requested = (
+                        config.growth_schedule.enabled
+                        and fgd_conditions_failed
+                        and should_trigger_fgd_growth(
+                            relative_error=config.fgd_approx.rel_error_threshold,
+                            epoch=epoch,
+                            last_growth_epoch=last_growth_epoch,
+                            config=config.fgd_approx,
+                        )
+                    )
                 if (
                     use_fgd_theory_learning_rate
                     and not fgd_growth_requested
+                    and not only_global_bound_failed
                     and (
                         fgd_stationary_bound_valid is False
                         or fgd_global_bound_valid is False
@@ -1016,9 +1118,11 @@ def run_pipeline(
                         0.0,
                     )
                     fgd_epoch_count = 0
+                    fgd_min_gradient_sq_norm = None
                     fgd_min_positive_learning_rate = None
                     fgd_min_descent_coefficient = None
                     fgd_global_contraction_product = 1.0
+                    fgd_global_bound_only_failed_epochs = 0
                     if (
                         config.fgd_approx.learning_rate_policy == "theory_interval"
                         and config.lr_scheduler.restart_on_growth
