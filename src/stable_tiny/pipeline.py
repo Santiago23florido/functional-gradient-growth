@@ -16,6 +16,7 @@ from stable_tiny.fgd_approx import (
     FGDLayerRelError,
     FGDOutputRelError,
     batch_functional_mse_loss,
+    evaluate_fgd_validation_certificate,
     select_certifying_growth_layer_index,
     should_trigger_fgd_growth,
     tiny_optimal_update_kwargs,
@@ -61,9 +62,11 @@ class DataConfig:
     in_features: int = 10
     out_features: int = 3
     train_batches: int = 10
+    validation_batches: int = 10
     test_batches: int = 1
     batch_size: int = 1_000
     train_seed: int = 0
+    validation_seed: int = 2
     test_seed: int = 1
     active_features: int = 2
     frequency: float = 1.0
@@ -118,8 +121,10 @@ class HistoryEntry:
     step: int
     step_type: StepType
     train_loss: float
+    validation_loss: float
     test_loss: float
     train_accuracy: float
+    validation_accuracy: float
     test_accuracy: float
     learning_rate: float
     num_params: int
@@ -145,6 +150,8 @@ class HistoryEntry:
     fgd_global_bound_valid: bool | None = None
     fgd_global_contraction: float | None = None
     fgd_theory_learning_rate_adjusted: bool = False
+    fgd_sensor_valid: bool | None = None
+    fgd_sensor_invalid_batches: int = 0
 
 
 @dataclass
@@ -305,7 +312,11 @@ def select_device(device: str) -> torch.device:
 def build_dataloaders(
     config: PipelineConfig,
     device: torch.device,
-) -> tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
+) -> tuple[
+    torch.utils.data.DataLoader,
+    torch.utils.data.DataLoader,
+    torch.utils.data.DataLoader,
+]:
     data_config = config.data
 
     if data_config.kind == "multi_sin":
@@ -335,6 +346,15 @@ def build_dataloaders(
         device=device,
         **extra_kwargs,
     )
+    validation_loader = loader_class(
+        nb_sample=data_config.validation_batches,
+        batch_size=data_config.batch_size,
+        in_features=data_config.in_features,
+        out_features=data_config.out_features,
+        seed=data_config.validation_seed,
+        device=device,
+        **extra_kwargs,
+    )
     test_loader = loader_class(
         nb_sample=data_config.test_batches,
         batch_size=data_config.batch_size,
@@ -344,7 +364,7 @@ def build_dataloaders(
         device=device,
         **extra_kwargs,
     )
-    return train_loader, test_loader
+    return train_loader, validation_loader, test_loader
 
 
 def build_model(config: PipelineConfig, device: torch.device) -> GrowingMLP:
@@ -425,7 +445,7 @@ def run_pipeline(
         config_payload=config_payload(config),
     )
     device = select_device(config.training.device)
-    train_loader, test_loader = build_dataloaders(config, device)
+    train_loader, validation_loader, test_loader = build_dataloaders(config, device)
     model = build_model(config, device)
     loss_function = torch.nn.MSELoss()
     optimizer = build_optimizer(model, config.optimizer)
@@ -467,6 +487,13 @@ def run_pipeline(
             device=device,
             accuracy_tolerance=config.training.accuracy_tolerance,
         )
+        validation_metrics = evaluate_regression_metrics(
+            model,
+            validation_loader,
+            loss_function,
+            device=device,
+            accuracy_tolerance=config.training.accuracy_tolerance,
+        )
         test_metrics = evaluate_regression_metrics(
             model,
             test_loader,
@@ -477,7 +504,7 @@ def run_pipeline(
         last_test_loss = test_metrics.loss
         initial_functional_loss = evaluate_functional_loss(
             model,
-            train_loader,
+            validation_loader,
             device,
         )
         theory_loss_star = config.fgd_approx.theory_loss_star
@@ -493,7 +520,7 @@ def run_pipeline(
             1,
             config.fgd_approx.projection_group_max
             if config.fgd_approx.projection_group_max is not None
-            else config.data.train_batches,
+            else max(config.data.train_batches, config.data.validation_batches),
         )
         current_projection_group_size = max(
             1,
@@ -508,7 +535,7 @@ def run_pipeline(
             nonlocal fgd_global_contraction_product
             nonlocal fgd_previous_train_loss, fgd_stalled_epochs
             initial_functional_gap = max(
-                evaluate_functional_loss(model, train_loader, device)
+                evaluate_functional_loss(model, validation_loader, device)
                 - theory_loss_star,
                 0.0,
             )
@@ -522,8 +549,10 @@ def run_pipeline(
             step=0,
             step_type="INIT",
             train_loss=train_metrics.loss,
+            validation_loss=validation_metrics.loss,
             test_loss=test_metrics.loss,
             train_accuracy=train_metrics.accuracy,
+            validation_accuracy=validation_metrics.accuracy,
             test_accuracy=test_metrics.accuracy,
             learning_rate=current_learning_rate(optimizer),
             num_params=count_parameters(model),
@@ -533,8 +562,10 @@ def run_pipeline(
         if progress is not None:
             progress(
                 f"[INIT] Epoch 0, train_loss={train_metrics.loss:.4f}, "
+                f"validation_loss={validation_metrics.loss:.4f}, "
                 f"test_loss={test_metrics.loss:.4f}, "
                 f"train_acc={train_metrics.accuracy:.3f}, "
+                f"validation_acc={validation_metrics.accuracy:.3f}, "
                 f"test_acc={test_metrics.accuracy:.3f}"
             )
 
@@ -576,6 +607,8 @@ def run_pipeline(
             fgd_global_bound_valid: bool | None = None
             fgd_global_contraction: float | None = None
             fgd_theory_learning_rate_adjusted = False
+            fgd_sensor_valid: bool | None = None
+            fgd_sensor_invalid_batches = 0
             fgd_growth_requested = False
             entry_learning_rate = current_learning_rate(optimizer)
             if config.training.method == "normal":
@@ -603,30 +636,14 @@ def run_pipeline(
                     projection_group_size=current_projection_group_size,
                 )
                 epoch_result = fgd_epoch_result
-                rel_error = fgd_epoch_result.relative_error
                 selected_layer_index = fgd_epoch_result.selected_layer_index
                 fgd_layer_rel_errors = fgd_epoch_result.layer_relative_errors
-                fgd_output_rel_error = fgd_epoch_result.output_relative_error
-                fgd_learning_rate_upper_bound = (
-                    fgd_epoch_result.learning_rate_upper_bound
-                )
-                fgd_learning_rate_interval_valid = (
-                    fgd_epoch_result.learning_rate_interval_valid
-                )
                 fgd_learning_rate_clipped_batches = (
                     fgd_epoch_result.learning_rate_clipped_batches
-                )
-                fgd_skipped_batches = fgd_epoch_result.skipped_batches
-                fgd_relative_error_condition_valid = (
-                    fgd_epoch_result.relative_error_condition_valid
                 )
                 fgd_loss_descent_valid = fgd_epoch_result.loss_descent_valid
                 fgd_loss_non_descent_batches = (
                     fgd_epoch_result.loss_non_descent_batches
-                )
-                fgd_gradient_sq_norm = fgd_epoch_result.gradient_sq_norm
-                fgd_theory_descent_coefficient = (
-                    fgd_epoch_result.theory_descent_coefficient
                 )
                 if fgd_epoch_result.next_learning_rate is not None:
                     current_fgd_learning_rate = fgd_epoch_result.next_learning_rate
@@ -634,7 +651,39 @@ def run_pipeline(
                 if fgd_epoch_result.learning_rate is not None:
                     entry_learning_rate = fgd_epoch_result.learning_rate
 
-                if fgd_gradient_sq_norm is not None:
+                validation_certificate = evaluate_fgd_validation_certificate(
+                    model=model,
+                    data_loader=validation_loader,
+                    device=device,
+                    config=config.fgd_approx,
+                    learning_rate=fgd_epoch_result.min_positive_learning_rate,
+                    projection_group_size=current_projection_group_size,
+                )
+                rel_error = validation_certificate.relative_error
+                fgd_output_rel_error = validation_certificate.output_relative_error
+                fgd_learning_rate_upper_bound = (
+                    validation_certificate.learning_rate_upper_bound
+                )
+                fgd_learning_rate_interval_valid = (
+                    validation_certificate.learning_rate_interval_valid
+                )
+                fgd_skipped_batches = validation_certificate.skipped_batches
+                fgd_relative_error_condition_valid = (
+                    validation_certificate.relative_error_condition_valid
+                )
+                fgd_gradient_sq_norm = validation_certificate.gradient_sq_norm
+                fgd_theory_descent_coefficient = (
+                    validation_certificate.theory_descent_coefficient
+                )
+                fgd_sensor_valid = validation_certificate.sensor_valid
+                fgd_sensor_invalid_batches = (
+                    validation_certificate.sensor_invalid_batches
+                )
+
+                if (
+                    fgd_gradient_sq_norm is not None
+                    and fgd_epoch_result.min_positive_learning_rate is not None
+                ):
                     fgd_epoch_count += 1
                     fgd_min_gradient_sq_norm = (
                         fgd_gradient_sq_norm
@@ -703,7 +752,11 @@ def run_pipeline(
                             * initial_functional_gap
                         )
                         current_functional_gap = max(
-                            evaluate_functional_loss(model, train_loader, device)
+                            evaluate_functional_loss(
+                                model,
+                                validation_loader,
+                                device,
+                            )
                             - theory_loss_star,
                             0.0,
                         )
@@ -712,7 +765,11 @@ def run_pipeline(
                             <= fgd_global_bound + config.fgd_approx.eps
                         )
 
-                if fgd_gradient_sq_norm is not None:
+                if (
+                    fgd_gradient_sq_norm is not None
+                    and fgd_min_positive_learning_rate is not None
+                    and fgd_min_descent_coefficient is not None
+                ):
                     if fgd_stationary_bound_valid is None:
                         fgd_stationary_bound_valid = False
                     if fgd_global_bound_valid is None:
@@ -756,12 +813,21 @@ def run_pipeline(
                     "Use one of: normal, fgd_approx."
                 )
 
+            validation_metrics = evaluate_regression_metrics(
+                model,
+                validation_loader,
+                loss_function,
+                device=device,
+                accuracy_tolerance=config.training.accuracy_tolerance,
+            )
             epoch_entry = HistoryEntry(
                 step=epoch,
                 step_type=step_type,
                 train_loss=epoch_result.train_loss,
+                validation_loss=validation_metrics.loss,
                 test_loss=epoch_result.test_loss,
                 train_accuracy=epoch_result.train_accuracy,
+                validation_accuracy=validation_metrics.accuracy,
                 test_accuracy=epoch_result.test_accuracy,
                 learning_rate=entry_learning_rate,
                 num_params=count_parameters(model),
@@ -789,6 +855,8 @@ def run_pipeline(
                 fgd_theory_learning_rate_adjusted=(
                     fgd_theory_learning_rate_adjusted
                 ),
+                fgd_sensor_valid=fgd_sensor_valid,
+                fgd_sensor_invalid_batches=fgd_sensor_invalid_batches,
             )
             history.append(epoch_entry)
             wandb_logger.log_history_entry(epoch_entry)
@@ -806,8 +874,10 @@ def run_pipeline(
                 progress(
                     f"[{step_type}] Epoch {epoch}, "
                     f"train_loss={epoch_result.train_loss:.4f}, "
+                    f"validation_loss={validation_metrics.loss:.4f}, "
                     f"test_loss={epoch_result.test_loss:.4f} ({delta:+.4f}), "
                     f"train_acc={epoch_result.train_accuracy:.3f}, "
+                    f"validation_acc={validation_metrics.accuracy:.3f}, "
                     f"test_acc={epoch_result.test_accuracy:.3f}, "
                     f"lr={entry_learning_rate:.4g}"
                     f"{rel_error_msg}"
@@ -833,6 +903,11 @@ def run_pipeline(
                     warnings.append(
                         f"loss did not descend on "
                         f"{fgd_loss_non_descent_batches} batch(es)"
+                    )
+                if fgd_sensor_valid is False:
+                    warnings.append(
+                        f"sensor invalid on "
+                        f"{fgd_sensor_invalid_batches} validation batch(es)"
                     )
                 if fgd_stationary_bound_valid is False:
                     warnings.append("stationary-point bound failed")
@@ -878,9 +953,11 @@ def run_pipeline(
                         certified_layer_index = select_certifying_growth_layer_index(
                             model=model,
                             train_loader=train_loader,
+                            validation_loader=validation_loader,
                             device=device,
                             config=config.fgd_approx,
                             line_search_config=config.scaling_line_search,
+                            projection_group_size=current_projection_group_size,
                         )
                     else:
                         certified_layer_index = None
@@ -934,7 +1011,7 @@ def run_pipeline(
                     # global bounds certify a fixed architecture, so restart
                     # them from the post-growth loss.
                     initial_functional_gap = max(
-                        evaluate_functional_loss(model, train_loader, device)
+                        evaluate_functional_loss(model, validation_loader, device)
                         - theory_loss_star,
                         0.0,
                     )
@@ -973,6 +1050,13 @@ def run_pipeline(
                     device=device,
                     accuracy_tolerance=config.training.accuracy_tolerance,
                 )
+                validation_metrics = evaluate_regression_metrics(
+                    model,
+                    validation_loader,
+                    loss_function,
+                    device=device,
+                    accuracy_tolerance=config.training.accuracy_tolerance,
+                )
                 test_metrics = evaluate_regression_metrics(
                     model,
                     test_loader,
@@ -984,8 +1068,10 @@ def run_pipeline(
                     step=epoch,
                     step_type="GRO",
                     train_loss=train_metrics.loss,
+                    validation_loss=validation_metrics.loss,
                     test_loss=test_metrics.loss,
                     train_accuracy=train_metrics.accuracy,
+                    validation_accuracy=validation_metrics.accuracy,
                     test_accuracy=test_metrics.accuracy,
                     learning_rate=current_learning_rate(optimizer),
                     num_params=count_parameters(model),
@@ -1019,6 +1105,8 @@ def run_pipeline(
                     fgd_theory_learning_rate_adjusted=(
                         fgd_theory_learning_rate_adjusted
                     ),
+                    fgd_sensor_valid=fgd_sensor_valid,
+                    fgd_sensor_invalid_batches=fgd_sensor_invalid_batches,
                 )
                 history.append(growth_entry)
                 wandb_logger.log_history_entry(growth_entry)
@@ -1027,8 +1115,10 @@ def run_pipeline(
                     delta = test_metrics.loss - last_test_loss
                     progress(
                         f"[GRO] Epoch {epoch}, train_loss={train_metrics.loss:.4f}, "
+                        f"validation_loss={validation_metrics.loss:.4f}, "
                         f"test_loss={test_metrics.loss:.4f} ({delta:+.4f}), "
                         f"train_acc={train_metrics.accuracy:.3f}, "
+                        f"validation_acc={validation_metrics.accuracy:.3f}, "
                         f"test_acc={test_metrics.accuracy:.3f}, "
                         f"scaling={growth_result.best_scaling_factor:.4g}"
                     )

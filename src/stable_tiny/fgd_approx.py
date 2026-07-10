@@ -106,10 +106,26 @@ class FGDApproxEpochResult:
     gradient_sq_norm: float | None
     theory_descent_coefficient: float | None
     min_positive_learning_rate: float | None
-    relative_error: float
+    relative_error: float | None
     selected_layer_index: int | None
     layer_relative_errors: list[FGDLayerRelError]
     output_relative_error: FGDOutputRelError | None
+    sensor_valid: bool
+    sensor_invalid_batches: int
+
+
+@dataclass(frozen=True)
+class FGDValidationCertificate:
+    learning_rate_upper_bound: float | None
+    learning_rate_interval_valid: bool | None
+    skipped_batches: int
+    relative_error_condition_valid: bool | None
+    gradient_sq_norm: float | None
+    theory_descent_coefficient: float | None
+    relative_error: float | None
+    output_relative_error: FGDOutputRelError | None
+    sensor_valid: bool
+    sensor_invalid_batches: int
 
 
 @dataclass(frozen=True)
@@ -289,6 +305,47 @@ def _output_relative_error_from_stats(
     )
 
 
+def _projection_sensor_valid(
+    *,
+    dot_product: float,
+    approximation_sq_norm: float,
+    target_sq_norm: float,
+    eps: float,
+    relative_tolerance: float = 1e-4,
+) -> bool:
+    """Return whether the damped projection satisfies exact-operator invariants."""
+    values = (dot_product, approximation_sq_norm, target_sq_norm)
+    if not all(math.isfinite(value) for value in values):
+        return False
+    if approximation_sq_norm < -eps or target_sq_norm < -eps:
+        return False
+
+    approximation_sq_norm = max(0.0, approximation_sq_norm)
+    target_sq_norm = max(0.0, target_sq_norm)
+    norm_product = math.sqrt(approximation_sq_norm * target_sq_norm)
+    dot_tolerance = relative_tolerance * max(norm_product, eps)
+    if dot_product < -dot_tolerance:
+        return False
+
+    norm_tolerance = relative_tolerance * max(target_sq_norm, eps)
+    if approximation_sq_norm > target_sq_norm + norm_tolerance:
+        return False
+
+    return True
+
+
+def _projection_step_sensor_valid(
+    step: _TangentProjectionStep,
+    config: FGDApproxConfig,
+) -> bool:
+    return _projection_sensor_valid(
+        dot_product=step.dot_product,
+        approximation_sq_norm=step.approximation_sq_norm,
+        target_sq_norm=step.target_sq_norm,
+        eps=config.eps,
+    )
+
+
 def theoretical_learning_rate_upper_bound(
     relative_error: float,
     config: FGDApproxConfig,
@@ -390,24 +447,72 @@ def _solve_tangent_projection(
     """Return parameter update and projected output gradient."""
     output_numel, parameter_numel = jacobian_matrix.shape
     damping = max(float(damping), 0.0)
+    original_dtype = jacobian_matrix.dtype
+    work_dtype = torch.float64
+    jacobian_work = jacobian_matrix.to(dtype=work_dtype)
+    target_work = target.reshape(-1).to(dtype=work_dtype)
 
-    if output_numel <= parameter_numel:
-        kernel = jacobian_matrix @ jacobian_matrix.t()
-        system = kernel.clone()
-        if damping > 0.0:
-            system.diagonal().add_(damping)
-        dual_solution = torch.linalg.solve(system, target)
-        flat_update = jacobian_matrix.t() @ dual_solution
-        approximation = kernel @ dual_solution
-        return flat_update, approximation
+    if output_numel == 0 or parameter_numel == 0:
+        return (
+            torch.zeros(
+                parameter_numel,
+                device=jacobian_matrix.device,
+                dtype=original_dtype,
+            ),
+            torch.zeros(
+                output_numel,
+                device=jacobian_matrix.device,
+                dtype=original_dtype,
+            ),
+        )
 
-    gram = jacobian_matrix.t() @ jacobian_matrix
+    u, singular_values, vh = torch.linalg.svd(jacobian_work, full_matrices=False)
+    if singular_values.numel() == 0:
+        return (
+            torch.zeros(
+                parameter_numel,
+                device=jacobian_matrix.device,
+                dtype=original_dtype,
+            ),
+            torch.zeros(
+                output_numel,
+                device=jacobian_matrix.device,
+                dtype=original_dtype,
+            ),
+        )
+
+    coefficients = u.t() @ target_work
+    eigenvalues = singular_values.square()
+
     if damping > 0.0:
-        gram.diagonal().add_(damping)
-    rhs = jacobian_matrix.t() @ target
-    flat_update = torch.linalg.solve(gram, rhs)
-    approximation = jacobian_matrix @ flat_update
-    return flat_update, approximation
+        denominator = eigenvalues + damping
+        output_factors = eigenvalues / denominator
+        update_factors = singular_values / denominator
+    else:
+        max_singular = torch.max(singular_values)
+        threshold = (
+            torch.finfo(work_dtype).eps
+            * max(output_numel, parameter_numel)
+            * max(float(max_singular.detach().item()), 1.0)
+        )
+        nonzero = singular_values > threshold
+        output_factors = torch.where(
+            nonzero,
+            torch.ones_like(singular_values),
+            torch.zeros_like(singular_values),
+        )
+        update_factors = torch.where(
+            nonzero,
+            singular_values.reciprocal(),
+            torch.zeros_like(singular_values),
+        )
+
+    approximation_work = u @ (output_factors * coefficients)
+    flat_update_work = vh.t() @ (update_factors * coefficients)
+    return (
+        flat_update_work.to(dtype=original_dtype),
+        approximation_work.to(dtype=original_dtype),
+    )
 
 
 def _conjugate_gradient(
@@ -1099,12 +1204,14 @@ def train_one_epoch_gromo_layer_proxy(
         min_positive_learning_rate=learning_rate if learning_rate > 0.0 else None,
         relative_error=selected_layer.relative_error
         if selected_layer is not None
-        else 0.0,
+        else None,
         selected_layer_index=selected_layer.layer_index
         if selected_layer is not None
         else None,
         layer_relative_errors=layer_errors,
         output_relative_error=output_error,
+        sensor_valid=True,
+        sensor_invalid_batches=0,
     )
 
 
@@ -1150,30 +1257,16 @@ def compute_tangent_projection_error(
     config: FGDApproxConfig,
 ) -> FGDOutputRelError:
     """Measure the global tangent-projection certificate without updating."""
-    model.eval()
-    dot_product = 0.0
-    approximation_sq_norm = 0.0
-    target_sq_norm = 0.0
-
-    for x, y in data_loader:
-        x = x.to(device)
-        y = y.to(device)
-        step = _compute_tangent_projection_step(
-            model=model,
-            x=x,
-            y=y,
-            config=config,
-        )
-        dot_product += step.dot_product
-        approximation_sq_norm += step.approximation_sq_norm
-        target_sq_norm += step.target_sq_norm
-
-    return _output_relative_error_from_stats(
-        dot_product=dot_product,
-        approximation_sq_norm=approximation_sq_norm,
-        target_sq_norm=target_sq_norm,
-        eps=config.eps,
+    certificate = evaluate_fgd_validation_certificate(
+        model=model,
+        data_loader=data_loader,
+        device=device,
+        config=config,
+        learning_rate=None,
     )
+    if certificate.output_relative_error is None:
+        raise RuntimeError("Invalid FGD tangent projection sensor measurement.")
+    return certificate.output_relative_error
 
 
 def _count_all_parameters(model: torch.nn.Module) -> int:
@@ -1183,11 +1276,13 @@ def _count_all_parameters(model: torch.nn.Module) -> int:
 def select_certifying_growth_layer_index(
     model: GrowingMLP,
     train_loader: torch.utils.data.DataLoader,
+    validation_loader: torch.utils.data.DataLoader,
     device: torch.device,
     config: FGDApproxConfig,
     line_search_config: ScalingLineSearchConfig,
+    projection_group_size: int = 1,
 ) -> int | None:
-    """Trial-grow each layer and choose the best post-growth certificate."""
+    """Trial-grow with train data and choose by validation certificate."""
     if not getattr(model, "_growable_layers", None):
         return None
 
@@ -1202,7 +1297,7 @@ def select_certifying_growth_layer_index(
 
     for layer_index in range(len(model._growable_layers)):
         trial_model = copy.deepcopy(model)
-        grow_layer(
+        growth_result = grow_layer(
             model=trial_model,
             train_loader=train_loader,
             layer_index=layer_index,
@@ -1211,19 +1306,35 @@ def select_certifying_growth_layer_index(
             optimal_update_kwargs=optimal_update_kwargs,
             progress=None,
         )
-        certificate = compute_tangent_projection_error(
+        effective_growth = growth_result.best_scaling_factor > max(
+            line_search_config.tolerance,
+            config.eps,
+        )
+        certificate = evaluate_fgd_validation_certificate(
             model=trial_model,
-            data_loader=train_loader,
+            data_loader=validation_loader,
             device=device,
             config=config,
+            learning_rate=None,
+            projection_group_size=projection_group_size,
+        )
+        relative_error = certificate.relative_error
+        certified = (
+            effective_growth
+            and certificate.sensor_valid
+            and relative_error is not None
+            and relative_error <= config.rel_error_threshold
         )
         trials.append(
             {
                 "layer_index": layer_index,
-                "relative_error": certificate.relative_error,
+                "relative_error": relative_error
+                if relative_error is not None
+                else float("inf"),
                 "added_parameters": _count_all_parameters(trial_model)
                 - base_parameter_count,
-                "certified": certificate.relative_error <= config.rel_error_threshold,
+                "certified": certified,
+                "sensor_valid": certificate.sensor_valid and effective_growth,
             }
         )
         del trial_model
@@ -1241,7 +1352,10 @@ def select_certifying_growth_layer_index(
             ),
         )
     else:
-        chosen = min(trials, key=lambda trial: float(trial["relative_error"]))
+        valid_trials = [trial for trial in trials if bool(trial["sensor_valid"])]
+        if not valid_trials:
+            return None
+        chosen = min(valid_trials, key=lambda trial: float(trial["relative_error"]))
     return int(chosen["layer_index"])
 
 
@@ -1260,6 +1374,155 @@ def should_trigger_fgd_growth(
             return False
 
     return relative_error >= config.rel_error_threshold
+
+
+def evaluate_fgd_validation_certificate(
+    model: GrowingMLP,
+    data_loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    config: FGDApproxConfig,
+    learning_rate: float | None,
+    projection_group_size: int = 1,
+) -> FGDValidationCertificate:
+    """Evaluate FGD certificate conditions on held-out validation data."""
+    if config.rel_error_mode != "tangent_projection":
+        raise ValueError(
+            f"Unsupported fgd_approx.rel_error_mode '{config.rel_error_mode}'. "
+            "Use tangent_projection."
+        )
+    if config.projection_solver == "gromo_layer":
+        raise ValueError(
+            "Validation certificates require projection_solver to be cg or exact."
+        )
+
+    model.eval()
+    dot_product = 0.0
+    approximation_sq_norm = 0.0
+    target_sq_norm = 0.0
+    upper_bound_sum = 0.0
+    upper_bound_count = 0
+    skipped_batches = 0
+    sensor_invalid_batches = 0
+    valid_projection_batches = 0
+    relative_error_condition_valid: bool | None = True
+    learning_rate_interval_valid: bool | None = (
+        True if config.learning_rate_policy == "theory_interval" else None
+    )
+    min_theory_descent_coefficient: float | None = None
+
+    for x, y in _grouped_batches(data_loader, projection_group_size):
+        x = x.to(device)
+        y = y.to(device)
+        projection_step = _compute_tangent_projection_step(
+            model=model,
+            x=x,
+            y=y,
+            config=config,
+        )
+        if not _projection_step_sensor_valid(projection_step, config):
+            sensor_invalid_batches += 1
+            continue
+
+        valid_projection_batches += 1
+        batch_relative_error = projection_step.output_error.relative_error
+        if batch_relative_error >= min(config.rel_error_threshold, 0.5):
+            relative_error_condition_valid = False
+
+        if config.learning_rate_policy == "theory_interval":
+            upper_bound = theoretical_learning_rate_upper_bound(
+                batch_relative_error,
+                config,
+            )
+            upper_bound_sum += upper_bound if upper_bound is not None else 0.0
+            upper_bound_count += 1
+            if upper_bound is None:
+                learning_rate_interval_valid = False
+                skipped_batches += 1
+            else:
+                safe_upper_bound = config.theory_lr_safety * upper_bound
+                interval_ok = safe_upper_bound > config.theory_lr_min + config.eps
+                if learning_rate is not None and learning_rate > config.eps:
+                    interval_ok = (
+                        interval_ok
+                        and learning_rate > config.theory_lr_min
+                        and learning_rate <= safe_upper_bound + config.eps
+                    )
+                if not interval_ok:
+                    learning_rate_interval_valid = False
+                    skipped_batches += 1
+                elif learning_rate is not None and learning_rate > config.eps:
+                    descent_coefficient = theoretical_descent_coefficient(
+                        batch_relative_error,
+                        learning_rate,
+                        config,
+                    )
+                    if descent_coefficient is not None:
+                        min_theory_descent_coefficient = (
+                            descent_coefficient
+                            if min_theory_descent_coefficient is None
+                            else min(
+                                min_theory_descent_coefficient,
+                                descent_coefficient,
+                            )
+                        )
+
+        dot_product += projection_step.dot_product
+        approximation_sq_norm += projection_step.approximation_sq_norm
+        target_sq_norm += projection_step.target_sq_norm
+
+    if valid_projection_batches == 0:
+        relative_error_condition_valid = None
+        learning_rate_interval_valid = None
+        return FGDValidationCertificate(
+            learning_rate_upper_bound=None,
+            learning_rate_interval_valid=learning_rate_interval_valid,
+            skipped_batches=skipped_batches,
+            relative_error_condition_valid=relative_error_condition_valid,
+            gradient_sq_norm=None,
+            theory_descent_coefficient=None,
+            relative_error=None,
+            output_relative_error=None,
+            sensor_valid=False,
+            sensor_invalid_batches=sensor_invalid_batches,
+        )
+
+    aggregate_sensor_valid = _projection_sensor_valid(
+        dot_product=dot_product,
+        approximation_sq_norm=approximation_sq_norm,
+        target_sq_norm=target_sq_norm,
+        eps=config.eps,
+    )
+    if not aggregate_sensor_valid:
+        sensor_invalid_batches += 1
+        output_error = None
+        relative_error = None
+        gradient_sq_norm = None
+    else:
+        output_error = _output_relative_error_from_stats(
+            dot_product=dot_product,
+            approximation_sq_norm=approximation_sq_norm,
+            target_sq_norm=target_sq_norm,
+            eps=config.eps,
+        )
+        relative_error = output_error.relative_error
+        gradient_sq_norm = output_error.target_norm**2
+        if relative_error >= min(config.rel_error_threshold, 0.5):
+            relative_error_condition_valid = False
+
+    return FGDValidationCertificate(
+        learning_rate_upper_bound=(
+            upper_bound_sum / upper_bound_count if upper_bound_count > 0 else None
+        ),
+        learning_rate_interval_valid=learning_rate_interval_valid,
+        skipped_batches=skipped_batches,
+        relative_error_condition_valid=relative_error_condition_valid,
+        gradient_sq_norm=gradient_sq_norm,
+        theory_descent_coefficient=min_theory_descent_coefficient,
+        relative_error=relative_error,
+        output_relative_error=output_error,
+        sensor_valid=sensor_invalid_batches == 0,
+        sensor_invalid_batches=sensor_invalid_batches,
+    )
 
 
 def train_one_epoch_fgd_approx(
@@ -1320,6 +1583,8 @@ def train_one_epoch_fgd_approx(
     loss_non_descent_batches = 0
     min_theory_descent_coefficient: float | None = None
     min_positive_learning_rate: float | None = None
+    valid_projection_batches = 0
+    sensor_invalid_batches = 0
 
     if config.learning_rate_policy == "theory_interval":
         if config.theory_lr_safety <= 0.0 or config.theory_lr_safety > 1.0:
@@ -1339,6 +1604,13 @@ def train_one_epoch_fgd_approx(
             y=y,
             config=config,
         )
+        if not _projection_step_sensor_valid(projection_step, config):
+            sensor_invalid_batches += 1
+            skipped_batches += 1
+            batch_count += 1
+            continue
+
+        valid_projection_batches += 1
         batch_relative_error = projection_step.output_error.relative_error
         if batch_relative_error >= min(config.rel_error_threshold, 0.5):
             relative_error_condition_valid = False
@@ -1424,13 +1696,20 @@ def train_one_epoch_fgd_approx(
                     else min(min_theory_descent_coefficient, descent_coefficient)
                 )
 
-    output_error = _output_relative_error_from_stats(
-        dot_product=dot_product,
-        approximation_sq_norm=approximation_sq_norm,
-        target_sq_norm=target_sq_norm,
-        eps=config.eps,
+    output_error = (
+        _output_relative_error_from_stats(
+            dot_product=dot_product,
+            approximation_sq_norm=approximation_sq_norm,
+            target_sq_norm=target_sq_norm,
+            eps=config.eps,
+        )
+        if valid_projection_batches > 0
+        else None
     )
-    if output_error.relative_error >= min(config.rel_error_threshold, 0.5):
+    if (
+        output_error is not None
+        and output_error.relative_error >= min(config.rel_error_threshold, 0.5)
+    ):
         relative_error_condition_valid = False
 
     selected_layer_index = select_tiny_growth_layer_index(
@@ -1479,11 +1758,17 @@ def train_one_epoch_fgd_approx(
         relative_error_condition_valid=relative_error_condition_valid,
         loss_descent_valid=loss_descent_valid,
         loss_non_descent_batches=loss_non_descent_batches,
-        gradient_sq_norm=output_error.target_norm**2,
+        gradient_sq_norm=output_error.target_norm**2
+        if output_error is not None
+        else None,
         theory_descent_coefficient=min_theory_descent_coefficient,
         min_positive_learning_rate=min_positive_learning_rate,
-        relative_error=output_error.relative_error,
+        relative_error=output_error.relative_error
+        if output_error is not None
+        else None,
         selected_layer_index=selected_layer_index,
         layer_relative_errors=[],
         output_relative_error=output_error,
+        sensor_valid=sensor_invalid_batches == 0,
+        sensor_invalid_batches=sensor_invalid_batches,
     )
