@@ -20,7 +20,7 @@ data:
   linear_strength: 0.1
 
 model:
-  hidden_size: 64
+  hidden_size: 2
   number_hidden_layers: 3
   model_seed: 0
 
@@ -59,11 +59,12 @@ fgd_approx:
   theory_smoothness_constant: 2.0
   theory_alpha: 1.0
   theory_beta: 1.0
-  theory_mu: 1.0
+  theory_mu: 2.0
   theory_loss_star: 0.0
   theory_lr_safety: 0.95
   theory_lr_initial: 0.01
   theory_lr_min: 0.0
+  theory_lr_follow_bound: true
   sufficient_descent_c: 0.1
   lr_backtrack: 0.5
   lr_min_factor: 0.001
