@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from stable_tiny.gromo_setup import ensure_gromo_importable
 
@@ -171,6 +171,7 @@ def grow_layer(
     layer_index: int,
     device: torch.device,
     line_search_config: ScalingLineSearchConfig,
+    optimal_update_kwargs: dict[str, Any] | None = None,
     progress: ProgressFn | None = None,
 ) -> GrowthResult:
     """Grow one GroMo layer and apply the best line-search update.
@@ -189,7 +190,7 @@ def grow_layer(
         device=device,
     )
 
-    model.compute_optimal_updates()
+    model.compute_optimal_updates(**(optimal_update_kwargs or {}))
     model.reset_computation()
     model.dummy_select_update()
 

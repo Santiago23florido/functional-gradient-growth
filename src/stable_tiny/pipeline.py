@@ -13,7 +13,11 @@ import yaml
 from stable_tiny.data import MultiSinDataLoader, SmoothSinDataLoader
 from stable_tiny.fgd_approx import (
     FGDApproxConfig,
+    FGDLayerRelError,
+    FGDOutputRelError,
+    select_certifying_growth_layer_index,
     should_trigger_fgd_growth,
+    tiny_optimal_update_kwargs,
     train_one_epoch_fgd_approx,
 )
 from stable_tiny.gromo_setup import ensure_gromo_importable
@@ -121,6 +125,9 @@ class HistoryEntry:
     layer_index: int | None = None
     scaling_factor: float | None = None
     rel_error: float | None = None
+    selected_layer_index: int | None = None
+    fgd_layer_rel_errors: list[FGDLayerRelError] = field(default_factory=list)
+    fgd_output_rel_error: FGDOutputRelError | None = None
 
 
 @dataclass
@@ -251,6 +258,25 @@ def with_wandb_overrides(
     if tags:
         wandb_config = replace(wandb_config, tags=wandb_config.tags + tuple(tags))
     return replace(config, wandb=wandb_config)
+
+
+def with_growth_overrides(
+    config: PipelineConfig,
+    *,
+    enabled: bool | None = None,
+) -> PipelineConfig:
+    """Return a config with CLI growth-schedule overrides applied."""
+    growth_schedule = config.growth_schedule
+    lr_scheduler = config.lr_scheduler
+    if enabled is not None:
+        growth_schedule = replace(growth_schedule, enabled=enabled)
+        if not enabled:
+            lr_scheduler = replace(
+                lr_scheduler,
+                restart_on_growth=False,
+                t_max=config.training.epochs,
+            )
+    return replace(config, growth_schedule=growth_schedule, lr_scheduler=lr_scheduler)
 
 
 def select_device(device: str) -> torch.device:
@@ -442,6 +468,10 @@ def run_pipeline(
             apply_learning_rate(optimizer, learning_rate)
 
             rel_error: float | None = None
+            selected_layer_index: int | None = None
+            fgd_layer_rel_errors: list[FGDLayerRelError] = []
+            fgd_output_rel_error: FGDOutputRelError | None = None
+            entry_learning_rate = current_learning_rate(optimizer)
             if config.training.method == "normal":
                 epoch_result = train_one_epoch(
                     model=model,
@@ -459,16 +489,19 @@ def run_pipeline(
                     model=model,
                     train_loader=train_loader,
                     test_loader=test_loader,
-                    optimizer=optimizer,
                     loss_function=loss_function,
                     device=device,
                     learning_rate=learning_rate,
                     accuracy_tolerance=config.training.accuracy_tolerance,
-                    gradient_clip_norm=config.training.gradient_clip_norm,
                     config=config.fgd_approx,
                 )
                 epoch_result = fgd_epoch_result
                 rel_error = fgd_epoch_result.relative_error
+                selected_layer_index = fgd_epoch_result.selected_layer_index
+                fgd_layer_rel_errors = fgd_epoch_result.layer_relative_errors
+                fgd_output_rel_error = fgd_epoch_result.output_relative_error
+                if fgd_epoch_result.learning_rate is not None:
+                    entry_learning_rate = fgd_epoch_result.learning_rate
                 step_type = "FGD"
             else:
                 raise ValueError(
@@ -483,9 +516,12 @@ def run_pipeline(
                 test_loss=epoch_result.test_loss,
                 train_accuracy=epoch_result.train_accuracy,
                 test_accuracy=epoch_result.test_accuracy,
-                learning_rate=current_learning_rate(optimizer),
+                learning_rate=entry_learning_rate,
                 num_params=count_parameters(model),
                 rel_error=rel_error,
+                selected_layer_index=selected_layer_index,
+                fgd_layer_rel_errors=fgd_layer_rel_errors,
+                fgd_output_rel_error=fgd_output_rel_error,
             )
             history.append(epoch_entry)
             wandb_logger.log_history_entry(epoch_entry)
@@ -495,14 +531,20 @@ def run_pipeline(
                 rel_error_msg = (
                     f", rel_err={rel_error:.3f}" if rel_error is not None else ""
                 )
+                selected_layer_msg = (
+                    f", selected_layer={selected_layer_index}"
+                    if selected_layer_index is not None
+                    else ""
+                )
                 progress(
                     f"[{step_type}] Epoch {epoch}, "
                     f"train_loss={epoch_result.train_loss:.4f}, "
                     f"test_loss={epoch_result.test_loss:.4f} ({delta:+.4f}), "
                     f"train_acc={epoch_result.train_accuracy:.3f}, "
                     f"test_acc={epoch_result.test_accuracy:.3f}, "
-                    f"lr={current_learning_rate(optimizer):.4g}"
+                    f"lr={entry_learning_rate:.4g}"
                     f"{rel_error_msg}"
+                    f"{selected_layer_msg}"
                 )
             last_test_loss = epoch_result.test_loss
 
@@ -520,11 +562,44 @@ def run_pipeline(
                 )
 
             if growth_triggered:
-                layer_index = layer_index_for_growth(
-                    growth_count=growth_count,
-                    number_hidden_layers=config.model.number_hidden_layers,
-                    config=config.growth_schedule,
-                )
+                if config.training.method == "fgd_approx":
+                    if (
+                        config.fgd_approx.layer_selection == "certifying"
+                        and config.fgd_approx.projection_solver != "gromo_layer"
+                    ):
+                        certified_layer_index = select_certifying_growth_layer_index(
+                            model=model,
+                            train_loader=train_loader,
+                            device=device,
+                            config=config.fgd_approx,
+                            line_search_config=config.scaling_line_search,
+                        )
+                    else:
+                        certified_layer_index = None
+
+                    layer_index = (
+                        certified_layer_index
+                        if certified_layer_index is not None
+                        else selected_layer_index
+                        if selected_layer_index is not None
+                        else layer_index_for_growth(
+                            growth_count=growth_count,
+                            number_hidden_layers=config.model.number_hidden_layers,
+                            config=config.growth_schedule,
+                        )
+                    )
+                    selected_layer_index = layer_index
+                    optimal_update_kwargs = tiny_optimal_update_kwargs(
+                        config.fgd_approx,
+                        compute_delta=config.fgd_approx.growth_compute_delta,
+                    )
+                else:
+                    layer_index = layer_index_for_growth(
+                        growth_count=growth_count,
+                        number_hidden_layers=config.model.number_hidden_layers,
+                        config=config.growth_schedule,
+                    )
+                    optimal_update_kwargs = None
                 if progress is not None:
                     progress(f"[GRO] Growing layer {layer_index} at epoch {epoch}")
 
@@ -534,6 +609,7 @@ def run_pipeline(
                     layer_index=layer_index,
                     device=device,
                     line_search_config=config.scaling_line_search,
+                    optimal_update_kwargs=optimal_update_kwargs,
                     progress=progress,
                 )
                 growth_events.append(growth_result)
@@ -581,6 +657,9 @@ def run_pipeline(
                     layer_index=layer_index,
                     scaling_factor=growth_result.best_scaling_factor,
                     rel_error=rel_error,
+                    selected_layer_index=selected_layer_index,
+                    fgd_layer_rel_errors=fgd_layer_rel_errors,
+                    fgd_output_rel_error=fgd_output_rel_error,
                 )
                 history.append(growth_entry)
                 wandb_logger.log_history_entry(growth_entry)

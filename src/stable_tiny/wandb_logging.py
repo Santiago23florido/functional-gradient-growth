@@ -128,6 +128,28 @@ class WandbRunLogger:
         if entry.rel_error is not None:
             payload["fgd/relative_error"] = entry.rel_error
 
+        if getattr(entry, "selected_layer_index", None) is not None:
+            payload["fgd/selected_layer_index"] = entry.selected_layer_index
+
+        output_error = getattr(entry, "fgd_output_rel_error", None)
+        if output_error is not None:
+            payload["fgd/approximation_norm"] = output_error.approximation_norm
+            payload["fgd/target_norm"] = output_error.target_norm
+            payload["fgd/directional_cosine"] = output_error.directional_cosine
+        else:
+            selected_layer = None
+            for layer_error in getattr(entry, "fgd_layer_rel_errors", []):
+                if layer_error.layer_index == getattr(
+                    entry, "selected_layer_index", None
+                ):
+                    selected_layer = layer_error
+                    break
+
+            if selected_layer is not None:
+                payload["fgd/approximation_norm"] = selected_layer.approximation_norm
+                payload["fgd/target_norm"] = selected_layer.target_norm
+                payload["fgd/directional_cosine"] = selected_layer.directional_cosine
+
         if entry.layer_index is not None:
             payload["growth/layer_index"] = entry.layer_index
 

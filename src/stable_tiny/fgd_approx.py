@@ -2,23 +2,74 @@
 
 from __future__ import annotations
 
+import copy
+import math
+from collections import OrderedDict
 from dataclasses import dataclass
+from typing import Callable, Literal
 
 from stable_tiny.gromo_setup import ensure_gromo_importable
+from stable_tiny.grow import ScalingLineSearchConfig, grow_layer
 from stable_tiny.train import RegressionMetrics, evaluate_regression_metrics
 
 
 ensure_gromo_importable()
 
 import torch
+from torch.func import functional_call, jacrev, jvp
+
+from gromo.containers.growing_mlp import GrowingMLP
+from gromo.utils.training_utils import compute_statistics
+
+
+RelErrorMode = Literal["tangent_projection"]
+LayerSelection = Literal["certifying", "tiny_best", "min_rel_error"]
+ProjectionSolver = Literal["gromo_layer", "cg", "exact"]
 
 
 @dataclass(frozen=True)
 class FGDApproxConfig:
     rel_error_threshold: float = 0.5
+    rel_error_mode: RelErrorMode = "tangent_projection"
+    layer_selection: LayerSelection = "certifying"
+    projection_solver: ProjectionSolver = "exact"
+    projection_damping: float = 1e-2
+    cg_max_iterations: int = 16
+    cg_tolerance: float = 1e-4
+    sufficient_descent_c: float | None = 0.1
+    lr_backtrack: float = 0.5
+    lr_min_factor: float = 1e-3
+    rel_error_compute_delta: bool = True
+    growth_compute_delta: bool = False
     start_epoch: int = 1
     min_epochs_between_growth: int = 1
     eps: float = 1e-12
+    tiny_use_covariance: bool = True
+    tiny_alpha_zero: bool = False
+    tiny_omega_zero: bool = False
+    tiny_use_projection: bool = True
+    tiny_ignore_singular_values: bool = False
+    tiny_use_fisher: bool = False
+    tiny_maximum_added_neurons: int | None = None
+    tiny_numerical_threshold: float = 1e-6
+    tiny_statistical_threshold: float = 1e-3
+
+
+@dataclass(frozen=True)
+class FGDLayerRelError:
+    layer_index: int
+    relative_error: float
+    approximation_norm: float
+    target_norm: float
+    directional_cosine: float
+
+
+@dataclass(frozen=True)
+class FGDOutputRelError:
+    relative_error: float
+    approximation_norm: float
+    target_norm: float
+    directional_cosine: float
 
 
 @dataclass(frozen=True)
@@ -27,15 +78,48 @@ class FGDApproxEpochResult:
     train_accuracy: float
     test_loss: float
     test_accuracy: float
+    learning_rate: float | None
     relative_error: float
+    selected_layer_index: int | None
+    layer_relative_errors: list[FGDLayerRelError]
+    output_relative_error: FGDOutputRelError | None
+
+
+@dataclass(frozen=True)
+class _FunctionalStepStats:
+    output_error: FGDOutputRelError
+    dot_product: float
+    approximation_sq_norm: float
+    target_sq_norm: float
+
+
+@dataclass(frozen=True)
+class _TangentProjectionStep:
+    output_error: FGDOutputRelError
+    parameter_updates: tuple[torch.Tensor, ...]
+    learning_rate_used: float
+    loss_before: float
+    loss_after: float
+    descent_ok: bool
+    dot_product: float
+    approximation_sq_norm: float
+    target_sq_norm: float
 
 
 def mse_functional_gradient(
     y_pred: torch.Tensor,
     y: torch.Tensor,
 ) -> torch.Tensor:
-    """Return the MSE functional-gradient direction up to a constant factor."""
-    return y_pred.detach() - y.detach()
+    """Return the output gradient for GroMo/TINY sum-MSE convention."""
+    return 2.0 * (y_pred.detach() - y.detach())
+
+
+def batch_functional_mse_loss(
+    y_pred: torch.Tensor,
+    y: torch.Tensor,
+) -> torch.Tensor:
+    """Return the sum-MSE loss used by GroMo/TINY statistics."""
+    return torch.sum((y_pred - y) ** 2)
 
 
 def relative_l2_error(
@@ -47,6 +131,941 @@ def relative_l2_error(
     numerator = torch.sqrt(torch.mean((approximation - target) ** 2))
     denominator = torch.sqrt(torch.mean(approximation**2)).clamp_min(eps)
     return float((numerator / denominator).detach().item())
+
+
+def _output_relative_error_from_tensors(
+    approximation: torch.Tensor,
+    target: torch.Tensor,
+    eps: float,
+) -> _FunctionalStepStats:
+    dot_product = float(torch.sum(approximation * target).detach().item())
+    approximation_sq_norm = float(torch.sum(approximation**2).detach().item())
+    target_sq_norm = float(torch.sum(target**2).detach().item())
+    output_error = _output_relative_error_from_stats(
+        dot_product=dot_product,
+        approximation_sq_norm=approximation_sq_norm,
+        target_sq_norm=target_sq_norm,
+        eps=eps,
+    )
+    return _FunctionalStepStats(
+        output_error=output_error,
+        dot_product=dot_product,
+        approximation_sq_norm=approximation_sq_norm,
+        target_sq_norm=target_sq_norm,
+    )
+
+
+def tiny_optimal_update_kwargs(
+    config: FGDApproxConfig,
+    *,
+    compute_delta: bool,
+) -> dict[str, object]:
+    """Return GroMo options matching the TINY-style optimal layer update."""
+    return {
+        "compute_delta": compute_delta,
+        "use_covariance": config.tiny_use_covariance,
+        "alpha_zero": config.tiny_alpha_zero,
+        "omega_zero": config.tiny_omega_zero,
+        "use_projection": config.tiny_use_projection,
+        "ignore_singular_values": config.tiny_ignore_singular_values,
+        "use_fisher": config.tiny_use_fisher,
+        "maximum_added_neurons": config.tiny_maximum_added_neurons,
+        "numerical_threshold": config.tiny_numerical_threshold,
+        "statistical_threshold": config.tiny_statistical_threshold,
+    }
+
+
+def _cleanup_tiny_update(model: GrowingMLP) -> None:
+    model.reset_computation()
+    for layer in getattr(model, "_growing_layers", []):
+        if hasattr(layer, "delete_update"):
+            layer.delete_update(include_previous=True)
+    model.currently_updated_layer_index = None
+    model.zero_grad(set_to_none=True)
+
+
+def _forward_with_tiny_update(
+    model: GrowingMLP,
+    x: torch.Tensor,
+) -> torch.Tensor:
+    """Forward the temporary layer delta all the way to the network output."""
+    x = model.flatten(x)
+    x_ext = None
+    for layer in model.layers:
+        x, x_ext = layer.extended_forward(
+            x,
+            x_ext,
+            use_optimal_delta=True,
+            use_extended_input=False,
+            use_extended_output=False,
+        )
+    return x
+
+
+def _relative_error_from_stats(
+    *,
+    layer_index: int,
+    dot_product: float,
+    approximation_sq_norm: float,
+    target_sq_norm: float,
+    config: FGDApproxConfig,
+) -> FGDLayerRelError:
+    numerator_sq = (
+        approximation_sq_norm
+        - 2.0 * dot_product
+        + target_sq_norm
+    )
+    numerator = math.sqrt(max(0.0, numerator_sq))
+
+    denominator_sq = approximation_sq_norm
+    denominator = max(math.sqrt(max(0.0, denominator_sq)), config.eps)
+    approximation_norm = math.sqrt(max(0.0, approximation_sq_norm))
+    target_norm = math.sqrt(max(0.0, target_sq_norm))
+
+    cosine_denominator = max(
+        math.sqrt(max(0.0, approximation_sq_norm * target_sq_norm)),
+        config.eps,
+    )
+    directional_cosine = dot_product / cosine_denominator
+
+    return FGDLayerRelError(
+        layer_index=layer_index,
+        relative_error=numerator / denominator,
+        approximation_norm=approximation_norm,
+        target_norm=target_norm,
+        directional_cosine=directional_cosine,
+    )
+
+
+def _output_relative_error_from_stats(
+    *,
+    dot_product: float,
+    approximation_sq_norm: float,
+    target_sq_norm: float,
+    eps: float,
+) -> FGDOutputRelError:
+    numerator_sq = approximation_sq_norm - 2.0 * dot_product + target_sq_norm
+    numerator = math.sqrt(max(0.0, numerator_sq))
+    denominator = max(math.sqrt(max(0.0, approximation_sq_norm)), eps)
+    approximation_norm = math.sqrt(max(0.0, approximation_sq_norm))
+    target_norm = math.sqrt(max(0.0, target_sq_norm))
+    cosine_denominator = max(
+        math.sqrt(max(0.0, approximation_sq_norm * target_sq_norm)),
+        eps,
+    )
+    directional_cosine = dot_product / cosine_denominator
+    return FGDOutputRelError(
+        relative_error=numerator / denominator,
+        approximation_norm=approximation_norm,
+        target_norm=target_norm,
+        directional_cosine=directional_cosine,
+    )
+
+
+def _clear_inaccessible_tensor_caches(model: torch.nn.Module) -> None:
+    """Drop functorch-wrapped tensors cached by GroMo modules during jacrev."""
+    for module in model.modules():
+        for name, value in list(vars(module).items()):
+            if torch.is_tensor(value):
+                try:
+                    value.untyped_storage()
+                except (NotImplementedError, RuntimeError):
+                    setattr(module, name, None)
+
+
+def _trainable_named_parameters(
+    model: torch.nn.Module,
+) -> OrderedDict[str, torch.nn.Parameter]:
+    return OrderedDict(
+        (name, parameter)
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    )
+
+
+def _flatten_jacobian(
+    jacobian: tuple[torch.Tensor, ...],
+    output_numel: int,
+) -> torch.Tensor:
+    columns = [item.reshape(output_numel, -1) for item in jacobian]
+    return torch.cat(columns, dim=1).detach()
+
+
+def _unflatten_parameter_update(
+    flat_update: torch.Tensor,
+    parameters: tuple[torch.nn.Parameter, ...],
+) -> tuple[torch.Tensor, ...]:
+    updates: list[torch.Tensor] = []
+    offset = 0
+    for parameter in parameters:
+        size = parameter.numel()
+        updates.append(flat_update[offset : offset + size].reshape_as(parameter))
+        offset += size
+    return tuple(updates)
+
+
+def _flatten_parameter_tensors(tensors: tuple[torch.Tensor, ...]) -> torch.Tensor:
+    return torch.cat([tensor.reshape(-1) for tensor in tensors])
+
+
+def _solve_tangent_projection(
+    jacobian_matrix: torch.Tensor,
+    target: torch.Tensor,
+    damping: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return parameter update and projected output gradient."""
+    output_numel, parameter_numel = jacobian_matrix.shape
+    damping = max(float(damping), 0.0)
+
+    if output_numel <= parameter_numel:
+        kernel = jacobian_matrix @ jacobian_matrix.t()
+        system = kernel.clone()
+        if damping > 0.0:
+            system.diagonal().add_(damping)
+        dual_solution = torch.linalg.solve(system, target)
+        flat_update = jacobian_matrix.t() @ dual_solution
+        approximation = kernel @ dual_solution
+        return flat_update, approximation
+
+    gram = jacobian_matrix.t() @ jacobian_matrix
+    if damping > 0.0:
+        gram.diagonal().add_(damping)
+    rhs = jacobian_matrix.t() @ target
+    flat_update = torch.linalg.solve(gram, rhs)
+    approximation = jacobian_matrix @ flat_update
+    return flat_update, approximation
+
+
+def _conjugate_gradient(
+    matvec: Callable[[torch.Tensor], torch.Tensor],
+    rhs: torch.Tensor,
+    *,
+    max_iterations: int,
+    tolerance: float,
+    eps: float,
+) -> torch.Tensor:
+    """Solve A x = rhs using conjugate gradient with an implicit SPD matvec."""
+    x = torch.zeros_like(rhs)
+    r = rhs.clone()
+    p = r.clone()
+    rhs_norm = torch.linalg.norm(rhs).clamp_min(eps)
+    residual_sq = torch.dot(r, r)
+    if torch.sqrt(residual_sq) <= tolerance * rhs_norm:
+        return x
+
+    for _ in range(max(1, max_iterations)):
+        ap = matvec(p)
+        denominator = torch.dot(p, ap)
+        if torch.abs(denominator) <= eps:
+            break
+
+        alpha = residual_sq / denominator
+        x = x + alpha * p
+        r = r - alpha * ap
+        next_residual_sq = torch.dot(r, r)
+        if torch.sqrt(next_residual_sq) <= tolerance * rhs_norm:
+            break
+
+        beta = next_residual_sq / residual_sq.clamp_min(eps)
+        p = r + beta * p
+        residual_sq = next_residual_sq
+
+    return x
+
+
+def _compute_exact_tangent_projection_step(
+    model: GrowingMLP,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    config: FGDApproxConfig,
+) -> _TangentProjectionStep:
+    """Compute g = P_T grad L by explicitly materializing the full Jacobian."""
+    named_parameters = _trainable_named_parameters(model)
+    if not named_parameters:
+        raise RuntimeError("FGD tangent projection requires trainable parameters.")
+
+    parameter_names = tuple(named_parameters.keys())
+    parameters = tuple(named_parameters.values())
+    buffers = OrderedDict(model.named_buffers())
+
+    output = model(x)
+    loss = batch_functional_mse_loss(output, y)
+    if not torch.isfinite(loss).all():
+        raise RuntimeError(f"Non-finite FGD loss detected before projection: {loss}.")
+
+    target_tensor = torch.autograd.grad(loss, output)[0].detach()
+    target = target_tensor.reshape(-1)
+    output_numel = target.numel()
+
+    if torch.linalg.norm(target) <= torch.finfo(target.dtype).eps:
+        zero_updates = tuple(torch.zeros_like(parameter) for parameter in parameters)
+        output_error = _output_relative_error_from_stats(
+            dot_product=0.0,
+            approximation_sq_norm=0.0,
+            target_sq_norm=0.0,
+            eps=config.eps,
+        )
+        return _TangentProjectionStep(
+            output_error=output_error,
+            parameter_updates=zero_updates,
+            learning_rate_used=0.0,
+            loss_before=float(loss.detach().item()),
+            loss_after=float(loss.detach().item()),
+            descent_ok=True,
+            dot_product=0.0,
+            approximation_sq_norm=0.0,
+            target_sq_norm=0.0,
+        )
+
+    def call_with_parameters(
+        parameter_values: tuple[torch.Tensor, ...],
+    ) -> torch.Tensor:
+        state = OrderedDict(zip(parameter_names, parameter_values))
+        state.update(buffers)
+        return functional_call(model, state, (x,)).reshape(-1)
+
+    try:
+        jacobian = jacrev(call_with_parameters)(parameters)
+    finally:
+        _clear_inaccessible_tensor_caches(model)
+
+    jacobian_matrix = _flatten_jacobian(jacobian, output_numel)
+    flat_update, approximation = _solve_tangent_projection(
+        jacobian_matrix=jacobian_matrix,
+        target=target,
+        damping=config.projection_damping,
+    )
+    if not torch.isfinite(flat_update).all() or not torch.isfinite(approximation).all():
+        raise RuntimeError("Non-finite FGD tangent projection update detected.")
+
+    stats = _output_relative_error_from_tensors(
+        approximation=approximation,
+        target=target,
+        eps=config.eps,
+    )
+    parameter_updates = _unflatten_parameter_update(flat_update, parameters)
+    return _TangentProjectionStep(
+        output_error=stats.output_error,
+        parameter_updates=parameter_updates,
+        learning_rate_used=0.0,
+        loss_before=float(loss.detach().item()),
+        loss_after=float(loss.detach().item()),
+        descent_ok=True,
+        dot_product=stats.dot_product,
+        approximation_sq_norm=stats.approximation_sq_norm,
+        target_sq_norm=stats.target_sq_norm,
+    )
+
+
+def _compute_cg_tangent_projection_step(
+    model: GrowingMLP,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    config: FGDApproxConfig,
+) -> _TangentProjectionStep:
+    """Compute g = P_T grad L with implicit CG products through the Jacobian."""
+    named_parameters = _trainable_named_parameters(model)
+    if not named_parameters:
+        raise RuntimeError("FGD tangent projection requires trainable parameters.")
+
+    parameter_names = tuple(named_parameters.keys())
+    parameters = tuple(named_parameters.values())
+    buffers = OrderedDict(model.named_buffers())
+
+    output = model(x)
+    loss = batch_functional_mse_loss(output, y)
+    if not torch.isfinite(loss).all():
+        raise RuntimeError(f"Non-finite FGD loss detected before projection: {loss}.")
+
+    target_tensor = torch.autograd.grad(loss, output, retain_graph=True)[0].detach()
+    target = target_tensor.reshape(-1)
+    output_numel = target.numel()
+    parameter_numel = sum(parameter.numel() for parameter in parameters)
+
+    if torch.linalg.norm(target) <= torch.finfo(target.dtype).eps:
+        zero_updates = tuple(torch.zeros_like(parameter) for parameter in parameters)
+        output_error = _output_relative_error_from_stats(
+            dot_product=0.0,
+            approximation_sq_norm=0.0,
+            target_sq_norm=0.0,
+            eps=config.eps,
+        )
+        return _TangentProjectionStep(
+            output_error=output_error,
+            parameter_updates=zero_updates,
+            learning_rate_used=0.0,
+            loss_before=float(loss.detach().item()),
+            loss_after=float(loss.detach().item()),
+            descent_ok=True,
+            dot_product=0.0,
+            approximation_sq_norm=0.0,
+            target_sq_norm=0.0,
+        )
+
+    def call_with_parameters(
+        parameter_values: tuple[torch.Tensor, ...],
+    ) -> torch.Tensor:
+        state = OrderedDict(zip(parameter_names, parameter_values))
+        state.update(buffers)
+        return functional_call(model, state, (x,))
+
+    def jvp_parameters_to_output(
+        parameter_tangent: tuple[torch.Tensor, ...],
+    ) -> torch.Tensor:
+        _, tangent_output = jvp(
+            call_with_parameters,
+            (parameters,),
+            (parameter_tangent,),
+        )
+        return tangent_output.reshape(-1).detach()
+
+    def vjp_output_to_parameters(vector: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        gradients = torch.autograd.grad(
+            output,
+            parameters,
+            grad_outputs=vector.reshape_as(output),
+            retain_graph=True,
+            allow_unused=True,
+        )
+        return tuple(
+            torch.zeros_like(parameter) if gradient is None else gradient.detach()
+            for parameter, gradient in zip(parameters, gradients)
+        )
+
+    def output_kernel_matvec(vector: torch.Tensor) -> torch.Tensor:
+        parameter_tangent = vjp_output_to_parameters(vector)
+        return jvp_parameters_to_output(parameter_tangent)
+
+    damping = max(float(config.projection_damping), 0.0)
+
+    def damped_output_kernel_matvec(vector: torch.Tensor) -> torch.Tensor:
+        product = output_kernel_matvec(vector)
+        if damping > 0.0:
+            product = product + damping * vector
+        return product
+
+    try:
+        if output_numel <= parameter_numel:
+            dual_solution = _conjugate_gradient(
+                damped_output_kernel_matvec,
+                target,
+                max_iterations=config.cg_max_iterations,
+                tolerance=config.cg_tolerance,
+                eps=config.eps,
+            )
+            approximation = output_kernel_matvec(dual_solution)
+            parameter_updates = vjp_output_to_parameters(dual_solution)
+        else:
+            rhs = _flatten_parameter_tensors(vjp_output_to_parameters(target))
+
+            def damped_parameter_gram_matvec(vector: torch.Tensor) -> torch.Tensor:
+                parameter_tangent = _unflatten_parameter_update(vector, parameters)
+                output_tangent = jvp_parameters_to_output(parameter_tangent)
+                product = _flatten_parameter_tensors(
+                    vjp_output_to_parameters(output_tangent)
+                )
+                if damping > 0.0:
+                    product = product + damping * vector
+                return product
+
+            flat_update = _conjugate_gradient(
+                damped_parameter_gram_matvec,
+                rhs,
+                max_iterations=config.cg_max_iterations,
+                tolerance=config.cg_tolerance,
+                eps=config.eps,
+            )
+            parameter_updates = _unflatten_parameter_update(flat_update, parameters)
+            approximation = jvp_parameters_to_output(parameter_updates)
+    finally:
+        _clear_inaccessible_tensor_caches(model)
+
+    if (
+        not torch.isfinite(approximation).all()
+        or any(not torch.isfinite(update).all() for update in parameter_updates)
+    ):
+        raise RuntimeError("Non-finite FGD CG tangent projection update detected.")
+
+    stats = _output_relative_error_from_tensors(
+        approximation=approximation,
+        target=target,
+        eps=config.eps,
+    )
+    return _TangentProjectionStep(
+        output_error=stats.output_error,
+        parameter_updates=parameter_updates,
+        learning_rate_used=0.0,
+        loss_before=float(loss.detach().item()),
+        loss_after=float(loss.detach().item()),
+        descent_ok=True,
+        dot_product=stats.dot_product,
+        approximation_sq_norm=stats.approximation_sq_norm,
+        target_sq_norm=stats.target_sq_norm,
+    )
+
+
+def _compute_tangent_projection_step(
+    model: GrowingMLP,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    config: FGDApproxConfig,
+) -> _TangentProjectionStep:
+    """Compute g = P_T grad L and the parameter update that realizes it."""
+    if config.projection_solver == "exact":
+        return _compute_exact_tangent_projection_step(
+            model=model,
+            x=x,
+            y=y,
+            config=config,
+        )
+
+    if config.projection_solver == "cg":
+        return _compute_cg_tangent_projection_step(
+            model=model,
+            x=x,
+            y=y,
+            config=config,
+        )
+
+    raise ValueError(
+        f"Unsupported fgd_approx.projection_solver '{config.projection_solver}'. "
+        "Use one of: cg, exact."
+    )
+
+
+def _apply_tangent_projection_step(
+    model: GrowingMLP,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    step: _TangentProjectionStep,
+    learning_rate: float,
+    config: FGDApproxConfig,
+) -> _TangentProjectionStep:
+    named_parameters = _trainable_named_parameters(model)
+    parameters = tuple(named_parameters.values())
+    base_parameters = tuple(parameter.detach().clone() for parameter in parameters)
+    base_loss = step.loss_before
+    directional_derivative = step.dot_product
+
+    def apply(step_learning_rate: float) -> None:
+        with torch.no_grad():
+            for parameter, base, update in zip(
+                parameters,
+                base_parameters,
+                step.parameter_updates,
+            ):
+                parameter.copy_(base)
+                parameter.add_(update, alpha=-step_learning_rate)
+
+    @torch.no_grad()
+    def trial_loss() -> float:
+        return float(batch_functional_mse_loss(model(x), y).detach().item())
+
+    if learning_rate <= config.eps or directional_derivative <= config.eps:
+        apply(0.0)
+        return _TangentProjectionStep(
+            output_error=step.output_error,
+            parameter_updates=step.parameter_updates,
+            learning_rate_used=0.0,
+            loss_before=step.loss_before,
+            loss_after=trial_loss(),
+            descent_ok=directional_derivative <= config.eps,
+            dot_product=step.dot_product,
+            approximation_sq_norm=step.approximation_sq_norm,
+            target_sq_norm=step.target_sq_norm,
+        )
+
+    if config.sufficient_descent_c is None:
+        apply(learning_rate)
+        return _TangentProjectionStep(
+            output_error=step.output_error,
+            parameter_updates=step.parameter_updates,
+            learning_rate_used=learning_rate,
+            loss_before=step.loss_before,
+            loss_after=trial_loss(),
+            descent_ok=True,
+            dot_product=step.dot_product,
+            approximation_sq_norm=step.approximation_sq_norm,
+            target_sq_norm=step.target_sq_norm,
+        )
+
+    trial_learning_rate = learning_rate
+    min_learning_rate = learning_rate * max(config.lr_min_factor, 0.0)
+    accepted_learning_rate: float | None = None
+    accepted_loss = base_loss
+    while trial_learning_rate >= min_learning_rate:
+        apply(trial_learning_rate)
+        current_loss = trial_loss()
+        sufficient_decrease = (
+            base_loss
+            - config.sufficient_descent_c
+            * trial_learning_rate
+            * directional_derivative
+        )
+        if current_loss <= sufficient_decrease:
+            accepted_learning_rate = trial_learning_rate
+            accepted_loss = current_loss
+            break
+        trial_learning_rate *= config.lr_backtrack
+
+    descent_ok = accepted_learning_rate is not None
+    if accepted_learning_rate is None:
+        accepted_learning_rate = max(trial_learning_rate, min_learning_rate)
+        apply(accepted_learning_rate)
+        accepted_loss = trial_loss()
+
+    return _TangentProjectionStep(
+        output_error=step.output_error,
+        parameter_updates=step.parameter_updates,
+        learning_rate_used=accepted_learning_rate,
+        loss_before=step.loss_before,
+        loss_after=accepted_loss,
+        descent_ok=descent_ok,
+        dot_product=step.dot_product,
+        approximation_sq_norm=step.approximation_sq_norm,
+        target_sq_norm=step.target_sq_norm,
+    )
+
+
+@torch.no_grad()
+def _layer_functional_error(
+    model: GrowingMLP,
+    train_loader: torch.utils.data.DataLoader,
+    layer_index: int,
+    device: torch.device,
+    config: FGDApproxConfig,
+) -> FGDLayerRelError:
+    model.set_scaling_factor(1.0)
+    model.eval()
+
+    dot_product = 0.0
+    approximation_sq_norm = 0.0
+    target_sq_norm = 0.0
+    for x, y in train_loader:
+        x = x.to(device)
+        y = y.to(device)
+
+        y_before = model(x)
+        y_candidate = _forward_with_tiny_update(model, x)
+
+        approximation = y_before - y_candidate
+        target = mse_functional_gradient(y_before, y)
+
+        dot_product += float(torch.sum(approximation * target).detach().item())
+        approximation_sq_norm += float(torch.sum(approximation**2).detach().item())
+        target_sq_norm += float(torch.sum(target**2).detach().item())
+
+    return _relative_error_from_stats(
+        layer_index=layer_index,
+        dot_product=dot_product,
+        approximation_sq_norm=approximation_sq_norm,
+        target_sq_norm=target_sq_norm,
+        config=config,
+    )
+
+
+def compute_tiny_layer_relative_errors(
+    model: GrowingMLP,
+    train_loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    config: FGDApproxConfig,
+) -> list[FGDLayerRelError]:
+    """Compute TINY optimal update and functional RelErr for every growable layer."""
+    layer_errors: list[FGDLayerRelError] = []
+    update_kwargs = tiny_optimal_update_kwargs(
+        config,
+        compute_delta=config.rel_error_compute_delta,
+    )
+
+    for layer_index in range(len(model._growable_layers)):
+        model.set_growing_layers(index=layer_index)
+        try:
+            compute_statistics(
+                model,
+                train_loader,
+                loss_function=batch_functional_mse_loss,
+                device=device,
+            )
+            model.compute_optimal_updates(**update_kwargs)
+            model.reset_computation()
+            model.dummy_select_update()
+            layer_errors.append(
+                _layer_functional_error(
+                    model=model,
+                    train_loader=train_loader,
+                    layer_index=layer_index,
+                    device=device,
+                    config=config,
+                )
+            )
+        finally:
+            _cleanup_tiny_update(model)
+
+    return layer_errors
+
+
+def apply_fgd_parameter_update(
+    model: GrowingMLP,
+    train_loader: torch.utils.data.DataLoader,
+    selected_layer: FGDLayerRelError,
+    device: torch.device,
+    learning_rate: float,
+    config: FGDApproxConfig,
+) -> None:
+    """Apply one FGD parameter update from GroMo's optimal delta approximation."""
+    model.set_growing_layers(index=selected_layer.layer_index)
+    try:
+        compute_statistics(
+            model,
+            train_loader,
+            loss_function=batch_functional_mse_loss,
+            device=device,
+        )
+        model.compute_optimal_updates(
+            **tiny_optimal_update_kwargs(config, compute_delta=True)
+        )
+        model.reset_computation()
+        model.dummy_select_update()
+        model.currently_updated_layer.apply_change(
+            apply_delta=True,
+            apply_extension=False,
+            optimal_delta_scaling=learning_rate,
+        )
+    finally:
+        _cleanup_tiny_update(model)
+
+
+def select_fgd_growth_layer(
+    layer_errors: list[FGDLayerRelError],
+    config: FGDApproxConfig,
+) -> FGDLayerRelError | None:
+    if not layer_errors:
+        return None
+    if config.layer_selection == "min_rel_error":
+        return min(layer_errors, key=lambda item: item.relative_error)
+    raise ValueError(
+        f"Unsupported fgd_approx.layer_selection '{config.layer_selection}'. "
+        "Use one of: tiny_best, min_rel_error."
+    )
+
+
+def _output_error_from_layer_error(
+    layer_error: FGDLayerRelError,
+) -> FGDOutputRelError:
+    return FGDOutputRelError(
+        relative_error=layer_error.relative_error,
+        approximation_norm=layer_error.approximation_norm,
+        target_norm=layer_error.target_norm,
+        directional_cosine=layer_error.directional_cosine,
+    )
+
+
+def train_one_epoch_gromo_layer_proxy(
+    model: GrowingMLP,
+    train_loader: torch.utils.data.DataLoader,
+    test_loader: torch.utils.data.DataLoader,
+    loss_function: torch.nn.Module,
+    device: torch.device,
+    learning_rate: float,
+    accuracy_tolerance: float,
+    config: FGDApproxConfig,
+) -> FGDApproxEpochResult:
+    """Train with GroMo's algebraic per-layer optimal update as the FGD proxy."""
+    model.train()
+    layer_errors = compute_tiny_layer_relative_errors(
+        model=model,
+        train_loader=train_loader,
+        device=device,
+        config=config,
+    )
+    selected_layer = (
+        min(layer_errors, key=lambda item: item.relative_error)
+        if layer_errors
+        else None
+    )
+
+    if selected_layer is not None:
+        apply_fgd_parameter_update(
+            model=model,
+            train_loader=train_loader,
+            selected_layer=selected_layer,
+            device=device,
+            learning_rate=learning_rate,
+            config=config,
+        )
+
+    train_metrics: RegressionMetrics = evaluate_regression_metrics(
+        model,
+        train_loader,
+        loss_function,
+        device=device,
+        accuracy_tolerance=accuracy_tolerance,
+    )
+    test_metrics: RegressionMetrics = evaluate_regression_metrics(
+        model,
+        test_loader,
+        loss_function,
+        device=device,
+        accuracy_tolerance=accuracy_tolerance,
+    )
+
+    output_error = (
+        _output_error_from_layer_error(selected_layer)
+        if selected_layer is not None
+        else None
+    )
+    return FGDApproxEpochResult(
+        train_loss=train_metrics.loss,
+        train_accuracy=train_metrics.accuracy,
+        test_loss=test_metrics.loss,
+        test_accuracy=test_metrics.accuracy,
+        learning_rate=learning_rate,
+        relative_error=selected_layer.relative_error
+        if selected_layer is not None
+        else 0.0,
+        selected_layer_index=selected_layer.layer_index
+        if selected_layer is not None
+        else None,
+        layer_relative_errors=layer_errors,
+        output_relative_error=output_error,
+    )
+
+
+def select_tiny_growth_layer_index(
+    model: GrowingMLP,
+    train_loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    config: FGDApproxConfig,
+) -> int | None:
+    """Read-only TINY scoring pass used to choose a growth layer."""
+    if not getattr(model, "_growable_layers", None):
+        return None
+
+    model.set_growing_layers(scheduling_method="all")
+    try:
+        compute_statistics(
+            model,
+            train_loader,
+            loss_function=batch_functional_mse_loss,
+            device=device,
+        )
+        model.compute_optimal_updates(
+            **tiny_optimal_update_kwargs(
+                config,
+                compute_delta=config.growth_compute_delta,
+            )
+        )
+        scores = {
+            int(index): float(info["update_value"].detach().cpu())
+            for index, info in model.update_information().items()
+        }
+        if not scores:
+            return None
+        return max(scores, key=scores.get)
+    finally:
+        _cleanup_tiny_update(model)
+
+
+def compute_tangent_projection_error(
+    model: GrowingMLP,
+    data_loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    config: FGDApproxConfig,
+) -> FGDOutputRelError:
+    """Measure the global tangent-projection certificate without updating."""
+    model.eval()
+    dot_product = 0.0
+    approximation_sq_norm = 0.0
+    target_sq_norm = 0.0
+
+    for x, y in data_loader:
+        x = x.to(device)
+        y = y.to(device)
+        step = _compute_tangent_projection_step(
+            model=model,
+            x=x,
+            y=y,
+            config=config,
+        )
+        dot_product += step.dot_product
+        approximation_sq_norm += step.approximation_sq_norm
+        target_sq_norm += step.target_sq_norm
+
+    return _output_relative_error_from_stats(
+        dot_product=dot_product,
+        approximation_sq_norm=approximation_sq_norm,
+        target_sq_norm=target_sq_norm,
+        eps=config.eps,
+    )
+
+
+def _count_all_parameters(model: torch.nn.Module) -> int:
+    return sum(parameter.numel() for parameter in model.parameters())
+
+
+def select_certifying_growth_layer_index(
+    model: GrowingMLP,
+    train_loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    config: FGDApproxConfig,
+    line_search_config: ScalingLineSearchConfig,
+) -> int | None:
+    """Trial-grow each layer and choose the best post-growth certificate."""
+    if not getattr(model, "_growable_layers", None):
+        return None
+
+    _clear_inaccessible_tensor_caches(model)
+    _cleanup_tiny_update(model)
+    base_parameter_count = _count_all_parameters(model)
+    trials: list[dict[str, float | int | bool]] = []
+    optimal_update_kwargs = tiny_optimal_update_kwargs(
+        config,
+        compute_delta=config.growth_compute_delta,
+    )
+
+    for layer_index in range(len(model._growable_layers)):
+        trial_model = copy.deepcopy(model)
+        grow_layer(
+            model=trial_model,
+            train_loader=train_loader,
+            layer_index=layer_index,
+            device=device,
+            line_search_config=line_search_config,
+            optimal_update_kwargs=optimal_update_kwargs,
+            progress=None,
+        )
+        certificate = compute_tangent_projection_error(
+            model=trial_model,
+            data_loader=train_loader,
+            device=device,
+            config=config,
+        )
+        trials.append(
+            {
+                "layer_index": layer_index,
+                "relative_error": certificate.relative_error,
+                "added_parameters": _count_all_parameters(trial_model)
+                - base_parameter_count,
+                "certified": certificate.relative_error <= config.rel_error_threshold,
+            }
+        )
+        del trial_model
+
+    if not trials:
+        return None
+
+    certifying_trials = [trial for trial in trials if bool(trial["certified"])]
+    if certifying_trials:
+        chosen = min(
+            certifying_trials,
+            key=lambda trial: (
+                int(trial["added_parameters"]),
+                float(trial["relative_error"]),
+            ),
+        )
+    else:
+        chosen = min(trials, key=lambda trial: float(trial["relative_error"]))
+    return int(chosen["layer_index"])
 
 
 def should_trigger_fgd_growth(
@@ -67,60 +1086,83 @@ def should_trigger_fgd_growth(
 
 
 def train_one_epoch_fgd_approx(
-    model: torch.nn.Module,
+    model: GrowingMLP,
     train_loader: torch.utils.data.DataLoader,
     test_loader: torch.utils.data.DataLoader,
-    optimizer: torch.optim.Optimizer,
     loss_function: torch.nn.Module,
     device: torch.device,
     learning_rate: float,
     accuracy_tolerance: float,
-    gradient_clip_norm: float | None,
     config: FGDApproxConfig,
 ) -> FGDApproxEpochResult:
-    """Train one epoch and estimate FGD relative error.
+    """Train one FGD epoch with the configured functional-gradient proxy.
 
-    The functional direction is approximated from the realized parameter update:
-    ``g_t,theta approx (f_t - f_{t+1}) / eta``.
+    ``exact`` computes the global tangent projection with the full Jacobian.
+    ``cg`` and ``gromo_layer`` remain available as cheaper proxy variants, but
+    they are not the default training path.
     """
-    model.train()
-    rel_error_sum = 0.0
-    rel_error_count = 0
-    step_scale = max(abs(learning_rate), config.eps)
+    if config.rel_error_mode != "tangent_projection":
+        raise ValueError(
+            f"Unsupported fgd_approx.rel_error_mode '{config.rel_error_mode}'. "
+            "Use tangent_projection."
+        )
 
-    for batch_index, (x, y) in enumerate(train_loader):
+    if config.projection_solver == "gromo_layer":
+        return train_one_epoch_gromo_layer_proxy(
+            model=model,
+            train_loader=train_loader,
+            test_loader=test_loader,
+            loss_function=loss_function,
+            device=device,
+            learning_rate=learning_rate,
+            accuracy_tolerance=accuracy_tolerance,
+            config=config,
+        )
+
+    model.train()
+    dot_product = 0.0
+    approximation_sq_norm = 0.0
+    target_sq_norm = 0.0
+    learning_rate_sum = 0.0
+    batch_count = 0
+
+    for x, y in train_loader:
         x = x.to(device)
         y = y.to(device)
 
-        optimizer.zero_grad()
-        y_before = model(x)
-        loss = loss_function(y_before, y)
-        if not torch.isfinite(loss).all():
-            raise RuntimeError(
-                "Non-finite FGD training loss detected "
-                f"(loss={loss.item()}, batch_index={batch_index})."
-            )
+        projection_step = _compute_tangent_projection_step(
+            model=model,
+            x=x,
+            y=y,
+            config=config,
+        )
+        applied_step = _apply_tangent_projection_step(
+            model=model,
+            x=x,
+            y=y,
+            step=projection_step,
+            learning_rate=learning_rate,
+            config=config,
+        )
+        dot_product += applied_step.dot_product
+        approximation_sq_norm += applied_step.approximation_sq_norm
+        target_sq_norm += applied_step.target_sq_norm
+        learning_rate_sum += applied_step.learning_rate_used
+        batch_count += 1
 
-        functional_gradient = mse_functional_gradient(y_before, y)
-        y_before_detached = y_before.detach()
+    output_error = _output_relative_error_from_stats(
+        dot_product=dot_product,
+        approximation_sq_norm=approximation_sq_norm,
+        target_sq_norm=target_sq_norm,
+        eps=config.eps,
+    )
 
-        loss.backward()
-        if gradient_clip_norm is not None and gradient_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
-        optimizer.step()
-
-        with torch.no_grad():
-            y_after = model(x)
-            fgd_direction = (y_before_detached - y_after) / step_scale
-            relative_error = relative_l2_error(
-                approximation=fgd_direction,
-                target=functional_gradient,
-                eps=config.eps,
-            )
-
-        batch_size = x.size(0)
-        rel_error_sum += relative_error * batch_size
-        rel_error_count += batch_size
+    selected_layer_index = select_tiny_growth_layer_index(
+        model=model,
+        train_loader=train_loader,
+        device=device,
+        config=config,
+    )
 
     train_metrics: RegressionMetrics = evaluate_regression_metrics(
         model,
@@ -142,5 +1184,9 @@ def train_one_epoch_fgd_approx(
         train_accuracy=train_metrics.accuracy,
         test_loss=test_metrics.loss,
         test_accuracy=test_metrics.accuracy,
-        relative_error=rel_error_sum / max(1, rel_error_count),
+        learning_rate=learning_rate_sum / max(1, batch_count),
+        relative_error=output_error.relative_error,
+        selected_layer_index=selected_layer_index,
+        layer_relative_errors=[],
+        output_relative_error=output_error,
     )
