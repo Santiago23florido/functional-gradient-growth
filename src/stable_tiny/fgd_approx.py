@@ -25,6 +25,7 @@ from gromo.utils.training_utils import compute_statistics
 RelErrorMode = Literal["tangent_projection"]
 LayerSelection = Literal["certifying", "tiny_best", "min_rel_error"]
 ProjectionSolver = Literal["gromo_layer", "cg", "exact"]
+LearningRatePolicy = Literal["scheduler", "theory_interval"]
 
 
 @dataclass(frozen=True)
@@ -33,9 +34,18 @@ class FGDApproxConfig:
     rel_error_mode: RelErrorMode = "tangent_projection"
     layer_selection: LayerSelection = "certifying"
     projection_solver: ProjectionSolver = "exact"
+    learning_rate_policy: LearningRatePolicy = "theory_interval"
     projection_damping: float = 1e-2
     cg_max_iterations: int = 16
     cg_tolerance: float = 1e-4
+    theory_smoothness_constant: float = 2.0
+    theory_alpha: float = 1.0
+    theory_beta: float = 1.0
+    theory_mu: float = 1.0
+    theory_loss_star: float = 0.0
+    theory_lr_safety: float = 0.95
+    theory_lr_initial: float = 0.01
+    theory_lr_min: float = 0.0
     sufficient_descent_c: float | None = 0.1
     lr_backtrack: float = 0.5
     lr_min_factor: float = 1e-3
@@ -79,6 +89,17 @@ class FGDApproxEpochResult:
     test_loss: float
     test_accuracy: float
     learning_rate: float | None
+    next_learning_rate: float | None
+    learning_rate_upper_bound: float | None
+    learning_rate_interval_valid: bool | None
+    learning_rate_clipped_batches: int
+    skipped_batches: int
+    relative_error_condition_valid: bool | None
+    loss_descent_valid: bool | None
+    loss_non_descent_batches: int
+    gradient_sq_norm: float | None
+    theory_descent_coefficient: float | None
+    min_positive_learning_rate: float | None
     relative_error: float
     selected_layer_index: int | None
     layer_relative_errors: list[FGDLayerRelError]
@@ -259,6 +280,53 @@ def _output_relative_error_from_stats(
         approximation_norm=approximation_norm,
         target_norm=target_norm,
         directional_cosine=directional_cosine,
+    )
+
+
+def theoretical_learning_rate_upper_bound(
+    relative_error: float,
+    config: FGDApproxConfig,
+) -> float | None:
+    """Return the FGD learning-rate upper bound from the current RelErr."""
+    if relative_error < 0.0 or relative_error >= 0.5:
+        return None
+
+    smoothness = float(config.theory_smoothness_constant)
+    if smoothness <= 0.0:
+        raise ValueError("fgd_approx.theory_smoothness_constant must be positive.")
+
+    return 2.0 * (1.0 - 2.0 * relative_error) / (
+        smoothness * (2.0 * relative_error + 1.0)
+    )
+
+
+def theoretical_descent_coefficient(
+    relative_error: float,
+    learning_rate: float,
+    config: FGDApproxConfig,
+) -> float | None:
+    """Return the proof coefficient r for the approximate FGD step."""
+    if relative_error < 0.0 or relative_error >= 1.0:
+        return None
+    if learning_rate <= 0.0:
+        return None
+
+    smoothness = float(config.theory_smoothness_constant)
+    alpha = float(config.theory_alpha)
+    beta = float(config.theory_beta)
+    if smoothness <= 0.0:
+        raise ValueError("fgd_approx.theory_smoothness_constant must be positive.")
+    if alpha <= 0.0:
+        raise ValueError("fgd_approx.theory_alpha must be positive.")
+    if beta <= 0.0:
+        raise ValueError("fgd_approx.theory_beta must be positive.")
+
+    error_ratio = relative_error / max(1.0 - relative_error, config.eps)
+    return (
+        alpha
+        - 0.5 * smoothness * learning_rate
+        - beta * error_ratio
+        - 1.5 * smoothness * learning_rate * error_ratio
     )
 
 
@@ -675,15 +743,86 @@ def _apply_tangent_projection_step(
             target_sq_norm=step.target_sq_norm,
         )
 
-    if config.sufficient_descent_c is None:
+    if (
+        config.learning_rate_policy == "theory_interval"
+        or config.sufficient_descent_c is None
+    ):
+        if config.learning_rate_policy == "theory_interval":
+            trial_learning_rate = learning_rate
+            min_learning_rate = max(
+                config.theory_lr_min,
+                learning_rate * max(config.lr_min_factor, 0.0),
+            )
+            while trial_learning_rate > config.eps and (
+                trial_learning_rate >= min_learning_rate
+                or min_learning_rate <= config.eps
+            ):
+                descent_coefficient = theoretical_descent_coefficient(
+                    step.output_error.relative_error,
+                    trial_learning_rate,
+                    config,
+                )
+                if (
+                    descent_coefficient is None
+                    or descent_coefficient <= config.eps
+                ):
+                    trial_learning_rate *= config.lr_backtrack
+                    continue
+
+                apply(trial_learning_rate)
+                accepted_loss = trial_loss()
+                descent_ok = accepted_loss <= step.loss_before + config.eps
+                contraction = (
+                    1.0
+                    - 2.0
+                    * trial_learning_rate
+                    * config.theory_mu
+                    * descent_coefficient
+                    / (config.theory_beta**2)
+                )
+                global_ok = (
+                    accepted_loss - config.theory_loss_star
+                    <= contraction
+                    * max(step.loss_before - config.theory_loss_star, 0.0)
+                    + config.eps
+                )
+                if descent_ok and global_ok:
+                    return _TangentProjectionStep(
+                        output_error=step.output_error,
+                        parameter_updates=step.parameter_updates,
+                        learning_rate_used=trial_learning_rate,
+                        loss_before=step.loss_before,
+                        loss_after=accepted_loss,
+                        descent_ok=True,
+                        dot_product=step.dot_product,
+                        approximation_sq_norm=step.approximation_sq_norm,
+                        target_sq_norm=step.target_sq_norm,
+                    )
+                trial_learning_rate *= config.lr_backtrack
+
+            apply(0.0)
+            skipped_loss = trial_loss()
+            return _TangentProjectionStep(
+                output_error=step.output_error,
+                parameter_updates=step.parameter_updates,
+                learning_rate_used=0.0,
+                loss_before=step.loss_before,
+                loss_after=skipped_loss,
+                descent_ok=False,
+                dot_product=step.dot_product,
+                approximation_sq_norm=step.approximation_sq_norm,
+                target_sq_norm=step.target_sq_norm,
+            )
+
         apply(learning_rate)
+        accepted_loss = trial_loss()
         return _TangentProjectionStep(
             output_error=step.output_error,
             parameter_updates=step.parameter_updates,
             learning_rate_used=learning_rate,
             loss_before=step.loss_before,
-            loss_after=trial_loss(),
-            descent_ok=True,
+            loss_after=accepted_loss,
+            descent_ok=accepted_loss <= step.loss_before + config.eps,
             dot_product=step.dot_product,
             approximation_sq_norm=step.approximation_sq_norm,
             target_sq_norm=step.target_sq_norm,
@@ -920,6 +1059,17 @@ def train_one_epoch_gromo_layer_proxy(
         test_loss=test_metrics.loss,
         test_accuracy=test_metrics.accuracy,
         learning_rate=learning_rate,
+        next_learning_rate=learning_rate,
+        learning_rate_upper_bound=None,
+        learning_rate_interval_valid=None,
+        learning_rate_clipped_batches=0,
+        skipped_batches=0,
+        relative_error_condition_valid=None,
+        loss_descent_valid=None,
+        loss_non_descent_batches=0,
+        gradient_sq_norm=None,
+        theory_descent_coefficient=None,
+        min_positive_learning_rate=learning_rate if learning_rate > 0.0 else None,
         relative_error=selected_layer.relative_error
         if selected_layer is not None
         else 0.0,
@@ -1082,7 +1232,7 @@ def should_trigger_fgd_growth(
         if epoch - last_growth_epoch < config.min_epochs_between_growth:
             return False
 
-    return relative_error > config.rel_error_threshold
+    return relative_error >= config.rel_error_threshold
 
 
 def train_one_epoch_fgd_approx(
@@ -1106,6 +1256,12 @@ def train_one_epoch_fgd_approx(
             f"Unsupported fgd_approx.rel_error_mode '{config.rel_error_mode}'. "
             "Use tangent_projection."
         )
+    if config.learning_rate_policy not in {"scheduler", "theory_interval"}:
+        raise ValueError(
+            f"Unsupported fgd_approx.learning_rate_policy "
+            f"'{config.learning_rate_policy}'. Use one of: scheduler, "
+            "theory_interval."
+        )
 
     if config.projection_solver == "gromo_layer":
         return train_one_epoch_gromo_layer_proxy(
@@ -1125,6 +1281,25 @@ def train_one_epoch_fgd_approx(
     target_sq_norm = 0.0
     learning_rate_sum = 0.0
     batch_count = 0
+    current_learning_rate = learning_rate
+    upper_bound_sum = 0.0
+    upper_bound_count = 0
+    learning_rate_interval_valid = True
+    learning_rate_clipped_batches = 0
+    skipped_batches = 0
+    relative_error_condition_valid = True
+    loss_descent_valid = True
+    loss_non_descent_batches = 0
+    min_theory_descent_coefficient: float | None = None
+    min_positive_learning_rate: float | None = None
+
+    if config.learning_rate_policy == "theory_interval":
+        if config.theory_lr_safety <= 0.0 or config.theory_lr_safety > 1.0:
+            raise ValueError("fgd_approx.theory_lr_safety must be in (0, 1].")
+        if config.theory_lr_min < 0.0:
+            raise ValueError("fgd_approx.theory_lr_min must be non-negative.")
+    if config.theory_mu <= 0.0:
+        raise ValueError("fgd_approx.theory_mu must be positive.")
 
     for x, y in train_loader:
         x = x.to(device)
@@ -1136,12 +1311,44 @@ def train_one_epoch_fgd_approx(
             y=y,
             config=config,
         )
+        batch_relative_error = projection_step.output_error.relative_error
+        if batch_relative_error >= min(config.rel_error_threshold, 0.5):
+            relative_error_condition_valid = False
+
+        step_learning_rate = current_learning_rate
+        if config.learning_rate_policy == "theory_interval":
+            upper_bound = theoretical_learning_rate_upper_bound(
+                batch_relative_error,
+                config,
+            )
+            upper_bound_sum += upper_bound if upper_bound is not None else 0.0
+            upper_bound_count += 1
+            if upper_bound is None:
+                learning_rate_interval_valid = False
+                step_learning_rate = 0.0
+                skipped_batches += 1
+            else:
+                safe_upper_bound = config.theory_lr_safety * upper_bound
+                if safe_upper_bound <= config.theory_lr_min + config.eps:
+                    learning_rate_interval_valid = False
+                    step_learning_rate = 0.0
+                    skipped_batches += 1
+                else:
+                    in_interval = (
+                        current_learning_rate > config.theory_lr_min
+                        and current_learning_rate <= safe_upper_bound
+                    )
+                    if not in_interval:
+                        current_learning_rate = safe_upper_bound
+                        learning_rate_clipped_batches += 1
+                    step_learning_rate = current_learning_rate
+
         applied_step = _apply_tangent_projection_step(
             model=model,
             x=x,
             y=y,
             step=projection_step,
-            learning_rate=learning_rate,
+            learning_rate=step_learning_rate,
             config=config,
         )
         dot_product += applied_step.dot_product
@@ -1149,6 +1356,40 @@ def train_one_epoch_fgd_approx(
         target_sq_norm += applied_step.target_sq_norm
         learning_rate_sum += applied_step.learning_rate_used
         batch_count += 1
+        if (
+            config.learning_rate_policy == "theory_interval"
+            and applied_step.learning_rate_used <= config.eps
+            and step_learning_rate > config.eps
+        ):
+            skipped_batches += 1
+            learning_rate_interval_valid = False
+        if (
+            config.learning_rate_policy == "theory_interval"
+            and applied_step.learning_rate_used > config.eps
+            and applied_step.learning_rate_used < step_learning_rate - config.eps
+        ):
+            current_learning_rate = applied_step.learning_rate_used
+            learning_rate_clipped_batches += 1
+        if applied_step.learning_rate_used > config.eps and not applied_step.descent_ok:
+            loss_descent_valid = False
+            loss_non_descent_batches += 1
+        if applied_step.learning_rate_used > config.eps:
+            min_positive_learning_rate = (
+                applied_step.learning_rate_used
+                if min_positive_learning_rate is None
+                else min(min_positive_learning_rate, applied_step.learning_rate_used)
+            )
+            descent_coefficient = theoretical_descent_coefficient(
+                batch_relative_error,
+                applied_step.learning_rate_used,
+                config,
+            )
+            if descent_coefficient is not None:
+                min_theory_descent_coefficient = (
+                    descent_coefficient
+                    if min_theory_descent_coefficient is None
+                    else min(min_theory_descent_coefficient, descent_coefficient)
+                )
 
     output_error = _output_relative_error_from_stats(
         dot_product=dot_product,
@@ -1156,6 +1397,8 @@ def train_one_epoch_fgd_approx(
         target_sq_norm=target_sq_norm,
         eps=config.eps,
     )
+    if output_error.relative_error >= min(config.rel_error_threshold, 0.5):
+        relative_error_condition_valid = False
 
     selected_layer_index = select_tiny_growth_layer_index(
         model=model,
@@ -1185,6 +1428,27 @@ def train_one_epoch_fgd_approx(
         test_loss=test_metrics.loss,
         test_accuracy=test_metrics.accuracy,
         learning_rate=learning_rate_sum / max(1, batch_count),
+        next_learning_rate=(
+            current_learning_rate
+            if config.learning_rate_policy == "theory_interval"
+            else None
+        ),
+        learning_rate_upper_bound=(
+            upper_bound_sum / upper_bound_count if upper_bound_count > 0 else None
+        ),
+        learning_rate_interval_valid=(
+            learning_rate_interval_valid
+            if config.learning_rate_policy == "theory_interval"
+            else None
+        ),
+        learning_rate_clipped_batches=learning_rate_clipped_batches,
+        skipped_batches=skipped_batches,
+        relative_error_condition_valid=relative_error_condition_valid,
+        loss_descent_valid=loss_descent_valid,
+        loss_non_descent_batches=loss_non_descent_batches,
+        gradient_sq_norm=output_error.target_norm**2,
+        theory_descent_coefficient=min_theory_descent_coefficient,
+        min_positive_learning_rate=min_positive_learning_rate,
         relative_error=output_error.relative_error,
         selected_layer_index=selected_layer_index,
         layer_relative_errors=[],

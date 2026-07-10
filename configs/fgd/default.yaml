@@ -52,9 +52,18 @@ fgd_approx:
   rel_error_mode: tangent_projection
   layer_selection: certifying
   projection_solver: exact
+  learning_rate_policy: theory_interval
   projection_damping: 0.01
   cg_max_iterations: 16
   cg_tolerance: 1.0e-4
+  theory_smoothness_constant: 2.0
+  theory_alpha: 1.0
+  theory_beta: 1.0
+  theory_mu: 1.0
+  theory_loss_star: 0.0
+  theory_lr_safety: 0.95
+  theory_lr_initial: 0.01
+  theory_lr_min: 0.0
   sufficient_descent_c: 0.1
   lr_backtrack: 0.5
   lr_min_factor: 0.001
@@ -93,7 +102,7 @@ wandb:
   run_name:
   group: fgd
   job_type: train
-  tags: [fgd_approx, gromo, tangent_projection, exact_projection]
+  tags: [fgd_approx, gromo, tangent_projection, exact_projection, theory_lr]
   notes:
   mode: online
   dir: results
