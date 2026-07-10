@@ -46,6 +46,7 @@ class FGDApproxConfig:
     theory_lr_safety: float = 0.95
     theory_lr_initial: float = 0.01
     theory_lr_min: float = 0.0
+    theory_lr_follow_bound: bool = False
     sufficient_descent_c: float | None = 0.1
     lr_backtrack: float = 0.5
     lr_min_factor: float = 1e-3
@@ -53,6 +54,11 @@ class FGDApproxConfig:
     growth_compute_delta: bool = False
     start_epoch: int = 1
     min_epochs_between_growth: int = 1
+    projection_group_size: int = 1
+    projection_group_auto: bool = True
+    projection_group_max: int | None = None
+    stall_min_epoch_decrease: float = 2e-3
+    stall_patience: int = 5
     eps: float = 1e-12
     tiny_use_covariance: bool = True
     tiny_alpha_zero: bool = False
@@ -672,6 +678,27 @@ def _compute_cg_tangent_projection_step(
     )
 
 
+def _grouped_batches(
+    data_loader: torch.utils.data.DataLoader,
+    group_size: int,
+):
+    """Yield concatenations of ``group_size`` consecutive mini-batches."""
+    if group_size <= 1:
+        yield from data_loader
+        return
+
+    xs: list[torch.Tensor] = []
+    ys: list[torch.Tensor] = []
+    for x, y in data_loader:
+        xs.append(x)
+        ys.append(y)
+        if len(xs) == group_size:
+            yield torch.cat(xs), torch.cat(ys)
+            xs, ys = [], []
+    if xs:
+        yield torch.cat(xs), torch.cat(ys)
+
+
 def _compute_tangent_projection_step(
     model: GrowingMLP,
     x: torch.Tensor,
@@ -1244,6 +1271,7 @@ def train_one_epoch_fgd_approx(
     learning_rate: float,
     accuracy_tolerance: float,
     config: FGDApproxConfig,
+    projection_group_size: int = 1,
 ) -> FGDApproxEpochResult:
     """Train one FGD epoch with the configured functional-gradient proxy.
 
@@ -1301,7 +1329,7 @@ def train_one_epoch_fgd_approx(
     if config.theory_mu <= 0.0:
         raise ValueError("fgd_approx.theory_mu must be positive.")
 
-    for x, y in train_loader:
+    for x, y in _grouped_batches(train_loader, projection_group_size):
         x = x.to(device)
         y = y.to(device)
 
@@ -1334,13 +1362,18 @@ def train_one_epoch_fgd_approx(
                     step_learning_rate = 0.0
                     skipped_batches += 1
                 else:
-                    in_interval = (
-                        current_learning_rate > config.theory_lr_min
-                        and current_learning_rate <= safe_upper_bound
-                    )
-                    if not in_interval:
+                    if config.theory_lr_follow_bound:
+                        if safe_upper_bound < current_learning_rate - config.eps:
+                            learning_rate_clipped_batches += 1
                         current_learning_rate = safe_upper_bound
-                        learning_rate_clipped_batches += 1
+                    else:
+                        in_interval = (
+                            current_learning_rate > config.theory_lr_min
+                            and current_learning_rate <= safe_upper_bound
+                        )
+                        if not in_interval:
+                            current_learning_rate = safe_upper_bound
+                            learning_rate_clipped_batches += 1
                     step_learning_rate = current_learning_rate
 
         applied_step = _apply_tangent_projection_step(

@@ -487,6 +487,37 @@ def run_pipeline(
         fgd_min_positive_learning_rate: float | None = None
         fgd_min_descent_coefficient: float | None = None
         fgd_global_contraction_product = 1.0
+        fgd_previous_train_loss: float | None = None
+        fgd_stalled_epochs = 0
+        projection_group_limit = max(
+            1,
+            config.fgd_approx.projection_group_max
+            if config.fgd_approx.projection_group_max is not None
+            else config.data.train_batches,
+        )
+        current_projection_group_size = max(
+            1,
+            min(config.fgd_approx.projection_group_size, projection_group_limit),
+        )
+
+        def reset_fgd_certificate() -> None:
+            """Re-anchor the per-mode FGD bounds at the current loss."""
+            nonlocal initial_functional_gap, fgd_epoch_count
+            nonlocal fgd_min_positive_learning_rate
+            nonlocal fgd_min_descent_coefficient
+            nonlocal fgd_global_contraction_product
+            nonlocal fgd_previous_train_loss, fgd_stalled_epochs
+            initial_functional_gap = max(
+                evaluate_functional_loss(model, train_loader, device)
+                - theory_loss_star,
+                0.0,
+            )
+            fgd_epoch_count = 0
+            fgd_min_positive_learning_rate = None
+            fgd_min_descent_coefficient = None
+            fgd_global_contraction_product = 1.0
+            fgd_previous_train_loss = None
+            fgd_stalled_epochs = 0
         init_entry = HistoryEntry(
             step=0,
             step_type="INIT",
@@ -545,6 +576,7 @@ def run_pipeline(
             fgd_global_bound_valid: bool | None = None
             fgd_global_contraction: float | None = None
             fgd_theory_learning_rate_adjusted = False
+            fgd_growth_requested = False
             entry_learning_rate = current_learning_rate(optimizer)
             if config.training.method == "normal":
                 epoch_result = train_one_epoch(
@@ -568,6 +600,7 @@ def run_pipeline(
                     learning_rate=learning_rate,
                     accuracy_tolerance=config.training.accuracy_tolerance,
                     config=config.fgd_approx,
+                    projection_group_size=current_projection_group_size,
                 )
                 epoch_result = fgd_epoch_result
                 rel_error = fgd_epoch_result.relative_error
@@ -685,8 +718,24 @@ def run_pipeline(
                     if fgd_global_bound_valid is None:
                         fgd_global_bound_valid = False
 
+                fgd_conditions_failed = (
+                    fgd_relative_error_condition_valid is False
+                    or fgd_stationary_bound_valid is False
+                    or fgd_global_bound_valid is False
+                )
+                fgd_growth_requested = (
+                    config.growth_schedule.enabled
+                    and fgd_conditions_failed
+                    and should_trigger_fgd_growth(
+                        relative_error=config.fgd_approx.rel_error_threshold,
+                        epoch=epoch,
+                        last_growth_epoch=last_growth_epoch,
+                        config=config.fgd_approx,
+                    )
+                )
                 if (
                     use_fgd_theory_learning_rate
+                    and not fgd_growth_requested
                     and (
                         fgd_stationary_bound_valid is False
                         or fgd_global_bound_valid is False
@@ -770,7 +819,10 @@ def run_pipeline(
                     warnings.append("relative-error condition failed")
                 if fgd_learning_rate_interval_valid is False:
                     warnings.append("learning-rate interval invalid")
-                if fgd_learning_rate_clipped_batches > 0:
+                if fgd_learning_rate_clipped_batches > 0 and not (
+                    config.fgd_approx.learning_rate_policy == "theory_interval"
+                    and config.fgd_approx.theory_lr_follow_bound
+                ):
                     warnings.append(
                         f"learning-rate clipped on "
                         f"{fgd_learning_rate_clipped_batches} batch(es)"
@@ -790,6 +842,8 @@ def run_pipeline(
                     warnings.append(
                         "learning-rate adjusted for accumulated theory bounds"
                     )
+                if fgd_growth_requested:
+                    warnings.append("FGD conditions request growth")
                 if (
                     fgd_theory_descent_coefficient is not None
                     and fgd_theory_descent_coefficient <= 0.0
@@ -802,17 +856,8 @@ def run_pipeline(
             if config.training.method == "normal":
                 growth_triggered = should_grow(epoch, config.growth_schedule)
             else:
-                relative_error_requires_growth = (
-                    fgd_relative_error_condition_valid is False
-                    and should_trigger_fgd_growth(
-                        relative_error=config.fgd_approx.rel_error_threshold,
-                        epoch=epoch,
-                        last_growth_epoch=last_growth_epoch,
-                        config=config.fgd_approx,
-                    )
-                )
                 growth_triggered = config.growth_schedule.enabled and (
-                    relative_error_requires_growth
+                    fgd_growth_requested
                     or (
                         rel_error is not None
                         and should_trigger_fgd_growth(
@@ -884,6 +929,27 @@ def run_pipeline(
                 )
                 last_growth_epoch = epoch
                 lr_cycle_start_epoch = epoch
+                if config.training.method == "fgd_approx":
+                    # Growth is a mode switch: the accumulated stationary and
+                    # global bounds certify a fixed architecture, so restart
+                    # them from the post-growth loss.
+                    initial_functional_gap = max(
+                        evaluate_functional_loss(model, train_loader, device)
+                        - theory_loss_star,
+                        0.0,
+                    )
+                    fgd_epoch_count = 0
+                    fgd_min_positive_learning_rate = None
+                    fgd_min_descent_coefficient = None
+                    fgd_global_contraction_product = 1.0
+                    if (
+                        config.fgd_approx.learning_rate_policy == "theory_interval"
+                        and config.lr_scheduler.restart_on_growth
+                    ):
+                        current_fgd_learning_rate = max(
+                            current_fgd_learning_rate,
+                            config.fgd_approx.theory_lr_initial,
+                        )
                 optimizer = build_optimizer(model, config.optimizer)
                 post_growth_learning_rate = (
                     current_fgd_learning_rate
