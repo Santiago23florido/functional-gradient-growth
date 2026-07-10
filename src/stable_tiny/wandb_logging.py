@@ -128,6 +128,115 @@ class WandbRunLogger:
         if entry.rel_error is not None:
             payload["fgd/relative_error"] = entry.rel_error
 
+        learning_rate_upper_bound = getattr(
+            entry,
+            "fgd_learning_rate_upper_bound",
+            None,
+        )
+        if learning_rate_upper_bound is not None:
+            payload["fgd/learning_rate_upper_bound"] = learning_rate_upper_bound
+
+        learning_rate_interval_valid = getattr(
+            entry,
+            "fgd_learning_rate_interval_valid",
+            None,
+        )
+        if learning_rate_interval_valid is not None:
+            payload["fgd/learning_rate_interval_valid"] = learning_rate_interval_valid
+
+        relative_error_condition_valid = getattr(
+            entry,
+            "fgd_relative_error_condition_valid",
+            None,
+        )
+        if relative_error_condition_valid is not None:
+            payload["fgd/relative_error_condition_valid"] = (
+                relative_error_condition_valid
+            )
+
+        loss_descent_valid = getattr(entry, "fgd_loss_descent_valid", None)
+        if loss_descent_valid is not None:
+            payload["fgd/loss_descent_valid"] = loss_descent_valid
+
+        for attribute_name, metric_name in (
+            ("fgd_gradient_sq_norm", "fgd/gradient_sq_norm"),
+            ("fgd_min_gradient_sq_norm", "fgd/min_gradient_sq_norm"),
+            (
+                "fgd_theory_descent_coefficient",
+                "fgd/theory_descent_coefficient",
+            ),
+            ("fgd_stationary_bound", "fgd/stationary_bound"),
+            ("fgd_global_bound", "fgd/global_bound"),
+            ("fgd_global_contraction", "fgd/global_contraction"),
+        ):
+            value = getattr(entry, attribute_name, None)
+            if value is not None:
+                payload[metric_name] = value
+
+        stationary_bound_valid = getattr(
+            entry,
+            "fgd_stationary_bound_valid",
+            None,
+        )
+        if stationary_bound_valid is not None:
+            payload["fgd/stationary_bound_valid"] = stationary_bound_valid
+
+        global_bound_valid = getattr(entry, "fgd_global_bound_valid", None)
+        if global_bound_valid is not None:
+            payload["fgd/global_bound_valid"] = global_bound_valid
+
+        theory_learning_rate_adjusted = getattr(
+            entry,
+            "fgd_theory_learning_rate_adjusted",
+            False,
+        )
+        if fgd_payload_active := (
+            getattr(entry, "rel_error", None) is not None
+            or learning_rate_interval_valid is not None
+            or relative_error_condition_valid is not None
+            or loss_descent_valid is not None
+            or stationary_bound_valid is not None
+            or global_bound_valid is not None
+        ):
+            payload["fgd/theory_learning_rate_adjusted"] = (
+                theory_learning_rate_adjusted
+            )
+
+        if fgd_payload_active:
+            payload["fgd/learning_rate_clipped_batches"] = getattr(
+                entry,
+                "fgd_learning_rate_clipped_batches",
+                0,
+            )
+            payload["fgd/skipped_batches"] = getattr(entry, "fgd_skipped_batches", 0)
+            payload["fgd/loss_non_descent_batches"] = getattr(
+                entry,
+                "fgd_loss_non_descent_batches",
+                0,
+            )
+
+        if getattr(entry, "selected_layer_index", None) is not None:
+            payload["fgd/selected_layer_index"] = entry.selected_layer_index
+
+        output_error = getattr(entry, "fgd_output_rel_error", None)
+        if output_error is not None:
+            payload["fgd/approximation_norm"] = output_error.approximation_norm
+            payload["fgd/target_norm"] = output_error.target_norm
+            payload["fgd/directional_cosine"] = output_error.directional_cosine
+        else:
+            selected_layer = None
+            for layer_error in getattr(entry, "fgd_layer_rel_errors", []):
+                if layer_error.layer_index == getattr(
+                    entry, "selected_layer_index", None
+                ):
+                    selected_layer = layer_error
+                    break
+
+            if selected_layer is not None:
+                payload["fgd/approximation_norm"] = selected_layer.approximation_norm
+                payload["fgd/target_norm"] = selected_layer.target_norm
+                payload["fgd/directional_cosine"] = selected_layer.directional_cosine
+
         if entry.layer_index is not None:
             payload["growth/layer_index"] = entry.layer_index
 

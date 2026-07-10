@@ -13,7 +13,12 @@ import yaml
 from stable_tiny.data import MultiSinDataLoader, SmoothSinDataLoader
 from stable_tiny.fgd_approx import (
     FGDApproxConfig,
+    FGDLayerRelError,
+    FGDOutputRelError,
+    batch_functional_mse_loss,
+    select_certifying_growth_layer_index,
     should_trigger_fgd_growth,
+    tiny_optimal_update_kwargs,
     train_one_epoch_fgd_approx,
 )
 from stable_tiny.gromo_setup import ensure_gromo_importable
@@ -121,6 +126,25 @@ class HistoryEntry:
     layer_index: int | None = None
     scaling_factor: float | None = None
     rel_error: float | None = None
+    selected_layer_index: int | None = None
+    fgd_layer_rel_errors: list[FGDLayerRelError] = field(default_factory=list)
+    fgd_output_rel_error: FGDOutputRelError | None = None
+    fgd_learning_rate_upper_bound: float | None = None
+    fgd_learning_rate_interval_valid: bool | None = None
+    fgd_learning_rate_clipped_batches: int = 0
+    fgd_skipped_batches: int = 0
+    fgd_relative_error_condition_valid: bool | None = None
+    fgd_loss_descent_valid: bool | None = None
+    fgd_loss_non_descent_batches: int = 0
+    fgd_gradient_sq_norm: float | None = None
+    fgd_min_gradient_sq_norm: float | None = None
+    fgd_theory_descent_coefficient: float | None = None
+    fgd_stationary_bound: float | None = None
+    fgd_stationary_bound_valid: bool | None = None
+    fgd_global_bound: float | None = None
+    fgd_global_bound_valid: bool | None = None
+    fgd_global_contraction: float | None = None
+    fgd_theory_learning_rate_adjusted: bool = False
 
 
 @dataclass
@@ -253,6 +277,25 @@ def with_wandb_overrides(
     return replace(config, wandb=wandb_config)
 
 
+def with_growth_overrides(
+    config: PipelineConfig,
+    *,
+    enabled: bool | None = None,
+) -> PipelineConfig:
+    """Return a config with CLI growth-schedule overrides applied."""
+    growth_schedule = config.growth_schedule
+    lr_scheduler = config.lr_scheduler
+    if enabled is not None:
+        growth_schedule = replace(growth_schedule, enabled=enabled)
+        if not enabled:
+            lr_scheduler = replace(
+                lr_scheduler,
+                restart_on_growth=False,
+                t_max=config.training.epochs,
+            )
+    return replace(config, growth_schedule=growth_schedule, lr_scheduler=lr_scheduler)
+
+
 def select_device(device: str) -> torch.device:
     if device == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -340,6 +383,21 @@ def scheduled_learning_rate(
     )
 
 
+@torch.no_grad()
+def evaluate_functional_loss(
+    model: torch.nn.Module,
+    data_loader: torch.utils.data.DataLoader,
+    device: torch.device,
+) -> float:
+    model.eval()
+    total_loss = 0.0
+    for x, y in data_loader:
+        x = x.to(device)
+        y = y.to(device)
+        total_loss += float(batch_functional_mse_loss(model(x), y).detach().item())
+    return total_loss
+
+
 def _json_safe(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
@@ -372,14 +430,20 @@ def run_pipeline(
     loss_function = torch.nn.MSELoss()
     optimizer = build_optimizer(model, config.optimizer)
     lr_cycle_start_epoch = 0
-    apply_learning_rate(
-        optimizer,
-        scheduled_learning_rate(
+    current_fgd_learning_rate = config.fgd_approx.theory_lr_initial
+    initial_learning_rate = (
+        current_fgd_learning_rate
+        if (
+            config.training.method == "fgd_approx"
+            and config.fgd_approx.learning_rate_policy == "theory_interval"
+        )
+        else scheduled_learning_rate(
             config,
             epoch=0,
             cycle_start_epoch=lr_cycle_start_epoch,
-        ),
+        )
     )
+    apply_learning_rate(optimizer, initial_learning_rate)
 
     history: list[HistoryEntry] = []
     growth_events: list[GrowthResult] = []
@@ -411,6 +475,18 @@ def run_pipeline(
             accuracy_tolerance=config.training.accuracy_tolerance,
         )
         last_test_loss = test_metrics.loss
+        initial_functional_loss = evaluate_functional_loss(
+            model,
+            train_loader,
+            device,
+        )
+        theory_loss_star = config.fgd_approx.theory_loss_star
+        initial_functional_gap = max(initial_functional_loss - theory_loss_star, 0.0)
+        fgd_epoch_count = 0
+        fgd_min_gradient_sq_norm: float | None = None
+        fgd_min_positive_learning_rate: float | None = None
+        fgd_min_descent_coefficient: float | None = None
+        fgd_global_contraction_product = 1.0
         init_entry = HistoryEntry(
             step=0,
             step_type="INIT",
@@ -434,14 +510,42 @@ def run_pipeline(
         growth_count = 0
         last_growth_epoch: int | None = None
         for epoch in range(1, config.training.epochs + 1):
-            learning_rate = scheduled_learning_rate(
-                config,
-                epoch=epoch,
-                cycle_start_epoch=lr_cycle_start_epoch,
+            use_fgd_theory_learning_rate = (
+                config.training.method == "fgd_approx"
+                and config.fgd_approx.learning_rate_policy == "theory_interval"
+            )
+            learning_rate = (
+                current_fgd_learning_rate
+                if use_fgd_theory_learning_rate
+                else scheduled_learning_rate(
+                    config,
+                    epoch=epoch,
+                    cycle_start_epoch=lr_cycle_start_epoch,
+                )
             )
             apply_learning_rate(optimizer, learning_rate)
 
             rel_error: float | None = None
+            selected_layer_index: int | None = None
+            fgd_layer_rel_errors: list[FGDLayerRelError] = []
+            fgd_output_rel_error: FGDOutputRelError | None = None
+            fgd_learning_rate_upper_bound: float | None = None
+            fgd_learning_rate_interval_valid: bool | None = None
+            fgd_learning_rate_clipped_batches = 0
+            fgd_skipped_batches = 0
+            fgd_relative_error_condition_valid: bool | None = None
+            fgd_loss_descent_valid: bool | None = None
+            fgd_loss_non_descent_batches = 0
+            fgd_gradient_sq_norm: float | None = None
+            fgd_min_gradient_sq_norm: float | None = None
+            fgd_theory_descent_coefficient: float | None = None
+            fgd_stationary_bound: float | None = None
+            fgd_stationary_bound_valid: bool | None = None
+            fgd_global_bound: float | None = None
+            fgd_global_bound_valid: bool | None = None
+            fgd_global_contraction: float | None = None
+            fgd_theory_learning_rate_adjusted = False
+            entry_learning_rate = current_learning_rate(optimizer)
             if config.training.method == "normal":
                 epoch_result = train_one_epoch(
                     model=model,
@@ -459,16 +563,143 @@ def run_pipeline(
                     model=model,
                     train_loader=train_loader,
                     test_loader=test_loader,
-                    optimizer=optimizer,
                     loss_function=loss_function,
                     device=device,
                     learning_rate=learning_rate,
                     accuracy_tolerance=config.training.accuracy_tolerance,
-                    gradient_clip_norm=config.training.gradient_clip_norm,
                     config=config.fgd_approx,
                 )
                 epoch_result = fgd_epoch_result
                 rel_error = fgd_epoch_result.relative_error
+                selected_layer_index = fgd_epoch_result.selected_layer_index
+                fgd_layer_rel_errors = fgd_epoch_result.layer_relative_errors
+                fgd_output_rel_error = fgd_epoch_result.output_relative_error
+                fgd_learning_rate_upper_bound = (
+                    fgd_epoch_result.learning_rate_upper_bound
+                )
+                fgd_learning_rate_interval_valid = (
+                    fgd_epoch_result.learning_rate_interval_valid
+                )
+                fgd_learning_rate_clipped_batches = (
+                    fgd_epoch_result.learning_rate_clipped_batches
+                )
+                fgd_skipped_batches = fgd_epoch_result.skipped_batches
+                fgd_relative_error_condition_valid = (
+                    fgd_epoch_result.relative_error_condition_valid
+                )
+                fgd_loss_descent_valid = fgd_epoch_result.loss_descent_valid
+                fgd_loss_non_descent_batches = (
+                    fgd_epoch_result.loss_non_descent_batches
+                )
+                fgd_gradient_sq_norm = fgd_epoch_result.gradient_sq_norm
+                fgd_theory_descent_coefficient = (
+                    fgd_epoch_result.theory_descent_coefficient
+                )
+                if fgd_epoch_result.next_learning_rate is not None:
+                    current_fgd_learning_rate = fgd_epoch_result.next_learning_rate
+                    apply_learning_rate(optimizer, current_fgd_learning_rate)
+                if fgd_epoch_result.learning_rate is not None:
+                    entry_learning_rate = fgd_epoch_result.learning_rate
+
+                if fgd_gradient_sq_norm is not None:
+                    fgd_epoch_count += 1
+                    fgd_min_gradient_sq_norm = (
+                        fgd_gradient_sq_norm
+                        if fgd_min_gradient_sq_norm is None
+                        else min(fgd_min_gradient_sq_norm, fgd_gradient_sq_norm)
+                    )
+
+                if fgd_epoch_result.min_positive_learning_rate is not None:
+                    fgd_min_positive_learning_rate = (
+                        fgd_epoch_result.min_positive_learning_rate
+                        if fgd_min_positive_learning_rate is None
+                        else min(
+                            fgd_min_positive_learning_rate,
+                            fgd_epoch_result.min_positive_learning_rate,
+                        )
+                    )
+
+                if (
+                    fgd_theory_descent_coefficient is not None
+                    and fgd_theory_descent_coefficient > 0.0
+                ):
+                    fgd_min_descent_coefficient = (
+                        fgd_theory_descent_coefficient
+                        if fgd_min_descent_coefficient is None
+                        else min(
+                            fgd_min_descent_coefficient,
+                            fgd_theory_descent_coefficient,
+                        )
+                    )
+
+                if (
+                    fgd_epoch_count > 0
+                    and fgd_min_positive_learning_rate is not None
+                    and fgd_min_descent_coefficient is not None
+                    and fgd_min_positive_learning_rate > 0.0
+                    and fgd_min_descent_coefficient > 0.0
+                ):
+                    fgd_stationary_bound = initial_functional_gap / (
+                        fgd_epoch_count
+                        * fgd_min_positive_learning_rate
+                        * fgd_min_descent_coefficient
+                    )
+                    fgd_stationary_bound_valid = (
+                        fgd_min_gradient_sq_norm is not None
+                        and fgd_min_gradient_sq_norm
+                        <= fgd_stationary_bound + config.fgd_approx.eps
+                    )
+
+                    beta = config.fgd_approx.theory_beta
+                    mu = config.fgd_approx.theory_mu
+                    epoch_eta = fgd_epoch_result.min_positive_learning_rate
+                    epoch_r = fgd_theory_descent_coefficient
+                    if (
+                        epoch_eta is not None
+                        and epoch_r is not None
+                        and beta > 0.0
+                        and mu > 0.0
+                    ):
+                        contraction = 1.0 - (
+                            2.0 * epoch_eta * mu * epoch_r / (beta**2)
+                        )
+                        fgd_global_contraction = contraction
+                        fgd_global_contraction_product *= contraction
+                        fgd_global_bound = (
+                            fgd_global_contraction_product
+                            * initial_functional_gap
+                        )
+                        current_functional_gap = max(
+                            evaluate_functional_loss(model, train_loader, device)
+                            - theory_loss_star,
+                            0.0,
+                        )
+                        fgd_global_bound_valid = (
+                            current_functional_gap
+                            <= fgd_global_bound + config.fgd_approx.eps
+                        )
+
+                if fgd_gradient_sq_norm is not None:
+                    if fgd_stationary_bound_valid is None:
+                        fgd_stationary_bound_valid = False
+                    if fgd_global_bound_valid is None:
+                        fgd_global_bound_valid = False
+
+                if (
+                    use_fgd_theory_learning_rate
+                    and (
+                        fgd_stationary_bound_valid is False
+                        or fgd_global_bound_valid is False
+                    )
+                ):
+                    adjusted_learning_rate = max(
+                        config.fgd_approx.theory_lr_min,
+                        current_fgd_learning_rate * config.fgd_approx.lr_backtrack,
+                    )
+                    if adjusted_learning_rate < current_fgd_learning_rate:
+                        current_fgd_learning_rate = adjusted_learning_rate
+                        apply_learning_rate(optimizer, current_fgd_learning_rate)
+                        fgd_theory_learning_rate_adjusted = True
                 step_type = "FGD"
             else:
                 raise ValueError(
@@ -483,9 +714,32 @@ def run_pipeline(
                 test_loss=epoch_result.test_loss,
                 train_accuracy=epoch_result.train_accuracy,
                 test_accuracy=epoch_result.test_accuracy,
-                learning_rate=current_learning_rate(optimizer),
+                learning_rate=entry_learning_rate,
                 num_params=count_parameters(model),
                 rel_error=rel_error,
+                selected_layer_index=selected_layer_index,
+                fgd_layer_rel_errors=fgd_layer_rel_errors,
+                fgd_output_rel_error=fgd_output_rel_error,
+                fgd_learning_rate_upper_bound=fgd_learning_rate_upper_bound,
+                fgd_learning_rate_interval_valid=fgd_learning_rate_interval_valid,
+                fgd_learning_rate_clipped_batches=fgd_learning_rate_clipped_batches,
+                fgd_skipped_batches=fgd_skipped_batches,
+                fgd_relative_error_condition_valid=(
+                    fgd_relative_error_condition_valid
+                ),
+                fgd_loss_descent_valid=fgd_loss_descent_valid,
+                fgd_loss_non_descent_batches=fgd_loss_non_descent_batches,
+                fgd_gradient_sq_norm=fgd_gradient_sq_norm,
+                fgd_min_gradient_sq_norm=fgd_min_gradient_sq_norm,
+                fgd_theory_descent_coefficient=fgd_theory_descent_coefficient,
+                fgd_stationary_bound=fgd_stationary_bound,
+                fgd_stationary_bound_valid=fgd_stationary_bound_valid,
+                fgd_global_bound=fgd_global_bound,
+                fgd_global_bound_valid=fgd_global_bound_valid,
+                fgd_global_contraction=fgd_global_contraction,
+                fgd_theory_learning_rate_adjusted=(
+                    fgd_theory_learning_rate_adjusted
+                ),
             )
             history.append(epoch_entry)
             wandb_logger.log_history_entry(epoch_entry)
@@ -495,36 +749,120 @@ def run_pipeline(
                 rel_error_msg = (
                     f", rel_err={rel_error:.3f}" if rel_error is not None else ""
                 )
+                selected_layer_msg = (
+                    f", selected_layer={selected_layer_index}"
+                    if selected_layer_index is not None
+                    else ""
+                )
                 progress(
                     f"[{step_type}] Epoch {epoch}, "
                     f"train_loss={epoch_result.train_loss:.4f}, "
                     f"test_loss={epoch_result.test_loss:.4f} ({delta:+.4f}), "
                     f"train_acc={epoch_result.train_accuracy:.3f}, "
                     f"test_acc={epoch_result.test_accuracy:.3f}, "
-                    f"lr={current_learning_rate(optimizer):.4g}"
+                    f"lr={entry_learning_rate:.4g}"
                     f"{rel_error_msg}"
+                    f"{selected_layer_msg}"
                 )
+            if progress is not None and config.training.method == "fgd_approx":
+                warnings = []
+                if fgd_relative_error_condition_valid is False:
+                    warnings.append("relative-error condition failed")
+                if fgd_learning_rate_interval_valid is False:
+                    warnings.append("learning-rate interval invalid")
+                if fgd_learning_rate_clipped_batches > 0:
+                    warnings.append(
+                        f"learning-rate clipped on "
+                        f"{fgd_learning_rate_clipped_batches} batch(es)"
+                    )
+                if fgd_skipped_batches > 0:
+                    warnings.append(f"skipped {fgd_skipped_batches} batch(es)")
+                if fgd_loss_descent_valid is False:
+                    warnings.append(
+                        f"loss did not descend on "
+                        f"{fgd_loss_non_descent_batches} batch(es)"
+                    )
+                if fgd_stationary_bound_valid is False:
+                    warnings.append("stationary-point bound failed")
+                if fgd_global_bound_valid is False:
+                    warnings.append("global-convergence bound failed")
+                if fgd_theory_learning_rate_adjusted:
+                    warnings.append(
+                        "learning-rate adjusted for accumulated theory bounds"
+                    )
+                if (
+                    fgd_theory_descent_coefficient is not None
+                    and fgd_theory_descent_coefficient <= 0.0
+                ):
+                    warnings.append("theory descent coefficient is non-positive")
+                if warnings:
+                    progress(f"[FGD-WARN] Epoch {epoch}: " + "; ".join(warnings))
             last_test_loss = epoch_result.test_loss
 
             if config.training.method == "normal":
                 growth_triggered = should_grow(epoch, config.growth_schedule)
             else:
-                growth_triggered = config.growth_schedule.enabled and (
-                    rel_error is not None
+                relative_error_requires_growth = (
+                    fgd_relative_error_condition_valid is False
                     and should_trigger_fgd_growth(
-                        relative_error=rel_error,
+                        relative_error=config.fgd_approx.rel_error_threshold,
                         epoch=epoch,
                         last_growth_epoch=last_growth_epoch,
                         config=config.fgd_approx,
                     )
                 )
+                growth_triggered = config.growth_schedule.enabled and (
+                    relative_error_requires_growth
+                    or (
+                        rel_error is not None
+                        and should_trigger_fgd_growth(
+                            relative_error=rel_error,
+                            epoch=epoch,
+                            last_growth_epoch=last_growth_epoch,
+                            config=config.fgd_approx,
+                        )
+                    )
+                )
 
             if growth_triggered:
-                layer_index = layer_index_for_growth(
-                    growth_count=growth_count,
-                    number_hidden_layers=config.model.number_hidden_layers,
-                    config=config.growth_schedule,
-                )
+                if config.training.method == "fgd_approx":
+                    if (
+                        config.fgd_approx.layer_selection == "certifying"
+                        and config.fgd_approx.projection_solver != "gromo_layer"
+                    ):
+                        certified_layer_index = select_certifying_growth_layer_index(
+                            model=model,
+                            train_loader=train_loader,
+                            device=device,
+                            config=config.fgd_approx,
+                            line_search_config=config.scaling_line_search,
+                        )
+                    else:
+                        certified_layer_index = None
+
+                    layer_index = (
+                        certified_layer_index
+                        if certified_layer_index is not None
+                        else selected_layer_index
+                        if selected_layer_index is not None
+                        else layer_index_for_growth(
+                            growth_count=growth_count,
+                            number_hidden_layers=config.model.number_hidden_layers,
+                            config=config.growth_schedule,
+                        )
+                    )
+                    selected_layer_index = layer_index
+                    optimal_update_kwargs = tiny_optimal_update_kwargs(
+                        config.fgd_approx,
+                        compute_delta=config.fgd_approx.growth_compute_delta,
+                    )
+                else:
+                    layer_index = layer_index_for_growth(
+                        growth_count=growth_count,
+                        number_hidden_layers=config.model.number_hidden_layers,
+                        config=config.growth_schedule,
+                    )
+                    optimal_update_kwargs = None
                 if progress is not None:
                     progress(f"[GRO] Growing layer {layer_index} at epoch {epoch}")
 
@@ -534,6 +872,7 @@ def run_pipeline(
                     layer_index=layer_index,
                     device=device,
                     line_search_config=config.scaling_line_search,
+                    optimal_update_kwargs=optimal_update_kwargs,
                     progress=progress,
                 )
                 growth_events.append(growth_result)
@@ -546,14 +885,20 @@ def run_pipeline(
                 last_growth_epoch = epoch
                 lr_cycle_start_epoch = epoch
                 optimizer = build_optimizer(model, config.optimizer)
-                apply_learning_rate(
-                    optimizer,
-                    scheduled_learning_rate(
+                post_growth_learning_rate = (
+                    current_fgd_learning_rate
+                    if (
+                        config.training.method == "fgd_approx"
+                        and config.fgd_approx.learning_rate_policy
+                        == "theory_interval"
+                    )
+                    else scheduled_learning_rate(
                         config,
                         epoch=epoch,
                         cycle_start_epoch=lr_cycle_start_epoch,
-                    ),
+                    )
                 )
+                apply_learning_rate(optimizer, post_growth_learning_rate)
 
                 train_metrics = evaluate_regression_metrics(
                     model,
@@ -581,6 +926,33 @@ def run_pipeline(
                     layer_index=layer_index,
                     scaling_factor=growth_result.best_scaling_factor,
                     rel_error=rel_error,
+                    selected_layer_index=selected_layer_index,
+                    fgd_layer_rel_errors=fgd_layer_rel_errors,
+                    fgd_output_rel_error=fgd_output_rel_error,
+                    fgd_learning_rate_upper_bound=fgd_learning_rate_upper_bound,
+                    fgd_learning_rate_interval_valid=fgd_learning_rate_interval_valid,
+                    fgd_learning_rate_clipped_batches=(
+                        fgd_learning_rate_clipped_batches
+                    ),
+                    fgd_skipped_batches=fgd_skipped_batches,
+                    fgd_relative_error_condition_valid=(
+                        fgd_relative_error_condition_valid
+                    ),
+                    fgd_loss_descent_valid=fgd_loss_descent_valid,
+                    fgd_loss_non_descent_batches=fgd_loss_non_descent_batches,
+                    fgd_gradient_sq_norm=fgd_gradient_sq_norm,
+                    fgd_min_gradient_sq_norm=fgd_min_gradient_sq_norm,
+                    fgd_theory_descent_coefficient=(
+                        fgd_theory_descent_coefficient
+                    ),
+                    fgd_stationary_bound=fgd_stationary_bound,
+                    fgd_stationary_bound_valid=fgd_stationary_bound_valid,
+                    fgd_global_bound=fgd_global_bound,
+                    fgd_global_bound_valid=fgd_global_bound_valid,
+                    fgd_global_contraction=fgd_global_contraction,
+                    fgd_theory_learning_rate_adjusted=(
+                        fgd_theory_learning_rate_adjusted
+                    ),
                 )
                 history.append(growth_entry)
                 wandb_logger.log_history_entry(growth_entry)

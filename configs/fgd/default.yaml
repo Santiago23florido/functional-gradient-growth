@@ -1,5 +1,5 @@
 run:
-  name: fgd_approx_growth_baseline
+  name: fgd_tangent_projection
   results_dir: results
   save_plot: false
   show_plot: false
@@ -20,7 +20,7 @@ data:
   linear_strength: 0.1
 
 model:
-  hidden_size: 2
+  hidden_size: 64
   number_hidden_layers: 3
   model_seed: 0
 
@@ -28,12 +28,12 @@ training:
   method: fgd_approx
   epochs: 1000
   accuracy_tolerance: 0.1
-  gradient_clip_norm: 1.0
+  gradient_clip_norm:
   log_every: 10
   device: auto
 
 optimizer:
-  name: adamW
+  name: sgd
   learning_rate: 0.01
   momentum: 0.0
   weight_decay: 0.0
@@ -49,9 +49,38 @@ lr_scheduler:
 
 fgd_approx:
   rel_error_threshold: 0.5
+  rel_error_mode: tangent_projection
+  layer_selection: certifying
+  projection_solver: exact
+  learning_rate_policy: theory_interval
+  projection_damping: 0.01
+  cg_max_iterations: 16
+  cg_tolerance: 1.0e-4
+  theory_smoothness_constant: 2.0
+  theory_alpha: 1.0
+  theory_beta: 1.0
+  theory_mu: 1.0
+  theory_loss_star: 0.0
+  theory_lr_safety: 0.95
+  theory_lr_initial: 0.01
+  theory_lr_min: 0.0
+  sufficient_descent_c: 0.1
+  lr_backtrack: 0.5
+  lr_min_factor: 0.001
+  rel_error_compute_delta: true
+  growth_compute_delta: false
   start_epoch: 1
   min_epochs_between_growth: 1
   eps: 1.0e-12
+  tiny_use_covariance: true
+  tiny_alpha_zero: false
+  tiny_omega_zero: false
+  tiny_use_projection: true
+  tiny_ignore_singular_values: false
+  tiny_use_fisher: false
+  tiny_maximum_added_neurons:
+  tiny_numerical_threshold: 1.0e-6
+  tiny_statistical_threshold: 1.0e-3
 
 scaling_line_search:
   method: golden_section
@@ -73,7 +102,7 @@ wandb:
   run_name:
   group: fgd
   job_type: train
-  tags: [fgd_approx, gromo]
+  tags: [fgd_approx, gromo, tangent_projection, exact_projection, theory_lr]
   notes:
   mode: online
   dir: results
