@@ -11,8 +11,10 @@ class HistoryEntryLike(Protocol):
     step: int
     step_type: str
     train_loss: float
+    validation_loss: float
     test_loss: float
     train_accuracy: float
+    validation_accuracy: float
     test_accuracy: float
     learning_rate: float
     num_params: int
@@ -29,8 +31,12 @@ def plot_history(
 
     steps = [entry.step for entry in history]
     train_losses = [entry.train_loss for entry in history]
+    validation_losses = [getattr(entry, "validation_loss", None) for entry in history]
     test_losses = [entry.test_loss for entry in history]
     train_accuracies = [entry.train_accuracy for entry in history]
+    validation_accuracies = [
+        getattr(entry, "validation_accuracy", None) for entry in history
+    ]
     test_accuracies = [entry.test_accuracy for entry in history]
     learning_rates = [entry.learning_rate for entry in history]
 
@@ -38,12 +44,34 @@ def plot_history(
     loss_ax, train_acc_ax, test_acc_ax, lr_ax = axes.ravel()
 
     loss_ax.plot(steps, train_losses, linewidth=1.8, label="Train Loss")
+    if all(loss is not None for loss in validation_losses):
+        loss_ax.plot(
+            steps,
+            validation_losses,
+            linewidth=1.8,
+            label="Validation Loss",
+        )
     loss_ax.plot(steps, test_losses, linewidth=1.8, label="Test Loss")
     loss_ax.set_title("Loss")
     loss_ax.set_ylabel("MSE")
     loss_ax.legend(loc="best")
 
-    train_acc_ax.plot(steps, train_accuracies, linewidth=1.8, color="tab:green")
+    train_acc_ax.plot(
+        steps,
+        train_accuracies,
+        linewidth=1.8,
+        color="tab:green",
+        label="Train Accuracy",
+    )
+    if all(accuracy is not None for accuracy in validation_accuracies):
+        train_acc_ax.plot(
+            steps,
+            validation_accuracies,
+            linewidth=1.8,
+            color="tab:blue",
+            label="Validation Accuracy",
+        )
+        train_acc_ax.legend(loc="best")
     train_acc_ax.set_title("Train Accuracy")
     train_acc_ax.set_ylabel("Tolerance Accuracy")
     train_acc_ax.set_ylim(0.0, 1.0)

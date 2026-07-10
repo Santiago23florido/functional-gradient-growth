@@ -117,8 +117,10 @@ class WandbRunLogger:
         payload: dict[str, Any] = {
             "epoch": entry.step,
             "train/loss": entry.train_loss,
+            "validation/loss": entry.validation_loss,
             "test/loss": entry.test_loss,
             "train/accuracy": entry.train_accuracy,
+            "validation/accuracy": entry.validation_accuracy,
             "test/accuracy": entry.test_accuracy,
             "optimizer/learning_rate": entry.learning_rate,
             "model/num_params": entry.num_params,
@@ -197,6 +199,7 @@ class WandbRunLogger:
             or loss_descent_valid is not None
             or stationary_bound_valid is not None
             or global_bound_valid is not None
+            or getattr(entry, "fgd_sensor_valid", None) is not None
         ):
             payload["fgd/theory_learning_rate_adjusted"] = (
                 theory_learning_rate_adjusted
@@ -212,6 +215,14 @@ class WandbRunLogger:
             payload["fgd/loss_non_descent_batches"] = getattr(
                 entry,
                 "fgd_loss_non_descent_batches",
+                0,
+            )
+            sensor_valid = getattr(entry, "fgd_sensor_valid", None)
+            if sensor_valid is not None:
+                payload["fgd/sensor_valid"] = sensor_valid
+            payload["fgd/sensor_invalid_batches"] = getattr(
+                entry,
+                "fgd_sensor_invalid_batches",
                 0,
             )
 

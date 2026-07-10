@@ -9,9 +9,11 @@ data:
   in_features: 10
   out_features: 3
   train_batches: 10
+  validation_batches: 10
   test_batches: 1
   batch_size: 512
   train_seed: 0
+  validation_seed: 2
   test_seed: 1
   active_features: 5
   frequency: 1.5
@@ -68,6 +70,8 @@ fgd_approx:
   sufficient_descent_c: 0.1
   lr_backtrack: 0.5
   lr_min_factor: 0.001
+  global_bound_action: lr_then_growth
+  global_bound_lr_patience: 5
   rel_error_compute_delta: true
   growth_compute_delta: false
   start_epoch: 1
