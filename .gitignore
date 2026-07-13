@@ -12,3 +12,6 @@ wandb/
 
 .env
 .env.*
+
+# Local report notes.
+report/README_FGD_GROWTH_MODEL.md

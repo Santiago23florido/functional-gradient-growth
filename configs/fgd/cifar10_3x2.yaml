@@ -9,7 +9,7 @@ data:
   in_features: 1024
   out_features: 10
   data_dir:
-  batch_size: 64
+  batch_size: 256
   train_seed: 0
   validation_seed: 2
   test_seed: 1
@@ -19,13 +19,13 @@ data:
   cifar_test_samples: 1000
 
 model:
-  hidden_size: 25
+  hidden_size: 2
   number_hidden_layers: 3
   model_seed: 0
 
 training:
   method: fgd_approx
-  epochs: 50
+  epochs: 1000
   accuracy_tolerance: 0.1
   gradient_clip_norm:
   log_every: 1
@@ -50,7 +50,7 @@ fgd_approx:
   rel_error_threshold: 0.5
   rel_error_mode: tangent_projection
   layer_selection: certifying
-  projection_solver: exact_kernel_eigh
+  projection_solver: exact
   learning_rate_policy: theory_interval
   projection_damping: 0.01
   cg_max_iterations: 16
@@ -63,19 +63,16 @@ fgd_approx:
   theory_lr_safety: 0.95
   theory_lr_initial: 0.01
   theory_lr_min: 0.0
-  theory_lr_follow_bound: false
+  theory_lr_follow_bound: true
   sufficient_descent_c: 0.1
   lr_backtrack: 0.5
   lr_min_factor: 0.001
-  global_bound_action: grow
+  global_bound_action: lr_then_growth
   global_bound_lr_patience: 5
   rel_error_compute_delta: true
   growth_compute_delta: false
   start_epoch: 1
   min_epochs_between_growth: 1
-  projection_group_size: 1
-  projection_group_auto: true
-  projection_group_max:
   eps: 1.0e-12
   tiny_use_covariance: true
   tiny_alpha_zero: false
@@ -101,13 +98,13 @@ growth_schedule:
   layer_policy: round_robin
 
 wandb:
-  enabled: false
+  enabled: true
   project: stable-tiny
   entity:
   run_name:
-  group: fgd-cifar10
+  group: fgd
   job_type: train
-  tags: [fgd_approx, gromo, cifar10, exact_kernel_eigh]
+  tags: [fgd_approx, gromo, tangent_projection, exact_projection, theory_lr]
   notes:
   mode: online
   dir: results

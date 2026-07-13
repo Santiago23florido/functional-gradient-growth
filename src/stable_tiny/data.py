@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import gzip
 import os
 import pickle
+import struct
 import warnings
 from pathlib import Path
 from typing import Any
@@ -220,6 +222,145 @@ def make_cifar10_dataloaders(
     if test_samples > test_x.shape[0]:
         raise ValueError(
             "CIFAR-10 test_samples exceeds the available test set "
+            f"({test_samples} > {test_x.shape[0]})."
+        )
+    test_indices = test_order[:test_samples]
+
+    def one_hot(labels: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.one_hot(labels, num_classes=num_classes).float()
+
+    loader_generator = torch.Generator().manual_seed(seed + 3)
+    train_loader = DataLoader(
+        TensorDataset(train_x[train_indices], one_hot(train_labels[train_indices])),
+        batch_size=batch_size,
+        shuffle=True,
+        generator=loader_generator,
+    )
+    validation_loader = DataLoader(
+        TensorDataset(
+            train_x[validation_indices],
+            one_hot(train_labels[validation_indices]),
+        ),
+        batch_size=batch_size,
+        shuffle=False,
+    )
+    test_loader = DataLoader(
+        TensorDataset(test_x[test_indices], one_hot(test_labels[test_indices])),
+        batch_size=batch_size,
+        shuffle=False,
+    )
+    return train_loader, validation_loader, test_loader
+
+
+def _mnist_root_candidates(data_dir: str | None) -> list[Path]:
+    candidates: list[Path] = []
+    if data_dir is not None:
+        root = Path(data_dir)
+        candidates.extend([root, root / "raw", root / "MNIST" / "raw"])
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix:
+        candidates.extend(
+            [
+                Path(conda_prefix) / "datasets" / "mnist" / "raw",
+                Path(conda_prefix) / "datasets" / "MNIST" / "raw",
+            ]
+        )
+    candidates.extend(
+        [
+            Path("data") / "mnist" / "raw",
+            Path("data") / "MNIST" / "raw",
+        ]
+    )
+    return candidates
+
+
+def _read_mnist_images(path: Path) -> torch.Tensor:
+    with gzip.open(path, "rb") as handle:
+        magic, count, rows, cols = struct.unpack(">IIII", handle.read(16))
+        if magic != 2051:
+            raise ValueError(f"Invalid MNIST image file magic in {path}: {magic}")
+        raw = handle.read()
+    images = torch.frombuffer(bytearray(raw), dtype=torch.uint8)
+    return images.reshape(count, rows * cols).float() / 255.0
+
+
+def _read_mnist_labels(path: Path) -> torch.Tensor:
+    with gzip.open(path, "rb") as handle:
+        magic, count = struct.unpack(">II", handle.read(8))
+        if magic != 2049:
+            raise ValueError(f"Invalid MNIST label file magic in {path}: {magic}")
+        raw = handle.read()
+    labels = torch.frombuffer(bytearray(raw), dtype=torch.uint8).long()
+    return labels.reshape(count)
+
+
+def make_mnist_dataloaders(
+    *,
+    data_dir: str | None = None,
+    train_samples: int | None = 10_000,
+    validation_samples: int | None = 2_000,
+    test_samples: int | None = 2_000,
+    batch_size: int = 64,
+    seed: int = 0,
+    num_classes: int = 10,
+) -> tuple[DataLoader, DataLoader, DataLoader]:
+    """Return MNIST loaders with one-hot targets for the MSE FGD pipeline."""
+    if num_classes != 10:
+        raise ValueError("MNIST requires data.out_features = 10.")
+
+    required_files = (
+        "train-images-idx3-ubyte.gz",
+        "train-labels-idx1-ubyte.gz",
+        "t10k-images-idx3-ubyte.gz",
+        "t10k-labels-idx1-ubyte.gz",
+    )
+    candidates = _mnist_root_candidates(data_dir)
+    root = next(
+        (
+            candidate
+            for candidate in candidates
+            if all((candidate / filename).exists() for filename in required_files)
+        ),
+        None,
+    )
+    if root is None:
+        searched = ", ".join(str(candidate) for candidate in candidates)
+        raise FileNotFoundError(
+            "MNIST IDX gzip files not found. Expected train/test image and "
+            f"label files in one of: {searched}"
+        )
+
+    train_x = _read_mnist_images(root / "train-images-idx3-ubyte.gz")
+    train_labels = _read_mnist_labels(root / "train-labels-idx1-ubyte.gz")
+    test_x = _read_mnist_images(root / "t10k-images-idx3-ubyte.gz")
+    test_labels = _read_mnist_labels(root / "t10k-labels-idx1-ubyte.gz")
+
+    mean = train_x.mean(dim=0, keepdim=True)
+    std = train_x.std(dim=0, keepdim=True).clamp_min(1e-6)
+    train_x = (train_x - mean) / std
+    test_x = (test_x - mean) / std
+
+    generator = torch.Generator().manual_seed(seed)
+    train_order = torch.randperm(train_x.shape[0], generator=generator)
+    if train_samples is None:
+        train_samples = train_x.shape[0] - (validation_samples or 0)
+    if validation_samples is None:
+        validation_samples = train_x.shape[0] - train_samples
+    requested_train = train_samples + validation_samples
+    if requested_train > train_x.shape[0]:
+        raise ValueError(
+            "MNIST train_samples + validation_samples exceeds the available "
+            f"train set ({requested_train} > {train_x.shape[0]})."
+        )
+
+    train_indices = train_order[:train_samples]
+    validation_indices = train_order[train_samples:requested_train]
+    test_order = torch.randperm(test_x.shape[0], generator=generator)
+    if test_samples is None:
+        test_samples = test_x.shape[0]
+    if test_samples > test_x.shape[0]:
+        raise ValueError(
+            "MNIST test_samples exceeds the available test set "
             f"({test_samples} > {test_x.shape[0]})."
         )
     test_indices = test_order[:test_samples]

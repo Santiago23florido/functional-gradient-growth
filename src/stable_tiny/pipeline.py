@@ -14,6 +14,7 @@ from stable_tiny.data import (
     MultiSinDataLoader,
     SmoothSinDataLoader,
     make_cifar10_dataloaders,
+    make_mnist_dataloaders,
 )
 from stable_tiny.fgd_approx import (
     FGDApproxConfig,
@@ -57,7 +58,7 @@ from gromo.containers.growing_mlp import GrowingMLP
 ProgressFn = Callable[[str], None]
 TrainingMethod = Literal["normal", "fgd_approx"]
 StepType = Literal["INIT", "SGD", "FGD", "GRO"]
-DataKind = Literal["multi_sin", "smooth_sin", "cifar10"]
+DataKind = Literal["multi_sin", "smooth_sin", "cifar10", "mnist"]
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,9 @@ class DataConfig:
     cifar_train_samples: int | None = 5_000
     cifar_validation_samples: int | None = 1_000
     cifar_test_samples: int | None = 1_000
+    mnist_train_samples: int | None = 10_000
+    mnist_validation_samples: int | None = 2_000
+    mnist_test_samples: int | None = 2_000
 
 
 @dataclass(frozen=True)
@@ -362,6 +366,20 @@ def build_dataloaders(
             seed=data_config.train_seed,
             num_classes=data_config.out_features,
         )
+    if data_config.kind == "mnist":
+        if data_config.in_features != 784:
+            raise ValueError("MNIST requires data.in_features=784.")
+        if data_config.out_features != 10:
+            raise ValueError("MNIST requires data.out_features=10.")
+        return make_mnist_dataloaders(
+            data_dir=data_config.data_dir,
+            train_samples=data_config.mnist_train_samples,
+            validation_samples=data_config.mnist_validation_samples,
+            test_samples=data_config.mnist_test_samples,
+            batch_size=data_config.batch_size,
+            seed=data_config.train_seed,
+            num_classes=data_config.out_features,
+        )
 
     if data_config.kind == "multi_sin":
         loader_class = MultiSinDataLoader
@@ -378,7 +396,7 @@ def build_dataloaders(
     else:
         raise ValueError(
             f"Unsupported data kind '{data_config.kind}'. "
-            "Use one of: multi_sin, smooth_sin, cifar10."
+            "Use one of: multi_sin, smooth_sin, cifar10, mnist."
         )
 
     train_loader = loader_class(
@@ -412,7 +430,7 @@ def build_dataloaders(
 
 
 def is_classification_task(config: PipelineConfig) -> bool:
-    return config.data.kind == "cifar10"
+    return config.data.kind in {"cifar10", "mnist"}
 
 
 def build_model(config: PipelineConfig, device: torch.device) -> GrowingMLP:
