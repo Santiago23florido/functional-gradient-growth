@@ -3,16 +3,30 @@ from __future__ import annotations
 from dataclasses import replace
 
 import torch
+from torch.utils.data import DataLoader, TensorDataset
 
 from stable_tiny.fgd_approx import (
     FGDApproxConfig,
+    FGDApproxEpochResult,
     FGDOutputRelError,
+    FGDValidationCertificate,
     _projection_sensor_valid,
     _solve_tangent_projection,
     _TangentProjectionStep,
     evaluate_fgd_validation_certificate,
+    should_trigger_fgd_growth,
+    train_one_epoch_fgd_approx,
 )
-from stable_tiny.pipeline import build_dataloaders, load_pipeline_config
+from stable_tiny.pipeline import (
+    _FGDTheoryState,
+    _FGDTrial,
+    _search_fgd_certified_trial,
+    build_dataloaders,
+    build_model,
+    load_pipeline_config,
+    run_pipeline,
+)
+from stable_tiny.grow import GrowthResult
 
 
 def _assert_projection_invariants(
@@ -31,6 +45,37 @@ def _assert_projection_invariants(
         approximation_sq_norm=approximation_sq_norm,
         target_sq_norm=target_sq_norm,
         eps=1e-12,
+    )
+
+
+def _fgd_epoch_result(
+    learning_rate: float,
+    *,
+    selected_layer_index: int | None = None,
+) -> FGDApproxEpochResult:
+    return FGDApproxEpochResult(
+        train_loss=1.0,
+        train_accuracy=0.0,
+        test_loss=1.0,
+        test_accuracy=0.0,
+        learning_rate=learning_rate,
+        next_learning_rate=None,
+        learning_rate_upper_bound=None,
+        learning_rate_interval_valid=None,
+        learning_rate_clipped_batches=0,
+        skipped_batches=0,
+        relative_error_condition_valid=None,
+        loss_descent_valid=None,
+        loss_non_descent_batches=0,
+        gradient_sq_norm=None,
+        theory_descent_coefficient=None,
+        min_positive_learning_rate=learning_rate,
+        relative_error=None,
+        selected_layer_index=selected_layer_index,
+        layer_relative_errors=[],
+        output_relative_error=None,
+        sensor_valid=True,
+        sensor_invalid_batches=0,
     )
 
 
@@ -88,6 +133,55 @@ def test_invalid_sensor_stats_do_not_form_growth_condition(monkeypatch) -> None:
     assert certificate.relative_error_condition_valid is not False
 
 
+def test_one_invalid_validation_batch_invalidates_full_certificate(
+    monkeypatch,
+) -> None:
+    invalid_step = _TangentProjectionStep(
+        output_error=FGDOutputRelError(0.0, 1.0, 1.0, -1.0),
+        parameter_updates=(),
+        learning_rate_used=0.0,
+        loss_before=0.0,
+        loss_after=0.0,
+        descent_ok=True,
+        dot_product=-1.0,
+        approximation_sq_norm=1.0,
+        target_sq_norm=1.0,
+    )
+    valid_step = _TangentProjectionStep(
+        output_error=FGDOutputRelError(0.0, 1.0, 1.0, 1.0),
+        parameter_updates=(),
+        learning_rate_used=0.0,
+        loss_before=0.0,
+        loss_after=0.0,
+        descent_ok=True,
+        dot_product=1.0,
+        approximation_sq_norm=1.0,
+        target_sq_norm=1.0,
+    )
+    steps = iter((invalid_step, valid_step))
+    monkeypatch.setattr(
+        "stable_tiny.fgd_approx._compute_tangent_projection_step",
+        lambda **_: next(steps),
+    )
+
+    certificate = evaluate_fgd_validation_certificate(
+        model=torch.nn.Linear(1, 1),
+        data_loader=[
+            (torch.zeros(1, 1), torch.zeros(1, 1)),
+            (torch.ones(1, 1), torch.ones(1, 1)),
+        ],
+        device=torch.device("cpu"),
+        config=FGDApproxConfig(),
+        learning_rate=0.01,
+    )
+
+    assert certificate.sensor_valid is False
+    assert certificate.sensor_invalid_batches == 1
+    assert certificate.relative_error is None
+    assert certificate.relative_error_condition_valid is None
+    assert certificate.max_valid_learning_rate is None
+
+
 def test_build_dataloaders_returns_distinct_validation_split() -> None:
     config = load_pipeline_config("configs/fgd/default.yaml")
     config = replace(
@@ -117,3 +211,403 @@ def test_build_dataloaders_returns_distinct_validation_split() -> None:
     assert not torch.equal(train_y, validation_y)
     assert not torch.equal(validation_x, test_x)
     assert not torch.equal(validation_y, test_y)
+
+
+def test_fgd_growth_is_not_delayed_by_epoch_or_dwell_constraints() -> None:
+    config = replace(
+        FGDApproxConfig(),
+        rel_error_threshold=0.2,
+        start_epoch=100,
+        min_epochs_between_growth=100,
+    )
+
+    assert should_trigger_fgd_growth(
+        relative_error=0.2,
+        epoch=1,
+        last_growth_epoch=1,
+        config=config,
+    )
+    assert not should_trigger_fgd_growth(
+        relative_error=0.19,
+        epoch=100,
+        last_growth_epoch=None,
+        config=config,
+    )
+
+
+def test_lr_search_returns_largest_valid_rate_found() -> None:
+    threshold = 0.003
+    rates: list[float] = []
+
+    def evaluate_trial(learning_rate: float) -> _FGDTrial:
+        rates.append(learning_rate)
+        condition_valid = learning_rate <= threshold
+        certificate = FGDValidationCertificate(
+            learning_rate_upper_bound=0.008 / 0.95,
+            max_valid_learning_rate=0.008,
+            learning_rate_interval_valid=True,
+            skipped_batches=0,
+            relative_error_condition_valid=True,
+            gradient_sq_norm=1.0,
+            theory_descent_coefficient=0.5,
+            relative_error=0.1,
+            output_relative_error=FGDOutputRelError(0.1, 0.9, 1.0, 1.0),
+            sensor_valid=True,
+            sensor_invalid_batches=0,
+        )
+        theory_state = _FGDTheoryState(1, 1.0, learning_rate, 0.5, 1.0, 1.0)
+        return _FGDTrial(
+            model=torch.nn.Linear(1, 1),
+            epoch_result=_fgd_epoch_result(learning_rate),
+            certificate=certificate,
+            theory_state=theory_state,
+            validation_functional_loss=1.0,
+            loss_descent_valid=True,
+            stationary_bound=1.0,
+            stationary_bound_valid=True,
+            global_bound=1.0,
+            global_bound_valid=condition_valid,
+            global_contraction=1.0,
+            all_conditions_valid=condition_valid,
+        )
+
+    result = _search_fgd_certified_trial(
+        maximum_learning_rate=0.008,
+        evaluate_trial=evaluate_trial,
+        config=replace(
+            FGDApproxConfig(),
+            theory_lr_search_steps=4,
+            theory_lr_search_refinements=12,
+        ),
+    )
+
+    assert rates[0] == 0.008
+    assert result.accepted is not None
+    accepted_rate = result.accepted.epoch_result.min_positive_learning_rate
+    assert accepted_rate is not None
+    assert 0.00299 <= accepted_rate <= threshold
+
+
+def test_train_epoch_does_not_evaluate_theory_conditions(monkeypatch) -> None:
+    config = load_pipeline_config("configs/fgd/default.yaml")
+    config = replace(
+        config,
+        data=replace(
+            config.data,
+            train_batches=1,
+            validation_batches=1,
+            test_batches=1,
+            batch_size=4,
+        ),
+        model=replace(config.model, hidden_size=2),
+        training=replace(config.training, device="cpu"),
+        fgd_approx=replace(
+            config.fgd_approx,
+            rel_error_threshold=0.0,
+            projection_solver="exact_svd",
+        ),
+    )
+    train_loader, _, test_loader = build_dataloaders(
+        config,
+        torch.device("cpu"),
+    )
+    model = build_model(config, torch.device("cpu"))
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("training must not evaluate validation theory conditions")
+
+    monkeypatch.setattr(
+        "stable_tiny.fgd_approx.theoretical_learning_rate_upper_bound",
+        fail_if_called,
+    )
+    monkeypatch.setattr(
+        "stable_tiny.fgd_approx.theoretical_descent_coefficient",
+        fail_if_called,
+    )
+    monkeypatch.setattr(
+        "stable_tiny.fgd_approx.select_tiny_growth_layer_index",
+        lambda **_: None,
+    )
+
+    result = train_one_epoch_fgd_approx(
+        model=model,
+        train_loader=train_loader,
+        test_loader=test_loader,
+        loss_function=torch.nn.MSELoss(),
+        device=torch.device("cpu"),
+        learning_rate=0.01,
+        accuracy_tolerance=1.0,
+        config=config.fgd_approx,
+    )
+
+    assert result.min_positive_learning_rate == 0.01
+    assert result.learning_rate_interval_valid is None
+    assert result.relative_error_condition_valid is None
+    assert result.theory_descent_coefficient is None
+    assert result.learning_rate_clipped_batches == 0
+
+
+def test_pipeline_clips_learning_rate_from_validation_certificate(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    config = load_pipeline_config("configs/fgd/default.yaml")
+    config = replace(
+        config,
+        training=replace(config.training, epochs=1, device="cpu", log_every=1),
+        fgd_approx=replace(
+            config.fgd_approx,
+            theory_lr_initial=0.01,
+            theory_lr_follow_bound=False,
+            theory_mu=1e-15,
+            theory_lr_search_steps=1,
+            theory_lr_search_refinements=0,
+            global_bound_action="ignore",
+        ),
+        growth_schedule=replace(config.growth_schedule, enabled=False),
+        wandb=replace(config.wandb, enabled=False),
+        run=replace(
+            config.run,
+            results_dir=tmp_path,
+            save_plot=False,
+            show_plot=False,
+        ),
+    )
+    generator = torch.Generator().manual_seed(7)
+    x = torch.randn(4, config.data.in_features, generator=generator)
+    y = torch.randn(4, config.data.out_features, generator=generator)
+    train_loader = DataLoader(TensorDataset(x, y), batch_size=4)
+    validation_loader = DataLoader(TensorDataset(x + 1.0, y), batch_size=4)
+    test_loader = DataLoader(TensorDataset(x + 2.0, y), batch_size=4)
+    monkeypatch.setattr(
+        "stable_tiny.pipeline.build_dataloaders",
+        lambda *_: (train_loader, validation_loader, test_loader),
+    )
+
+    certificate_loaders = []
+
+    def validation_certificate(**kwargs):
+        certificate_loaders.append(kwargs["data_loader"])
+        learning_rate = kwargs["learning_rate"]
+        return FGDValidationCertificate(
+            learning_rate_upper_bound=0.004,
+            max_valid_learning_rate=0.004,
+            learning_rate_interval_valid=(
+                learning_rate is None or learning_rate <= 0.004
+            ),
+            skipped_batches=0,
+            relative_error_condition_valid=True,
+            gradient_sq_norm=1.0,
+            theory_descent_coefficient=0.5,
+            relative_error=0.1,
+            output_relative_error=FGDOutputRelError(
+                relative_error=0.1,
+                approximation_norm=0.9,
+                target_norm=1.0,
+                directional_cosine=1.0,
+            ),
+            sensor_valid=True,
+            sensor_invalid_batches=0,
+        )
+
+    monkeypatch.setattr(
+        "stable_tiny.pipeline.evaluate_fgd_validation_certificate",
+        validation_certificate,
+    )
+    observed_learning_rates = []
+
+    def train_epoch(**kwargs):
+        observed_learning_rates.append(kwargs["learning_rate"])
+        assert kwargs["evaluate_test"] is False
+        return _fgd_epoch_result(kwargs["learning_rate"])
+
+    monkeypatch.setattr(
+        "stable_tiny.pipeline.train_one_epoch_fgd_approx",
+        train_epoch,
+    )
+
+    result = run_pipeline(config, progress=None)
+
+    assert observed_learning_rates == [0.004]
+    assert certificate_loaders
+    assert all(loader is validation_loader for loader in certificate_loaders)
+    assert result.history[1].learning_rate == 0.004
+    assert result.history[1].fgd_learning_rate_clipped_batches == 1
+    assert result.history[1].fgd_loss_descent_valid is True
+    assert result.history[1].fgd_loss_non_descent_batches == 0
+    assert result.history[1].fgd_candidate_accepted is True
+
+
+def test_failed_lr_trials_do_not_modify_the_committed_model(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    config = load_pipeline_config("configs/fgd/default.yaml")
+    config = replace(
+        config,
+        training=replace(config.training, epochs=1, device="cpu", log_every=1),
+        fgd_approx=replace(
+            config.fgd_approx,
+            theory_lr_initial=0.01,
+            theory_lr_follow_bound=False,
+            theory_lr_search_steps=2,
+            theory_lr_search_refinements=0,
+            global_bound_action="lr_then_growth",
+        ),
+        growth_schedule=replace(config.growth_schedule, enabled=False),
+        wandb=replace(config.wandb, enabled=False),
+        run=replace(
+            config.run,
+            results_dir=tmp_path,
+            save_plot=False,
+            show_plot=False,
+        ),
+    )
+    x = torch.zeros(4, config.data.in_features)
+    y = torch.ones(4, config.data.out_features)
+    train_loader = DataLoader(TensorDataset(x, y), batch_size=4)
+    validation_loader = DataLoader(TensorDataset(x + 1.0, y), batch_size=4)
+    test_loader = DataLoader(TensorDataset(x + 2.0, y), batch_size=4)
+    monkeypatch.setattr(
+        "stable_tiny.pipeline.build_dataloaders",
+        lambda *_: (train_loader, validation_loader, test_loader),
+    )
+
+    def validation_certificate(**kwargs):
+        maximum = 0.008
+        learning_rate = kwargs["learning_rate"]
+        return FGDValidationCertificate(
+            learning_rate_upper_bound=maximum / 0.95,
+            max_valid_learning_rate=maximum,
+            learning_rate_interval_valid=(
+                learning_rate is None or learning_rate <= maximum
+            ),
+            skipped_batches=0,
+            relative_error_condition_valid=False,
+            gradient_sq_norm=1.0,
+            theory_descent_coefficient=0.5,
+            relative_error=0.6,
+            output_relative_error=FGDOutputRelError(0.6, 0.4, 1.0, 1.0),
+            sensor_valid=True,
+            sensor_invalid_batches=0,
+        )
+
+    monkeypatch.setattr(
+        "stable_tiny.pipeline.evaluate_fgd_validation_certificate",
+        validation_certificate,
+    )
+    observed_learning_rates = []
+
+    def train_epoch(**kwargs):
+        learning_rate = kwargs["learning_rate"]
+        observed_learning_rates.append(learning_rate)
+        assert kwargs["evaluate_test"] is False
+        with torch.no_grad():
+            for parameter in kwargs["model"].parameters():
+                parameter.add_(1.0)
+        return _fgd_epoch_result(learning_rate)
+
+    monkeypatch.setattr(
+        "stable_tiny.pipeline.train_one_epoch_fgd_approx",
+        train_epoch,
+    )
+
+    initial_model = build_model(config, torch.device("cpu"))
+    initial_state = {
+        name: tensor.detach().clone()
+        for name, tensor in initial_model.state_dict().items()
+    }
+    result = run_pipeline(config, progress=None)
+
+    assert observed_learning_rates[0] == 0.008
+    assert len(observed_learning_rates) == 2
+    assert result.history[1].learning_rate == 0.0
+    assert result.history[1].fgd_candidate_accepted is False
+    assert result.history[1].fgd_lr_search_trials == 2
+    assert not result.growth_events
+    for name, tensor in result.model.state_dict().items():
+        assert torch.equal(tensor, initial_state[name])
+
+
+def test_growth_sets_lr_to_new_architecture_certified_maximum(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    config = load_pipeline_config("configs/fgd/default.yaml")
+    config = replace(
+        config,
+        training=replace(config.training, epochs=1, device="cpu", log_every=1),
+        fgd_approx=replace(
+            config.fgd_approx,
+            rel_error_threshold=0.1,
+            layer_selection="tiny_best",
+            theory_lr_follow_bound=False,
+            theory_lr_search_steps=2,
+            theory_lr_search_refinements=0,
+        ),
+        growth_schedule=replace(config.growth_schedule, enabled=True),
+        wandb=replace(config.wandb, enabled=False),
+        run=replace(
+            config.run,
+            results_dir=tmp_path,
+            save_plot=False,
+            show_plot=False,
+        ),
+    )
+    x = torch.zeros(4, config.data.in_features)
+    y = torch.ones(4, config.data.out_features)
+    train_loader = DataLoader(TensorDataset(x, y), batch_size=4)
+    validation_loader = DataLoader(TensorDataset(x + 1.0, y), batch_size=4)
+    test_loader = DataLoader(TensorDataset(x + 2.0, y), batch_size=4)
+    monkeypatch.setattr(
+        "stable_tiny.pipeline.build_dataloaders",
+        lambda *_: (train_loader, validation_loader, test_loader),
+    )
+
+    def validation_certificate(**kwargs):
+        maximum = 0.007 if kwargs["learning_rate"] is None else 0.004
+        return FGDValidationCertificate(
+            learning_rate_upper_bound=maximum / 0.95,
+            max_valid_learning_rate=maximum,
+            learning_rate_interval_valid=True,
+            skipped_batches=0,
+            relative_error_condition_valid=False,
+            gradient_sq_norm=1.0,
+            theory_descent_coefficient=0.5,
+            relative_error=0.2,
+            output_relative_error=FGDOutputRelError(0.2, 0.8, 1.0, 1.0),
+            sensor_valid=True,
+            sensor_invalid_batches=0,
+        )
+
+    monkeypatch.setattr(
+        "stable_tiny.pipeline.evaluate_fgd_validation_certificate",
+        validation_certificate,
+    )
+
+    def train_epoch(**kwargs):
+        learning_rate = kwargs["learning_rate"]
+        assert kwargs["evaluate_test"] is False
+        return _fgd_epoch_result(learning_rate, selected_layer_index=0)
+
+    monkeypatch.setattr(
+        "stable_tiny.pipeline.train_one_epoch_fgd_approx",
+        train_epoch,
+    )
+    monkeypatch.setattr(
+        "stable_tiny.pipeline.select_tiny_growth_layer_index",
+        lambda **_: 0,
+    )
+    monkeypatch.setattr(
+        "stable_tiny.pipeline.grow_layer",
+        lambda **_: GrowthResult(0, 1.0, 1.0, []),
+    )
+
+    result = run_pipeline(config, progress=None)
+
+    assert len(result.growth_events) == 1
+    assert result.history[1].learning_rate == 0.0
+    assert result.history[1].fgd_candidate_accepted is False
+    assert result.history[-1].step_type == "GRO"
+    assert result.history[-1].learning_rate == 0.007
+    assert result.history[-1].fgd_max_valid_learning_rate == 0.007

@@ -1,0 +1,668 @@
+nohup: ignoring input
+wandb: [wandb.login()] Using explicit session credentials for https://api.wandb.ai.
+wandb: Appending key for api.wandb.ai to your netrc file: /home/santiago/.netrc
+wandb: Currently logged in as: santiago-florido (TAU-Frugal) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: Tracking run with wandb version 0.28.0
+wandb: Run data is saved locally in results/wandb/run-20260713_121559-3o9tcmxd
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run mnist_fgd_grow_3x2_th010
+wandb: ⭐️ View project at https://wandb.ai/TAU-Frugal/stable-tiny
+wandb: 🚀 View run at https://wandb.ai/TAU-Frugal/stable-tiny/runs/3o9tcmxd
+Using device: cuda
+Training method: fgd_approx
+W&B logging enabled: project=stable-tiny, run=mnist_fgd_grow_3x2_th010
+Original model:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=2, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=2, out_features=2, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=2, out_features=2, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=2, out_features=10, use_bias=True)
+[INIT] Epoch 0, train_loss=0.4646, validation_loss=0.4626, test_loss=0.4601, train_acc=0.072, validation_acc=0.083, test_acc=0.091
+[FGD] Epoch 1, train_loss=0.3356, validation_loss=0.3335, test_loss=0.3313 (-0.1288), train_acc=0.083, validation_acc=0.092, test_acc=0.101, lr=0.0007434, rel_err=0.508, selected_layer=0
+[FGD-WARN] Epoch 1: relative-error condition failed; learning-rate interval invalid; learning-rate clipped on 3 batch(es); skipped 22 batch(es); FGD conditions request growth
+[GRO] Growing layer 2 at epoch 1
+  scaling=0, train_loss=0.3356
+  scaling=1, train_loss=0.3324
+  scaling=0.381966, train_loss=0.3343
+  scaling=0.618034, train_loss=0.3329
+  scaling=0.763932, train_loss=0.3323
+  scaling=0.854102, train_loss=0.3321
+  scaling=0.90983, train_loss=0.3321
+  scaling=0.81966, train_loss=0.3322
+  scaling=0.875388, train_loss=0.3321
+  scaling=0.888544, train_loss=0.3321
+  scaling=0.867258, train_loss=0.3321
+  scaling=0.880413, train_loss=0.3321
+  scaling=0.872283, train_loss=0.3321
+  scaling=0.870363, train_loss=0.3321
+  scaling=0.869177, train_loss=0.3321
+  scaling=0.871096, train_loss=0.3321
+[GRO] Epoch 1, train_loss=0.3321, validation_loss=0.3300, test_loss=0.3278 (-0.0035), train_acc=0.108, validation_acc=0.110, test_acc=0.124, scaling=0.8711
+Model after growing:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=2, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=2, out_features=2, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=2, out_features=4, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=4, out_features=10, use_bias=True)
+[FGD] Epoch 2, train_loss=0.2728, validation_loss=0.2711, test_loss=0.2692 (-0.0586), train_acc=0.116, validation_acc=0.119, test_acc=0.132, lr=0.0004033, rel_err=0.541, selected_layer=0
+[FGD-WARN] Epoch 2: relative-error condition failed; learning-rate interval invalid; learning-rate clipped on 3 batch(es); skipped 32 batch(es); FGD conditions request growth
+[GRO] Growing layer 0 at epoch 2
+  scaling=0, train_loss=0.2728
+  scaling=1, train_loss=0.3384
+  scaling=0.381966, train_loss=0.2647
+  scaling=0.618034, train_loss=0.2688
+  scaling=0.236068, train_loss=0.2684
+  scaling=0.472136, train_loss=0.2642
+  scaling=0.527864, train_loss=0.2650
+  scaling=0.437694, train_loss=0.2642
+  scaling=0.416408, train_loss=0.2643
+  scaling=0.45085, train_loss=0.2642
+  scaling=0.45898, train_loss=0.2642
+  scaling=0.445825, train_loss=0.2642
+  scaling=0.453955, train_loss=0.2642
+  scaling=0.44893, train_loss=0.2642
+  scaling=0.452036, train_loss=0.2642
+  scaling=0.452769, train_loss=0.2642
+[GRO] Epoch 2, train_loss=0.2642, validation_loss=0.2638, test_loss=0.2615 (-0.0077), train_acc=0.184, validation_acc=0.194, test_acc=0.194, scaling=0.452
+Model after growing:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=4, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=4, out_features=2, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=2, out_features=4, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=4, out_features=10, use_bias=True)
+[FGD] Epoch 3, train_loss=0.2568, validation_loss=0.2562, test_loss=0.2541 (-0.0073), train_acc=0.184, validation_acc=0.193, test_acc=0.195, lr=6.369e-05, rel_err=0.561, selected_layer=1
+[FGD-WARN] Epoch 3: relative-error condition failed; learning-rate interval invalid; skipped 32 batch(es); FGD conditions request growth
+[GRO] Growing layer 1 at epoch 3
+  scaling=0, train_loss=0.2568
+  scaling=1, train_loss=0.2869
+  scaling=0.381966, train_loss=0.2498
+  scaling=0.618034, train_loss=0.2485
+  scaling=0.763932, train_loss=0.2551
+  scaling=0.527864, train_loss=0.2478
+  scaling=0.472136, train_loss=0.2482
+  scaling=0.562306, train_loss=0.2478
+  scaling=0.506578, train_loss=0.2478
+  scaling=0.54102, train_loss=0.2477
+  scaling=0.54915, train_loss=0.2478
+  scaling=0.535995, train_loss=0.2477
+  scaling=0.532889, train_loss=0.2477
+  scaling=0.537914, train_loss=0.2477
+  scaling=0.5391, train_loss=0.2477
+  scaling=0.537181, train_loss=0.2477
+[GRO] Epoch 3, train_loss=0.2477, validation_loss=0.2480, test_loss=0.2469 (-0.0072), train_acc=0.224, validation_acc=0.248, test_acc=0.239, scaling=0.5379
+Model after growing:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=4, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=4, out_features=6, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=6, out_features=4, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=4, out_features=10, use_bias=True)
+[FGD] Epoch 4, train_loss=0.2058, validation_loss=0.2055, test_loss=0.2049 (-0.0420), train_acc=0.219, validation_acc=0.242, test_acc=0.227, lr=0.0004697, rel_err=0.544, selected_layer=0
+[FGD-WARN] Epoch 4: relative-error condition failed; learning-rate interval invalid; learning-rate clipped on 3 batch(es); skipped 31 batch(es); FGD conditions request growth
+[GRO] Growing layer 2 at epoch 4
+  scaling=0, train_loss=0.2058
+  scaling=1, train_loss=0.2031
+  scaling=0.381966, train_loss=0.2040
+  scaling=0.618034, train_loss=0.2022
+  scaling=0.763932, train_loss=0.2017
+  scaling=0.854102, train_loss=0.2018
+  scaling=0.708204, train_loss=0.2018
+  scaling=0.798374, train_loss=0.2017
+  scaling=0.81966, train_loss=0.2017
+  scaling=0.785218, train_loss=0.2017
+  scaling=0.777088, train_loss=0.2017
+  scaling=0.790243, train_loss=0.2017
+  scaling=0.782113, train_loss=0.2017
+  scaling=0.787138, train_loss=0.2017
+  scaling=0.784032, train_loss=0.2017
+  scaling=0.785951, train_loss=0.2017
+[GRO] Epoch 4, train_loss=0.2017, validation_loss=0.2013, test_loss=0.2014 (-0.0035), train_acc=0.259, validation_acc=0.281, test_acc=0.270, scaling=0.7852
+Model after growing:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=4, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=4, out_features=6, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=6, out_features=10, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=10, out_features=10, use_bias=True)
+[FGD] Epoch 5, train_loss=0.0789, validation_loss=0.0799, test_loss=0.0804 (-0.1210), train_acc=0.579, validation_acc=0.587, test_acc=0.581, lr=0.003087, rel_err=0.453, selected_layer=0
+[FGD-WARN] Epoch 5: relative-error condition failed; learning-rate interval invalid; learning-rate clipped on 3 batch(es); skipped 6 batch(es); FGD conditions request growth
+[GRO] Growing layer 0 at epoch 5
+  scaling=0, train_loss=0.0789
+  scaling=1, train_loss=1095.3423
+  scaling=0.381966, train_loss=23.5920
+  scaling=0.618034, train_loss=160.2357
+  scaling=0.236068, train_loss=3.5572
+  scaling=0.145898, train_loss=0.6060
+  scaling=0.0901699, train_loss=0.1638
+  scaling=0.0557281, train_loss=0.0900
+  scaling=0.0344419, train_loss=0.0767
+  scaling=0.0212862, train_loss=0.0762
+  scaling=0.0131556, train_loss=0.0775
+  scaling=0.0263112, train_loss=0.0759
+  scaling=0.0294169, train_loss=0.0760
+  scaling=0.0243919, train_loss=0.0760
+  scaling=0.0274975, train_loss=0.0759
+  scaling=0.0255781, train_loss=0.0759
+[GRO] Epoch 5, train_loss=0.0759, validation_loss=0.0793, test_loss=0.0780 (-0.0023), train_acc=0.617, validation_acc=0.618, test_acc=0.615, scaling=0.02631
+Model after growing:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=10, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=10, out_features=6, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=6, out_features=10, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=10, out_features=10, use_bias=True)/home/santiago/StageFrugal/gromo/src/gromo/modules/growing_module.py:2138: UserWarning: input_extension_scaling is null. The input extension will have no effect.
+  warnings.warn(
+/home/santiago/StageFrugal/gromo/src/gromo/utils/tools.py:119: UserWarning: Using the pseudo-inverse for the computation of the optimal delta.
+  warn("Using the pseudo-inverse for the computation of the optimal delta.")
+
+[FGD] Epoch 6, train_loss=0.0832, validation_loss=0.0926, test_loss=0.0863 (+0.0083), train_acc=0.656, validation_acc=0.642, test_acc=0.642, lr=0.01, rel_err=0.171, selected_layer=0
+[FGD-WARN] Epoch 6: relative-error condition failed; global-convergence bound failed; FGD conditions request growth
+[GRO] Growing layer 1 at epoch 6
+  scaling=0, train_loss=0.0832
+  scaling=1, train_loss=1.3244
+  scaling=0.381966, train_loss=0.1162
+  scaling=0.618034, train_loss=0.3093
+  scaling=0.236068, train_loss=0.0858
+  scaling=0.145898, train_loss=0.0825
+  scaling=0.0901699, train_loss=0.0826
+  scaling=0.18034, train_loss=0.0830
+  scaling=0.124612, train_loss=0.0824
+  scaling=0.111456, train_loss=0.0825
+  scaling=0.132742, train_loss=0.0824
+  scaling=0.137767, train_loss=0.0824
+  scaling=0.129637, train_loss=0.0824
+  scaling=0.127717, train_loss=0.0824
+  scaling=0.130823, train_loss=0.0824
+  scaling=0.131556, train_loss=0.0824
+[GRO] Epoch 6, train_loss=0.0824, validation_loss=0.0919, test_loss=0.0855 (-0.0008), train_acc=0.667, validation_acc=0.650, test_acc=0.652, scaling=0.1308
+Model after growing:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=10, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=10, out_features=14, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=14, out_features=10, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=10, out_features=10, use_bias=True)
+[FGD] Epoch 7, train_loss=0.0854, validation_loss=0.0955, test_loss=0.0889 (+0.0034), train_acc=0.671, validation_acc=0.662, test_acc=0.658, lr=0.0007922, rel_err=0.050, selected_layer=0
+[FGD-WARN] Epoch 7: relative-error condition failed; learning-rate clipped on 2 batch(es); global-convergence bound failed; FGD conditions request growth
+[GRO] Growing layer 2 at epoch 7
+  scaling=0, train_loss=0.0854
+  scaling=1, train_loss=0.1033
+  scaling=0.381966, train_loss=0.0835
+  scaling=0.618034, train_loss=0.0843
+  scaling=0.236068, train_loss=0.0844
+  scaling=0.472136, train_loss=0.0833
+  scaling=0.527864, train_loss=0.0835
+  scaling=0.437694, train_loss=0.0833
+  scaling=0.493422, train_loss=0.0833
+  scaling=0.45898, train_loss=0.0833
+  scaling=0.480267, train_loss=0.0833
+  scaling=0.467111, train_loss=0.0833
+  scaling=0.464005, train_loss=0.0833
+  scaling=0.46903, train_loss=0.0833
+  scaling=0.465925, train_loss=0.0833
+  scaling=0.465192, train_loss=0.0833
+[GRO] Epoch 7, train_loss=0.0833, validation_loss=0.0928, test_loss=0.0873 (-0.0017), train_acc=0.705, validation_acc=0.704, test_acc=0.693, scaling=0.4659
+Model after growing:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=10, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=10, out_features=14, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=14, out_features=19, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=19, out_features=10, use_bias=True)
+[FGD] Epoch 8, train_loss=0.0736, validation_loss=0.0818, test_loss=0.0768 (-0.0105), train_acc=0.724, validation_acc=0.719, test_acc=0.716, lr=0.0008499, rel_err=0.007, selected_layer=0
+[FGD-WARN] Epoch 8: learning-rate clipped on 4 batch(es)
+[FGD] Epoch 9, train_loss=0.0731, validation_loss=0.0813, test_loss=0.0763 (-0.0004), train_acc=0.725, validation_acc=0.720, test_acc=0.717, lr=4.951e-05, rel_err=0.007, selected_layer=0
+[FGD-WARN] Epoch 9: learning-rate clipped on 1 batch(es)
+[FGD] Epoch 10, train_loss=0.0730, validation_loss=0.0812, test_loss=0.0762 (-0.0001), train_acc=0.724, validation_acc=0.721, test_acc=0.717, lr=9.457e-06, rel_err=0.007, selected_layer=0
+[FGD-WARN] Epoch 10: learning-rate clipped on 3 batch(es)
+[FGD] Epoch 11, train_loss=0.0730, validation_loss=0.0812, test_loss=0.0762 (+0.0000), train_acc=0.724, validation_acc=0.721, test_acc=0.717, lr=1.139e-11, rel_err=0.007, selected_layer=0
+[FGD] Epoch 12, train_loss=0.0730, validation_loss=0.0812, test_loss=0.0762 (-0.0000), train_acc=0.724, validation_acc=0.721, test_acc=0.717, lr=2.658e-11, rel_err=0.007, selected_layer=0
+[FGD] Epoch 13, train_loss=0.0730, validation_loss=0.0812, test_loss=0.0762 (+0.0000), train_acc=0.724, validation_acc=0.721, test_acc=0.717, lr=3.037e-11, rel_err=0.007, selected_layer=0
+[FGD] Epoch 14, train_loss=0.0730, validation_loss=0.0812, test_loss=0.0762 (-0.0000), train_acc=0.724, validation_acc=0.721, test_acc=0.717, lr=3.037e-11, rel_err=0.007, selected_layer=0
+[FGD] Epoch 15, train_loss=0.0730, validation_loss=0.0812, test_loss=0.0762 (+0.0000), train_acc=0.724, validation_acc=0.721, test_acc=0.717, lr=1.329e-11, rel_err=0.007, selected_layer=0
+[FGD-WARN] Epoch 15: learning-rate clipped on 1 batch(es)
+[FGD] Epoch 16, train_loss=0.0730, validation_loss=0.0812, test_loss=0.0762 (+0.0000), train_acc=0.724, validation_acc=0.721, test_acc=0.717, lr=1.898e-12, rel_err=0.007, selected_layer=0
+[FGD] Epoch 17, train_loss=0.0730, validation_loss=0.0812, test_loss=0.0762 (+0.0000), train_acc=0.724, validation_acc=0.721, test_acc=0.717, lr=0, rel_err=0.007, selected_layer=0
+[FGD-WARN] Epoch 17: stationary-point bound failed; global-convergence bound failed; FGD conditions request growth
+[GRO] Growing layer 2 at epoch 17
+  scaling=0, train_loss=0.0730
+  scaling=1, train_loss=0.0737
+  scaling=0.381966, train_loss=0.0731
+  scaling=0.618034, train_loss=0.0732
+  scaling=0.236068, train_loss=0.0731
+  scaling=0.145898, train_loss=0.0730
+  scaling=0.0901699, train_loss=0.0730
+  scaling=0.0557281, train_loss=0.0730
+  scaling=0.0344419, train_loss=0.0730
+  scaling=0.0212862, train_loss=0.0730
+  scaling=0.0131556, train_loss=0.0730
+  scaling=0.00813062, train_loss=0.0730
+  scaling=0.005025, train_loss=0.0730
+  scaling=0.00310562, train_loss=0.0730
+  scaling=0.00621124, train_loss=0.0730
+  scaling=0.00429186, train_loss=0.0730
+[GRO] Epoch 17, train_loss=0.0730, validation_loss=0.0812, test_loss=0.0762 (+0.0000), train_acc=0.724, validation_acc=0.721, test_acc=0.717, scaling=0
+Model after growing:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=10, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=10, out_features=14, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=14, out_features=28, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=28, out_features=10, use_bias=True)
+[FGD] Epoch 18, train_loss=0.0529, validation_loss=0.0591, test_loss=0.0557 (-0.0205), train_acc=0.772, validation_acc=0.762, test_acc=0.762, lr=0.004098, rel_err=0.006, selected_layer=0
+[FGD-WARN] Epoch 18: learning-rate clipped on 7 batch(es)
+[FGD] Epoch 19, train_loss=0.0529, validation_loss=0.0591, test_loss=0.0557 (-0.0000), train_acc=0.772, validation_acc=0.762, test_acc=0.762, lr=2.695e-10, rel_err=0.006, selected_layer=0
+[FGD-WARN] Epoch 19: learning-rate clipped on 4 batch(es)
+[FGD] Epoch 20, train_loss=0.0529, validation_loss=0.0591, test_loss=0.0557 (-0.0000), train_acc=0.772, validation_acc=0.762, test_acc=0.762, lr=3.037e-11, rel_err=0.006, selected_layer=0
+[FGD] Epoch 21, train_loss=0.0529, validation_loss=0.0591, test_loss=0.0557 (+0.0000), train_acc=0.772, validation_acc=0.762, test_acc=0.762, lr=2.278e-11, rel_err=0.006, selected_layer=0
+[FGD] Epoch 22, train_loss=0.0529, validation_loss=0.0591, test_loss=0.0557 (+0.0000), train_acc=0.772, validation_acc=0.762, test_acc=0.762, lr=1.898e-11, rel_err=0.006, selected_layer=0
+[FGD] Epoch 23, train_loss=0.0529, validation_loss=0.0591, test_loss=0.0557 (-0.0000), train_acc=0.772, validation_acc=0.762, test_acc=0.762, lr=2.658e-11, rel_err=0.006, selected_layer=0
+[FGD] Epoch 24, train_loss=0.0529, validation_loss=0.0591, test_loss=0.0557 (-0.0000), train_acc=0.772, validation_acc=0.762, test_acc=0.762, lr=1.898e-11, rel_err=0.006, selected_layer=0
+[FGD] Epoch 25, train_loss=0.0529, validation_loss=0.0591, test_loss=0.0557 (-0.0000), train_acc=0.772, validation_acc=0.762, test_acc=0.762, lr=3.037e-11, rel_err=0.006, selected_layer=0
+[FGD] Epoch 26, train_loss=0.0529, validation_loss=0.0591, test_loss=0.0557 (+0.0000), train_acc=0.772, validation_acc=0.762, test_acc=0.762, lr=3.037e-11, rel_err=0.006, selected_layer=0
+[FGD] Epoch 27, train_loss=0.0529, validation_loss=0.0591, test_loss=0.0557 (+0.0000), train_acc=0.772, validation_acc=0.762, test_acc=0.762, lr=7.593e-12, rel_err=0.006, selected_layer=0
+[FGD-WARN] Epoch 27: learning-rate clipped on 1 batch(es)
+[FGD] Epoch 28, train_loss=0.0529, validation_loss=0.0591, test_loss=0.0557 (+0.0000), train_acc=0.772, validation_acc=0.762, test_acc=0.762, lr=3.796e-12, rel_err=0.006, selected_layer=0
+[FGD] Epoch 29, train_loss=0.0529, validation_loss=0.0591, test_loss=0.0557 (+0.0000), train_acc=0.772, validation_acc=0.762, test_acc=0.762, lr=3.796e-12, rel_err=0.006, selected_layer=0
+[FGD] Epoch 30, train_loss=0.0529, validation_loss=0.0591, test_loss=0.0557 (+0.0000), train_acc=0.772, validation_acc=0.762, test_acc=0.762, lr=3.796e-12, rel_err=0.006, selected_layer=0
+[FGD] Epoch 31, train_loss=0.0529, validation_loss=0.0591, test_loss=0.0557 (-0.0000), train_acc=0.772, validation_acc=0.762, test_acc=0.762, lr=3.796e-12, rel_err=0.006, selected_layer=0
+[FGD] Epoch 32, train_loss=0.0529, validation_loss=0.0591, test_loss=0.0557 (+0.0000), train_acc=0.772, validation_acc=0.762, test_acc=0.762, lr=1.898e-12, rel_err=0.006, selected_layer=0
+[FGD] Epoch 33, train_loss=0.0529, validation_loss=0.0591, test_loss=0.0557 (+0.0000), train_acc=0.772, validation_acc=0.762, test_acc=0.762, lr=3.796e-12, rel_err=0.006, selected_layer=0
+[FGD] Epoch 34, train_loss=0.0529, validation_loss=0.0591, test_loss=0.0557 (+0.0000), train_acc=0.772, validation_acc=0.762, test_acc=0.762, lr=3.796e-12, rel_err=0.006, selected_layer=0
+[FGD] Epoch 35, train_loss=0.0529, validation_loss=0.0591, test_loss=0.0557 (+0.0000), train_acc=0.772, validation_acc=0.762, test_acc=0.762, lr=0, rel_err=0.006, selected_layer=0
+[FGD-WARN] Epoch 35: stationary-point bound failed; global-convergence bound failed; FGD conditions request growth
+[GRO] Growing layer 2 at epoch 35
+  scaling=0, train_loss=0.0529
+  scaling=1, train_loss=0.0533
+  scaling=0.381966, train_loss=0.0529
+  scaling=0.618034, train_loss=0.0530
+  scaling=0.236068, train_loss=0.0529
+  scaling=0.145898, train_loss=0.0529
+  scaling=0.291796, train_loss=0.0529
+  scaling=0.201626, train_loss=0.0529
+  scaling=0.257354, train_loss=0.0529
+  scaling=0.27051, train_loss=0.0529
+  scaling=0.249224, train_loss=0.0529
+  scaling=0.244199, train_loss=0.0529
+  scaling=0.252329, train_loss=0.0529
+  scaling=0.254249, train_loss=0.0529
+  scaling=0.251143, train_loss=0.0529
+  scaling=0.253062, train_loss=0.0529
+[GRO] Epoch 35, train_loss=0.0529, validation_loss=0.0591, test_loss=0.0557 (-0.0000), train_acc=0.773, validation_acc=0.761, test_acc=0.761, scaling=0.2523
+Model after growing:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=10, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=10, out_features=14, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=14, out_features=37, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=37, out_features=10, use_bias=True)
+[FGD] Epoch 36, train_loss=0.0508, validation_loss=0.0567, test_loss=0.0535 (-0.0022), train_acc=0.778, validation_acc=0.772, test_acc=0.765, lr=0.0006658, rel_err=0.005, selected_layer=0
+[FGD-WARN] Epoch 36: learning-rate clipped on 3 batch(es)
+[FGD] Epoch 37, train_loss=0.0504, validation_loss=0.0563, test_loss=0.0531 (-0.0004), train_acc=0.779, validation_acc=0.773, test_acc=0.765, lr=0.0001563, rel_err=0.005, selected_layer=0
+[FGD] Epoch 38, train_loss=0.0500, validation_loss=0.0558, test_loss=0.0527 (-0.0004), train_acc=0.780, validation_acc=0.774, test_acc=0.767, lr=0.0001458, rel_err=0.005, selected_layer=0
+[FGD-WARN] Epoch 38: learning-rate clipped on 1 batch(es)
+[FGD] Epoch 39, train_loss=0.0498, validation_loss=0.0556, test_loss=0.0525 (-0.0002), train_acc=0.781, validation_acc=0.776, test_acc=0.768, lr=7.813e-05, rel_err=0.005, selected_layer=0
+[FGD] Epoch 40, train_loss=0.0497, validation_loss=0.0555, test_loss=0.0524 (-0.0001), train_acc=0.781, validation_acc=0.776, test_acc=0.770, lr=5.003e-05, rel_err=0.005, selected_layer=0
+[FGD-WARN] Epoch 40: learning-rate clipped on 5 batch(es)
+[FGD] Epoch 41, train_loss=0.0497, validation_loss=0.0555, test_loss=0.0524 (-0.0000), train_acc=0.781, validation_acc=0.776, test_acc=0.770, lr=6.074e-11, rel_err=0.005, selected_layer=0
+[FGD] Epoch 42, train_loss=0.0497, validation_loss=0.0555, test_loss=0.0524 (+0.0000), train_acc=0.781, validation_acc=0.776, test_acc=0.770, lr=9.491e-12, rel_err=0.005, selected_layer=0
+[FGD-WARN] Epoch 42: learning-rate clipped on 2 batch(es)
+[FGD] Epoch 43, train_loss=0.0497, validation_loss=0.0555, test_loss=0.0524 (-0.0000), train_acc=0.781, validation_acc=0.776, test_acc=0.770, lr=9.491e-12, rel_err=0.005, selected_layer=0
+[FGD] Epoch 44, train_loss=0.0497, validation_loss=0.0555, test_loss=0.0524 (-0.0000), train_acc=0.781, validation_acc=0.776, test_acc=0.770, lr=3.796e-12, rel_err=0.005, selected_layer=0
+[FGD] Epoch 45, train_loss=0.0497, validation_loss=0.0555, test_loss=0.0524 (+0.0000), train_acc=0.781, validation_acc=0.776, test_acc=0.770, lr=9.491e-12, rel_err=0.005, selected_layer=0
+[FGD] Epoch 46, train_loss=0.0497, validation_loss=0.0555, test_loss=0.0524 (+0.0000), train_acc=0.781, validation_acc=0.776, test_acc=0.770, lr=1.898e-12, rel_err=0.005, selected_layer=0
+[FGD] Epoch 47, train_loss=0.0497, validation_loss=0.0555, test_loss=0.0524 (+0.0000), train_acc=0.781, validation_acc=0.776, test_acc=0.770, lr=0, rel_err=0.005, selected_layer=0
+[FGD-WARN] Epoch 47: stationary-point bound failed; global-convergence bound failed; FGD conditions request growth
+[GRO] Growing layer 2 at epoch 47
+  scaling=0, train_loss=0.0497
+  scaling=1, train_loss=0.0499
+  scaling=0.381966, train_loss=0.0497
+  scaling=0.618034, train_loss=0.0497
+  scaling=0.236068, train_loss=0.0497
+  scaling=0.145898, train_loss=0.0497
+  scaling=0.0901699, train_loss=0.0497
+  scaling=0.0557281, train_loss=0.0497
+  scaling=0.0344419, train_loss=0.0497
+  scaling=0.0212862, train_loss=0.0497
+  scaling=0.0131556, train_loss=0.0497
+  scaling=0.00813062, train_loss=0.0497
+  scaling=0.0162612, train_loss=0.0497
+  scaling=0.0112362, train_loss=0.0497
+  scaling=0.0143419, train_loss=0.0497
+  scaling=0.0124225, train_loss=0.0497
+[GRO] Epoch 47, train_loss=0.0497, validation_loss=0.0555, test_loss=0.0524 (+0.0000), train_acc=0.781, validation_acc=0.776, test_acc=0.770, scaling=0
+Model after growing:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=10, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=10, out_features=14, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=14, out_features=46, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=46, out_features=10, use_bias=True)
+[FGD] Epoch 48, train_loss=0.0468, validation_loss=0.0520, test_loss=0.0492 (-0.0032), train_acc=0.793, validation_acc=0.791, test_acc=0.779, lr=0.00153, rel_err=0.005, selected_layer=0
+[FGD-WARN] Epoch 48: learning-rate clipped on 4 batch(es)
+[FGD] Epoch 49, train_loss=0.0467, validation_loss=0.0519, test_loss=0.0491 (-0.0001), train_acc=0.793, validation_acc=0.792, test_acc=0.780, lr=4.106e-05, rel_err=0.005, selected_layer=0
+[FGD-WARN] Epoch 49: learning-rate clipped on 8 batch(es)
+[FGD] Epoch 50, train_loss=0.0467, validation_loss=0.0519, test_loss=0.0491 (-0.0000), train_acc=0.793, validation_acc=0.792, test_acc=0.780, lr=3.796e-11, rel_err=0.005, selected_layer=0
+[FGD-WARN] Epoch 50: learning-rate clipped on 2 batch(es)
+[FGD] Epoch 51, train_loss=0.0467, validation_loss=0.0519, test_loss=0.0491 (+0.0000), train_acc=0.793, validation_acc=0.792, test_acc=0.780, lr=7.593e-12, rel_err=0.005, selected_layer=0
+[FGD] Epoch 52, train_loss=0.0467, validation_loss=0.0519, test_loss=0.0491 (+0.0000), train_acc=0.793, validation_acc=0.792, test_acc=0.780, lr=0, rel_err=0.005, selected_layer=0
+[FGD-WARN] Epoch 52: stationary-point bound failed; global-convergence bound failed; FGD conditions request growth
+[GRO] Growing layer 2 at epoch 52
+  scaling=0, train_loss=0.0467
+  scaling=1, train_loss=0.0468
+  scaling=0.381966, train_loss=0.0467
+  scaling=0.618034, train_loss=0.0467
+  scaling=0.236068, train_loss=0.0467
+  scaling=0.472136, train_loss=0.0467
+  scaling=0.326238, train_loss=0.0467
+  scaling=0.291796, train_loss=0.0467
+  scaling=0.347524, train_loss=0.0467
+  scaling=0.313082, train_loss=0.0467
+  scaling=0.304952, train_loss=0.0467
+  scaling=0.318107, train_loss=0.0467
+  scaling=0.321213, train_loss=0.0467
+  scaling=0.316188, train_loss=0.0467
+  scaling=0.319294, train_loss=0.0467
+  scaling=0.317374, train_loss=0.0467
+[GRO] Epoch 52, train_loss=0.0467, validation_loss=0.0518, test_loss=0.0491 (-0.0000), train_acc=0.793, validation_acc=0.792, test_acc=0.781, scaling=0.3181
+Model after growing:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=10, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=10, out_features=14, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=14, out_features=55, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=55, out_features=10, use_bias=True)
+[FGD] Epoch 53, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (-0.0003), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=0.000212, rel_err=0.005, selected_layer=0
+[FGD-WARN] Epoch 53: learning-rate clipped on 3 batch(es)
+[FGD] Epoch 54, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (-0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=5.589e-08, rel_err=0.005, selected_layer=0
+[FGD-WARN] Epoch 54: learning-rate clipped on 7 batch(es)
+[FGD] Epoch 55, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (-0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=4.176e-11, rel_err=0.005, selected_layer=0
+[FGD] Epoch 56, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (+0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=2.278e-11, rel_err=0.005, selected_layer=0
+[FGD] Epoch 57, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (+0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=2.658e-11, rel_err=0.005, selected_layer=0
+[FGD] Epoch 58, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (-0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=3.037e-11, rel_err=0.005, selected_layer=0
+[FGD] Epoch 59, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (+0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=1.519e-11, rel_err=0.005, selected_layer=0
+[FGD] Epoch 60, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (-0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=2.658e-11, rel_err=0.005, selected_layer=0
+[FGD] Epoch 61, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (-0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=1.519e-11, rel_err=0.005, selected_layer=0
+[FGD] Epoch 62, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (+0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=7.593e-12, rel_err=0.005, selected_layer=0
+[FGD] Epoch 63, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (-0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=2.278e-11, rel_err=0.005, selected_layer=0
+[FGD] Epoch 64, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (+0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=2.278e-11, rel_err=0.005, selected_layer=0
+[FGD] Epoch 65, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (-0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=7.593e-12, rel_err=0.005, selected_layer=0
+[FGD] Epoch 66, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (-0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=1.898e-11, rel_err=0.005, selected_layer=0
+[FGD] Epoch 67, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (+0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=2.278e-11, rel_err=0.005, selected_layer=0
+[FGD] Epoch 68, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (-0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=5.315e-11, rel_err=0.005, selected_layer=0
+[FGD] Epoch 69, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (+0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=3.037e-11, rel_err=0.005, selected_layer=0
+[FGD] Epoch 70, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (+0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=1.139e-11, rel_err=0.005, selected_layer=0
+[FGD-WARN] Epoch 70: learning-rate clipped on 1 batch(es)
+[FGD] Epoch 71, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (+0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=9.491e-12, rel_err=0.005, selected_layer=0
+[FGD] Epoch 72, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (+0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=9.491e-12, rel_err=0.005, selected_layer=0
+[FGD] Epoch 73, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (-0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=9.491e-12, rel_err=0.005, selected_layer=0
+[FGD] Epoch 74, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (+0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=1.898e-12, rel_err=0.005, selected_layer=0
+[FGD] Epoch 75, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (+0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=7.593e-12, rel_err=0.005, selected_layer=0
+[FGD] Epoch 76, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (-0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=7.593e-12, rel_err=0.005, selected_layer=0
+[FGD] Epoch 77, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (+0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=3.796e-12, rel_err=0.005, selected_layer=0
+[FGD] Epoch 78, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (-0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=9.491e-12, rel_err=0.005, selected_layer=0
+[FGD] Epoch 79, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (+0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=3.796e-12, rel_err=0.005, selected_layer=0
+[FGD] Epoch 80, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (+0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=1.898e-12, rel_err=0.005, selected_layer=0
+[FGD] Epoch 81, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (-0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=2.847e-12, rel_err=0.005, selected_layer=0
+[FGD-WARN] Epoch 81: learning-rate clipped on 1 batch(es)
+[FGD] Epoch 82, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (+0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=9.491e-13, rel_err=0.005, selected_layer=0
+[FGD] Epoch 83, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (+0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=1.898e-12, rel_err=0.005, selected_layer=0
+[FGD] Epoch 84, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (-0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=9.491e-13, rel_err=0.005, selected_layer=0
+[FGD] Epoch 85, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (+0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=1.898e-12, rel_err=0.005, selected_layer=0
+[FGD] Epoch 86, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (+0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=1.898e-12, rel_err=0.005, selected_layer=0
+[FGD] Epoch 87, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (+0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=1.898e-12, rel_err=0.005, selected_layer=0
+[FGD] Epoch 88, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (+0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, lr=0, rel_err=0.005, selected_layer=0
+[FGD-WARN] Epoch 88: stationary-point bound failed; global-convergence bound failed; FGD conditions request growth
+[GRO] Growing layer 2 at epoch 88
+  scaling=0, train_loss=0.0464
+  scaling=1, train_loss=0.0465
+  scaling=0.381966, train_loss=0.0464
+  scaling=0.618034, train_loss=0.0464
+  scaling=0.236068, train_loss=0.0464
+  scaling=0.145898, train_loss=0.0464
+  scaling=0.0901699, train_loss=0.0464
+  scaling=0.18034, train_loss=0.0464
+  scaling=0.201626, train_loss=0.0464
+  scaling=0.167184, train_loss=0.0464
+  scaling=0.159054, train_loss=0.0464
+  scaling=0.154029, train_loss=0.0464
+  scaling=0.162159, train_loss=0.0464
+  scaling=0.157134, train_loss=0.0464
+  scaling=0.16024, train_loss=0.0464
+  scaling=0.158321, train_loss=0.0464
+[GRO] Epoch 88, train_loss=0.0464, validation_loss=0.0516, test_loss=0.0488 (-0.0000), train_acc=0.793, validation_acc=0.794, test_acc=0.782, scaling=0.1591
+Model after growing:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=10, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=10, out_features=14, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=14, out_features=64, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=64, out_features=10, use_bias=True)
+[FGD] Epoch 89, train_loss=0.0444, validation_loss=0.0492, test_loss=0.0467 (-0.0021), train_acc=0.798, validation_acc=0.796, test_acc=0.788, lr=0.001078, rel_err=0.005, selected_layer=0
+[FGD-WARN] Epoch 89: learning-rate clipped on 2 batch(es)
+[FGD] Epoch 90, train_loss=0.0444, validation_loss=0.0491, test_loss=0.0467 (-0.0000), train_acc=0.798, validation_acc=0.796, test_acc=0.788, lr=1.953e-05, rel_err=0.005, selected_layer=0
+[FGD] Epoch 91, train_loss=0.0444, validation_loss=0.0491, test_loss=0.0467 (-0.0000), train_acc=0.798, validation_acc=0.796, test_acc=0.788, lr=1.953e-05, rel_err=0.005, selected_layer=0
+[FGD] Epoch 92, train_loss=0.0443, validation_loss=0.0491, test_loss=0.0467 (-0.0000), train_acc=0.799, validation_acc=0.796, test_acc=0.788, lr=4.584e-06, rel_err=0.005, selected_layer=0
+[FGD-WARN] Epoch 92: learning-rate clipped on 9 batch(es)
+[FGD] Epoch 93, train_loss=0.0443, validation_loss=0.0491, test_loss=0.0467 (+0.0000), train_acc=0.799, validation_acc=0.796, test_acc=0.788, lr=5.695e-12, rel_err=0.005, selected_layer=0
+[FGD] Epoch 94, train_loss=0.0443, validation_loss=0.0491, test_loss=0.0467 (+0.0000), train_acc=0.799, validation_acc=0.796, test_acc=0.788, lr=1.898e-12, rel_err=0.005, selected_layer=0
+[FGD] Epoch 95, train_loss=0.0443, validation_loss=0.0491, test_loss=0.0467 (+0.0000), train_acc=0.799, validation_acc=0.796, test_acc=0.788, lr=3.796e-12, rel_err=0.005, selected_layer=0
+[FGD] Epoch 96, train_loss=0.0443, validation_loss=0.0491, test_loss=0.0467 (-0.0000), train_acc=0.799, validation_acc=0.796, test_acc=0.788, lr=7.593e-12, rel_err=0.005, selected_layer=0
+[FGD] Epoch 97, train_loss=0.0443, validation_loss=0.0491, test_loss=0.0467 (+0.0000), train_acc=0.799, validation_acc=0.796, test_acc=0.788, lr=0, rel_err=0.005, selected_layer=0
+[FGD-WARN] Epoch 97: stationary-point bound failed; global-convergence bound failed; FGD conditions request growth
+[GRO] Growing layer 2 at epoch 97
+  scaling=0, train_loss=0.0443
+  scaling=1, train_loss=0.0444
+  scaling=0.381966, train_loss=0.0443
+  scaling=0.618034, train_loss=0.0443
+  scaling=0.236068, train_loss=0.0443
+  scaling=0.472136, train_loss=0.0443
+  scaling=0.326238, train_loss=0.0443
+  scaling=0.416408, train_loss=0.0443
+  scaling=0.437694, train_loss=0.0443
+  scaling=0.403252, train_loss=0.0443
+  scaling=0.424538, train_loss=0.0443
+  scaling=0.411383, train_loss=0.0443
+  scaling=0.408277, train_loss=0.0443
+  scaling=0.413302, train_loss=0.0443
+  scaling=0.414488, train_loss=0.0443
+  scaling=0.412569, train_loss=0.0443
+[GRO] Epoch 97, train_loss=0.0443, validation_loss=0.0490, test_loss=0.0467 (-0.0000), train_acc=0.799, validation_acc=0.796, test_acc=0.789, scaling=0.4133
+Model after growing:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=10, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=10, out_features=14, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=14, out_features=73, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=73, out_features=10, use_bias=True)
+[FGD] Epoch 98, train_loss=0.0436, validation_loss=0.0482, test_loss=0.0459 (-0.0008), train_acc=0.801, validation_acc=0.800, test_acc=0.793, lr=0.0006399, rel_err=0.005, selected_layer=0
+[FGD-WARN] Epoch 98: learning-rate clipped on 4 batch(es)
+[FGD] Epoch 99, train_loss=0.0435, validation_loss=0.0481, test_loss=0.0458 (-0.0001), train_acc=0.801, validation_acc=0.801, test_acc=0.793, lr=7.813e-05, rel_err=0.005, selected_layer=0
+[FGD] Epoch 100, train_loss=0.0434, validation_loss=0.0480, test_loss=0.0457 (-0.0001), train_acc=0.802, validation_acc=0.802, test_acc=0.793, lr=7.813e-05, rel_err=0.005, selected_layer=0
+[FGD] Epoch 101, train_loss=0.0433, validation_loss=0.0479, test_loss=0.0456 (-0.0001), train_acc=0.802, validation_acc=0.801, test_acc=0.794, lr=7.813e-05, rel_err=0.005, selected_layer=0
+[FGD] Epoch 102, train_loss=0.0432, validation_loss=0.0478, test_loss=0.0455 (-0.0000), train_acc=0.803, validation_acc=0.801, test_acc=0.794, lr=1.361e-05, rel_err=0.005, selected_layer=0
+[FGD-WARN] Epoch 102: learning-rate clipped on 5 batch(es)
+[FGD] Epoch 103, train_loss=0.0432, validation_loss=0.0478, test_loss=0.0455 (-0.0000), train_acc=0.803, validation_acc=0.801, test_acc=0.794, lr=7.213e-11, rel_err=0.005, selected_layer=0
+[FGD-WARN] Epoch 103: learning-rate clipped on 1 batch(es)
+[FGD] Epoch 104, train_loss=0.0432, validation_loss=0.0478, test_loss=0.0455 (+0.0000), train_acc=0.803, validation_acc=0.801, test_acc=0.794, lr=2.658e-11, rel_err=0.005, selected_layer=0
+[FGD] Epoch 105, train_loss=0.0432, validation_loss=0.0478, test_loss=0.0455 (+0.0000), train_acc=0.803, validation_acc=0.801, test_acc=0.794, lr=2.278e-11, rel_err=0.005, selected_layer=0
+[FGD] Epoch 106, train_loss=0.0432, validation_loss=0.0478, test_loss=0.0455 (-0.0000), train_acc=0.803, validation_acc=0.801, test_acc=0.794, lr=4.176e-11, rel_err=0.005, selected_layer=0
+[FGD] Epoch 107, train_loss=0.0432, validation_loss=0.0478, test_loss=0.0455 (-0.0000), train_acc=0.803, validation_acc=0.801, test_acc=0.794, lr=1.519e-11, rel_err=0.005, selected_layer=0
+[FGD] Epoch 108, train_loss=0.0432, validation_loss=0.0478, test_loss=0.0455 (+0.0000), train_acc=0.803, validation_acc=0.801, test_acc=0.794, lr=1.898e-11, rel_err=0.005, selected_layer=0
+[FGD] Epoch 109, train_loss=0.0432, validation_loss=0.0478, test_loss=0.0455 (+0.0000), train_acc=0.803, validation_acc=0.801, test_acc=0.794, lr=1.898e-11, rel_err=0.005, selected_layer=0
+[FGD] Epoch 110, train_loss=0.0432, validation_loss=0.0478, test_loss=0.0455 (+0.0000), train_acc=0.803, validation_acc=0.801, test_acc=0.794, lr=1.519e-11, rel_err=0.005, selected_layer=0
+[FGD-WARN] Epoch 110: learning-rate clipped on 1 batch(es)
+[FGD] Epoch 111, train_loss=0.0432, validation_loss=0.0478, test_loss=0.0455 (+0.0000), train_acc=0.803, validation_acc=0.801, test_acc=0.794, lr=0, rel_err=0.005, selected_layer=0
+[FGD-WARN] Epoch 111: stationary-point bound failed; global-convergence bound failed; FGD conditions request growth
+[GRO] Growing layer 2 at epoch 111
+  scaling=0, train_loss=0.0432
+  scaling=1, train_loss=0.0432
+  scaling=0.381966, train_loss=0.0432
+  scaling=0.618034, train_loss=0.0432
+  scaling=0.763932, train_loss=0.0432
+  scaling=0.854102, train_loss=0.0432
+  scaling=0.90983, train_loss=0.0432
+  scaling=0.944272, train_loss=0.0432
+  scaling=0.965558, train_loss=0.0432
+  scaling=0.978714, train_loss=0.0432
+  scaling=0.986844, train_loss=0.0432
+  scaling=0.991869, train_loss=0.0432
+  scaling=0.994975, train_loss=0.0432
+  scaling=0.996894, train_loss=0.0432
+  scaling=0.998081, train_loss=0.0432
+  scaling=0.998814, train_loss=0.0432
+[GRO] Epoch 111, train_loss=0.0432, validation_loss=0.0476, test_loss=0.0455 (-0.0001), train_acc=0.804, validation_acc=0.803, test_acc=0.795, scaling=1
+Model after growing:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=10, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=10, out_features=14, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=14, out_features=82, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=82, out_features=10, use_bias=True)
+[FGD] Epoch 112, train_loss=0.0423, validation_loss=0.0465, test_loss=0.0445 (-0.0010), train_acc=0.806, validation_acc=0.804, test_acc=0.797, lr=0.000834, rel_err=0.004, selected_layer=0
+[FGD-WARN] Epoch 112: learning-rate clipped on 3 batch(es)
+[FGD] Epoch 113, train_loss=0.0422, validation_loss=0.0464, test_loss=0.0443 (-0.0001), train_acc=0.806, validation_acc=0.805, test_acc=0.798, lr=7.962e-05, rel_err=0.004, selected_layer=0
+[FGD-WARN] Epoch 113: learning-rate clipped on 1 batch(es)
+[FGD] Epoch 114, train_loss=0.0421, validation_loss=0.0463, test_loss=0.0443 (-0.0001), train_acc=0.807, validation_acc=0.805, test_acc=0.798, lr=4.479e-05, rel_err=0.004, selected_layer=0
+[FGD-WARN] Epoch 114: learning-rate clipped on 2 batch(es)
+[FGD] Epoch 115, train_loss=0.0421, validation_loss=0.0463, test_loss=0.0443 (-0.0000), train_acc=0.807, validation_acc=0.805, test_acc=0.798, lr=2.832e-09, rel_err=0.004, selected_layer=0
+[FGD-WARN] Epoch 115: learning-rate clipped on 7 batch(es)
+[FGD] Epoch 116, train_loss=0.0421, validation_loss=0.0463, test_loss=0.0443 (-0.0000), train_acc=0.807, validation_acc=0.805, test_acc=0.798, lr=1.025e-10, rel_err=0.004, selected_layer=0
+[FGD-WARN] Epoch 116: learning-rate clipped on 1 batch(es)
+[FGD] Epoch 117, train_loss=0.0421, validation_loss=0.0463, test_loss=0.0443 (+0.0000), train_acc=0.807, validation_acc=0.805, test_acc=0.798, lr=2.278e-11, rel_err=0.004, selected_layer=0
+[FGD] Epoch 118, train_loss=0.0421, validation_loss=0.0463, test_loss=0.0443 (-0.0000), train_acc=0.807, validation_acc=0.805, test_acc=0.798, lr=1.519e-11, rel_err=0.004, selected_layer=0
+[FGD] Epoch 119, train_loss=0.0421, validation_loss=0.0463, test_loss=0.0443 (+0.0000), train_acc=0.807, validation_acc=0.805, test_acc=0.798, lr=2.658e-11, rel_err=0.004, selected_layer=0
+[FGD] Epoch 120, train_loss=0.0421, validation_loss=0.0463, test_loss=0.0443 (+0.0000), train_acc=0.807, validation_acc=0.805, test_acc=0.798, lr=1.898e-11, rel_err=0.004, selected_layer=0
+[FGD] Epoch 121, train_loss=0.0421, validation_loss=0.0463, test_loss=0.0443 (+0.0000), train_acc=0.807, validation_acc=0.805, test_acc=0.798, lr=1.329e-11, rel_err=0.004, selected_layer=0
+[FGD-WARN] Epoch 121: learning-rate clipped on 1 batch(es)
+[FGD] Epoch 122, train_loss=0.0421, validation_loss=0.0463, test_loss=0.0443 (+0.0000), train_acc=0.807, validation_acc=0.805, test_acc=0.798, lr=0, rel_err=0.004, selected_layer=0
+[FGD-WARN] Epoch 122: stationary-point bound failed; global-convergence bound failed; FGD conditions request growth
+[GRO] Growing layer 2 at epoch 122
+  scaling=0, train_loss=0.0421
+  scaling=1, train_loss=0.0421
+  scaling=0.381966, train_loss=0.0421
+  scaling=0.618034, train_loss=0.0421
+  scaling=0.763932, train_loss=0.0421
+  scaling=0.854102, train_loss=0.0421
+  scaling=0.90983, train_loss=0.0421
+  scaling=0.81966, train_loss=0.0421
+  scaling=0.875388, train_loss=0.0421
+  scaling=0.840946, train_loss=0.0421
+  scaling=0.832816, train_loss=0.0421
+  scaling=0.845971, train_loss=0.0421
+  scaling=0.837841, train_loss=0.0421
+  scaling=0.842866, train_loss=0.0421
+  scaling=0.83976, train_loss=0.0421
+  scaling=0.841679, train_loss=0.0421
+[GRO] Epoch 122, train_loss=0.0421, validation_loss=0.0462, test_loss=0.0443 (-0.0000), train_acc=0.807, validation_acc=0.806, test_acc=0.797, scaling=0.8409
+Model after growing:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=10, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=10, out_features=14, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=14, out_features=90, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=90, out_features=10, use_bias=True)
+[FGD] Epoch 123, train_loss=0.0414, validation_loss=0.0455, test_loss=0.0435 (-0.0007), train_acc=0.810, validation_acc=0.808, test_acc=0.801, lr=0.0005235, rel_err=0.004, selected_layer=0
+[FGD-WARN] Epoch 123: learning-rate clipped on 4 batch(es)
+[FGD] Epoch 124, train_loss=0.0412, validation_loss=0.0452, test_loss=0.0433 (-0.0003), train_acc=0.810, validation_acc=0.809, test_acc=0.802, lr=0.0001957, rel_err=0.004, selected_layer=0
+[FGD-WARN] Epoch 124: learning-rate clipped on 3 batch(es)
+[FGD] Epoch 125, train_loss=0.0412, validation_loss=0.0452, test_loss=0.0433 (-0.0000), train_acc=0.810, validation_acc=0.809, test_acc=0.802, lr=4.996e-06, rel_err=0.004, selected_layer=0
+[FGD-WARN] Epoch 125: learning-rate clipped on 4 batch(es)
+[FGD] Epoch 126, train_loss=0.0412, validation_loss=0.0452, test_loss=0.0433 (+0.0000), train_acc=0.810, validation_acc=0.809, test_acc=0.802, lr=4.176e-11, rel_err=0.004, selected_layer=0
+[FGD-WARN] Epoch 126: learning-rate clipped on 1 batch(es)
+[FGD] Epoch 127, train_loss=0.0412, validation_loss=0.0452, test_loss=0.0433 (-0.0000), train_acc=0.810, validation_acc=0.809, test_acc=0.802, lr=2.658e-11, rel_err=0.004, selected_layer=0
+[FGD] Epoch 128, train_loss=0.0412, validation_loss=0.0452, test_loss=0.0433 (-0.0000), train_acc=0.810, validation_acc=0.809, test_acc=0.802, lr=1.519e-11, rel_err=0.004, selected_layer=0
+[FGD] Epoch 129, train_loss=0.0412, validation_loss=0.0452, test_loss=0.0433 (+0.0000), train_acc=0.810, validation_acc=0.809, test_acc=0.802, lr=1.519e-11, rel_err=0.004, selected_layer=0
+[FGD] Epoch 130, train_loss=0.0412, validation_loss=0.0452, test_loss=0.0433 (+0.0000), train_acc=0.810, validation_acc=0.809, test_acc=0.802, lr=1.519e-11, rel_err=0.004, selected_layer=0
+[FGD] Epoch 131, train_loss=0.0412, validation_loss=0.0452, test_loss=0.0433 (-0.0000), train_acc=0.810, validation_acc=0.809, test_acc=0.802, lr=1.519e-11, rel_err=0.004, selected_layer=0
+[FGD] Epoch 132, train_loss=0.0412, validation_loss=0.0452, test_loss=0.0433 (+0.0000), train_acc=0.810, validation_acc=0.809, test_acc=0.802, lr=1.898e-11, rel_err=0.004, selected_layer=0
+[FGD] Epoch 133, train_loss=0.0412, validation_loss=0.0452, test_loss=0.0433 (+0.0000), train_acc=0.810, validation_acc=0.809, test_acc=0.802, lr=2.278e-11, rel_err=0.004, selected_layer=0
+[FGD-WARN] Epoch 133: learning-rate clipped on 1 batch(es)
+[FGD] Epoch 134, train_loss=0.0412, validation_loss=0.0452, test_loss=0.0433 (+0.0000), train_acc=0.810, validation_acc=0.809, test_acc=0.802, lr=9.491e-13, rel_err=0.004, selected_layer=0
+[FGD-WARN] Epoch 134: learning-rate clipped on 1 batch(es)
+[FGD] Epoch 135, train_loss=0.0412, validation_loss=0.0452, test_loss=0.0433 (+0.0000), train_acc=0.810, validation_acc=0.809, test_acc=0.802, lr=0, rel_err=0.004, selected_layer=0
+[FGD-WARN] Epoch 135: stationary-point bound failed; global-convergence bound failed; FGD conditions request growth
+[GRO] Growing layer 2 at epoch 135
+  scaling=0, train_loss=0.0412
+  scaling=1, train_loss=0.0412
+  scaling=0.381966, train_loss=0.0412
+  scaling=0.618034, train_loss=0.0412
+  scaling=0.236068, train_loss=0.0412
+  scaling=0.472136, train_loss=0.0412
+  scaling=0.326238, train_loss=0.0412
+  scaling=0.291796, train_loss=0.0412
+  scaling=0.347524, train_loss=0.0412
+  scaling=0.313082, train_loss=0.0412
+  scaling=0.304952, train_loss=0.0412
+  scaling=0.318107, train_loss=0.0412
+  scaling=0.309977, train_loss=0.0412
+  scaling=0.315002, train_loss=0.0412
+  scaling=0.311896, train_loss=0.0412
+  scaling=0.313815, train_loss=0.0412
+[GRO] Epoch 135, train_loss=0.0412, validation_loss=0.0452, test_loss=0.0433 (-0.0000), train_acc=0.811, validation_acc=0.809, test_acc=0.802, scaling=0.3262
+Model after growing:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=10, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=10, out_features=14, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=14, out_features=98, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=98, out_features=10, use_bias=True)
+[FGD] Epoch 136, train_loss=0.0397, validation_loss=0.0438, test_loss=0.0418 (-0.0015), train_acc=0.818, validation_acc=0.816, test_acc=0.803, lr=0.001607, rel_err=0.004, selected_layer=0
+[FGD-WARN] Epoch 136: learning-rate clipped on 3 batch(es)
+[FGD] Epoch 137, train_loss=0.0396, validation_loss=0.0437, test_loss=0.0417 (-0.0001), train_acc=0.819, validation_acc=0.816, test_acc=0.803, lr=8.882e-05, rel_err=0.004, selected_layer=0
+[FGD-WARN] Epoch 137: learning-rate clipped on 2 batch(es)
+[FGD] Epoch 138, train_loss=0.0396, validation_loss=0.0437, test_loss=0.0417 (-0.0000), train_acc=0.819, validation_acc=0.816, test_acc=0.803, lr=9.739e-06, rel_err=0.004, selected_layer=0
+[FGD-WARN] Epoch 138: learning-rate clipped on 7 batch(es)
+[FGD] Epoch 139, train_loss=0.0396, validation_loss=0.0437, test_loss=0.0417 (-0.0000), train_acc=0.819, validation_acc=0.816, test_acc=0.803, lr=6.834e-11, rel_err=0.004, selected_layer=0
+[FGD-WARN] Epoch 139: learning-rate clipped on 1 batch(es)
+[FGD] Epoch 140, train_loss=0.0396, validation_loss=0.0437, test_loss=0.0417 (-0.0000), train_acc=0.819, validation_acc=0.816, test_acc=0.803, lr=1.898e-11, rel_err=0.004, selected_layer=0
+[FGD] Epoch 141, train_loss=0.0396, validation_loss=0.0437, test_loss=0.0417 (+0.0000), train_acc=0.819, validation_acc=0.816, test_acc=0.803, lr=1.898e-11, rel_err=0.004, selected_layer=0
+[FGD] Epoch 142, train_loss=0.0396, validation_loss=0.0437, test_loss=0.0417 (+0.0000), train_acc=0.819, validation_acc=0.816, test_acc=0.803, lr=7.593e-12, rel_err=0.004, selected_layer=0
+[FGD] Epoch 143, train_loss=0.0396, validation_loss=0.0437, test_loss=0.0417 (-0.0000), train_acc=0.819, validation_acc=0.816, test_acc=0.803, lr=7.593e-12, rel_err=0.004, selected_layer=0
+[FGD] Epoch 144, train_loss=0.0396, validation_loss=0.0437, test_loss=0.0417 (+0.0000), train_acc=0.819, validation_acc=0.816, test_acc=0.803, lr=1.139e-11, rel_err=0.004, selected_layer=0
+[FGD] Epoch 145, train_loss=0.0396, validation_loss=0.0437, test_loss=0.0417 (-0.0000), train_acc=0.819, validation_acc=0.816, test_acc=0.803, lr=1.614e-11, rel_err=0.004, selected_layer=0
+[FGD-WARN] Epoch 145: learning-rate clipped on 1 batch(es)
+[FGD] Epoch 146, train_loss=0.0396, validation_loss=0.0437, test_loss=0.0417 (+0.0000), train_acc=0.819, validation_acc=0.816, test_acc=0.803, lr=0, rel_err=0.004, selected_layer=0
+[FGD-WARN] Epoch 146: stationary-point bound failed; global-convergence bound failed; FGD conditions request growth
+[GRO] Growing layer 2 at epoch 146
+  scaling=0, train_loss=0.0396
+  scaling=1, train_loss=0.0396
+  scaling=0.381966, train_loss=0.0396
+  scaling=0.618034, train_loss=0.0396
+  scaling=0.763932, train_loss=0.0396
+  scaling=0.854102, train_loss=0.0396
+  scaling=0.90983, train_loss=0.0396
+  scaling=0.944272, train_loss=0.0396
+  scaling=0.965558, train_loss=0.0396
+  scaling=0.978714, train_loss=0.0396
+  scaling=0.986844, train_loss=0.0396
+  scaling=0.991869, train_loss=0.0396
+  scaling=0.994975, train_loss=0.0396
+  scaling=0.98995, train_loss=0.0396
+  scaling=0.988764, train_loss=0.0396
+  scaling=0.990683, train_loss=0.0396
+[GRO] Epoch 146, train_loss=0.0396, validation_loss=0.0436, test_loss=0.0416 (-0.0000), train_acc=0.817, validation_acc=0.815, test_acc=0.805, scaling=1
+Model after growing:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=10, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=10, out_features=14, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=14, out_features=105, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=105, out_features=10, use_bias=True)
+[FGD] Epoch 147, train_loss=0.0390, validation_loss=0.0430, test_loss=0.0412 (-0.0005), train_acc=0.820, validation_acc=0.818, test_acc=0.808, lr=0.0005454, rel_err=0.004, selected_layer=0
+[FGD-WARN] Epoch 147: learning-rate clipped on 3 batch(es)
+[FGD] Epoch 148, train_loss=0.0389, validation_loss=0.0428, test_loss=0.0410 (-0.0001), train_acc=0.820, validation_acc=0.819, test_acc=0.808, lr=0.0001242, rel_err=0.004, selected_layer=0
+[FGD-WARN] Epoch 148: learning-rate clipped on 2 batch(es)
+[FGD] Epoch 149, train_loss=0.0389, validation_loss=0.0428, test_loss=0.0410 (-0.0000), train_acc=0.821, validation_acc=0.819, test_acc=0.807, lr=3.906e-05, rel_err=0.004, selected_layer=0
+[FGD] Epoch 150, train_loss=0.0388, validation_loss=0.0428, test_loss=0.0410 (-0.0000), train_acc=0.821, validation_acc=0.819, test_acc=0.807, lr=3.86e-05, rel_err=0.004, selected_layer=0
+[FGD-WARN] Epoch 150: learning-rate clipped on 1 batch(es)
+[FGD] Epoch 151, train_loss=0.0388, validation_loss=0.0428, test_loss=0.0410 (-0.0000), train_acc=0.821, validation_acc=0.819, test_acc=0.807, lr=2.149e-08, rel_err=0.004, selected_layer=0
+[FGD-WARN] Epoch 151: learning-rate clipped on 7 batch(es)
+[FGD] Epoch 152, train_loss=0.0388, validation_loss=0.0428, test_loss=0.0410 (+0.0000), train_acc=0.821, validation_acc=0.819, test_acc=0.807, lr=3.796e-12, rel_err=0.004, selected_layer=0
+[FGD] Epoch 153, train_loss=0.0388, validation_loss=0.0428, test_loss=0.0410 (+0.0000), train_acc=0.821, validation_acc=0.819, test_acc=0.807, lr=7.593e-12, rel_err=0.004, selected_layer=0
+[FGD] Epoch 154, train_loss=0.0388, validation_loss=0.0428, test_loss=0.0410 (+0.0000), train_acc=0.821, validation_acc=0.819, test_acc=0.807, lr=0, rel_err=0.004, selected_layer=0
+[FGD-WARN] Epoch 154: stationary-point bound failed; global-convergence bound failed; FGD conditions request growth
+[GRO] Growing layer 1 at epoch 154
+  scaling=0, train_loss=0.0388
+  scaling=1, train_loss=0.0805
+  scaling=0.381966, train_loss=0.0395
+  scaling=0.618034, train_loss=0.0449
+  scaling=0.236068, train_loss=0.0388
+  scaling=0.145898, train_loss=0.0388
+  scaling=0.0901699, train_loss=0.0388
+  scaling=0.18034, train_loss=0.0388
+  scaling=0.201626, train_loss=0.0388
+  scaling=0.167184, train_loss=0.0388
+  scaling=0.159054, train_loss=0.0388
+  scaling=0.172209, train_loss=0.0388
+  scaling=0.164079, train_loss=0.0388
+  scaling=0.169104, train_loss=0.0388
+  scaling=0.17029, train_loss=0.0388
+  scaling=0.171023, train_loss=0.0388
+[GRO] Epoch 154, train_loss=0.0388, validation_loss=0.0427, test_loss=0.0409 (-0.0001), train_acc=0.823, validation_acc=0.822, test_acc=0.810, scaling=0.1703
+Model after growing:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=10, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=10, out_features=23, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=23, out_features=105, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=105, out_features=10, use_bias=True)
+[FGD] Epoch 155, train_loss=0.0369, validation_loss=0.0408, test_loss=0.0393 (-0.0016), train_acc=0.831, validation_acc=0.827, test_acc=0.815, lr=0.002978, rel_err=0.003, selected_layer=0
+[FGD-WARN] Epoch 155: learning-rate clipped on 5 batch(es)
+[FGD] Epoch 156, train_loss=0.0368, validation_loss=0.0407, test_loss=0.0392 (-0.0001), train_acc=0.831, validation_acc=0.828, test_acc=0.814, lr=0.0001548, rel_err=0.003, selected_layer=0
+[FGD-WARN] Epoch 156: learning-rate clipped on 1 batch(es)
+[FGD] Epoch 157, train_loss=0.0367, validation_loss=0.0407, test_loss=0.0391 (-0.0001), train_acc=0.832, validation_acc=0.828, test_acc=0.814, lr=7.813e-05, rel_err=0.003, selected_layer=0
+[FGD] Epoch 158, train_loss=0.0367, validation_loss=0.0407, test_loss=0.0391 (-0.0000), train_acc=0.832, validation_acc=0.828, test_acc=0.814, lr=2.73e-06, rel_err=0.003, selected_layer=0
+[FGD-WARN] Epoch 158: learning-rate clipped on 12 batch(es)
+[FGD] Epoch 159, train_loss=0.0367, validation_loss=0.0407, test_loss=0.0391 (-0.0000), train_acc=0.832, validation_acc=0.828, test_acc=0.814, lr=6.074e-11, rel_err=0.003, selected_layer=0
+[FGD-WARN] Epoch 159: learning-rate clipped on 1 batch(es)
+[FGD] Epoch 160, train_loss=0.0367, validation_loss=0.0407, test_loss=0.0391 (+0.0000), train_acc=0.832, validation_acc=0.828, test_acc=0.814, lr=2.658e-11, rel_err=0.003, selected_layer=0
+[FGD] Epoch 161, train_loss=0.0367, validation_loss=0.0407, test_loss=0.0391 (-0.0000), train_acc=0.832, validation_acc=0.828, test_acc=0.814, lr=2.658e-11, rel_err=0.003, selected_layer=0
+[FGD] Epoch 162, train_loss=0.0367, validation_loss=0.0407, test_loss=0.0391 (+0.0000), train_acc=0.832, validation_acc=0.828, test_acc=0.814, lr=2.373e-11, rel_err=0.003, selected_layer=0
+[FGD-WARN] Epoch 162: learning-rate clipped on 1 batch(es)
+[FGD] Epoch 163, train_loss=0.0367, validation_loss=0.0407, test_loss=0.0391 (+0.0000), train_acc=0.832, validation_acc=0.828, test_acc=0.814, lr=9.491e-13, rel_err=0.003, selected_layer=0

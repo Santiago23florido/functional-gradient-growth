@@ -1,25 +1,22 @@
 run:
-  name: fgd_tangent_projection
+  name: cifar10_fgd_grow_3x25_gray
   results_dir: results
   save_plot: false
   show_plot: false
 
 data:
-  kind: smooth_sin
-  in_features: 10
-  out_features: 3
-  train_batches: 10
-  validation_batches: 10
-  test_batches: 1
-  batch_size: 512
+  kind: cifar10
+  in_features: 1024
+  out_features: 10
+  data_dir:
+  batch_size: 256
   train_seed: 0
   validation_seed: 2
   test_seed: 1
-  active_features: 5
-  frequency: 1.5
-  phase_shift: 0.5
-  interaction_strength: 0.25
-  linear_strength: 0.1
+  cifar_grayscale: true
+  cifar_train_samples: 5000
+  cifar_validation_samples: 1000
+  cifar_test_samples: 1000
 
 model:
   hidden_size: 2
@@ -31,7 +28,7 @@ training:
   epochs: 1000
   accuracy_tolerance: 0.1
   gradient_clip_norm:
-  log_every: 10
+  log_every: 1
   device: auto
 
 optimizer:

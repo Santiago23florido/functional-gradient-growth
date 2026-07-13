@@ -102,6 +102,7 @@ class WandbRunLogger:
         self._run.define_metric("epoch")
         for pattern in (
             "train/*",
+            "validation/*",
             "test/*",
             "optimizer/*",
             "model/*",
@@ -138,6 +139,14 @@ class WandbRunLogger:
         if learning_rate_upper_bound is not None:
             payload["fgd/learning_rate_upper_bound"] = learning_rate_upper_bound
 
+        max_valid_learning_rate = getattr(
+            entry,
+            "fgd_max_valid_learning_rate",
+            None,
+        )
+        if max_valid_learning_rate is not None:
+            payload["fgd/max_valid_learning_rate"] = max_valid_learning_rate
+
         learning_rate_interval_valid = getattr(
             entry,
             "fgd_learning_rate_interval_valid",
@@ -158,7 +167,7 @@ class WandbRunLogger:
 
         loss_descent_valid = getattr(entry, "fgd_loss_descent_valid", None)
         if loss_descent_valid is not None:
-            payload["fgd/loss_descent_valid"] = loss_descent_valid
+            payload["fgd/validation_loss_descent_valid"] = loss_descent_valid
 
         for attribute_name, metric_name in (
             ("fgd_gradient_sq_norm", "fgd/gradient_sq_norm"),
@@ -206,13 +215,15 @@ class WandbRunLogger:
             )
 
         if fgd_payload_active:
-            payload["fgd/learning_rate_clipped_batches"] = getattr(
+            payload["fgd/learning_rate_clipped_by_validation"] = bool(
+                getattr(entry, "fgd_learning_rate_clipped_batches", 0)
+            )
+            payload["fgd/validation_rejected_batches"] = getattr(
                 entry,
-                "fgd_learning_rate_clipped_batches",
+                "fgd_skipped_batches",
                 0,
             )
-            payload["fgd/skipped_batches"] = getattr(entry, "fgd_skipped_batches", 0)
-            payload["fgd/loss_non_descent_batches"] = getattr(
+            payload["fgd/validation_loss_non_descent_epochs"] = getattr(
                 entry,
                 "fgd_loss_non_descent_batches",
                 0,
@@ -223,6 +234,14 @@ class WandbRunLogger:
             payload["fgd/sensor_invalid_batches"] = getattr(
                 entry,
                 "fgd_sensor_invalid_batches",
+                0,
+            )
+            candidate_accepted = getattr(entry, "fgd_candidate_accepted", None)
+            if candidate_accepted is not None:
+                payload["fgd/candidate_accepted"] = candidate_accepted
+            payload["fgd/lr_search_trials"] = getattr(
+                entry,
+                "fgd_lr_search_trials",
                 0,
             )
 
