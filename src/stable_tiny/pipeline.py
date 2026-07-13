@@ -23,10 +23,12 @@ from stable_tiny.fgd_approx import (
     FGDLayerRelError,
     FGDOutputRelError,
     FGDValidationCertificate,
+    SecantFGDConfig,
     _clear_inaccessible_tensor_caches,
     batch_functional_mse_loss,
     evaluate_fgd_validation_certificate,
-    select_certifying_growth_layer_index,
+    evaluate_secant_validation_certificate,
+    mse_functional_gradient,
     select_tiny_growth_layer_index,
     should_trigger_fgd_growth,
     tiny_optimal_update_kwargs,
@@ -62,7 +64,7 @@ from gromo.containers.growing_mlp import GrowingMLP
 
 ProgressFn = Callable[[str], None]
 TrainingMethod = Literal["normal", "fgd_approx"]
-StepType = Literal["INIT", "SGD", "FGD", "GRO"]
+StepType = Literal["INIT", "SGD", "FGD", "SEC", "GRO"]
 DataKind = Literal["multi_sin", "smooth_sin", "cifar10", "mnist"]
 
 
@@ -126,6 +128,7 @@ class PipelineConfig:
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     lr_scheduler: LRSchedulerConfig = field(default_factory=LRSchedulerConfig)
     fgd_approx: FGDApproxConfig = field(default_factory=FGDApproxConfig)
+    secant_fgd: SecantFGDConfig = field(default_factory=SecantFGDConfig)
     scaling_line_search: ScalingLineSearchConfig = field(
         default_factory=ScalingLineSearchConfig
     )
@@ -173,6 +176,11 @@ class HistoryEntry:
     fgd_sensor_invalid_batches: int = 0
     fgd_candidate_accepted: bool | None = None
     fgd_lr_search_trials: int = 0
+    fgd_approximation_kind: str | None = None
+    fgd_secant_attempted: bool = False
+    fgd_secant_accepted: bool | None = None
+    fgd_secant_trials: int = 0
+    fgd_growth_probe_improved: bool | None = None
 
 
 @dataclass
@@ -218,6 +226,14 @@ class _FGDSearchResult:
     sensor_failure: bool
 
 
+@dataclass(frozen=True)
+class _GrowthProbe:
+    model: GrowingMLP
+    result: GrowthResult
+    certificate: FGDValidationCertificate
+    improves_fgd: bool
+
+
 def _section_dataclass(
     section_name: str,
     section_type: type,
@@ -259,6 +275,7 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         "optimizer",
         "lr_scheduler",
         "fgd_approx",
+        "secant_fgd",
         "scaling_line_search",
         "growth_schedule",
         "wandb",
@@ -276,6 +293,7 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         optimizer=_section_dataclass("optimizer", OptimizerConfig, raw),
         lr_scheduler=_section_dataclass("lr_scheduler", LRSchedulerConfig, raw),
         fgd_approx=_section_dataclass("fgd_approx", FGDApproxConfig, raw),
+        secant_fgd=_section_dataclass("secant_fgd", SecantFGDConfig, raw),
         scaling_line_search=_section_dataclass(
             "scaling_line_search",
             ScalingLineSearchConfig,
@@ -541,48 +559,21 @@ def certified_validation_learning_rate(
     return learning_rate
 
 
-def _evaluate_fgd_trial(
+def _certify_fgd_candidate(
     *,
-    base_model: GrowingMLP,
-    train_batches: list[tuple[torch.Tensor, torch.Tensor]],
-    test_loader: torch.utils.data.DataLoader,
+    candidate_model: GrowingMLP,
+    epoch_result: FGDApproxEpochResult,
+    certificate: FGDValidationCertificate,
     validation_loader: torch.utils.data.DataLoader,
-    loss_function: torch.nn.Module,
     device: torch.device,
-    learning_rate: float,
-    accuracy_tolerance: float,
     config: PipelineConfig,
-    projection_group_size: int,
-    classification: bool,
     theory_state: _FGDTheoryState,
     initial_functional_gap: float,
     theory_loss_star: float,
 ) -> _FGDTrial:
-    """Train a disposable model and certify every condition on validation."""
-    trial_model = copy.deepcopy(base_model)
-    epoch_result = train_one_epoch_fgd_approx(
-        model=trial_model,
-        train_loader=train_batches,
-        test_loader=test_loader,
-        loss_function=loss_function,
-        device=device,
-        learning_rate=learning_rate,
-        accuracy_tolerance=accuracy_tolerance,
-        config=config.fgd_approx,
-        projection_group_size=projection_group_size,
-        classification=classification,
-        evaluate_test=False,
-    )
-    certificate = evaluate_fgd_validation_certificate(
-        model=trial_model,
-        data_loader=validation_loader,
-        device=device,
-        config=config.fgd_approx,
-        learning_rate=epoch_result.min_positive_learning_rate,
-        projection_group_size=projection_group_size,
-    )
+    """Evaluate accumulated FGD conditions for a realizable candidate."""
     validation_functional_loss = evaluate_functional_loss(
-        trial_model,
+        candidate_model,
         validation_loader,
         device,
     )
@@ -683,7 +674,7 @@ def _evaluate_fgd_trial(
         and global_bound_valid is True
     )
     return _FGDTrial(
-        model=trial_model,
+        model=candidate_model,
         epoch_result=epoch_result,
         certificate=certificate,
         theory_state=updated_state,
@@ -695,6 +686,183 @@ def _evaluate_fgd_trial(
         global_bound_valid=global_bound_valid,
         global_contraction=global_contraction,
         all_conditions_valid=all_conditions_valid,
+    )
+
+
+def _evaluate_fgd_trial(
+    *,
+    base_model: GrowingMLP,
+    train_batches: list[tuple[torch.Tensor, torch.Tensor]],
+    test_loader: torch.utils.data.DataLoader,
+    validation_loader: torch.utils.data.DataLoader,
+    loss_function: torch.nn.Module,
+    device: torch.device,
+    learning_rate: float,
+    accuracy_tolerance: float,
+    config: PipelineConfig,
+    projection_group_size: int,
+    classification: bool,
+    theory_state: _FGDTheoryState,
+    initial_functional_gap: float,
+    theory_loss_star: float,
+) -> _FGDTrial:
+    """Train a disposable model and certify every condition on validation."""
+    trial_model = copy.deepcopy(base_model)
+    epoch_result = train_one_epoch_fgd_approx(
+        model=trial_model,
+        train_loader=train_batches,
+        test_loader=test_loader,
+        loss_function=loss_function,
+        device=device,
+        learning_rate=learning_rate,
+        accuracy_tolerance=accuracy_tolerance,
+        config=config.fgd_approx,
+        projection_group_size=projection_group_size,
+        classification=classification,
+        evaluate_test=False,
+    )
+    certificate = evaluate_fgd_validation_certificate(
+        model=trial_model,
+        data_loader=validation_loader,
+        device=device,
+        config=config.fgd_approx,
+        learning_rate=epoch_result.min_positive_learning_rate,
+        projection_group_size=projection_group_size,
+    )
+    return _certify_fgd_candidate(
+        candidate_model=trial_model,
+        epoch_result=epoch_result,
+        certificate=certificate,
+        validation_loader=validation_loader,
+        device=device,
+        config=config,
+        theory_state=theory_state,
+        initial_functional_gap=initial_functional_gap,
+        theory_loss_star=theory_loss_star,
+    )
+
+
+def _evaluate_secant_fgd_trial(
+    *,
+    base_model: GrowingMLP,
+    train_batches: list[tuple[torch.Tensor, torch.Tensor]],
+    validation_loader: torch.utils.data.DataLoader,
+    loss_function: torch.nn.Module,
+    device: torch.device,
+    learning_rate: float,
+    accuracy_tolerance: float,
+    config: PipelineConfig,
+    projection_group_size: int,
+    classification: bool,
+    theory_state: _FGDTheoryState,
+    initial_functional_gap: float,
+    theory_loss_star: float,
+) -> _FGDTrial:
+    """Fit a finite Hilbert secant with the current fixed architecture."""
+    trial_model = copy.deepcopy(base_model)
+    base_model.eval()
+    trial_model.train()
+    base_parameters = {
+        name: parameter.detach().clone()
+        for name, parameter in base_model.named_parameters()
+    }
+    optimizer = torch.optim.Adam(
+        trial_model.parameters(),
+        lr=config.secant_fgd.inner_learning_rate,
+    )
+    numerical_failure = False
+
+    for _ in range(max(1, config.secant_fgd.inner_steps)):
+        for x, y in train_batches:
+            x = x.to(device)
+            y = y.to(device)
+            with torch.no_grad():
+                base_output = base_model(x)
+                functional_gradient = mse_functional_gradient(base_output, y)
+                functional_target = (
+                    base_output - learning_rate * functional_gradient
+                )
+
+            optimizer.zero_grad(set_to_none=True)
+            candidate_output = trial_model(x)
+            objective = torch.mean((candidate_output - functional_target) ** 2)
+            if config.secant_fgd.parameter_penalty > 0.0:
+                penalty = torch.zeros((), device=device)
+                for name, parameter in trial_model.named_parameters():
+                    penalty = penalty + torch.mean(
+                        (parameter - base_parameters[name]) ** 2
+                    )
+                objective = (
+                    objective
+                    + config.secant_fgd.parameter_penalty * penalty
+                )
+            if not torch.isfinite(objective):
+                numerical_failure = True
+                break
+            objective.backward()
+            gradient_clip_norm = config.secant_fgd.gradient_clip_norm
+            if gradient_clip_norm is not None and gradient_clip_norm > 0.0:
+                torch.nn.utils.clip_grad_norm_(
+                    trial_model.parameters(),
+                    gradient_clip_norm,
+                )
+            optimizer.step()
+        if numerical_failure:
+            break
+
+    train_metrics = evaluate_regression_metrics(
+        trial_model,
+        train_batches,
+        loss_function,
+        device=device,
+        accuracy_tolerance=accuracy_tolerance,
+        classification=classification,
+    )
+    epoch_result = FGDApproxEpochResult(
+        train_loss=train_metrics.loss,
+        train_accuracy=train_metrics.accuracy,
+        test_loss=float("nan"),
+        test_accuracy=float("nan"),
+        learning_rate=learning_rate,
+        next_learning_rate=None,
+        learning_rate_upper_bound=None,
+        learning_rate_interval_valid=None,
+        learning_rate_clipped_batches=0,
+        skipped_batches=int(numerical_failure),
+        relative_error_condition_valid=None,
+        loss_descent_valid=None,
+        loss_non_descent_batches=0,
+        gradient_sq_norm=None,
+        theory_descent_coefficient=None,
+        min_positive_learning_rate=(
+            None if numerical_failure else learning_rate
+        ),
+        relative_error=None,
+        selected_layer_index=None,
+        layer_relative_errors=[],
+        output_relative_error=None,
+        sensor_valid=not numerical_failure,
+        sensor_invalid_batches=int(numerical_failure),
+    )
+    certificate = evaluate_secant_validation_certificate(
+        base_model=base_model,
+        candidate_model=trial_model,
+        data_loader=validation_loader,
+        device=device,
+        config=config.fgd_approx,
+        learning_rate=learning_rate,
+        projection_group_size=projection_group_size,
+    )
+    return _certify_fgd_candidate(
+        candidate_model=trial_model,
+        epoch_result=epoch_result,
+        certificate=certificate,
+        validation_loader=validation_loader,
+        device=device,
+        config=config,
+        theory_state=theory_state,
+        initial_functional_gap=initial_functional_gap,
+        theory_loss_star=theory_loss_star,
     )
 
 
@@ -778,6 +946,174 @@ def _search_fgd_certified_trial(
         last_trial=last_trial,
         trial_count=trial_count,
         sensor_failure=sensor_failure,
+    )
+
+
+def _growth_certificate_improves(
+    before: FGDValidationCertificate,
+    after: FGDValidationCertificate,
+    config: PipelineConfig,
+) -> bool:
+    """Return whether a trial growth expands the usable FGD certificate."""
+    if not after.sensor_valid or after.relative_error is None:
+        return False
+    if not before.sensor_valid or before.relative_error is None:
+        return True
+    if (
+        after.relative_error_condition_valid is True
+        and before.relative_error_condition_valid is not True
+    ):
+        return True
+    if (
+        before.relative_error - after.relative_error
+        >= config.secant_fgd.growth_min_relative_error_improvement
+    ):
+        return True
+
+    after_learning_rate = after.max_valid_learning_rate
+    before_learning_rate = before.max_valid_learning_rate
+    if after_learning_rate is None:
+        return False
+    if before_learning_rate is None:
+        return True
+    required_learning_rate = before_learning_rate * (
+        1.0 + config.secant_fgd.growth_min_learning_rate_improvement
+    )
+    return after_learning_rate >= required_learning_rate
+
+
+def _probe_fgd_growth(
+    *,
+    model: GrowingMLP,
+    train_batches: list[tuple[torch.Tensor, torch.Tensor]],
+    validation_loader: torch.utils.data.DataLoader,
+    base_certificate: FGDValidationCertificate,
+    selected_layer_index: int | None,
+    growth_count: int,
+    device: torch.device,
+    config: PipelineConfig,
+    projection_group_size: int,
+) -> _GrowthProbe | None:
+    """Trial growth on clones and retain the best FGD certificate change."""
+    growable_layers = getattr(model, "_growable_layers", None)
+    if not growable_layers:
+        return None
+    if config.fgd_approx.layer_selection == "certifying":
+        layer_indices = list(range(len(growable_layers)))
+    else:
+        layer_indices = [
+            selected_layer_index
+            if selected_layer_index is not None
+            else layer_index_for_growth(
+                growth_count=growth_count,
+                number_hidden_layers=config.model.number_hidden_layers,
+                config=config.growth_schedule,
+            )
+        ]
+
+    _clear_inaccessible_tensor_caches(model)
+    probes: list[_GrowthProbe] = []
+    optimal_update_kwargs = tiny_optimal_update_kwargs(
+        config.fgd_approx,
+        compute_delta=config.fgd_approx.growth_compute_delta,
+    )
+    for layer_index in layer_indices:
+        trial_model = copy.deepcopy(model)
+        growth_result = grow_layer(
+            model=trial_model,
+            train_loader=train_batches,
+            layer_index=layer_index,
+            device=device,
+            line_search_config=config.scaling_line_search,
+            optimal_update_kwargs=optimal_update_kwargs,
+            progress=None,
+        )
+        certificate = evaluate_fgd_validation_certificate(
+            model=trial_model,
+            data_loader=validation_loader,
+            device=device,
+            config=config.fgd_approx,
+            learning_rate=None,
+            projection_group_size=projection_group_size,
+        )
+        probes.append(
+            _GrowthProbe(
+                model=trial_model,
+                result=growth_result,
+                certificate=certificate,
+                improves_fgd=_growth_certificate_improves(
+                    base_certificate,
+                    certificate,
+                    config,
+                ),
+            )
+        )
+
+    if not probes:
+        return None
+    improving = [probe for probe in probes if probe.improves_fgd]
+    candidates = improving if improving else probes
+    return min(
+        candidates,
+        key=lambda probe: (
+            sum(parameter.numel() for parameter in probe.model.parameters()),
+            probe.certificate.relative_error
+            if probe.certificate.relative_error is not None
+            else float("inf"),
+        ),
+    )
+
+
+def _search_secant_fgd_candidate(
+    *,
+    model: GrowingMLP,
+    train_batches: list[tuple[torch.Tensor, torch.Tensor]],
+    validation_loader: torch.utils.data.DataLoader,
+    loss_function: torch.nn.Module,
+    device: torch.device,
+    accuracy_tolerance: float,
+    config: PipelineConfig,
+    projection_group_size: int,
+    classification: bool,
+    theory_state: _FGDTheoryState,
+    initial_functional_gap: float,
+    theory_loss_star: float,
+) -> _FGDSearchResult:
+    """Search realizable non-tangent Hilbert secants at fixed architecture."""
+    if (
+        not config.secant_fgd.enabled
+        or config.secant_fgd.max_learning_rate <= config.fgd_approx.eps
+    ):
+        return _FGDSearchResult(None, None, 0, False)
+
+    search_config = replace(
+        config.fgd_approx,
+        theory_lr_search_steps=config.secant_fgd.search_steps,
+        theory_lr_search_refinements=0,
+        lr_min_factor=config.secant_fgd.min_learning_rate_factor,
+    )
+
+    def evaluate_trial(learning_rate: float) -> _FGDTrial:
+        return _evaluate_secant_fgd_trial(
+            base_model=model,
+            train_batches=train_batches,
+            validation_loader=validation_loader,
+            loss_function=loss_function,
+            device=device,
+            learning_rate=learning_rate,
+            accuracy_tolerance=accuracy_tolerance,
+            config=config,
+            projection_group_size=projection_group_size,
+            classification=classification,
+            theory_state=theory_state,
+            initial_functional_gap=initial_functional_gap,
+            theory_loss_star=theory_loss_star,
+        )
+
+    return _search_fgd_certified_trial(
+        maximum_learning_rate=config.secant_fgd.max_learning_rate,
+        evaluate_trial=evaluate_trial,
+        config=search_config,
     )
 
 
@@ -1049,6 +1385,13 @@ def run_pipeline(
             fgd_growth_requested = False
             fgd_candidate_accepted: bool | None = None
             fgd_lr_search_trials = 0
+            fgd_approximation_kind: str | None = (
+                "tangent" if config.training.method == "fgd_approx" else None
+            )
+            fgd_secant_attempted = False
+            fgd_secant_accepted: bool | None = None
+            fgd_secant_trials = 0
+            fgd_growth_probe_improved: bool | None = None
             entry_learning_rate = current_learning_rate(optimizer)
             if config.training.method == "normal":
                 epoch_result = train_one_epoch(
@@ -1380,6 +1723,11 @@ def run_pipeline(
                 fgd_sensor_invalid_batches=fgd_sensor_invalid_batches,
                 fgd_candidate_accepted=fgd_candidate_accepted,
                 fgd_lr_search_trials=fgd_lr_search_trials,
+                fgd_approximation_kind=fgd_approximation_kind,
+                fgd_secant_attempted=fgd_secant_attempted,
+                fgd_secant_accepted=fgd_secant_accepted,
+                fgd_secant_trials=fgd_secant_trials,
+                fgd_growth_probe_improved=fgd_growth_probe_improved,
             )
             history.append(epoch_entry)
             wandb_logger.log_history_entry(epoch_entry)
@@ -1473,59 +1821,357 @@ def run_pipeline(
                     )
                 )
 
+            growth_probe: _GrowthProbe | None = None
+            if (
+                growth_triggered
+                and config.training.method == "fgd_approx"
+                and config.fgd_approx.projection_solver != "gromo_layer"
+                and config.fgd_approx.learning_rate_policy == "theory_interval"
+            ):
+                growth_train_batches = list(train_loader)
+                growth_probe = _probe_fgd_growth(
+                    model=model,
+                    train_batches=growth_train_batches,
+                    validation_loader=validation_loader,
+                    base_certificate=validation_certificate,
+                    selected_layer_index=selected_layer_index,
+                    growth_count=growth_count,
+                    device=device,
+                    config=config,
+                    projection_group_size=current_projection_group_size,
+                )
+                fgd_growth_probe_improved = bool(
+                    growth_probe is not None and growth_probe.improves_fgd
+                )
+                if not fgd_growth_probe_improved:
+                    fgd_secant_attempted = config.secant_fgd.enabled
+                    secant_theory_state = _FGDTheoryState(
+                        epoch_count=fgd_epoch_count,
+                        min_gradient_sq_norm=fgd_min_gradient_sq_norm,
+                        min_positive_learning_rate=fgd_min_positive_learning_rate,
+                        min_descent_coefficient=fgd_min_descent_coefficient,
+                        global_contraction_product=fgd_global_contraction_product,
+                        previous_validation_functional_loss=(
+                            previous_validation_functional_loss
+                        ),
+                    )
+                    secant_search = _search_secant_fgd_candidate(
+                        model=model,
+                        train_batches=growth_train_batches,
+                        validation_loader=validation_loader,
+                        loss_function=loss_function,
+                        device=device,
+                        accuracy_tolerance=config.training.accuracy_tolerance,
+                        config=config,
+                        projection_group_size=current_projection_group_size,
+                        classification=classification,
+                        theory_state=secant_theory_state,
+                        initial_functional_gap=initial_functional_gap,
+                        theory_loss_star=theory_loss_star,
+                    )
+                    fgd_secant_trials = secant_search.trial_count
+                    secant_trial = secant_search.accepted
+                    fgd_secant_accepted = secant_trial is not None
+                    growth_triggered = False
+
+                    if secant_trial is not None:
+                        model = secant_trial.model
+                        secant_certificate = secant_trial.certificate
+                        secant_test_metrics = evaluate_regression_metrics(
+                            model,
+                            test_loader,
+                            loss_function,
+                            device=device,
+                            accuracy_tolerance=(
+                                config.training.accuracy_tolerance
+                            ),
+                            classification=classification,
+                        )
+                        secant_validation_metrics = evaluate_regression_metrics(
+                            model,
+                            validation_loader,
+                            loss_function,
+                            device=device,
+                            accuracy_tolerance=(
+                                config.training.accuracy_tolerance
+                            ),
+                            classification=classification,
+                        )
+                        secant_epoch_result = replace(
+                            secant_trial.epoch_result,
+                            test_loss=secant_test_metrics.loss,
+                            test_accuracy=secant_test_metrics.accuracy,
+                        )
+                        accepted_state = secant_trial.theory_state
+                        fgd_epoch_count = accepted_state.epoch_count
+                        fgd_min_gradient_sq_norm = (
+                            accepted_state.min_gradient_sq_norm
+                        )
+                        fgd_min_positive_learning_rate = (
+                            accepted_state.min_positive_learning_rate
+                        )
+                        fgd_min_descent_coefficient = (
+                            accepted_state.min_descent_coefficient
+                        )
+                        fgd_global_contraction_product = (
+                            accepted_state.global_contraction_product
+                        )
+                        previous_validation_functional_loss = (
+                            accepted_state.previous_validation_functional_loss
+                        )
+                        current_fgd_learning_rate = (
+                            secant_epoch_result.min_positive_learning_rate
+                            or config.fgd_approx.theory_lr_initial
+                        )
+                        validation_certificate_for_next_epoch = (
+                            secant_certificate
+                        )
+                        optimizer = build_optimizer(model, config.optimizer)
+                        apply_learning_rate(
+                            optimizer,
+                            current_fgd_learning_rate,
+                        )
+                        secant_entry = HistoryEntry(
+                            step=epoch,
+                            step_type="SEC",
+                            train_loss=secant_epoch_result.train_loss,
+                            validation_loss=secant_validation_metrics.loss,
+                            test_loss=secant_test_metrics.loss,
+                            train_accuracy=secant_epoch_result.train_accuracy,
+                            validation_accuracy=(
+                                secant_validation_metrics.accuracy
+                            ),
+                            test_accuracy=secant_test_metrics.accuracy,
+                            learning_rate=current_fgd_learning_rate,
+                            num_params=count_parameters(model),
+                            rel_error=secant_certificate.relative_error,
+                            fgd_output_rel_error=(
+                                secant_certificate.output_relative_error
+                            ),
+                            fgd_learning_rate_upper_bound=(
+                                secant_certificate.learning_rate_upper_bound
+                            ),
+                            fgd_max_valid_learning_rate=(
+                                secant_certificate.max_valid_learning_rate
+                            ),
+                            fgd_learning_rate_interval_valid=(
+                                secant_certificate.learning_rate_interval_valid
+                            ),
+                            fgd_skipped_batches=(
+                                secant_certificate.skipped_batches
+                            ),
+                            fgd_relative_error_condition_valid=(
+                                secant_certificate.relative_error_condition_valid
+                            ),
+                            fgd_loss_descent_valid=(
+                                secant_trial.loss_descent_valid
+                            ),
+                            fgd_gradient_sq_norm=(
+                                secant_certificate.gradient_sq_norm
+                            ),
+                            fgd_min_gradient_sq_norm=(
+                                fgd_min_gradient_sq_norm
+                            ),
+                            fgd_theory_descent_coefficient=(
+                                secant_certificate.theory_descent_coefficient
+                            ),
+                            fgd_stationary_bound=secant_trial.stationary_bound,
+                            fgd_stationary_bound_valid=(
+                                secant_trial.stationary_bound_valid
+                            ),
+                            fgd_global_bound=secant_trial.global_bound,
+                            fgd_global_bound_valid=(
+                                secant_trial.global_bound_valid
+                            ),
+                            fgd_global_contraction=(
+                                secant_trial.global_contraction
+                            ),
+                            fgd_sensor_valid=secant_certificate.sensor_valid,
+                            fgd_sensor_invalid_batches=(
+                                secant_certificate.sensor_invalid_batches
+                            ),
+                            fgd_candidate_accepted=True,
+                            fgd_approximation_kind="secant",
+                            fgd_secant_attempted=True,
+                            fgd_secant_accepted=True,
+                            fgd_secant_trials=fgd_secant_trials,
+                            fgd_growth_probe_improved=False,
+                        )
+                        history.append(secant_entry)
+                        wandb_logger.log_history_entry(secant_entry)
+                        if progress is not None:
+                            progress(
+                                f"[SEC] Epoch {epoch}, "
+                                f"train_loss={secant_entry.train_loss:.4f}, "
+                                f"validation_loss="
+                                f"{secant_entry.validation_loss:.4f}, "
+                                f"test_loss={secant_entry.test_loss:.4f}, "
+                                f"lr={secant_entry.learning_rate:.4g}, "
+                                f"rel_err={secant_entry.rel_error:.3f}"
+                            )
+                        last_test_loss = secant_test_metrics.loss
+                    else:
+                        diagnostic_secant = secant_search.last_trial
+                        diagnostic_certificate = (
+                            diagnostic_secant.certificate
+                            if diagnostic_secant is not None
+                            else None
+                        )
+                        rejected_secant_entry = HistoryEntry(
+                            step=epoch,
+                            step_type="SEC",
+                            train_loss=epoch_result.train_loss,
+                            validation_loss=validation_metrics.loss,
+                            test_loss=epoch_result.test_loss,
+                            train_accuracy=epoch_result.train_accuracy,
+                            validation_accuracy=validation_metrics.accuracy,
+                            test_accuracy=epoch_result.test_accuracy,
+                            learning_rate=0.0,
+                            num_params=count_parameters(model),
+                            rel_error=(
+                                diagnostic_certificate.relative_error
+                                if diagnostic_certificate is not None
+                                else None
+                            ),
+                            fgd_output_rel_error=(
+                                diagnostic_certificate.output_relative_error
+                                if diagnostic_certificate is not None
+                                else None
+                            ),
+                            fgd_learning_rate_upper_bound=(
+                                diagnostic_certificate.learning_rate_upper_bound
+                                if diagnostic_certificate is not None
+                                else None
+                            ),
+                            fgd_max_valid_learning_rate=(
+                                diagnostic_certificate.max_valid_learning_rate
+                                if diagnostic_certificate is not None
+                                else None
+                            ),
+                            fgd_learning_rate_interval_valid=(
+                                diagnostic_certificate.learning_rate_interval_valid
+                                if diagnostic_certificate is not None
+                                else None
+                            ),
+                            fgd_relative_error_condition_valid=(
+                                diagnostic_certificate.relative_error_condition_valid
+                                if diagnostic_certificate is not None
+                                else None
+                            ),
+                            fgd_loss_descent_valid=(
+                                diagnostic_secant.loss_descent_valid
+                                if diagnostic_secant is not None
+                                else None
+                            ),
+                            fgd_stationary_bound=(
+                                diagnostic_secant.stationary_bound
+                                if diagnostic_secant is not None
+                                else None
+                            ),
+                            fgd_stationary_bound_valid=(
+                                diagnostic_secant.stationary_bound_valid
+                                if diagnostic_secant is not None
+                                else None
+                            ),
+                            fgd_global_bound=(
+                                diagnostic_secant.global_bound
+                                if diagnostic_secant is not None
+                                else None
+                            ),
+                            fgd_global_bound_valid=(
+                                diagnostic_secant.global_bound_valid
+                                if diagnostic_secant is not None
+                                else None
+                            ),
+                            fgd_sensor_valid=(
+                                diagnostic_certificate.sensor_valid
+                                if diagnostic_certificate is not None
+                                else None
+                            ),
+                            fgd_sensor_invalid_batches=(
+                                diagnostic_certificate.sensor_invalid_batches
+                                if diagnostic_certificate is not None
+                                else 0
+                            ),
+                            fgd_candidate_accepted=False,
+                            fgd_approximation_kind="secant",
+                            fgd_secant_attempted=fgd_secant_attempted,
+                            fgd_secant_accepted=False,
+                            fgd_secant_trials=fgd_secant_trials,
+                            fgd_growth_probe_improved=False,
+                        )
+                        history.append(rejected_secant_entry)
+                        wandb_logger.log_history_entry(rejected_secant_entry)
+                        if progress is not None:
+                            progress(
+                                f"[SEC-WARN] Epoch {epoch}: growth did not "
+                                "improve the FGD certificate and no "
+                                "fixed-architecture Hilbert secant satisfied "
+                                "all validation conditions"
+                            )
+
             if growth_triggered:
                 if config.training.method == "fgd_approx":
-                    if (
-                        config.fgd_approx.layer_selection == "certifying"
-                        and config.fgd_approx.projection_solver != "gromo_layer"
-                    ):
-                        certified_layer_index = select_certifying_growth_layer_index(
+                    if growth_probe is not None:
+                        model = growth_probe.model
+                        growth_result = growth_probe.result
+                        layer_index = growth_result.layer_index
+                        selected_layer_index = layer_index
+                        if progress is not None:
+                            progress(
+                                f"[GRO] Committing layer {layer_index} at epoch "
+                                f"{epoch}; trial improved the FGD certificate"
+                            )
+                            for point in growth_result.line_search:
+                                progress(
+                                    f"  scaling={point.scaling_factor:.6g}, "
+                                    f"train_loss={point.train_loss:.4f}"
+                                )
+                    else:
+                        layer_index = (
+                            selected_layer_index
+                            if selected_layer_index is not None
+                            else layer_index_for_growth(
+                                growth_count=growth_count,
+                                number_hidden_layers=(
+                                    config.model.number_hidden_layers
+                                ),
+                                config=config.growth_schedule,
+                            )
+                        )
+                        growth_result = grow_layer(
                             model=model,
                             train_loader=train_loader,
-                            validation_loader=validation_loader,
+                            layer_index=layer_index,
                             device=device,
-                            config=config.fgd_approx,
                             line_search_config=config.scaling_line_search,
-                            projection_group_size=current_projection_group_size,
+                            optimal_update_kwargs=tiny_optimal_update_kwargs(
+                                config.fgd_approx,
+                                compute_delta=(
+                                    config.fgd_approx.growth_compute_delta
+                                ),
+                            ),
+                            progress=progress,
                         )
-                    else:
-                        certified_layer_index = None
-
-                    layer_index = (
-                        certified_layer_index
-                        if certified_layer_index is not None
-                        else selected_layer_index
-                        if selected_layer_index is not None
-                        else layer_index_for_growth(
-                            growth_count=growth_count,
-                            number_hidden_layers=config.model.number_hidden_layers,
-                            config=config.growth_schedule,
-                        )
-                    )
-                    selected_layer_index = layer_index
-                    optimal_update_kwargs = tiny_optimal_update_kwargs(
-                        config.fgd_approx,
-                        compute_delta=config.fgd_approx.growth_compute_delta,
-                    )
                 else:
                     layer_index = layer_index_for_growth(
                         growth_count=growth_count,
                         number_hidden_layers=config.model.number_hidden_layers,
                         config=config.growth_schedule,
                     )
-                    optimal_update_kwargs = None
-                if progress is not None:
-                    progress(f"[GRO] Growing layer {layer_index} at epoch {epoch}")
-
-                growth_result = grow_layer(
-                    model=model,
-                    train_loader=train_loader,
-                    layer_index=layer_index,
-                    device=device,
-                    line_search_config=config.scaling_line_search,
-                    optimal_update_kwargs=optimal_update_kwargs,
-                    progress=progress,
-                )
+                    if progress is not None:
+                        progress(
+                            f"[GRO] Growing layer {layer_index} at epoch {epoch}"
+                        )
+                    growth_result = grow_layer(
+                        model=model,
+                        train_loader=train_loader,
+                        layer_index=layer_index,
+                        device=device,
+                        line_search_config=config.scaling_line_search,
+                        optimal_update_kwargs=None,
+                        progress=progress,
+                    )
                 growth_events.append(growth_result)
                 growth_count += 1
                 wandb_logger.log_growth_event(
@@ -1564,6 +2210,27 @@ def run_pipeline(
                         )
                         fgd_max_valid_learning_rate = (
                             post_growth_certified_learning_rate
+                        )
+                        rel_error = (
+                            validation_certificate_for_next_epoch.relative_error
+                        )
+                        fgd_output_rel_error = (
+                            validation_certificate_for_next_epoch.output_relative_error
+                        )
+                        fgd_learning_rate_upper_bound = (
+                            validation_certificate_for_next_epoch.learning_rate_upper_bound
+                        )
+                        fgd_learning_rate_interval_valid = (
+                            validation_certificate_for_next_epoch.learning_rate_interval_valid
+                        )
+                        fgd_relative_error_condition_valid = (
+                            validation_certificate_for_next_epoch.relative_error_condition_valid
+                        )
+                        fgd_sensor_valid = (
+                            validation_certificate_for_next_epoch.sensor_valid
+                        )
+                        fgd_sensor_invalid_batches = (
+                            validation_certificate_for_next_epoch.sensor_invalid_batches
                         )
                 optimizer = build_optimizer(model, config.optimizer)
                 post_growth_learning_rate = (
@@ -1651,6 +2318,11 @@ def run_pipeline(
                     fgd_sensor_invalid_batches=fgd_sensor_invalid_batches,
                     fgd_candidate_accepted=fgd_candidate_accepted,
                     fgd_lr_search_trials=fgd_lr_search_trials,
+                    fgd_approximation_kind=fgd_approximation_kind,
+                    fgd_secant_attempted=fgd_secant_attempted,
+                    fgd_secant_accepted=fgd_secant_accepted,
+                    fgd_secant_trials=fgd_secant_trials,
+                    fgd_growth_probe_improved=fgd_growth_probe_improved,
                 )
                 history.append(growth_entry)
                 wandb_logger.log_history_entry(growth_entry)
