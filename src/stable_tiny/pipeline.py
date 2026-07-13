@@ -10,7 +10,11 @@ from typing import Any, Literal
 
 import yaml
 
-from stable_tiny.data import MultiSinDataLoader, SmoothSinDataLoader
+from stable_tiny.data import (
+    MultiSinDataLoader,
+    SmoothSinDataLoader,
+    make_cifar10_dataloaders,
+)
 from stable_tiny.fgd_approx import (
     FGDApproxConfig,
     FGDLayerRelError,
@@ -53,7 +57,7 @@ from gromo.containers.growing_mlp import GrowingMLP
 ProgressFn = Callable[[str], None]
 TrainingMethod = Literal["normal", "fgd_approx"]
 StepType = Literal["INIT", "SGD", "FGD", "GRO"]
-DataKind = Literal["multi_sin", "smooth_sin"]
+DataKind = Literal["multi_sin", "smooth_sin", "cifar10"]
 
 
 @dataclass(frozen=True)
@@ -61,6 +65,7 @@ class DataConfig:
     kind: DataKind = "smooth_sin"
     in_features: int = 10
     out_features: int = 3
+    data_dir: str | None = None
     train_batches: int = 10
     validation_batches: int = 10
     test_batches: int = 1
@@ -73,6 +78,10 @@ class DataConfig:
     phase_shift: float = 0.5
     interaction_strength: float = 0.25
     linear_strength: float = 0.1
+    cifar_grayscale: bool = True
+    cifar_train_samples: int | None = 5_000
+    cifar_validation_samples: int | None = 1_000
+    cifar_test_samples: int | None = 1_000
 
 
 @dataclass(frozen=True)
@@ -333,6 +342,26 @@ def build_dataloaders(
     torch.utils.data.DataLoader,
 ]:
     data_config = config.data
+    if data_config.kind == "cifar10":
+        expected_features = 1024 if data_config.cifar_grayscale else 3072
+        if data_config.in_features != expected_features:
+            raise ValueError(
+                "CIFAR-10 feature size mismatch: expected "
+                f"data.in_features={expected_features} for "
+                f"cifar_grayscale={data_config.cifar_grayscale}."
+            )
+        if data_config.out_features != 10:
+            raise ValueError("CIFAR-10 requires data.out_features=10.")
+        return make_cifar10_dataloaders(
+            data_dir=data_config.data_dir,
+            train_samples=data_config.cifar_train_samples,
+            validation_samples=data_config.cifar_validation_samples,
+            test_samples=data_config.cifar_test_samples,
+            batch_size=data_config.batch_size,
+            grayscale=data_config.cifar_grayscale,
+            seed=data_config.train_seed,
+            num_classes=data_config.out_features,
+        )
 
     if data_config.kind == "multi_sin":
         loader_class = MultiSinDataLoader
@@ -349,7 +378,7 @@ def build_dataloaders(
     else:
         raise ValueError(
             f"Unsupported data kind '{data_config.kind}'. "
-            "Use one of: multi_sin, smooth_sin."
+            "Use one of: multi_sin, smooth_sin, cifar10."
         )
 
     train_loader = loader_class(
@@ -380,6 +409,10 @@ def build_dataloaders(
         **extra_kwargs,
     )
     return train_loader, validation_loader, test_loader
+
+
+def is_classification_task(config: PipelineConfig) -> bool:
+    return config.data.kind == "cifar10"
 
 
 def build_model(config: PipelineConfig, device: torch.device) -> GrowingMLP:
@@ -461,6 +494,7 @@ def run_pipeline(
     )
     device = select_device(config.training.device)
     train_loader, validation_loader, test_loader = build_dataloaders(config, device)
+    classification = is_classification_task(config)
     model = build_model(config, device)
     loss_function = torch.nn.MSELoss()
     optimizer = build_optimizer(model, config.optimizer)
@@ -501,6 +535,7 @@ def run_pipeline(
             loss_function,
             device=device,
             accuracy_tolerance=config.training.accuracy_tolerance,
+            classification=classification,
         )
         validation_metrics = evaluate_regression_metrics(
             model,
@@ -508,6 +543,7 @@ def run_pipeline(
             loss_function,
             device=device,
             accuracy_tolerance=config.training.accuracy_tolerance,
+            classification=classification,
         )
         test_metrics = evaluate_regression_metrics(
             model,
@@ -515,6 +551,7 @@ def run_pipeline(
             loss_function,
             device=device,
             accuracy_tolerance=config.training.accuracy_tolerance,
+            classification=classification,
         )
         last_test_loss = test_metrics.loss
         initial_functional_loss = evaluate_functional_loss(
@@ -536,7 +573,7 @@ def run_pipeline(
             1,
             config.fgd_approx.projection_group_max
             if config.fgd_approx.projection_group_max is not None
-            else max(config.data.train_batches, config.data.validation_batches),
+            else max(len(train_loader), len(validation_loader)),
         )
         current_projection_group_size = max(
             1,
@@ -642,6 +679,7 @@ def run_pipeline(
                     device=device,
                     accuracy_tolerance=config.training.accuracy_tolerance,
                     gradient_clip_norm=config.training.gradient_clip_norm,
+                    classification=classification,
                 )
                 step_type: StepType = "SGD"
             elif config.training.method == "fgd_approx":
@@ -655,6 +693,7 @@ def run_pipeline(
                     accuracy_tolerance=config.training.accuracy_tolerance,
                     config=config.fgd_approx,
                     projection_group_size=current_projection_group_size,
+                    classification=classification,
                 )
                 epoch_result = fgd_epoch_result
                 selected_layer_index = fgd_epoch_result.selected_layer_index
@@ -921,6 +960,7 @@ def run_pipeline(
                 loss_function,
                 device=device,
                 accuracy_tolerance=config.training.accuracy_tolerance,
+                classification=classification,
             )
             epoch_entry = HistoryEntry(
                 step=epoch,
@@ -1153,6 +1193,7 @@ def run_pipeline(
                     loss_function,
                     device=device,
                     accuracy_tolerance=config.training.accuracy_tolerance,
+                    classification=classification,
                 )
                 validation_metrics = evaluate_regression_metrics(
                     model,
@@ -1160,6 +1201,7 @@ def run_pipeline(
                     loss_function,
                     device=device,
                     accuracy_tolerance=config.training.accuracy_tolerance,
+                    classification=classification,
                 )
                 test_metrics = evaluate_regression_metrics(
                     model,
@@ -1167,6 +1209,7 @@ def run_pipeline(
                     loss_function,
                     device=device,
                     accuracy_tolerance=config.training.accuracy_tolerance,
+                    classification=classification,
                 )
                 growth_entry = HistoryEntry(
                     step=epoch,

@@ -1227,6 +1227,7 @@ def train_one_epoch_gromo_layer_proxy(
     learning_rate: float,
     accuracy_tolerance: float,
     config: FGDApproxConfig,
+    classification: bool = False,
 ) -> FGDApproxEpochResult:
     """Train with GroMo's algebraic per-layer optimal update as the FGD proxy."""
     model.train()
@@ -1258,6 +1259,7 @@ def train_one_epoch_gromo_layer_proxy(
         loss_function,
         device=device,
         accuracy_tolerance=accuracy_tolerance,
+        classification=classification,
     )
     test_metrics: RegressionMetrics = evaluate_regression_metrics(
         model,
@@ -1265,6 +1267,7 @@ def train_one_epoch_gromo_layer_proxy(
         loss_function,
         device=device,
         accuracy_tolerance=accuracy_tolerance,
+        classification=classification,
     )
 
     output_error = (
@@ -1640,6 +1643,7 @@ def train_one_epoch_fgd_approx(
     accuracy_tolerance: float,
     config: FGDApproxConfig,
     projection_group_size: int = 1,
+    classification: bool = False,
 ) -> FGDApproxEpochResult:
     """Train one FGD epoch with the configured functional-gradient proxy.
 
@@ -1669,6 +1673,7 @@ def train_one_epoch_fgd_approx(
             learning_rate=learning_rate,
             accuracy_tolerance=accuracy_tolerance,
             config=config,
+            classification=classification,
         )
 
     model.train()
@@ -1830,6 +1835,7 @@ def train_one_epoch_fgd_approx(
         loss_function,
         device=device,
         accuracy_tolerance=accuracy_tolerance,
+        classification=classification,
     )
     test_metrics: RegressionMetrics = evaluate_regression_metrics(
         model,
@@ -1837,6 +1843,7 @@ def train_one_epoch_fgd_approx(
         loss_function,
         device=device,
         accuracy_tolerance=accuracy_tolerance,
+        classification=classification,
     )
 
     return FGDApproxEpochResult(

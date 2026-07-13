@@ -56,17 +56,18 @@ def evaluate_regression_metrics(
     loss_function: torch.nn.Module,
     device: torch.device,
     accuracy_tolerance: float,
+    classification: bool = False,
 ) -> RegressionMetrics:
-    """Evaluate loss and tolerance-based regression accuracy.
+    """Evaluate loss and accuracy.
 
-    Accuracy is the element-wise fraction of predictions whose absolute error is
-    less than or equal to ``accuracy_tolerance``.
+    Regression accuracy is the element-wise fraction of predictions within
+    ``accuracy_tolerance``. Classification accuracy is sample-wise argmax.
     """
     model.eval()
     total_loss = 0.0
     total_samples = 0
-    correct_values = 0
-    total_values = 0
+    correct = 0
+    total_predictions = 0
 
     for x, y in dataloader:
         x = x.to(device)
@@ -78,12 +79,18 @@ def evaluate_regression_metrics(
         total_loss += float(loss.detach()) * batch_size
         total_samples += batch_size
 
-        correct_values += int((y_pred - y).abs().le(accuracy_tolerance).sum().item())
-        total_values += y.numel()
+        if classification:
+            target_class = y.argmax(dim=1) if y.ndim > 1 else y.long()
+            predicted_class = y_pred.argmax(dim=1)
+            correct += int((predicted_class == target_class).sum().item())
+            total_predictions += batch_size
+        else:
+            correct += int((y_pred - y).abs().le(accuracy_tolerance).sum().item())
+            total_predictions += y.numel()
 
     return RegressionMetrics(
         loss=total_loss / max(1, total_samples),
-        accuracy=correct_values / max(1, total_values),
+        accuracy=correct / max(1, total_predictions),
     )
 
 
@@ -96,6 +103,7 @@ def train_one_epoch(
     device: torch.device,
     accuracy_tolerance: float,
     gradient_clip_norm: float | None = None,
+    classification: bool = False,
 ) -> TrainEpochResult:
     """Run one gradient-descent epoch and evaluate on the test loader."""
     model.train()
@@ -125,6 +133,7 @@ def train_one_epoch(
         loss_function,
         device=device,
         accuracy_tolerance=accuracy_tolerance,
+        classification=classification,
     )
     test_metrics = evaluate_regression_metrics(
         model,
@@ -132,6 +141,7 @@ def train_one_epoch(
         loss_function,
         device=device,
         accuracy_tolerance=accuracy_tolerance,
+        classification=classification,
     )
     return TrainEpochResult(
         train_loss=train_metrics.loss,

@@ -102,6 +102,7 @@ class WandbRunLogger:
         self._run.define_metric("epoch")
         for pattern in (
             "train/*",
+            "validation/*",
             "test/*",
             "optimizer/*",
             "model/*",
