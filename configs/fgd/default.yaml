@@ -71,11 +71,8 @@ fgd_approx:
   lr_backtrack: 0.5
   lr_min_factor: 0.001
   global_bound_action: lr_then_growth
-  global_bound_lr_patience: 5
   rel_error_compute_delta: true
   growth_compute_delta: false
-  start_epoch: 1
-  min_epochs_between_growth: 1
   eps: 1.0e-12
   tiny_use_covariance: true
   tiny_alpha_zero: false

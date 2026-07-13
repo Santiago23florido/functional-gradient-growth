@@ -577,6 +577,7 @@ def run_pipeline(
             validation_loader,
             device,
         )
+        previous_validation_functional_loss = initial_functional_loss
         theory_loss_star = config.fgd_approx.theory_loss_star
         initial_functional_gap = max(initial_functional_loss - theory_loss_star, 0.0)
         fgd_epoch_count = 0
@@ -584,7 +585,6 @@ def run_pipeline(
         fgd_min_positive_learning_rate: float | None = None
         fgd_min_descent_coefficient: float | None = None
         fgd_global_contraction_product = 1.0
-        fgd_global_bound_only_failed_epochs = 0
         fgd_previous_train_loss: float | None = None
         fgd_stalled_epochs = 0
         projection_group_limit = max(
@@ -597,19 +597,40 @@ def run_pipeline(
             1,
             min(config.fgd_approx.projection_group_size, projection_group_limit),
         )
+        validation_certificate_for_next_epoch = None
+        if (
+            config.training.method == "fgd_approx"
+            and config.fgd_approx.learning_rate_policy == "theory_interval"
+            and config.fgd_approx.projection_solver != "gromo_layer"
+        ):
+            validation_certificate_for_next_epoch = (
+                evaluate_fgd_validation_certificate(
+                    model=model,
+                    data_loader=validation_loader,
+                    device=device,
+                    config=config.fgd_approx,
+                    learning_rate=current_fgd_learning_rate,
+                    projection_group_size=current_projection_group_size,
+                )
+            )
 
         def reset_fgd_certificate() -> None:
             """Re-anchor the per-mode FGD bounds at the current loss."""
             nonlocal initial_functional_gap, fgd_epoch_count
+            nonlocal previous_validation_functional_loss
             nonlocal fgd_min_gradient_sq_norm
             nonlocal fgd_min_positive_learning_rate
             nonlocal fgd_min_descent_coefficient
             nonlocal fgd_global_contraction_product
-            nonlocal fgd_global_bound_only_failed_epochs
             nonlocal fgd_previous_train_loss, fgd_stalled_epochs
+            nonlocal validation_certificate_for_next_epoch
+            previous_validation_functional_loss = evaluate_functional_loss(
+                model,
+                validation_loader,
+                device,
+            )
             initial_functional_gap = max(
-                evaluate_functional_loss(model, validation_loader, device)
-                - theory_loss_star,
+                previous_validation_functional_loss - theory_loss_star,
                 0.0,
             )
             fgd_epoch_count = 0
@@ -617,9 +638,9 @@ def run_pipeline(
             fgd_min_positive_learning_rate = None
             fgd_min_descent_coefficient = None
             fgd_global_contraction_product = 1.0
-            fgd_global_bound_only_failed_epochs = 0
             fgd_previous_train_loss = None
             fgd_stalled_epochs = 0
+            validation_certificate_for_next_epoch = None
         init_entry = HistoryEntry(
             step=0,
             step_type="INIT",
@@ -651,15 +672,56 @@ def run_pipeline(
                 config.training.method == "fgd_approx"
                 and config.fgd_approx.learning_rate_policy == "theory_interval"
             )
-            learning_rate = (
-                current_fgd_learning_rate
-                if use_fgd_theory_learning_rate
-                else scheduled_learning_rate(
+            learning_rate_clipped_by_validation = False
+            if use_fgd_theory_learning_rate:
+                if validation_certificate_for_next_epoch is None:
+                    validation_certificate_for_next_epoch = (
+                        evaluate_fgd_validation_certificate(
+                            model=model,
+                            data_loader=validation_loader,
+                            device=device,
+                            config=config.fgd_approx,
+                            learning_rate=current_fgd_learning_rate,
+                            projection_group_size=current_projection_group_size,
+                        )
+                    )
+                lr_certificate = validation_certificate_for_next_epoch
+                max_valid_learning_rate = lr_certificate.max_valid_learning_rate
+                if (
+                    lr_certificate.sensor_valid
+                    and max_valid_learning_rate is not None
+                    and max_valid_learning_rate
+                    > config.fgd_approx.theory_lr_min + config.fgd_approx.eps
+                ):
+                    current_lr_in_interval = (
+                        current_fgd_learning_rate
+                        > config.fgd_approx.theory_lr_min
+                        and current_fgd_learning_rate
+                        <= max_valid_learning_rate + config.fgd_approx.eps
+                    )
+                    if (
+                        config.fgd_approx.theory_lr_follow_bound
+                        or not current_lr_in_interval
+                    ):
+                        learning_rate_clipped_by_validation = (
+                            abs(
+                                current_fgd_learning_rate
+                                - max_valid_learning_rate
+                            )
+                            > config.fgd_approx.eps
+                        )
+                        current_fgd_learning_rate = max_valid_learning_rate
+                    learning_rate = current_fgd_learning_rate
+                else:
+                    # No theoretically admissible step was certified. Keep the
+                    # model fixed so validation can decide whether to grow.
+                    learning_rate = 0.0
+            else:
+                learning_rate = scheduled_learning_rate(
                     config,
                     epoch=epoch,
                     cycle_start_epoch=lr_cycle_start_epoch,
                 )
-            )
             apply_learning_rate(optimizer, learning_rate)
 
             rel_error: float | None = None
@@ -669,7 +731,9 @@ def run_pipeline(
             fgd_learning_rate_upper_bound: float | None = None
             fgd_max_valid_learning_rate: float | None = None
             fgd_learning_rate_interval_valid: bool | None = None
-            fgd_learning_rate_clipped_batches = 0
+            fgd_learning_rate_clipped_batches = int(
+                learning_rate_clipped_by_validation
+            )
             fgd_skipped_batches = 0
             fgd_relative_error_condition_valid: bool | None = None
             fgd_loss_descent_valid: bool | None = None
@@ -716,16 +780,6 @@ def run_pipeline(
                 epoch_result = fgd_epoch_result
                 selected_layer_index = fgd_epoch_result.selected_layer_index
                 fgd_layer_rel_errors = fgd_epoch_result.layer_relative_errors
-                fgd_learning_rate_clipped_batches = (
-                    fgd_epoch_result.learning_rate_clipped_batches
-                )
-                fgd_loss_descent_valid = fgd_epoch_result.loss_descent_valid
-                fgd_loss_non_descent_batches = (
-                    fgd_epoch_result.loss_non_descent_batches
-                )
-                if fgd_epoch_result.next_learning_rate is not None:
-                    current_fgd_learning_rate = fgd_epoch_result.next_learning_rate
-                    apply_learning_rate(optimizer, current_fgd_learning_rate)
                 if fgd_epoch_result.learning_rate is not None:
                     entry_learning_rate = fgd_epoch_result.learning_rate
 
@@ -759,6 +813,23 @@ def run_pipeline(
                 fgd_sensor_valid = validation_certificate.sensor_valid
                 fgd_sensor_invalid_batches = (
                     validation_certificate.sensor_invalid_batches
+                )
+                validation_certificate_for_next_epoch = validation_certificate
+                current_validation_functional_loss = evaluate_functional_loss(
+                    model,
+                    validation_loader,
+                    device,
+                )
+                fgd_loss_descent_valid = (
+                    current_validation_functional_loss
+                    <= previous_validation_functional_loss
+                    + config.fgd_approx.eps
+                )
+                fgd_loss_non_descent_batches = int(
+                    not fgd_loss_descent_valid
+                )
+                previous_validation_functional_loss = (
+                    current_validation_functional_loss
                 )
 
                 if (
@@ -833,12 +904,7 @@ def run_pipeline(
                             * initial_functional_gap
                         )
                         current_functional_gap = max(
-                            evaluate_functional_loss(
-                                model,
-                                validation_loader,
-                                device,
-                            )
-                            - theory_loss_star,
+                            current_validation_functional_loss - theory_loss_star,
                             0.0,
                         )
                         fgd_global_bound_valid = (
@@ -857,9 +923,12 @@ def run_pipeline(
                         fgd_global_bound_valid = False
 
                 fgd_conditions_failed = (
-                    fgd_relative_error_condition_valid is False
-                    or fgd_stationary_bound_valid is False
-                    or fgd_global_bound_valid is False
+                    fgd_sensor_valid is True
+                    and (
+                        fgd_relative_error_condition_valid is False
+                        or fgd_stationary_bound_valid is False
+                        or fgd_global_bound_valid is False
+                    )
                 )
                 only_global_bound_failed = (
                     fgd_global_bound_valid is False
@@ -868,7 +937,6 @@ def run_pipeline(
                     and fgd_sensor_valid is not False
                 )
                 if only_global_bound_failed:
-                    fgd_global_bound_only_failed_epochs += 1
                     if config.fgd_approx.global_bound_action == "ignore":
                         fgd_growth_requested = False
                     elif config.fgd_approx.global_bound_action == "grow":
@@ -883,13 +951,8 @@ def run_pipeline(
                             )
                         )
                     else:
-                        global_bound_patience_reached = (
-                            fgd_global_bound_only_failed_epochs
-                            >= max(1, config.fgd_approx.global_bound_lr_patience)
-                        )
                         if (
                             use_fgd_theory_learning_rate
-                            and global_bound_patience_reached
                             and fgd_max_valid_learning_rate is not None
                             and fgd_max_valid_learning_rate
                             > config.fgd_approx.theory_lr_min + config.fgd_approx.eps
@@ -923,8 +986,6 @@ def run_pipeline(
                                         config=config.fgd_approx,
                                     )
                                 )
-                        elif not global_bound_patience_reached:
-                            fgd_growth_requested = False
                         else:
                             fgd_growth_requested = (
                                 config.growth_schedule.enabled
@@ -937,7 +998,6 @@ def run_pipeline(
                                 )
                             )
                 else:
-                    fgd_global_bound_only_failed_epochs = 0
                     fgd_growth_requested = (
                         config.growth_schedule.enabled
                         and fgd_conditions_failed
@@ -1054,16 +1114,15 @@ def run_pipeline(
                     and config.fgd_approx.theory_lr_follow_bound
                 ):
                     warnings.append(
-                        f"learning-rate clipped on "
-                        f"{fgd_learning_rate_clipped_batches} batch(es)"
+                        "learning-rate clipped by validation certificate"
                     )
                 if fgd_skipped_batches > 0:
-                    warnings.append(f"skipped {fgd_skipped_batches} batch(es)")
-                if fgd_loss_descent_valid is False:
                     warnings.append(
-                        f"loss did not descend on "
-                        f"{fgd_loss_non_descent_batches} batch(es)"
+                        "validation certificate rejected "
+                        f"{fgd_skipped_batches} batch(es)"
                     )
+                if fgd_loss_descent_valid is False:
+                    warnings.append("validation functional loss increased")
                 if fgd_sensor_valid is False:
                     warnings.append(
                         f"sensor invalid on "
@@ -1094,7 +1153,8 @@ def run_pipeline(
                 growth_triggered = config.growth_schedule.enabled and (
                     fgd_growth_requested
                     or (
-                        rel_error is not None
+                        fgd_sensor_valid is True
+                        and rel_error is not None
                         and should_trigger_fgd_growth(
                             relative_error=rel_error,
                             epoch=epoch,
@@ -1170,17 +1230,7 @@ def run_pipeline(
                     # Growth is a mode switch: the accumulated stationary and
                     # global bounds certify a fixed architecture, so restart
                     # them from the post-growth loss.
-                    initial_functional_gap = max(
-                        evaluate_functional_loss(model, validation_loader, device)
-                        - theory_loss_star,
-                        0.0,
-                    )
-                    fgd_epoch_count = 0
-                    fgd_min_gradient_sq_norm = None
-                    fgd_min_positive_learning_rate = None
-                    fgd_min_descent_coefficient = None
-                    fgd_global_contraction_product = 1.0
-                    fgd_global_bound_only_failed_epochs = 0
+                    reset_fgd_certificate()
                     if (
                         config.fgd_approx.learning_rate_policy == "theory_interval"
                         and config.lr_scheduler.restart_on_growth

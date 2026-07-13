@@ -159,7 +159,7 @@ class WandbRunLogger:
 
         loss_descent_valid = getattr(entry, "fgd_loss_descent_valid", None)
         if loss_descent_valid is not None:
-            payload["fgd/loss_descent_valid"] = loss_descent_valid
+            payload["fgd/validation_loss_descent_valid"] = loss_descent_valid
 
         for attribute_name, metric_name in (
             ("fgd_gradient_sq_norm", "fgd/gradient_sq_norm"),
@@ -207,13 +207,15 @@ class WandbRunLogger:
             )
 
         if fgd_payload_active:
-            payload["fgd/learning_rate_clipped_batches"] = getattr(
+            payload["fgd/learning_rate_clipped_by_validation"] = bool(
+                getattr(entry, "fgd_learning_rate_clipped_batches", 0)
+            )
+            payload["fgd/validation_rejected_batches"] = getattr(
                 entry,
-                "fgd_learning_rate_clipped_batches",
+                "fgd_skipped_batches",
                 0,
             )
-            payload["fgd/skipped_batches"] = getattr(entry, "fgd_skipped_batches", 0)
-            payload["fgd/loss_non_descent_batches"] = getattr(
+            payload["fgd/validation_loss_non_descent_epochs"] = getattr(
                 entry,
                 "fgd_loss_non_descent_batches",
                 0,

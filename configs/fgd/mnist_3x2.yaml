@@ -67,11 +67,8 @@ fgd_approx:
   lr_backtrack: 0.5
   lr_min_factor: 0.001
   global_bound_action: grow
-  global_bound_lr_patience: 5
   rel_error_compute_delta: true
   growth_compute_delta: false
-  start_epoch: 1
-  min_epochs_between_growth: 1
   projection_group_size: 1
   projection_group_auto: true
   projection_group_max:
