@@ -54,6 +54,8 @@ class FGDApproxConfig:
     theory_lr_initial: float = 0.01
     theory_lr_min: float = 0.0
     theory_lr_follow_bound: bool = False
+    theory_lr_search_steps: int = 8
+    theory_lr_search_refinements: int = 4
     sufficient_descent_c: float | None = 0.1
     lr_backtrack: float = 0.5
     lr_min_factor: float = 1e-3
@@ -1620,6 +1622,7 @@ def train_one_epoch_fgd_approx(
     config: FGDApproxConfig,
     projection_group_size: int = 1,
     classification: bool = False,
+    evaluate_test: bool = True,
 ) -> FGDApproxEpochResult:
     """Train one FGD epoch with the configured functional-gradient proxy.
 
@@ -1720,13 +1723,17 @@ def train_one_epoch_fgd_approx(
         accuracy_tolerance=accuracy_tolerance,
         classification=classification,
     )
-    test_metrics: RegressionMetrics = evaluate_regression_metrics(
-        model,
-        test_loader,
-        loss_function,
-        device=device,
-        accuracy_tolerance=accuracy_tolerance,
-        classification=classification,
+    test_metrics = (
+        evaluate_regression_metrics(
+            model,
+            test_loader,
+            loss_function,
+            device=device,
+            accuracy_tolerance=accuracy_tolerance,
+            classification=classification,
+        )
+        if evaluate_test
+        else RegressionMetrics(loss=float("nan"), accuracy=float("nan"))
     )
 
     return FGDApproxEpochResult(

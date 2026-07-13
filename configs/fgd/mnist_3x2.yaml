@@ -63,6 +63,8 @@ fgd_approx:
   theory_lr_initial: 0.01
   theory_lr_min: 0.0
   theory_lr_follow_bound: false
+  theory_lr_search_steps: 8
+  theory_lr_search_refinements: 4
   sufficient_descent_c: 0.1
   lr_backtrack: 0.5
   lr_min_factor: 0.001

@@ -139,6 +139,14 @@ class WandbRunLogger:
         if learning_rate_upper_bound is not None:
             payload["fgd/learning_rate_upper_bound"] = learning_rate_upper_bound
 
+        max_valid_learning_rate = getattr(
+            entry,
+            "fgd_max_valid_learning_rate",
+            None,
+        )
+        if max_valid_learning_rate is not None:
+            payload["fgd/max_valid_learning_rate"] = max_valid_learning_rate
+
         learning_rate_interval_valid = getattr(
             entry,
             "fgd_learning_rate_interval_valid",
@@ -226,6 +234,14 @@ class WandbRunLogger:
             payload["fgd/sensor_invalid_batches"] = getattr(
                 entry,
                 "fgd_sensor_invalid_batches",
+                0,
+            )
+            candidate_accepted = getattr(entry, "fgd_candidate_accepted", None)
+            if candidate_accepted is not None:
+                payload["fgd/candidate_accepted"] = candidate_accepted
+            payload["fgd/lr_search_trials"] = getattr(
+                entry,
+                "fgd_lr_search_trials",
                 0,
             )
 

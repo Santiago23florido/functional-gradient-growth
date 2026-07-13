@@ -1,0 +1,426 @@
+
+===== STARTING mnist_fgd_transactional_3x2_th020 =====
+wandb: [wandb.login()] Using explicit session credentials for https://api.wandb.ai.
+wandb: Appending key for api.wandb.ai to your netrc file: /home/santiago/.netrc
+wandb: Currently logged in as: santiago-florido (TAU-Frugal) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: setting up run m01g1wg5
+wandb: Tracking run with wandb version 0.28.0
+wandb: Run data is saved locally in results/wandb/run-20260713_155512-m01g1wg5
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run mnist_fgd_transactional_3x2_th020
+wandb: ⭐️ View project at https://wandb.ai/TAU-Frugal/stable-tiny
+wandb: 🚀 View run at https://wandb.ai/TAU-Frugal/stable-tiny/runs/m01g1wg5
+Using device: cuda
+Training method: fgd_approx
+W&B logging enabled: project=stable-tiny, run=mnist_fgd_transactional_3x2_th020
+Original model:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=2, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=2, out_features=2, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=2, out_features=2, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=2, out_features=10, use_bias=True)
+[INIT] Epoch 0, train_loss=0.4646, validation_loss=0.4626, test_loss=0.4601, train_acc=0.072, validation_acc=0.083, test_acc=0.091
+[FGD] Epoch 1, train_loss=0.4646, validation_loss=0.4626, test_loss=0.4601 (+0.0000), train_acc=0.072, validation_acc=0.083, test_acc=0.091, lr=0, rel_err=0.422, selected_layer=0
+[FGD-WARN] Epoch 1: relative-error condition failed; no learning rate satisfied all validation conditions; model update rejected; FGD conditions request growth
+/home/santiago/StageFrugal/gromo/src/gromo/modules/growing_module.py:2138: UserWarning: input_extension_scaling is null. The input extension will have no effect.
+  warnings.warn(
+[GRO] Growing layer 2 at epoch 1
+  scaling=0, train_loss=0.4646
+  scaling=1, train_loss=0.4648
+  scaling=0.381966, train_loss=0.4640
+  scaling=0.618034, train_loss=0.4636
+  scaling=0.763932, train_loss=0.4636
+  scaling=0.527864, train_loss=0.4637
+  scaling=0.673762, train_loss=0.4635
+  scaling=0.708204, train_loss=0.4635
+  scaling=0.652476, train_loss=0.4635
+  scaling=0.686918, train_loss=0.4635
+  scaling=0.665631, train_loss=0.4635
+  scaling=0.678787, train_loss=0.4635
+  scaling=0.681893, train_loss=0.4635
+  scaling=0.683812, train_loss=0.4635
+  scaling=0.680706, train_loss=0.4635
+  scaling=0.682626, train_loss=0.4635
+[GRO] Epoch 1, train_loss=0.4635, validation_loss=0.4615, test_loss=0.4593 (-0.0008), train_acc=0.077, validation_acc=0.086, test_acc=0.096, scaling=0.6819
+Model after growing:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=2, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=2, out_features=2, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=2, out_features=4, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=4, out_features=10, use_bias=True)
+[FGD] Epoch 2, train_loss=0.4635, validation_loss=0.4615, test_loss=0.4593 (+0.0000), train_acc=0.077, validation_acc=0.086, test_acc=0.096, lr=0, rel_err=0.399, selected_layer=0
+[FGD-WARN] Epoch 2: relative-error condition failed; no learning rate satisfied all validation conditions; model update rejected; FGD conditions request growth
+[GRO] Growing layer 2 at epoch 2
+  scaling=0, train_loss=0.4635
+  scaling=1, train_loss=0.4636
+  scaling=0.381966, train_loss=0.4635
+  scaling=0.618034, train_loss=0.4635
+  scaling=0.236068, train_loss=0.4635
+  scaling=0.145898, train_loss=0.4635
+  scaling=0.0901699, train_loss=0.4635
+  scaling=0.0557281, train_loss=0.4635
+  scaling=0.0344419, train_loss=0.4635
+  scaling=0.0212862, train_loss=0.4635
+  scaling=0.0131556, train_loss=0.4635
+  scaling=0.0263112, train_loss=0.4635
+  scaling=0.0181806, train_loss=0.4635
+  scaling=0.0232056, train_loss=0.4635
+  scaling=0.0201, train_loss=0.4635
+  scaling=0.0220194, train_loss=0.4635
+[GRO] Epoch 2, train_loss=0.4635, validation_loss=0.4615, test_loss=0.4593 (+0.0000), train_acc=0.077, validation_acc=0.086, test_acc=0.096, scaling=0.02129
+Model after growing:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=2, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=2, out_features=2, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=2, out_features=6, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=6, out_features=10, use_bias=True)
+[FGD] Epoch 3, train_loss=0.4635, validation_loss=0.4615, test_loss=0.4593 (+0.0000), train_acc=0.077, validation_acc=0.086, test_acc=0.096, lr=0, rel_err=0.399, selected_layer=0
+[FGD-WARN] Epoch 3: relative-error condition failed; no learning rate satisfied all validation conditions; model update rejected; FGD conditions request growth
+[GRO] Growing layer 0 at epoch 3
+  scaling=0, train_loss=0.4635
+  scaling=1, train_loss=0.5768
+  scaling=0.381966, train_loss=0.4551
+  scaling=0.618034, train_loss=0.4652
+  scaling=0.236068, train_loss=0.4587
+  scaling=0.472136, train_loss=0.4557
+  scaling=0.326238, train_loss=0.4561
+  scaling=0.416408, train_loss=0.4550
+  scaling=0.437694, train_loss=0.4551
+  scaling=0.403252, train_loss=0.4550
+  scaling=0.424538, train_loss=0.4550
+  scaling=0.411383, train_loss=0.4550
+  scaling=0.408277, train_loss=0.4550
+  scaling=0.413302, train_loss=0.4550
+  scaling=0.414488, train_loss=0.4550
+  scaling=0.412569, train_loss=0.4550
+[GRO] Epoch 3, train_loss=0.4550, validation_loss=0.5389, test_loss=0.5486 (+0.0894), train_acc=0.141, validation_acc=0.146, test_acc=0.143, scaling=0.4126
+Model after growing:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=4, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=4, out_features=2, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=2, out_features=6, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=6, out_features=10, use_bias=True)
+[FGD] Epoch 4, train_loss=0.4550, validation_loss=0.5389, test_loss=0.5486 (+0.0000), train_acc=0.141, validation_acc=0.146, test_acc=0.143, lr=0, rel_err=0.365, selected_layer=0
+[FGD-WARN] Epoch 4: relative-error condition failed; no learning rate satisfied all validation conditions; model update rejected; FGD conditions request growth
+[GRO] Growing layer 1 at epoch 4
+  scaling=0, train_loss=0.4550
+  scaling=1, train_loss=0.5045
+  scaling=0.381966, train_loss=0.4546
+  scaling=0.618034, train_loss=0.4601
+  scaling=0.236068, train_loss=0.4545
+  scaling=0.145898, train_loss=0.4548
+  scaling=0.291796, train_loss=0.4544
+  scaling=0.326238, train_loss=0.4544
+  scaling=0.27051, train_loss=0.4544
+  scaling=0.304952, train_loss=0.4544
+  scaling=0.313082, train_loss=0.4544
+  scaling=0.299927, train_loss=0.4544
+  scaling=0.308057, train_loss=0.4544
+  scaling=0.303032, train_loss=0.4544
+  scaling=0.301846, train_loss=0.4544
+  scaling=0.303765, train_loss=0.4544
+[GRO] Epoch 4, train_loss=0.4544, validation_loss=0.5789, test_loss=0.5952 (+0.0466), train_acc=0.152, validation_acc=0.160, test_acc=0.152, scaling=0.303
+Model after growing:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=4, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=4, out_features=5, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=5, out_features=6, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=6, out_features=10, use_bias=True)
+[FGD] Epoch 5, train_loss=0.4544, validation_loss=0.5789, test_loss=0.5952 (+0.0000), train_acc=0.152, validation_acc=0.160, test_acc=0.152, lr=0, rel_err=0.336, selected_layer=0
+[FGD-WARN] Epoch 5: relative-error condition failed; no learning rate satisfied all validation conditions; model update rejected; FGD conditions request growth
+[GRO] Growing layer 2 at epoch 5
+  scaling=0, train_loss=0.4544
+  scaling=1, train_loss=0.4494
+  scaling=0.381966, train_loss=0.4527
+  scaling=0.618034, train_loss=0.4509
+  scaling=0.763932, train_loss=0.4499
+  scaling=0.854102, train_loss=0.4495
+  scaling=0.90983, train_loss=0.4493
+  scaling=0.944272, train_loss=0.4493
+  scaling=0.965558, train_loss=0.4493
+  scaling=0.931116, train_loss=0.4493
+  scaling=0.952403, train_loss=0.4493
+  scaling=0.957428, train_loss=0.4493
+  scaling=0.949297, train_loss=0.4493
+  scaling=0.954322, train_loss=0.4493
+  scaling=0.951216, train_loss=0.4493
+  scaling=0.953136, train_loss=0.4493
+[GRO] Epoch 5, train_loss=0.4493, validation_loss=0.5980, test_loss=0.6167 (+0.0214), train_acc=0.171, validation_acc=0.172, test_acc=0.172, scaling=0.9524
+Model after growing:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=4, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=4, out_features=5, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=5, out_features=11, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=11, out_features=10, use_bias=True)
+[FGD] Epoch 6, train_loss=0.4493, validation_loss=0.5980, test_loss=0.6167 (+0.0000), train_acc=0.171, validation_acc=0.172, test_acc=0.172, lr=0, rel_err=0.268, selected_layer=0
+[FGD-WARN] Epoch 6: relative-error condition failed; no learning rate satisfied all validation conditions; model update rejected; FGD conditions request growth
+[GRO] Growing layer 0 at epoch 6
+  scaling=0, train_loss=0.4493
+  scaling=1, train_loss=47.7248
+  scaling=0.381966, train_loss=1.7147
+  scaling=0.618034, train_loss=7.7819
+  scaling=0.236068, train_loss=0.6755
+  scaling=0.145898, train_loss=0.4846
+  scaling=0.0901699, train_loss=0.4520
+  scaling=0.0557281, train_loss=0.4471
+  scaling=0.0344419, train_loss=0.4474
+  scaling=0.0688837, train_loss=0.4481
+  scaling=0.0475975, train_loss=0.4469
+  scaling=0.0425725, train_loss=0.4470
+  scaling=0.0507031, train_loss=0.4470
+  scaling=0.0456781, train_loss=0.4470
+  scaling=0.0487837, train_loss=0.4469
+  scaling=0.0495168, train_loss=0.4469
+[GRO] Epoch 6, train_loss=0.4469, validation_loss=0.5978, test_loss=0.6186 (+0.0019), train_acc=0.180, validation_acc=0.185, test_acc=0.182, scaling=0.04878
+Model after growing:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=9, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=9, out_features=5, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=5, out_features=11, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=11, out_features=10, use_bias=True)
+[FGD] Epoch 7, train_loss=0.4469, validation_loss=0.5978, test_loss=0.6186 (+0.0000), train_acc=0.180, validation_acc=0.185, test_acc=0.182, lr=0, rel_err=0.250, selected_layer=0
+[FGD-WARN] Epoch 7: relative-error condition failed; no learning rate satisfied all validation conditions; model update rejected; FGD conditions request growth
+[GRO] Growing layer 1 at epoch 7
+  scaling=0, train_loss=0.4469
+  scaling=1, train_loss=0.4497
+  scaling=0.381966, train_loss=0.4462
+  scaling=0.618034, train_loss=0.4458
+  scaling=0.763932, train_loss=0.4464
+  scaling=0.527864, train_loss=0.4458
+  scaling=0.673762, train_loss=0.4459
+  scaling=0.583592, train_loss=0.4458
+  scaling=0.562306, train_loss=0.4458
+  scaling=0.596748, train_loss=0.4458
+  scaling=0.575462, train_loss=0.4458
+  scaling=0.588617, train_loss=0.4458
+  scaling=0.580487, train_loss=0.4458
+  scaling=0.578567, train_loss=0.4458
+  scaling=0.577381, train_loss=0.4458
+  scaling=0.5793, train_loss=0.4458
+[GRO] Epoch 7, train_loss=0.4458, validation_loss=0.5962, test_loss=0.6157 (-0.0029), train_acc=0.184, validation_acc=0.190, test_acc=0.188, scaling=0.5786
+Model after growing:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=9, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=9, out_features=12, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=12, out_features=11, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=11, out_features=10, use_bias=True)
+[FGD] Epoch 8, train_loss=0.0329, validation_loss=0.0361, test_loss=0.0377 (-0.5780), train_acc=0.855, validation_acc=0.851, test_acc=0.831, lr=0.03807, rel_err=0.070, selected_layer=0
+[FGD-WARN] Epoch 8: maximum validation-certified learning rate accepted after transactional search
+[FGD] Epoch 9, train_loss=0.0264, validation_loss=0.0298, test_loss=0.0310 (-0.0066), train_acc=0.875, validation_acc=0.864, test_acc=0.852, lr=0.0125, rel_err=0.091, selected_layer=0
+[FGD-WARN] Epoch 9: maximum validation-certified learning rate accepted after transactional search
+/home/santiago/StageFrugal/gromo/src/gromo/utils/tools.py:119: UserWarning: Using the pseudo-inverse for the computation of the optimal delta.
+  warn("Using the pseudo-inverse for the computation of the optimal delta.")
+[FGD] Epoch 10, train_loss=0.0261, validation_loss=0.0295, test_loss=0.0308 (-0.0003), train_acc=0.877, validation_acc=0.865, test_acc=0.853, lr=0.0007643, rel_err=0.092, selected_layer=0
+[FGD-WARN] Epoch 10: maximum validation-certified learning rate accepted after transactional search
+[FGD] Epoch 11, train_loss=0.0261, validation_loss=0.0295, test_loss=0.0308 (+0.0000), train_acc=0.877, validation_acc=0.865, test_acc=0.853, lr=0, rel_err=0.092, selected_layer=0
+[FGD-WARN] Epoch 11: no learning rate satisfied all validation conditions; model update rejected; FGD conditions request growth
+[GRO] Growing layer 2 at epoch 11
+  scaling=0, train_loss=0.0261
+  scaling=1, train_loss=0.0266
+  scaling=0.381966, train_loss=0.0259
+  scaling=0.618034, train_loss=0.0258
+  scaling=0.763932, train_loss=0.0259
+  scaling=0.527864, train_loss=0.0258
+  scaling=0.673762, train_loss=0.0258
+  scaling=0.583592, train_loss=0.0258
+  scaling=0.562306, train_loss=0.0258
+  scaling=0.596748, train_loss=0.0258
+  scaling=0.604878, train_loss=0.0258
+  scaling=0.591723, train_loss=0.0258
+  scaling=0.588617, train_loss=0.0258
+  scaling=0.593642, train_loss=0.0258
+  scaling=0.594828, train_loss=0.0258
+  scaling=0.592909, train_loss=0.0258
+[GRO] Epoch 11, train_loss=0.0258, validation_loss=0.0291, test_loss=0.0302 (-0.0005), train_acc=0.881, validation_acc=0.868, test_acc=0.856, scaling=0.5936
+Model after growing:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=9, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=9, out_features=12, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=12, out_features=20, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=20, out_features=10, use_bias=True)
+[FGD] Epoch 12, train_loss=0.0209, validation_loss=0.0232, test_loss=0.0233 (-0.0069), train_acc=0.893, validation_acc=0.879, test_acc=0.880, lr=0.04655, rel_err=0.076, selected_layer=0
+[FGD-WARN] Epoch 12: maximum validation-certified learning rate accepted after transactional search
+[FGD] Epoch 13, train_loss=0.0205, validation_loss=0.0228, test_loss=0.0229 (-0.0004), train_acc=0.894, validation_acc=0.881, test_acc=0.881, lr=0.0004913, rel_err=0.079, selected_layer=0
+[FGD-WARN] Epoch 13: maximum validation-certified learning rate accepted after transactional search
+[FGD] Epoch 14, train_loss=0.0205, validation_loss=0.0228, test_loss=0.0229 (+0.0000), train_acc=0.894, validation_acc=0.881, test_acc=0.881, lr=0, rel_err=0.079, selected_layer=0
+[FGD-WARN] Epoch 14: no learning rate satisfied all validation conditions; model update rejected; FGD conditions request growth
+[GRO] Growing layer 2 at epoch 14
+  scaling=0, train_loss=0.0205
+  scaling=1, train_loss=0.0205
+  scaling=0.381966, train_loss=0.0204
+  scaling=0.618034, train_loss=0.0204
+  scaling=0.763932, train_loss=0.0204
+  scaling=0.527864, train_loss=0.0204
+  scaling=0.673762, train_loss=0.0204
+  scaling=0.583592, train_loss=0.0204
+  scaling=0.63932, train_loss=0.0204
+  scaling=0.604878, train_loss=0.0204
+  scaling=0.626165, train_loss=0.0204
+  scaling=0.613009, train_loss=0.0204
+  scaling=0.62114, train_loss=0.0204
+  scaling=0.616115, train_loss=0.0204
+  scaling=0.61922, train_loss=0.0204
+  scaling=0.617301, train_loss=0.0204
+[GRO] Epoch 14, train_loss=0.0204, validation_loss=0.0227, test_loss=0.0228 (-0.0001), train_acc=0.895, validation_acc=0.881, test_acc=0.881, scaling=0.618
+Model after growing:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=9, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=9, out_features=12, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=12, out_features=29, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=29, out_features=10, use_bias=True)
+[FGD] Epoch 15, train_loss=0.0175, validation_loss=0.0200, test_loss=0.0202 (-0.0025), train_acc=0.909, validation_acc=0.894, test_acc=0.890, lr=0.03097, rel_err=0.042, selected_layer=0
+[FGD-WARN] Epoch 15: maximum validation-certified learning rate accepted after transactional search
+[FGD] Epoch 16, train_loss=0.0160, validation_loss=0.0187, test_loss=0.0191 (-0.0011), train_acc=0.912, validation_acc=0.899, test_acc=0.890, lr=0.02024, rel_err=0.055, selected_layer=0
+[FGD-WARN] Epoch 16: maximum validation-certified learning rate accepted after transactional search
+[FGD] Epoch 17, train_loss=0.0152, validation_loss=0.0179, test_loss=0.0186 (-0.0006), train_acc=0.915, validation_acc=0.897, test_acc=0.889, lr=0.01548, rel_err=0.068, selected_layer=0
+[FGD-WARN] Epoch 17: maximum validation-certified learning rate accepted after transactional search
+[FGD] Epoch 18, train_loss=0.0147, validation_loss=0.0176, test_loss=0.0182 (-0.0003), train_acc=0.916, validation_acc=0.898, test_acc=0.892, lr=0.006601, rel_err=0.067, selected_layer=0
+[FGD-WARN] Epoch 18: maximum validation-certified learning rate accepted after transactional search
+[FGD] Epoch 19, train_loss=0.0146, validation_loss=0.0175, test_loss=0.0182 (-0.0001), train_acc=0.916, validation_acc=0.899, test_acc=0.895, lr=0.002428, rel_err=0.068, selected_layer=0
+[FGD-WARN] Epoch 19: maximum validation-certified learning rate accepted after transactional search
+[FGD] Epoch 20, train_loss=0.0145, validation_loss=0.0173, test_loss=0.0180 (-0.0001), train_acc=0.917, validation_acc=0.901, test_acc=0.895, lr=0.002629, rel_err=0.068, selected_layer=0
+[FGD-WARN] Epoch 20: maximum validation-certified learning rate accepted after transactional search
+[FGD] Epoch 21, train_loss=0.0145, validation_loss=0.0173, test_loss=0.0180 (+0.0000), train_acc=0.917, validation_acc=0.901, test_acc=0.895, lr=0, rel_err=0.068, selected_layer=0
+[FGD-WARN] Epoch 21: global-convergence bound failed; no learning rate satisfied all validation conditions; model update rejected; FGD conditions request growth
+[GRO] Growing layer 2 at epoch 21
+  scaling=0, train_loss=0.0145
+  scaling=1, train_loss=0.0146
+  scaling=0.381966, train_loss=0.0145
+  scaling=0.618034, train_loss=0.0145
+  scaling=0.763932, train_loss=0.0145
+  scaling=0.527864, train_loss=0.0145
+  scaling=0.472136, train_loss=0.0145
+  scaling=0.562306, train_loss=0.0145
+  scaling=0.506578, train_loss=0.0145
+  scaling=0.493422, train_loss=0.0145
+  scaling=0.514708, train_loss=0.0145
+  scaling=0.519733, train_loss=0.0145
+  scaling=0.522839, train_loss=0.0145
+  scaling=0.517814, train_loss=0.0145
+  scaling=0.52092, train_loss=0.0145
+  scaling=0.519, train_loss=0.0145
+[GRO] Epoch 21, train_loss=0.0145, validation_loss=0.0173, test_loss=0.0180 (+0.0000), train_acc=0.917, validation_acc=0.899, test_acc=0.895, scaling=0.519
+Model after growing:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=9, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=9, out_features=12, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=12, out_features=36, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=36, out_features=10, use_bias=True)
+[FGD] Epoch 22, train_loss=0.0145, validation_loss=0.0173, test_loss=0.0180 (+0.0000), train_acc=0.917, validation_acc=0.899, test_acc=0.895, lr=0, rel_err=0.050, selected_layer=0
+[FGD-WARN] Epoch 22: global-convergence bound failed; no learning rate satisfied all validation conditions; model update rejected; FGD conditions request growth
+[GRO] Growing layer 2 at epoch 22
+  scaling=0, train_loss=0.0145
+  scaling=1, train_loss=0.0146
+  scaling=0.381966, train_loss=0.0145
+  scaling=0.618034, train_loss=0.0145
+  scaling=0.236068, train_loss=0.0145
+  scaling=0.145898, train_loss=0.0145
+  scaling=0.0901699, train_loss=0.0145
+  scaling=0.0557281, train_loss=0.0145
+  scaling=0.0344419, train_loss=0.0145
+  scaling=0.0212862, train_loss=0.0145
+  scaling=0.0131556, train_loss=0.0145
+  scaling=0.00813062, train_loss=0.0145
+  scaling=0.0162612, train_loss=0.0145
+  scaling=0.0112362, train_loss=0.0145
+  scaling=0.0143419, train_loss=0.0145
+  scaling=0.0124225, train_loss=0.0145
+[GRO] Epoch 22, train_loss=0.0145, validation_loss=0.0173, test_loss=0.0180 (+0.0000), train_acc=0.917, validation_acc=0.899, test_acc=0.895, scaling=0
+Model after growing:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=9, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=9, out_features=12, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=12, out_features=42, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=42, out_features=10, use_bias=True)
+[FGD] Epoch 23, train_loss=0.0144, validation_loss=0.0171, test_loss=0.0179 (-0.0002), train_acc=0.917, validation_acc=0.900, test_acc=0.896, lr=0.002746, rel_err=0.054, selected_layer=0
+[FGD-WARN] Epoch 23: maximum validation-certified learning rate accepted after transactional search
+[FGD] Epoch 24, train_loss=0.0144, validation_loss=0.0171, test_loss=0.0178 (-0.0000), train_acc=0.918, validation_acc=0.901, test_acc=0.896, lr=0.001297, rel_err=0.054, selected_layer=0
+[FGD-WARN] Epoch 24: maximum validation-certified learning rate accepted after transactional search
+[FGD] Epoch 25, train_loss=0.0144, validation_loss=0.0171, test_loss=0.0178 (+0.0000), train_acc=0.918, validation_acc=0.901, test_acc=0.896, lr=0, rel_err=0.054, selected_layer=0
+[FGD-WARN] Epoch 25: global-convergence bound failed; no learning rate satisfied all validation conditions; model update rejected; FGD conditions request growth
+[GRO] Growing layer 2 at epoch 25
+  scaling=0, train_loss=0.0144
+  scaling=1, train_loss=0.0144
+  scaling=0.381966, train_loss=0.0144
+  scaling=0.618034, train_loss=0.0144
+  scaling=0.236068, train_loss=0.0144
+  scaling=0.472136, train_loss=0.0144
+  scaling=0.326238, train_loss=0.0144
+  scaling=0.416408, train_loss=0.0144
+  scaling=0.437694, train_loss=0.0144
+  scaling=0.403252, train_loss=0.0144
+  scaling=0.424538, train_loss=0.0144
+  scaling=0.411383, train_loss=0.0144
+  scaling=0.419513, train_loss=0.0144
+  scaling=0.414488, train_loss=0.0144
+  scaling=0.417594, train_loss=0.0144
+  scaling=0.418327, train_loss=0.0144
+[GRO] Epoch 25, train_loss=0.0144, validation_loss=0.0171, test_loss=0.0178 (-0.0000), train_acc=0.918, validation_acc=0.901, test_acc=0.896, scaling=0.4176
+Model after growing:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=9, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=9, out_features=12, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=12, out_features=49, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=49, out_features=10, use_bias=True)
+[FGD] Epoch 26, train_loss=0.0144, validation_loss=0.0171, test_loss=0.0178 (+0.0000), train_acc=0.918, validation_acc=0.901, test_acc=0.896, lr=0, rel_err=0.044, selected_layer=0
+[FGD-WARN] Epoch 26: global-convergence bound failed; no learning rate satisfied all validation conditions; model update rejected; FGD conditions request growth
+[GRO] Growing layer 2 at epoch 26
+  scaling=0, train_loss=0.0144
+  scaling=1, train_loss=0.0144
+  scaling=0.381966, train_loss=0.0144
+  scaling=0.618034, train_loss=0.0144
+  scaling=0.236068, train_loss=0.0144
+  scaling=0.145898, train_loss=0.0144
+  scaling=0.0901699, train_loss=0.0144
+  scaling=0.0557281, train_loss=0.0144
+  scaling=0.0344419, train_loss=0.0144
+  scaling=0.0212862, train_loss=0.0144
+  scaling=0.0131556, train_loss=0.0144
+  scaling=0.00813062, train_loss=0.0144
+  scaling=0.005025, train_loss=0.0144
+  scaling=0.00310562, train_loss=0.0144
+  scaling=0.00621124, train_loss=0.0144
+  scaling=0.00429186, train_loss=0.0144
+[GRO] Epoch 26, train_loss=0.0144, validation_loss=0.0171, test_loss=0.0178 (-0.0000), train_acc=0.918, validation_acc=0.901, test_acc=0.896, scaling=0.005025
+Model after growing:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=9, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=9, out_features=12, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=12, out_features=56, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=56, out_features=10, use_bias=True)
+[FGD] Epoch 27, train_loss=0.0144, validation_loss=0.0171, test_loss=0.0178 (+0.0000), train_acc=0.918, validation_acc=0.901, test_acc=0.896, lr=0, rel_err=0.044, selected_layer=0
+[FGD-WARN] Epoch 27: global-convergence bound failed; no learning rate satisfied all validation conditions; model update rejected; FGD conditions request growth
+[GRO] Growing layer 2 at epoch 27
+  scaling=0, train_loss=0.0144
+  scaling=1, train_loss=0.0144
+  scaling=0.381966, train_loss=0.0144
+  scaling=0.618034, train_loss=0.0144
+  scaling=0.236068, train_loss=0.0144
+  scaling=0.145898, train_loss=0.0144
+  scaling=0.0901699, train_loss=0.0144
+  scaling=0.0557281, train_loss=0.0144
+  scaling=0.0344419, train_loss=0.0144
+  scaling=0.0212862, train_loss=0.0144
+  scaling=0.0131556, train_loss=0.0144
+  scaling=0.00813062, train_loss=0.0144
+  scaling=0.005025, train_loss=0.0144
+  scaling=0.01005, train_loss=0.0144
+  scaling=0.00694438, train_loss=0.0144
+  scaling=0.00886376, train_loss=0.0144
+[GRO] Epoch 27, train_loss=0.0144, validation_loss=0.0171, test_loss=0.0178 (+0.0000), train_acc=0.918, validation_acc=0.901, test_acc=0.896, scaling=0.01316
+Model after growing:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=9, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=9, out_features=12, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=12, out_features=63, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=63, out_features=10, use_bias=True)
+[FGD] Epoch 28, train_loss=0.0144, validation_loss=0.0171, test_loss=0.0178 (+0.0000), train_acc=0.918, validation_acc=0.901, test_acc=0.896, lr=0, rel_err=0.044, selected_layer=0
+[FGD-WARN] Epoch 28: global-convergence bound failed; no learning rate satisfied all validation conditions; model update rejected; FGD conditions request growth
+[GRO] Growing layer 2 at epoch 28
+  scaling=0, train_loss=0.0144
+  scaling=1, train_loss=0.0144
+  scaling=0.381966, train_loss=0.0144
+  scaling=0.618034, train_loss=0.0144
+  scaling=0.236068, train_loss=0.0144
+  scaling=0.145898, train_loss=0.0144
+  scaling=0.0901699, train_loss=0.0144
+  scaling=0.0557281, train_loss=0.0144
+  scaling=0.0344419, train_loss=0.0144
+  scaling=0.0212862, train_loss=0.0144
+  scaling=0.0131556, train_loss=0.0144
+  scaling=0.0263112, train_loss=0.0144
+  scaling=0.0181806, train_loss=0.0144
+  scaling=0.0162612, train_loss=0.0144
+  scaling=0.0193669, train_loss=0.0144
+  scaling=0.0174475, train_loss=0.0144
+[GRO] Epoch 28, train_loss=0.0144, validation_loss=0.0171, test_loss=0.0178 (+0.0000), train_acc=0.918, validation_acc=0.901, test_acc=0.896, scaling=0.01818
+Model after growing:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=784, out_features=9, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=9, out_features=12, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=12, out_features=70, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=70, out_features=10, use_bias=True)

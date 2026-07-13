@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, fields, replace
@@ -18,11 +19,15 @@ from stable_tiny.data import (
 )
 from stable_tiny.fgd_approx import (
     FGDApproxConfig,
+    FGDApproxEpochResult,
     FGDLayerRelError,
     FGDOutputRelError,
+    FGDValidationCertificate,
+    _clear_inaccessible_tensor_caches,
     batch_functional_mse_loss,
     evaluate_fgd_validation_certificate,
     select_certifying_growth_layer_index,
+    select_tiny_growth_layer_index,
     should_trigger_fgd_growth,
     tiny_optimal_update_kwargs,
     train_one_epoch_fgd_approx,
@@ -148,6 +153,7 @@ class HistoryEntry:
     fgd_layer_rel_errors: list[FGDLayerRelError] = field(default_factory=list)
     fgd_output_rel_error: FGDOutputRelError | None = None
     fgd_learning_rate_upper_bound: float | None = None
+    fgd_max_valid_learning_rate: float | None = None
     fgd_learning_rate_interval_valid: bool | None = None
     fgd_learning_rate_clipped_batches: int = 0
     fgd_skipped_batches: int = 0
@@ -165,6 +171,8 @@ class HistoryEntry:
     fgd_theory_learning_rate_adjusted: bool = False
     fgd_sensor_valid: bool | None = None
     fgd_sensor_invalid_batches: int = 0
+    fgd_candidate_accepted: bool | None = None
+    fgd_lr_search_trials: int = 0
 
 
 @dataclass
@@ -174,6 +182,40 @@ class PipelineResult:
     growth_events: list[GrowthResult]
     model: GrowingMLP
     device: str
+
+
+@dataclass(frozen=True)
+class _FGDTheoryState:
+    epoch_count: int
+    min_gradient_sq_norm: float | None
+    min_positive_learning_rate: float | None
+    min_descent_coefficient: float | None
+    global_contraction_product: float
+    previous_validation_functional_loss: float
+
+
+@dataclass(frozen=True)
+class _FGDTrial:
+    model: GrowingMLP
+    epoch_result: FGDApproxEpochResult
+    certificate: FGDValidationCertificate
+    theory_state: _FGDTheoryState
+    validation_functional_loss: float
+    loss_descent_valid: bool
+    stationary_bound: float | None
+    stationary_bound_valid: bool | None
+    global_bound: float | None
+    global_bound_valid: bool | None
+    global_contraction: float | None
+    all_conditions_valid: bool
+
+
+@dataclass(frozen=True)
+class _FGDSearchResult:
+    accepted: _FGDTrial | None
+    last_trial: _FGDTrial | None
+    trial_count: int
+    sensor_failure: bool
 
 
 def _section_dataclass(
@@ -484,6 +526,261 @@ def evaluate_functional_loss(
     return total_loss
 
 
+def certified_validation_learning_rate(
+    certificate: FGDValidationCertificate,
+    config: FGDApproxConfig,
+) -> float | None:
+    """Return the validation-certified LR, including the safety factor."""
+    learning_rate = certificate.max_valid_learning_rate
+    if (
+        not certificate.sensor_valid
+        or learning_rate is None
+        or learning_rate <= config.theory_lr_min + config.eps
+    ):
+        return None
+    return learning_rate
+
+
+def _evaluate_fgd_trial(
+    *,
+    base_model: GrowingMLP,
+    train_batches: list[tuple[torch.Tensor, torch.Tensor]],
+    test_loader: torch.utils.data.DataLoader,
+    validation_loader: torch.utils.data.DataLoader,
+    loss_function: torch.nn.Module,
+    device: torch.device,
+    learning_rate: float,
+    accuracy_tolerance: float,
+    config: PipelineConfig,
+    projection_group_size: int,
+    classification: bool,
+    theory_state: _FGDTheoryState,
+    initial_functional_gap: float,
+    theory_loss_star: float,
+) -> _FGDTrial:
+    """Train a disposable model and certify every condition on validation."""
+    trial_model = copy.deepcopy(base_model)
+    epoch_result = train_one_epoch_fgd_approx(
+        model=trial_model,
+        train_loader=train_batches,
+        test_loader=test_loader,
+        loss_function=loss_function,
+        device=device,
+        learning_rate=learning_rate,
+        accuracy_tolerance=accuracy_tolerance,
+        config=config.fgd_approx,
+        projection_group_size=projection_group_size,
+        classification=classification,
+        evaluate_test=False,
+    )
+    certificate = evaluate_fgd_validation_certificate(
+        model=trial_model,
+        data_loader=validation_loader,
+        device=device,
+        config=config.fgd_approx,
+        learning_rate=epoch_result.min_positive_learning_rate,
+        projection_group_size=projection_group_size,
+    )
+    validation_functional_loss = evaluate_functional_loss(
+        trial_model,
+        validation_loader,
+        device,
+    )
+    loss_descent_valid = (
+        validation_functional_loss
+        <= theory_state.previous_validation_functional_loss
+        + config.fgd_approx.eps
+    )
+
+    epoch_count = theory_state.epoch_count
+    min_gradient_sq_norm = theory_state.min_gradient_sq_norm
+    min_positive_learning_rate = theory_state.min_positive_learning_rate
+    min_descent_coefficient = theory_state.min_descent_coefficient
+    contraction_product = theory_state.global_contraction_product
+
+    eta = epoch_result.min_positive_learning_rate
+    gradient_sq_norm = certificate.gradient_sq_norm
+    descent_coefficient = certificate.theory_descent_coefficient
+    if gradient_sq_norm is not None and eta is not None:
+        epoch_count += 1
+        min_gradient_sq_norm = (
+            gradient_sq_norm
+            if min_gradient_sq_norm is None
+            else min(min_gradient_sq_norm, gradient_sq_norm)
+        )
+        min_positive_learning_rate = (
+            eta
+            if min_positive_learning_rate is None
+            else min(min_positive_learning_rate, eta)
+        )
+    if descent_coefficient is not None and descent_coefficient > 0.0:
+        min_descent_coefficient = (
+            descent_coefficient
+            if min_descent_coefficient is None
+            else min(min_descent_coefficient, descent_coefficient)
+        )
+
+    stationary_bound: float | None = None
+    stationary_bound_valid: bool | None = None
+    global_bound: float | None = None
+    global_bound_valid: bool | None = None
+    global_contraction: float | None = None
+    if (
+        epoch_count > 0
+        and min_positive_learning_rate is not None
+        and min_descent_coefficient is not None
+        and min_positive_learning_rate > 0.0
+        and min_descent_coefficient > 0.0
+    ):
+        stationary_bound = initial_functional_gap / (
+            epoch_count
+            * min_positive_learning_rate
+            * min_descent_coefficient
+        )
+        stationary_bound_valid = (
+            min_gradient_sq_norm is not None
+            and min_gradient_sq_norm
+            <= stationary_bound + config.fgd_approx.eps
+        )
+
+        beta = config.fgd_approx.theory_beta
+        mu = config.fgd_approx.theory_mu
+        if (
+            eta is not None
+            and descent_coefficient is not None
+            and beta > 0
+            and mu > 0
+        ):
+            global_contraction = 1.0 - (
+                2.0 * eta * mu * descent_coefficient / (beta**2)
+            )
+            contraction_product *= global_contraction
+            global_bound = contraction_product * initial_functional_gap
+            current_gap = max(
+                validation_functional_loss - theory_loss_star,
+                0.0,
+            )
+            global_bound_valid = (
+                current_gap <= global_bound + config.fgd_approx.eps
+            )
+
+    updated_state = _FGDTheoryState(
+        epoch_count=epoch_count,
+        min_gradient_sq_norm=min_gradient_sq_norm,
+        min_positive_learning_rate=min_positive_learning_rate,
+        min_descent_coefficient=min_descent_coefficient,
+        global_contraction_product=contraction_product,
+        previous_validation_functional_loss=validation_functional_loss,
+    )
+    all_conditions_valid = (
+        epoch_result.sensor_valid
+        and epoch_result.skipped_batches == 0
+        and certificate.sensor_valid
+        and certificate.relative_error_condition_valid is True
+        and certificate.learning_rate_interval_valid is True
+        and loss_descent_valid
+        and stationary_bound_valid is True
+        and global_bound_valid is True
+    )
+    return _FGDTrial(
+        model=trial_model,
+        epoch_result=epoch_result,
+        certificate=certificate,
+        theory_state=updated_state,
+        validation_functional_loss=validation_functional_loss,
+        loss_descent_valid=loss_descent_valid,
+        stationary_bound=stationary_bound,
+        stationary_bound_valid=stationary_bound_valid,
+        global_bound=global_bound,
+        global_bound_valid=global_bound_valid,
+        global_contraction=global_contraction,
+        all_conditions_valid=all_conditions_valid,
+    )
+
+
+def _search_fgd_certified_trial(
+    *,
+    maximum_learning_rate: float,
+    evaluate_trial: Callable[[float], _FGDTrial],
+    config: FGDApproxConfig,
+) -> _FGDSearchResult:
+    """Return the numerically largest LR found to satisfy every condition."""
+    trial_count = 0
+    last_trial: _FGDTrial | None = None
+    sensor_failure = False
+
+    def sensor_valid(trial: _FGDTrial) -> bool:
+        return (
+            trial.epoch_result.sensor_valid
+            and trial.epoch_result.skipped_batches == 0
+            and trial.certificate.sensor_valid
+        )
+
+    def run(learning_rate: float) -> _FGDTrial:
+        nonlocal trial_count, last_trial, sensor_failure
+        trial = evaluate_trial(learning_rate)
+        trial_count += 1
+        last_trial = trial
+        sensor_failure = sensor_failure or not sensor_valid(trial)
+        return trial
+
+    lower_interval_bound = config.theory_lr_min + config.eps
+    if maximum_learning_rate <= lower_interval_bound:
+        return _FGDSearchResult(None, None, 0, False)
+    floor_factor = min(max(config.lr_min_factor, 0.0), 1.0)
+    minimum = max(
+        lower_interval_bound,
+        maximum_learning_rate * floor_factor,
+    )
+    steps = max(1, config.theory_lr_search_steps)
+    if abs(maximum_learning_rate - minimum) <= config.eps:
+        steps = 1
+
+    failed_above: float | None = None
+    for index in range(steps):
+        if steps == 1:
+            candidate = maximum_learning_rate
+        else:
+            fraction = index / (steps - 1)
+            candidate = maximum_learning_rate * (
+                minimum / maximum_learning_rate
+            ) ** fraction
+        trial = run(candidate)
+        if not sensor_valid(trial):
+            return _FGDSearchResult(None, last_trial, trial_count, True)
+        if not trial.all_conditions_valid:
+            failed_above = candidate
+            continue
+
+        best_trial = trial
+        lower_passing = candidate
+        if failed_above is not None and failed_above > lower_passing:
+            upper_failing = failed_above
+            for _ in range(max(0, config.theory_lr_search_refinements)):
+                midpoint = 0.5 * (lower_passing + upper_failing)
+                midpoint_trial = run(midpoint)
+                if not sensor_valid(midpoint_trial):
+                    return _FGDSearchResult(None, last_trial, trial_count, True)
+                if midpoint_trial.all_conditions_valid:
+                    lower_passing = midpoint
+                    best_trial = midpoint_trial
+                else:
+                    upper_failing = midpoint
+        return _FGDSearchResult(
+            accepted=best_trial,
+            last_trial=last_trial,
+            trial_count=trial_count,
+            sensor_failure=sensor_failure,
+        )
+
+    return _FGDSearchResult(
+        accepted=None,
+        last_trial=last_trial,
+        trial_count=trial_count,
+        sensor_failure=sensor_failure,
+    )
+
+
 def _json_safe(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
@@ -686,18 +983,16 @@ def run_pipeline(
                         )
                     )
                 lr_certificate = validation_certificate_for_next_epoch
-                max_valid_learning_rate = lr_certificate.max_valid_learning_rate
-                if (
-                    lr_certificate.sensor_valid
-                    and max_valid_learning_rate is not None
-                    and max_valid_learning_rate
-                    > config.fgd_approx.theory_lr_min + config.fgd_approx.eps
-                ):
+                certified_learning_rate = certified_validation_learning_rate(
+                    lr_certificate,
+                    config.fgd_approx,
+                )
+                if certified_learning_rate is not None:
                     current_lr_in_interval = (
                         current_fgd_learning_rate
                         > config.fgd_approx.theory_lr_min
                         and current_fgd_learning_rate
-                        <= max_valid_learning_rate + config.fgd_approx.eps
+                        <= certified_learning_rate + config.fgd_approx.eps
                     )
                     if (
                         config.fgd_approx.theory_lr_follow_bound
@@ -706,11 +1001,11 @@ def run_pipeline(
                         learning_rate_clipped_by_validation = (
                             abs(
                                 current_fgd_learning_rate
-                                - max_valid_learning_rate
+                                - certified_learning_rate
                             )
                             > config.fgd_approx.eps
                         )
-                        current_fgd_learning_rate = max_valid_learning_rate
+                        current_fgd_learning_rate = certified_learning_rate
                     learning_rate = current_fgd_learning_rate
                 else:
                     # No theoretically admissible step was certified. Keep the
@@ -749,7 +1044,11 @@ def run_pipeline(
             fgd_theory_learning_rate_adjusted = False
             fgd_sensor_valid: bool | None = None
             fgd_sensor_invalid_batches = 0
+            fgd_trial_sensor_failure = False
+            diagnostic_trial: _FGDTrial | None = None
             fgd_growth_requested = False
+            fgd_candidate_accepted: bool | None = None
+            fgd_lr_search_trials = 0
             entry_learning_rate = current_learning_rate(optimizer)
             if config.training.method == "normal":
                 epoch_result = train_one_epoch(
@@ -765,32 +1064,225 @@ def run_pipeline(
                 )
                 step_type: StepType = "SGD"
             elif config.training.method == "fgd_approx":
-                fgd_epoch_result = train_one_epoch_fgd_approx(
-                    model=model,
-                    train_loader=train_loader,
-                    test_loader=test_loader,
-                    loss_function=loss_function,
-                    device=device,
-                    learning_rate=learning_rate,
-                    accuracy_tolerance=config.training.accuracy_tolerance,
-                    config=config.fgd_approx,
-                    projection_group_size=current_projection_group_size,
-                    classification=classification,
-                )
-                epoch_result = fgd_epoch_result
-                selected_layer_index = fgd_epoch_result.selected_layer_index
-                fgd_layer_rel_errors = fgd_epoch_result.layer_relative_errors
-                if fgd_epoch_result.learning_rate is not None:
-                    entry_learning_rate = fgd_epoch_result.learning_rate
+                if use_fgd_theory_learning_rate:
+                    theory_state = _FGDTheoryState(
+                        epoch_count=fgd_epoch_count,
+                        min_gradient_sq_norm=fgd_min_gradient_sq_norm,
+                        min_positive_learning_rate=fgd_min_positive_learning_rate,
+                        min_descent_coefficient=fgd_min_descent_coefficient,
+                        global_contraction_product=fgd_global_contraction_product,
+                        previous_validation_functional_loss=(
+                            previous_validation_functional_loss
+                        ),
+                    )
+                    _clear_inaccessible_tensor_caches(model)
+                    frozen_train_batches = list(train_loader)
+                    maximum_learning_rate = certified_validation_learning_rate(
+                        lr_certificate,
+                        config.fgd_approx,
+                    )
 
-                validation_certificate = evaluate_fgd_validation_certificate(
-                    model=model,
-                    data_loader=validation_loader,
-                    device=device,
-                    config=config.fgd_approx,
-                    learning_rate=fgd_epoch_result.min_positive_learning_rate,
-                    projection_group_size=current_projection_group_size,
-                )
+                    def evaluate_trial(candidate_learning_rate: float) -> _FGDTrial:
+                        return _evaluate_fgd_trial(
+                            base_model=model,
+                            train_batches=frozen_train_batches,
+                            test_loader=test_loader,
+                            validation_loader=validation_loader,
+                            loss_function=loss_function,
+                            device=device,
+                            learning_rate=candidate_learning_rate,
+                            accuracy_tolerance=config.training.accuracy_tolerance,
+                            config=config,
+                            projection_group_size=current_projection_group_size,
+                            classification=classification,
+                            theory_state=theory_state,
+                            initial_functional_gap=initial_functional_gap,
+                            theory_loss_star=theory_loss_star,
+                        )
+
+                    search_result = (
+                        _search_fgd_certified_trial(
+                            maximum_learning_rate=maximum_learning_rate,
+                            evaluate_trial=evaluate_trial,
+                            config=config.fgd_approx,
+                        )
+                        if maximum_learning_rate is not None
+                        else _FGDSearchResult(None, None, 0, False)
+                    )
+                    fgd_lr_search_trials = search_result.trial_count
+                    fgd_trial_sensor_failure = search_result.sensor_failure
+                    accepted_trial = search_result.accepted
+                    diagnostic_trial = search_result.last_trial
+
+                    if accepted_trial is not None:
+                        model = accepted_trial.model
+                        fgd_epoch_result = accepted_trial.epoch_result
+                        test_metrics = evaluate_regression_metrics(
+                            model,
+                            test_loader,
+                            loss_function,
+                            device=device,
+                            accuracy_tolerance=config.training.accuracy_tolerance,
+                            classification=classification,
+                        )
+                        fgd_epoch_result = replace(
+                            fgd_epoch_result,
+                            test_loss=test_metrics.loss,
+                            test_accuracy=test_metrics.accuracy,
+                        )
+                        epoch_result = fgd_epoch_result
+                        validation_certificate = accepted_trial.certificate
+                        validation_certificate_for_next_epoch = (
+                            validation_certificate
+                        )
+                        current_fgd_learning_rate = (
+                            fgd_epoch_result.min_positive_learning_rate
+                            or learning_rate
+                        )
+                        optimizer = build_optimizer(model, config.optimizer)
+                        apply_learning_rate(optimizer, current_fgd_learning_rate)
+                        entry_learning_rate = current_fgd_learning_rate
+                        fgd_candidate_accepted = True
+                        fgd_theory_learning_rate_adjusted = (
+                            abs(current_fgd_learning_rate - learning_rate)
+                            > config.fgd_approx.eps
+                        )
+                        fgd_growth_requested = False
+
+                        accepted_state = accepted_trial.theory_state
+                        fgd_epoch_count = accepted_state.epoch_count
+                        fgd_min_gradient_sq_norm = (
+                            accepted_state.min_gradient_sq_norm
+                        )
+                        fgd_min_positive_learning_rate = (
+                            accepted_state.min_positive_learning_rate
+                        )
+                        fgd_min_descent_coefficient = (
+                            accepted_state.min_descent_coefficient
+                        )
+                        fgd_global_contraction_product = (
+                            accepted_state.global_contraction_product
+                        )
+                        previous_validation_functional_loss = (
+                            accepted_state.previous_validation_functional_loss
+                        )
+                        fgd_loss_descent_valid = (
+                            accepted_trial.loss_descent_valid
+                        )
+                        fgd_stationary_bound = accepted_trial.stationary_bound
+                        fgd_stationary_bound_valid = (
+                            accepted_trial.stationary_bound_valid
+                        )
+                        fgd_global_bound = accepted_trial.global_bound
+                        fgd_global_bound_valid = (
+                            accepted_trial.global_bound_valid
+                        )
+                        fgd_global_contraction = (
+                            accepted_trial.global_contraction
+                        )
+                    else:
+                        base_train_metrics = evaluate_regression_metrics(
+                            model,
+                            frozen_train_batches,
+                            loss_function,
+                            device=device,
+                            accuracy_tolerance=config.training.accuracy_tolerance,
+                            classification=classification,
+                        )
+                        base_test_metrics = evaluate_regression_metrics(
+                            model,
+                            test_loader,
+                            loss_function,
+                            device=device,
+                            accuracy_tolerance=config.training.accuracy_tolerance,
+                            classification=classification,
+                        )
+                        epoch_result = FGDApproxEpochResult(
+                            train_loss=base_train_metrics.loss,
+                            train_accuracy=base_train_metrics.accuracy,
+                            test_loss=base_test_metrics.loss,
+                            test_accuracy=base_test_metrics.accuracy,
+                            learning_rate=0.0,
+                            next_learning_rate=None,
+                            learning_rate_upper_bound=None,
+                            learning_rate_interval_valid=None,
+                            learning_rate_clipped_batches=0,
+                            skipped_batches=0,
+                            relative_error_condition_valid=None,
+                            loss_descent_valid=None,
+                            loss_non_descent_batches=0,
+                            gradient_sq_norm=None,
+                            theory_descent_coefficient=None,
+                            min_positive_learning_rate=None,
+                            relative_error=None,
+                            selected_layer_index=None,
+                            layer_relative_errors=[],
+                            output_relative_error=None,
+                            sensor_valid=not search_result.sensor_failure,
+                            sensor_invalid_batches=0,
+                        )
+                        validation_certificate = lr_certificate
+                        validation_certificate_for_next_epoch = lr_certificate
+                        entry_learning_rate = 0.0
+                        fgd_candidate_accepted = False
+                        fgd_growth_requested = (
+                            config.growth_schedule.enabled
+                            and lr_certificate.sensor_valid
+                            and not search_result.sensor_failure
+                        )
+                        if fgd_growth_requested:
+                            selected_layer_index = select_tiny_growth_layer_index(
+                                model=model,
+                                train_loader=frozen_train_batches,
+                                device=device,
+                                config=config.fgd_approx,
+                            )
+                            epoch_result = replace(
+                                epoch_result,
+                                selected_layer_index=selected_layer_index,
+                            )
+                        if diagnostic_trial is not None:
+                            fgd_loss_descent_valid = (
+                                diagnostic_trial.loss_descent_valid
+                            )
+                            fgd_stationary_bound = (
+                                diagnostic_trial.stationary_bound
+                            )
+                            fgd_stationary_bound_valid = (
+                                diagnostic_trial.stationary_bound_valid
+                            )
+                            fgd_global_bound = diagnostic_trial.global_bound
+                            fgd_global_bound_valid = (
+                                diagnostic_trial.global_bound_valid
+                            )
+                            fgd_global_contraction = (
+                                diagnostic_trial.global_contraction
+                            )
+                else:
+                    fgd_epoch_result = train_one_epoch_fgd_approx(
+                        model=model,
+                        train_loader=train_loader,
+                        test_loader=test_loader,
+                        loss_function=loss_function,
+                        device=device,
+                        learning_rate=learning_rate,
+                        accuracy_tolerance=config.training.accuracy_tolerance,
+                        config=config.fgd_approx,
+                        projection_group_size=current_projection_group_size,
+                        classification=classification,
+                    )
+                    epoch_result = fgd_epoch_result
+                    validation_certificate = evaluate_fgd_validation_certificate(
+                        model=model,
+                        data_loader=validation_loader,
+                        device=device,
+                        config=config.fgd_approx,
+                        learning_rate=None,
+                        projection_group_size=current_projection_group_size,
+                    )
+
+                selected_layer_index = epoch_result.selected_layer_index
+                fgd_layer_rel_errors = epoch_result.layer_relative_errors
                 rel_error = validation_certificate.relative_error
                 fgd_output_rel_error = validation_certificate.output_relative_error
                 fgd_learning_rate_upper_bound = (
@@ -814,217 +1306,25 @@ def run_pipeline(
                 fgd_sensor_invalid_batches = (
                     validation_certificate.sensor_invalid_batches
                 )
-                validation_certificate_for_next_epoch = validation_certificate
-                current_validation_functional_loss = evaluate_functional_loss(
-                    model,
-                    validation_loader,
-                    device,
-                )
-                fgd_loss_descent_valid = (
-                    current_validation_functional_loss
-                    <= previous_validation_functional_loss
-                    + config.fgd_approx.eps
-                )
+                if fgd_trial_sensor_failure:
+                    diagnostic_invalid_batches = (
+                        diagnostic_trial.epoch_result.sensor_invalid_batches
+                        + diagnostic_trial.certificate.sensor_invalid_batches
+                        if diagnostic_trial is not None
+                        else 0
+                    )
+                    fgd_sensor_valid = False
+                    fgd_sensor_invalid_batches = max(
+                        1,
+                        fgd_sensor_invalid_batches,
+                        diagnostic_invalid_batches,
+                    )
+                    rel_error = None
+                    fgd_output_rel_error = None
+                    fgd_relative_error_condition_valid = None
                 fgd_loss_non_descent_batches = int(
-                    not fgd_loss_descent_valid
+                    fgd_loss_descent_valid is False
                 )
-                previous_validation_functional_loss = (
-                    current_validation_functional_loss
-                )
-
-                if (
-                    fgd_gradient_sq_norm is not None
-                    and fgd_epoch_result.min_positive_learning_rate is not None
-                ):
-                    fgd_epoch_count += 1
-                    fgd_min_gradient_sq_norm = (
-                        fgd_gradient_sq_norm
-                        if fgd_min_gradient_sq_norm is None
-                        else min(fgd_min_gradient_sq_norm, fgd_gradient_sq_norm)
-                    )
-
-                if fgd_epoch_result.min_positive_learning_rate is not None:
-                    fgd_min_positive_learning_rate = (
-                        fgd_epoch_result.min_positive_learning_rate
-                        if fgd_min_positive_learning_rate is None
-                        else min(
-                            fgd_min_positive_learning_rate,
-                            fgd_epoch_result.min_positive_learning_rate,
-                        )
-                    )
-
-                if (
-                    fgd_theory_descent_coefficient is not None
-                    and fgd_theory_descent_coefficient > 0.0
-                ):
-                    fgd_min_descent_coefficient = (
-                        fgd_theory_descent_coefficient
-                        if fgd_min_descent_coefficient is None
-                        else min(
-                            fgd_min_descent_coefficient,
-                            fgd_theory_descent_coefficient,
-                        )
-                    )
-
-                if (
-                    fgd_epoch_count > 0
-                    and fgd_min_positive_learning_rate is not None
-                    and fgd_min_descent_coefficient is not None
-                    and fgd_min_positive_learning_rate > 0.0
-                    and fgd_min_descent_coefficient > 0.0
-                ):
-                    fgd_stationary_bound = initial_functional_gap / (
-                        fgd_epoch_count
-                        * fgd_min_positive_learning_rate
-                        * fgd_min_descent_coefficient
-                    )
-                    fgd_stationary_bound_valid = (
-                        fgd_min_gradient_sq_norm is not None
-                        and fgd_min_gradient_sq_norm
-                        <= fgd_stationary_bound + config.fgd_approx.eps
-                    )
-
-                    beta = config.fgd_approx.theory_beta
-                    mu = config.fgd_approx.theory_mu
-                    epoch_eta = fgd_epoch_result.min_positive_learning_rate
-                    epoch_r = fgd_theory_descent_coefficient
-                    if (
-                        epoch_eta is not None
-                        and epoch_r is not None
-                        and beta > 0.0
-                        and mu > 0.0
-                    ):
-                        contraction = 1.0 - (
-                            2.0 * epoch_eta * mu * epoch_r / (beta**2)
-                        )
-                        fgd_global_contraction = contraction
-                        fgd_global_contraction_product *= contraction
-                        fgd_global_bound = (
-                            fgd_global_contraction_product
-                            * initial_functional_gap
-                        )
-                        current_functional_gap = max(
-                            current_validation_functional_loss - theory_loss_star,
-                            0.0,
-                        )
-                        fgd_global_bound_valid = (
-                            current_functional_gap
-                            <= fgd_global_bound + config.fgd_approx.eps
-                        )
-
-                if (
-                    fgd_gradient_sq_norm is not None
-                    and fgd_min_positive_learning_rate is not None
-                    and fgd_min_descent_coefficient is not None
-                ):
-                    if fgd_stationary_bound_valid is None:
-                        fgd_stationary_bound_valid = False
-                    if fgd_global_bound_valid is None:
-                        fgd_global_bound_valid = False
-
-                fgd_conditions_failed = (
-                    fgd_sensor_valid is True
-                    and (
-                        fgd_relative_error_condition_valid is False
-                        or fgd_stationary_bound_valid is False
-                        or fgd_global_bound_valid is False
-                    )
-                )
-                only_global_bound_failed = (
-                    fgd_global_bound_valid is False
-                    and fgd_relative_error_condition_valid is not False
-                    and fgd_stationary_bound_valid is not False
-                    and fgd_sensor_valid is not False
-                )
-                if only_global_bound_failed:
-                    if config.fgd_approx.global_bound_action == "ignore":
-                        fgd_growth_requested = False
-                    elif config.fgd_approx.global_bound_action == "grow":
-                        fgd_growth_requested = (
-                            config.growth_schedule.enabled
-                            and fgd_conditions_failed
-                            and should_trigger_fgd_growth(
-                                relative_error=config.fgd_approx.rel_error_threshold,
-                                epoch=epoch,
-                                last_growth_epoch=last_growth_epoch,
-                                config=config.fgd_approx,
-                            )
-                        )
-                    else:
-                        if (
-                            use_fgd_theory_learning_rate
-                            and fgd_max_valid_learning_rate is not None
-                            and fgd_max_valid_learning_rate
-                            > config.fgd_approx.theory_lr_min + config.fgd_approx.eps
-                        ):
-                            adjusted_learning_rate = min(
-                                current_fgd_learning_rate
-                                * config.fgd_approx.lr_backtrack,
-                                fgd_max_valid_learning_rate,
-                            )
-                            if (
-                                adjusted_learning_rate
-                                > config.fgd_approx.theory_lr_min
-                                + config.fgd_approx.eps
-                                and adjusted_learning_rate
-                                < current_fgd_learning_rate - config.fgd_approx.eps
-                            ):
-                                current_fgd_learning_rate = adjusted_learning_rate
-                                apply_learning_rate(optimizer, current_fgd_learning_rate)
-                                fgd_theory_learning_rate_adjusted = True
-                                reset_fgd_certificate()
-                            else:
-                                fgd_growth_requested = (
-                                    config.growth_schedule.enabled
-                                    and fgd_conditions_failed
-                                    and should_trigger_fgd_growth(
-                                        relative_error=(
-                                            config.fgd_approx.rel_error_threshold
-                                        ),
-                                        epoch=epoch,
-                                        last_growth_epoch=last_growth_epoch,
-                                        config=config.fgd_approx,
-                                    )
-                                )
-                        else:
-                            fgd_growth_requested = (
-                                config.growth_schedule.enabled
-                                and fgd_conditions_failed
-                                and should_trigger_fgd_growth(
-                                    relative_error=config.fgd_approx.rel_error_threshold,
-                                    epoch=epoch,
-                                    last_growth_epoch=last_growth_epoch,
-                                    config=config.fgd_approx,
-                                )
-                            )
-                else:
-                    fgd_growth_requested = (
-                        config.growth_schedule.enabled
-                        and fgd_conditions_failed
-                        and should_trigger_fgd_growth(
-                            relative_error=config.fgd_approx.rel_error_threshold,
-                            epoch=epoch,
-                            last_growth_epoch=last_growth_epoch,
-                            config=config.fgd_approx,
-                        )
-                    )
-                if (
-                    use_fgd_theory_learning_rate
-                    and not fgd_growth_requested
-                    and not only_global_bound_failed
-                    and (
-                        fgd_stationary_bound_valid is False
-                        or fgd_global_bound_valid is False
-                    )
-                ):
-                    adjusted_learning_rate = max(
-                        config.fgd_approx.theory_lr_min,
-                        current_fgd_learning_rate * config.fgd_approx.lr_backtrack,
-                    )
-                    if adjusted_learning_rate < current_fgd_learning_rate:
-                        current_fgd_learning_rate = adjusted_learning_rate
-                        apply_learning_rate(optimizer, current_fgd_learning_rate)
-                        fgd_theory_learning_rate_adjusted = True
                 step_type = "FGD"
             else:
                 raise ValueError(
@@ -1056,6 +1356,7 @@ def run_pipeline(
                 fgd_layer_rel_errors=fgd_layer_rel_errors,
                 fgd_output_rel_error=fgd_output_rel_error,
                 fgd_learning_rate_upper_bound=fgd_learning_rate_upper_bound,
+                fgd_max_valid_learning_rate=fgd_max_valid_learning_rate,
                 fgd_learning_rate_interval_valid=fgd_learning_rate_interval_valid,
                 fgd_learning_rate_clipped_batches=fgd_learning_rate_clipped_batches,
                 fgd_skipped_batches=fgd_skipped_batches,
@@ -1077,6 +1378,8 @@ def run_pipeline(
                 ),
                 fgd_sensor_valid=fgd_sensor_valid,
                 fgd_sensor_invalid_batches=fgd_sensor_invalid_batches,
+                fgd_candidate_accepted=fgd_candidate_accepted,
+                fgd_lr_search_trials=fgd_lr_search_trials,
             )
             history.append(epoch_entry)
             wandb_logger.log_history_entry(epoch_entry)
@@ -1134,7 +1437,13 @@ def run_pipeline(
                     warnings.append("global-convergence bound failed")
                 if fgd_theory_learning_rate_adjusted:
                     warnings.append(
-                        "learning-rate adjusted for accumulated theory bounds"
+                        "maximum validation-certified learning rate accepted "
+                        "after transactional search"
+                    )
+                if fgd_candidate_accepted is False:
+                    warnings.append(
+                        "no learning rate satisfied all validation conditions; "
+                        "model update rejected"
                     )
                 if fgd_growth_requested:
                     warnings.append("FGD conditions request growth")
@@ -1231,13 +1540,30 @@ def run_pipeline(
                     # global bounds certify a fixed architecture, so restart
                     # them from the post-growth loss.
                     reset_fgd_certificate()
-                    if (
-                        config.fgd_approx.learning_rate_policy == "theory_interval"
-                        and config.lr_scheduler.restart_on_growth
-                    ):
-                        current_fgd_learning_rate = max(
-                            current_fgd_learning_rate,
-                            config.fgd_approx.theory_lr_initial,
+                    if config.fgd_approx.learning_rate_policy == "theory_interval":
+                        validation_certificate_for_next_epoch = (
+                            evaluate_fgd_validation_certificate(
+                                model=model,
+                                data_loader=validation_loader,
+                                device=device,
+                                config=config.fgd_approx,
+                                learning_rate=None,
+                                projection_group_size=current_projection_group_size,
+                            )
+                        )
+                        post_growth_certified_learning_rate = (
+                            certified_validation_learning_rate(
+                                validation_certificate_for_next_epoch,
+                                config.fgd_approx,
+                            )
+                        )
+                        current_fgd_learning_rate = (
+                            post_growth_certified_learning_rate
+                            if post_growth_certified_learning_rate is not None
+                            else 0.0
+                        )
+                        fgd_max_valid_learning_rate = (
+                            post_growth_certified_learning_rate
                         )
                 optimizer = build_optimizer(model, config.optimizer)
                 post_growth_learning_rate = (
@@ -1297,6 +1623,7 @@ def run_pipeline(
                     fgd_layer_rel_errors=fgd_layer_rel_errors,
                     fgd_output_rel_error=fgd_output_rel_error,
                     fgd_learning_rate_upper_bound=fgd_learning_rate_upper_bound,
+                    fgd_max_valid_learning_rate=fgd_max_valid_learning_rate,
                     fgd_learning_rate_interval_valid=fgd_learning_rate_interval_valid,
                     fgd_learning_rate_clipped_batches=(
                         fgd_learning_rate_clipped_batches
@@ -1322,6 +1649,8 @@ def run_pipeline(
                     ),
                     fgd_sensor_valid=fgd_sensor_valid,
                     fgd_sensor_invalid_batches=fgd_sensor_invalid_batches,
+                    fgd_candidate_accepted=fgd_candidate_accepted,
+                    fgd_lr_search_trials=fgd_lr_search_trials,
                 )
                 history.append(growth_entry)
                 wandb_logger.log_history_entry(growth_entry)
