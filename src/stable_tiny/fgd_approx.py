@@ -52,7 +52,7 @@ class FGDApproxConfig:
     theory_loss_star: float = 0.0
     theory_lr_safety: float = 0.95
     theory_lr_initial: float = 0.01
-    theory_lr_min: float = 0.0
+    theory_lr_min: float = 1e-5
     theory_lr_follow_bound: bool = False
     theory_lr_search_steps: int = 8
     theory_lr_search_refinements: int = 4
@@ -82,6 +82,20 @@ class FGDApproxConfig:
     tiny_maximum_added_neurons: int | None = None
     tiny_numerical_threshold: float = 1e-6
     tiny_statistical_threshold: float = 1e-3
+
+
+@dataclass(frozen=True)
+class SecantFGDConfig:
+    enabled: bool = True
+    inner_steps: int = 8
+    inner_learning_rate: float = 1e-2
+    parameter_penalty: float = 1e-6
+    gradient_clip_norm: float | None = 1.0
+    search_steps: int = 3
+    max_learning_rate: float = 0.1
+    min_learning_rate_factor: float = 1e-2
+    growth_min_relative_error_improvement: float = 1e-3
+    growth_min_learning_rate_improvement: float = 0.05
 
 
 @dataclass(frozen=True)
@@ -1608,6 +1622,154 @@ def evaluate_fgd_validation_certificate(
         output_relative_error=output_error,
         sensor_valid=sensor_invalid_batches == 0,
         sensor_invalid_batches=sensor_invalid_batches,
+    )
+
+
+def evaluate_secant_validation_certificate(
+    base_model: GrowingMLP,
+    candidate_model: GrowingMLP,
+    data_loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    config: FGDApproxConfig,
+    learning_rate: float,
+    projection_group_size: int = 1,
+) -> FGDValidationCertificate:
+    """Certify a finite functional secant in the output Hilbert space."""
+    if learning_rate <= config.eps:
+        raise ValueError("A secant FGD learning rate must be positive.")
+
+    base_model.eval()
+    candidate_model.eval()
+    dot_product = 0.0
+    approximation_sq_norm = 0.0
+    target_sq_norm = 0.0
+    upper_bound_sum = 0.0
+    upper_bound_count = 0
+    max_valid_learning_rate: float | None = None
+    learning_rate_interval_possible = True
+    skipped_batches = 0
+    sensor_invalid_batches = 0
+    valid_batches = 0
+    relative_error_condition_valid: bool | None = True
+    learning_rate_interval_valid: bool | None = True
+    min_theory_descent_coefficient: float | None = None
+
+    with torch.no_grad():
+        for x, y in _grouped_batches(data_loader, projection_group_size):
+            x = x.to(device)
+            y = y.to(device)
+            base_output = base_model(x)
+            candidate_output = candidate_model(x)
+            target = mse_functional_gradient(base_output, y)
+            approximation = (base_output - candidate_output) / learning_rate
+            if not (
+                torch.isfinite(target).all()
+                and torch.isfinite(approximation).all()
+            ):
+                sensor_invalid_batches += 1
+                continue
+
+            stats = _output_relative_error_from_tensors(
+                approximation,
+                target,
+                config.eps,
+            )
+            batch_error = stats.output_error.relative_error
+            valid_batches += 1
+            if batch_error >= min(config.rel_error_threshold, 0.5):
+                relative_error_condition_valid = False
+
+            upper_bound = theoretical_learning_rate_upper_bound(
+                batch_error,
+                config,
+            )
+            upper_bound_sum += upper_bound if upper_bound is not None else 0.0
+            upper_bound_count += 1
+            if upper_bound is None:
+                learning_rate_interval_possible = False
+                learning_rate_interval_valid = False
+                skipped_batches += 1
+            else:
+                safe_upper_bound = config.theory_lr_safety * upper_bound
+                interval_ok = (
+                    safe_upper_bound > config.theory_lr_min + config.eps
+                    and learning_rate > config.theory_lr_min
+                    and learning_rate <= safe_upper_bound + config.eps
+                )
+                if safe_upper_bound > config.theory_lr_min + config.eps:
+                    max_valid_learning_rate = (
+                        safe_upper_bound
+                        if max_valid_learning_rate is None
+                        else min(max_valid_learning_rate, safe_upper_bound)
+                    )
+                else:
+                    learning_rate_interval_possible = False
+                if not interval_ok:
+                    learning_rate_interval_valid = False
+                    skipped_batches += 1
+                else:
+                    descent_coefficient = theoretical_descent_coefficient(
+                        batch_error,
+                        learning_rate,
+                        config,
+                    )
+                    if descent_coefficient is not None:
+                        min_theory_descent_coefficient = (
+                            descent_coefficient
+                            if min_theory_descent_coefficient is None
+                            else min(
+                                min_theory_descent_coefficient,
+                                descent_coefficient,
+                            )
+                        )
+
+            dot_product += stats.dot_product
+            approximation_sq_norm += stats.approximation_sq_norm
+            target_sq_norm += stats.target_sq_norm
+
+    if valid_batches == 0 or sensor_invalid_batches > 0:
+        return FGDValidationCertificate(
+            learning_rate_upper_bound=None,
+            max_valid_learning_rate=None,
+            learning_rate_interval_valid=None,
+            skipped_batches=skipped_batches,
+            relative_error_condition_valid=None,
+            gradient_sq_norm=None,
+            theory_descent_coefficient=None,
+            relative_error=None,
+            output_relative_error=None,
+            sensor_valid=False,
+            sensor_invalid_batches=max(1, sensor_invalid_batches),
+        )
+
+    output_error = _output_relative_error_from_stats(
+        dot_product=dot_product,
+        approximation_sq_norm=approximation_sq_norm,
+        target_sq_norm=target_sq_norm,
+        eps=config.eps,
+    )
+    relative_error = output_error.relative_error
+    if relative_error >= min(config.rel_error_threshold, 0.5):
+        relative_error_condition_valid = False
+
+    return FGDValidationCertificate(
+        learning_rate_upper_bound=(
+            upper_bound_sum / upper_bound_count if upper_bound_count > 0 else None
+        ),
+        max_valid_learning_rate=(
+            max_valid_learning_rate
+            if learning_rate_interval_possible
+            else None
+        ),
+        learning_rate_interval_valid=learning_rate_interval_valid,
+        skipped_batches=skipped_batches,
+        relative_error_condition_valid=relative_error_condition_valid,
+        gradient_sq_norm=output_error.target_norm**2,
+        theory_descent_coefficient=min_theory_descent_coefficient,
+        relative_error=relative_error,
+        output_relative_error=output_error,
+        sensor_valid=True,
+        sensor_invalid_batches=0,
     )
 
 

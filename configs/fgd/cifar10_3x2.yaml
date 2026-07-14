@@ -62,7 +62,7 @@ fgd_approx:
   theory_loss_star: 0.0
   theory_lr_safety: 0.95
   theory_lr_initial: 0.01
-  theory_lr_min: 0.0
+  theory_lr_min: 1.0e-5
   theory_lr_follow_bound: true
   theory_lr_search_steps: 8
   theory_lr_search_refinements: 4
@@ -82,6 +82,18 @@ fgd_approx:
   tiny_maximum_added_neurons:
   tiny_numerical_threshold: 1.0e-6
   tiny_statistical_threshold: 1.0e-3
+
+secant_fgd:
+  enabled: true
+  inner_steps: 8
+  inner_learning_rate: 0.01
+  parameter_penalty: 1.0e-6
+  gradient_clip_norm: 1.0
+  search_steps: 3
+  max_learning_rate: 0.1
+  min_learning_rate_factor: 0.01
+  growth_min_relative_error_improvement: 0.001
+  growth_min_learning_rate_improvement: 0.05
 
 scaling_line_search:
   method: golden_section

@@ -244,6 +244,33 @@ class WandbRunLogger:
                 "fgd_lr_search_trials",
                 0,
             )
+            approximation_kind = getattr(
+                entry,
+                "fgd_approximation_kind",
+                None,
+            )
+            if approximation_kind is not None:
+                payload["fgd/approximation_kind"] = approximation_kind
+            payload["fgd/secant_attempted"] = getattr(
+                entry,
+                "fgd_secant_attempted",
+                False,
+            )
+            secant_accepted = getattr(entry, "fgd_secant_accepted", None)
+            if secant_accepted is not None:
+                payload["fgd/secant_accepted"] = secant_accepted
+            payload["fgd/secant_trials"] = getattr(
+                entry,
+                "fgd_secant_trials",
+                0,
+            )
+            growth_probe_improved = getattr(
+                entry,
+                "fgd_growth_probe_improved",
+                None,
+            )
+            if growth_probe_improved is not None:
+                payload["fgd/growth_probe_improved"] = growth_probe_improved
 
         if getattr(entry, "selected_layer_index", None) is not None:
             payload["fgd/selected_layer_index"] = entry.selected_layer_index
