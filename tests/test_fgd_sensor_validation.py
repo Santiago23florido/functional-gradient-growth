@@ -29,7 +29,7 @@ from stable_tiny.pipeline import (
     load_pipeline_config,
     run_pipeline,
 )
-from stable_tiny.grow import GrowthResult
+from fgdlib.growth import GrowthResult
 
 
 def _assert_projection_invariants(

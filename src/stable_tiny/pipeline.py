@@ -43,7 +43,7 @@ from stable_tiny.fgd_rkhs import (
     KernelDictionaryModel,
 )
 from fgdlib.gromo_setup import ensure_gromo_importable
-from stable_tiny.grow import GrowthResult, ScalingLineSearchConfig, grow_layer
+from fgdlib.growth import GrowthResult, ScalingLineSearchConfig, grow_layer
 from fgdlib.growth_schedule import (
     GrowthScheduleConfig,
     layer_index_for_growth,
