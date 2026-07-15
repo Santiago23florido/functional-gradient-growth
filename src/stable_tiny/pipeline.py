@@ -17,7 +17,7 @@ from stable_tiny.data import (
     make_cifar10_dataloaders,
     make_mnist_dataloaders,
 )
-from stable_tiny.fgd_approx import (
+from fgdlib.tangent import (
     FGDApproxConfig,
     FGDApproxEpochResult,
     FGDLayerRelError,

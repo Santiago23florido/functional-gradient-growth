@@ -5,7 +5,7 @@ from dataclasses import replace
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from stable_tiny.fgd_approx import (
+from fgdlib.tangent import (
     FGDApproxConfig,
     FGDApproxEpochResult,
     FGDOutputRelError,
@@ -120,7 +120,7 @@ def test_invalid_sensor_stats_do_not_form_growth_condition(monkeypatch) -> None:
     )
 
     monkeypatch.setattr(
-        "stable_tiny.fgd_approx._compute_tangent_projection_step",
+        "fgdlib.tangent._compute_tangent_projection_step",
         lambda **_: invalid_step,
     )
     certificate = evaluate_fgd_validation_certificate(
@@ -163,7 +163,7 @@ def test_one_invalid_validation_batch_invalidates_full_certificate(
     )
     steps = iter((invalid_step, valid_step))
     monkeypatch.setattr(
-        "stable_tiny.fgd_approx._compute_tangent_projection_step",
+        "fgdlib.tangent._compute_tangent_projection_step",
         lambda **_: next(steps),
     )
 
@@ -517,15 +517,15 @@ def test_train_epoch_does_not_evaluate_theory_conditions(monkeypatch) -> None:
         raise AssertionError("training must not evaluate validation theory conditions")
 
     monkeypatch.setattr(
-        "stable_tiny.fgd_approx.theoretical_learning_rate_upper_bound",
+        "fgdlib.tangent.theoretical_learning_rate_upper_bound",
         fail_if_called,
     )
     monkeypatch.setattr(
-        "stable_tiny.fgd_approx.theoretical_descent_coefficient",
+        "fgdlib.tangent.theoretical_descent_coefficient",
         fail_if_called,
     )
     monkeypatch.setattr(
-        "stable_tiny.fgd_approx.select_tiny_growth_layer_index",
+        "fgdlib.tangent.select_tiny_growth_layer_index",
         lambda **_: None,
     )
 
