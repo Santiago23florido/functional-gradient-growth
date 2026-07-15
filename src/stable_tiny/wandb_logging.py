@@ -179,6 +179,9 @@ class WandbRunLogger:
             ("fgd_stationary_bound", "fgd/stationary_bound"),
             ("fgd_global_bound", "fgd/global_bound"),
             ("fgd_global_contraction", "fgd/global_contraction"),
+            ("fgd_rkhs_dictionary_size", "fgd/rkhs_dictionary_size"),
+            ("fgd_rkhs_functional_loss", "fgd/rkhs_functional_loss"),
+            ("fgd_rkhs_loss_star", "fgd/rkhs_loss_star"),
         ):
             value = getattr(entry, attribute_name, None)
             if value is not None:
@@ -251,17 +254,17 @@ class WandbRunLogger:
             )
             if approximation_kind is not None:
                 payload["fgd/approximation_kind"] = approximation_kind
-            payload["fgd/secant_attempted"] = getattr(
+            payload["fgd/rkhs_phase_attempted"] = getattr(
                 entry,
-                "fgd_secant_attempted",
+                "fgd_rkhs_phase_attempted",
                 False,
             )
-            secant_accepted = getattr(entry, "fgd_secant_accepted", None)
-            if secant_accepted is not None:
-                payload["fgd/secant_accepted"] = secant_accepted
-            payload["fgd/secant_trials"] = getattr(
+            rkhs_phase_accepted = getattr(entry, "fgd_rkhs_phase_accepted", None)
+            if rkhs_phase_accepted is not None:
+                payload["fgd/rkhs_phase_accepted"] = rkhs_phase_accepted
+            payload["fgd/rkhs_phase_steps"] = getattr(
                 entry,
-                "fgd_secant_trials",
+                "fgd_rkhs_phase_steps",
                 0,
             )
             growth_probe_improved = getattr(
