@@ -13,7 +13,7 @@ from dataclasses import replace
 import pytest
 import torch
 
-from stable_tiny.fgd_rkhs import (
+from fgdlib.rkhs import (
     FGDRKHSConfig,
     FGDRKHSTrainer,
     FrozenAffineFeatureMap,

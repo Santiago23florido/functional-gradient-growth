@@ -34,7 +34,7 @@ from fgdlib.tangent import (
     tiny_optimal_update_kwargs,
     train_one_epoch_fgd_approx,
 )
-from stable_tiny.fgd_rkhs import (
+from fgdlib.rkhs import (
     FGDRKHSConfig,
     FGDRKHSEpochResult,
     FGDRKHSStepRecord,
