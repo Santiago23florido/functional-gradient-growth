@@ -1,0 +1,54 @@
+# Certified RKHS FGD (third training method) on MNIST with one-hot MSE.
+# The certificate applies to the empirical loss over the sampled training
+# subset. Fixed structure: MLP 784 -> 18 -> 18 -> 18 -> 10 (three hidden
+# layers of 18 neurons, frozen) with the output layer trained by certified
+# FGD; the certified optimum L* is the exact global optimum of that fixed
+# structure.
+
+run:
+  name: fgd_rkhs_mnist
+  results_dir: results
+  save_plot: false
+  show_plot: false
+
+data:
+  kind: mnist
+  in_features: 784
+  out_features: 10
+  batch_size: 64
+  train_seed: 0
+  mnist_train_samples: 4096
+  mnist_validation_samples: 2000
+  mnist_test_samples: 2000
+
+training:
+  method: fgd_rkhs
+  epochs: 1000
+  accuracy_tolerance: 0.001
+  log_every: 10
+  device: auto
+
+fgd_rkhs:
+  kernel: linear
+  feature_hidden_layers: 3
+  feature_hidden_size: 18
+  feature_activation: tanh
+  feature_seed: 0
+  feature_whitening: true
+  kernel_gamma: null
+  epsilon: 0.25
+  lr_safety: 0.9
+  steps_per_epoch: 10
+  levels: null
+  max_train_points: 4096
+  centers_seed: 0
+  solver_jitter: 1.0e-10
+
+wandb:
+  enabled: false
+  project: stable-tiny
+  group: fgd_rkhs
+  job_type: train
+  tags: [fgd_rkhs, kernel_dictionary, certified_global, mnist]
+  mode: online
+  dir: results

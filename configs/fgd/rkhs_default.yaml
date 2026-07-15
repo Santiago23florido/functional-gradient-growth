@@ -1,0 +1,72 @@
+# Third training method: certified approximate functional gradient descent
+# in an RKHS (Algorithm 1 of arXiv:2606.16926) over a FIXED kernel
+# dictionary structure. No growth, no optimizer, no LR schedule: the
+# learning rate is the certified constant of Proposition 3.8 and each epoch
+# runs `fgd_rkhs.steps_per_epoch` certified full-batch FGD steps.
+
+run:
+  name: fgd_rkhs_smooth_sin
+  results_dir: results
+  save_plot: false
+  show_plot: false
+
+data:
+  kind: smooth_sin
+  in_features: 10
+  out_features: 3
+  train_batches: 8
+  validation_batches: 4
+  test_batches: 1
+  batch_size: 512
+  train_seed: 0
+  validation_seed: 2
+  test_seed: 1
+  active_features: 5
+  frequency: 1.5
+  phase_shift: 0.5
+  interaction_strength: 0.25
+  linear_strength: 0.1
+
+training:
+  method: fgd_rkhs
+  epochs: 300
+  accuracy_tolerance: 0.1
+  log_every: 10
+  device: auto
+
+fgd_rkhs:
+  # Fixed structure: a 3-hidden-layer x 18-neuron MLP. The hidden weights
+  # are frozen (part of the fixed structure, drawn once from feature_seed);
+  # the linear output layer is trained by certified FGD. kernel: linear
+  # makes the trained model exactly phi(x) @ W, i.e. the plain MLP
+  # in -> 18 -> 18 -> 18 -> out. Set kernel: gaussian to recover the RBF
+  # dictionary structure instead (kernel_gamma: null -> median heuristic).
+  kernel: linear
+  feature_hidden_layers: 3
+  feature_hidden_size: 18
+  feature_activation: tanh
+  feature_seed: 0
+  # Fixed whitening reparametrization of the output layer: same function
+  # class and same L*, but the certified contraction becomes sharp.
+  feature_whitening: true
+  kernel_gamma: null
+  # Algorithm 1 tolerance (0, 1); certified RelErr <= epsilon/(1+epsilon).
+  epsilon: 0.25
+  # Strict fraction of the Prop. 3.8 learning-rate bound.
+  lr_safety: 0.9
+  steps_per_epoch: 1
+  # null -> geometric ladder n/16, n/8, ..., n (last level is always the
+  # full dictionary; that is what guarantees certificate termination).
+  levels: null
+  max_train_points: 4096
+  centers_seed: 0
+  solver_jitter: 1.0e-10
+
+wandb:
+  enabled: false
+  project: stable-tiny
+  group: fgd_rkhs
+  job_type: train
+  tags: [fgd_rkhs, kernel_dictionary, certified_global]
+  mode: online
+  dir: results
