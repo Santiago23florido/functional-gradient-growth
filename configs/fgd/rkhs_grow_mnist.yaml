@@ -1,0 +1,86 @@
+# Certified train-and-grow (fourth training method: fgd_rkhs_grow) on MNIST.
+#
+# Cycle: freeze the grown network's hidden layers as the fixed structure,
+# train the output layer to the CERTIFIED global optimum of that structure
+# (Algorithm 1 of arXiv:2606.16926, exact constants, whitened head), write
+# the optimal head back, then grow one GroMo layer. Stops when the
+# closed-form ceiling L* of the newly grown structure stops improving
+# (growth_min_ceiling_improvement), when every hidden block reaches
+# growth_max_hidden_size, or after growth_max_cycles growth events.
+#
+# The certificate is conditional: it certifies the best possible output
+# layer for the hidden weights growth produced (the maximum achievable on
+# each fixed structure), never the nonconvex full-weight optimum.
+
+run:
+  name: fgd_rkhs_grow_mnist
+  results_dir: results
+  save_plot: false
+  show_plot: false
+
+data:
+  kind: mnist
+  in_features: 784
+  out_features: 10
+  batch_size: 64
+  train_seed: 0
+  mnist_train_samples: 4096
+  mnist_validation_samples: 2000
+  mnist_test_samples: 2000
+
+model:
+  # Starting structure: 3 hidden layers x 2 neurons; growth widens the
+  # hidden blocks up to fgd_rkhs.growth_max_hidden_size neurons each.
+  hidden_size: 2
+  number_hidden_layers: 3
+  model_seed: 0
+
+training:
+  method: fgd_rkhs_grow
+  # Global cap on certified head-training epochs across all cycles.
+  epochs: 400
+  accuracy_tolerance: 0.001
+  log_every: 5
+  device: auto
+
+fgd_rkhs:
+  kernel: linear
+  # The feature map comes from the grown network's hidden layers, so the
+  # random-feature settings are unused in this method.
+  feature_hidden_layers: 0
+  feature_hidden_size: 0
+  feature_whitening: true
+  epsilon: 0.25
+  lr_safety: 0.9
+  steps_per_epoch: 10
+  levels: null
+  max_train_points: 4096
+  centers_seed: 0
+  solver_jitter: 1.0e-10
+  # High enough that the stop is decided by the certified ceiling
+  # criterion or by the width cap, not by the cycle counter.
+  growth_max_cycles: 24
+  growth_epochs_per_cycle: 30
+  growth_min_ceiling_improvement: 0.01
+  # Target architecture cap: grow each hidden layer up to 18 neurons.
+  growth_max_hidden_size: 18
+
+scaling_line_search:
+  method: golden_section
+  min_value: 0.0
+  max_value: 1.0
+  iterations: 12
+  tolerance: 0.001
+
+growth_schedule:
+  enabled: true
+  layer_policy: round_robin
+
+wandb:
+  enabled: false
+  project: stable-tiny
+  group: fgd_rkhs_grow
+  job_type: train
+  tags: [fgd_rkhs_grow, certified_head, gromo_growth, mnist]
+  mode: online
+  dir: results

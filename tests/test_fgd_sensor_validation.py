@@ -5,7 +5,7 @@ from dataclasses import replace
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from stable_tiny.fgd_approx import (
+from fgdlib.tangent import (
     FGDApproxConfig,
     FGDApproxEpochResult,
     FGDOutputRelError,
@@ -29,7 +29,7 @@ from stable_tiny.pipeline import (
     load_pipeline_config,
     run_pipeline,
 )
-from stable_tiny.grow import GrowthResult
+from fgdlib.growth import GrowthResult
 
 
 def _assert_projection_invariants(
@@ -120,7 +120,7 @@ def test_invalid_sensor_stats_do_not_form_growth_condition(monkeypatch) -> None:
     )
 
     monkeypatch.setattr(
-        "stable_tiny.fgd_approx._compute_tangent_projection_step",
+        "fgdlib.tangent._compute_tangent_projection_step",
         lambda **_: invalid_step,
     )
     certificate = evaluate_fgd_validation_certificate(
@@ -163,7 +163,7 @@ def test_one_invalid_validation_batch_invalidates_full_certificate(
     )
     steps = iter((invalid_step, valid_step))
     monkeypatch.setattr(
-        "stable_tiny.fgd_approx._compute_tangent_projection_step",
+        "fgdlib.tangent._compute_tangent_projection_step",
         lambda **_: next(steps),
     )
 
@@ -269,10 +269,11 @@ def test_secant_search_keeps_architecture_fixed() -> None:
     )
 
 
-def test_pipeline_uses_secant_when_growth_does_not_improve_fgd(
+def test_pipeline_uses_rkhs_phase_when_growth_does_not_improve_fgd(
     monkeypatch,
     tmp_path,
 ) -> None:
+    """The certified RKHS head phase replaces the Hilbert-secant search."""
     config = load_pipeline_config("configs/fgd/default.yaml")
     config = replace(
         config,
@@ -319,13 +320,16 @@ def test_pipeline_uses_secant_when_growth_does_not_improve_fgd(
     result = run_pipeline(config, progress=None)
 
     initial_entry = next(entry for entry in result.history if entry.step_type == "INIT")
-    secant_entry = next(entry for entry in result.history if entry.step_type == "SEC")
+    phase_entry = next(entry for entry in result.history if entry.step_type == "RKHS")
     assert result.growth_events == []
-    assert secant_entry.fgd_growth_probe_improved is False
-    assert secant_entry.fgd_secant_attempted is True
-    assert secant_entry.fgd_secant_accepted is True
-    assert secant_entry.fgd_candidate_accepted is True
-    assert secant_entry.num_params == initial_entry.num_params
+    assert phase_entry.fgd_growth_probe_improved is False
+    assert phase_entry.fgd_rkhs_phase_attempted is True
+    assert phase_entry.fgd_rkhs_phase_accepted is True
+    assert phase_entry.fgd_candidate_accepted is True
+    assert phase_entry.fgd_approximation_kind == "rkhs_head"
+    assert phase_entry.fgd_rkhs_loss_star is not None
+    # The phase never changes the architecture: same parameter count.
+    assert phase_entry.num_params == initial_entry.num_params
 
 
 def test_build_dataloaders_returns_distinct_validation_split() -> None:
@@ -513,15 +517,15 @@ def test_train_epoch_does_not_evaluate_theory_conditions(monkeypatch) -> None:
         raise AssertionError("training must not evaluate validation theory conditions")
 
     monkeypatch.setattr(
-        "stable_tiny.fgd_approx.theoretical_learning_rate_upper_bound",
+        "fgdlib.tangent.theoretical_learning_rate_upper_bound",
         fail_if_called,
     )
     monkeypatch.setattr(
-        "stable_tiny.fgd_approx.theoretical_descent_coefficient",
+        "fgdlib.tangent.theoretical_descent_coefficient",
         fail_if_called,
     )
     monkeypatch.setattr(
-        "stable_tiny.fgd_approx.select_tiny_growth_layer_index",
+        "fgdlib.tangent.select_tiny_growth_layer_index",
         lambda **_: None,
     )
 

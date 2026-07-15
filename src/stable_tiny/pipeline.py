@@ -17,7 +17,7 @@ from stable_tiny.data import (
     make_cifar10_dataloaders,
     make_mnist_dataloaders,
 )
-from stable_tiny.fgd_approx import (
+from fgdlib.tangent import (
     FGDApproxConfig,
     FGDApproxEpochResult,
     FGDLayerRelError,
@@ -34,20 +34,28 @@ from stable_tiny.fgd_approx import (
     tiny_optimal_update_kwargs,
     train_one_epoch_fgd_approx,
 )
-from stable_tiny.gromo_setup import ensure_gromo_importable
-from stable_tiny.grow import GrowthResult, ScalingLineSearchConfig, grow_layer
-from stable_tiny.growth_schedule import (
+from fgdlib.rkhs import (
+    FGDRKHSConfig,
+    FGDRKHSEpochResult,
+    FGDRKHSStepRecord,
+    FGDRKHSTrainer,
+    FrozenAffineFeatureMap,
+    KernelDictionaryModel,
+)
+from fgdlib.gromo_setup import ensure_gromo_importable
+from fgdlib.growth import GrowthResult, ScalingLineSearchConfig, grow_layer
+from fgdlib.growth_schedule import (
     GrowthScheduleConfig,
     layer_index_for_growth,
     should_grow,
 )
-from stable_tiny.lr_scheduler import (
+from fgdlib.lr_scheduler import (
     LRSchedulerConfig,
     apply_learning_rate,
     learning_rate_for_epoch,
 )
-from stable_tiny.optim import OptimizerConfig, build_optimizer, current_learning_rate
-from stable_tiny.train import (
+from fgdlib.optim import OptimizerConfig, build_optimizer, current_learning_rate
+from fgdlib.training import (
     count_parameters,
     evaluate_regression_metrics,
     train_one_epoch,
@@ -63,8 +71,8 @@ from gromo.containers.growing_mlp import GrowingMLP
 
 
 ProgressFn = Callable[[str], None]
-TrainingMethod = Literal["normal", "fgd_approx"]
-StepType = Literal["INIT", "SGD", "FGD", "SEC", "GRO"]
+TrainingMethod = Literal["normal", "fgd_approx", "fgd_rkhs", "fgd_rkhs_grow"]
+StepType = Literal["INIT", "SGD", "FGD", "SEC", "GRO", "RKHS"]
 DataKind = Literal["multi_sin", "smooth_sin", "cifar10", "mnist"]
 
 
@@ -129,6 +137,7 @@ class PipelineConfig:
     lr_scheduler: LRSchedulerConfig = field(default_factory=LRSchedulerConfig)
     fgd_approx: FGDApproxConfig = field(default_factory=FGDApproxConfig)
     secant_fgd: SecantFGDConfig = field(default_factory=SecantFGDConfig)
+    fgd_rkhs: FGDRKHSConfig = field(default_factory=FGDRKHSConfig)
     scaling_line_search: ScalingLineSearchConfig = field(
         default_factory=ScalingLineSearchConfig
     )
@@ -177,10 +186,13 @@ class HistoryEntry:
     fgd_candidate_accepted: bool | None = None
     fgd_lr_search_trials: int = 0
     fgd_approximation_kind: str | None = None
-    fgd_secant_attempted: bool = False
-    fgd_secant_accepted: bool | None = None
-    fgd_secant_trials: int = 0
+    fgd_rkhs_phase_attempted: bool = False
+    fgd_rkhs_phase_accepted: bool | None = None
+    fgd_rkhs_phase_steps: int = 0
     fgd_growth_probe_improved: bool | None = None
+    fgd_rkhs_dictionary_size: int | None = None
+    fgd_rkhs_functional_loss: float | None = None
+    fgd_rkhs_loss_star: float | None = None
 
 
 @dataclass
@@ -258,6 +270,13 @@ def _section_dataclass(
     if section_type is WandbConfig and "tags" in values:
         values["tags"] = tuple(str(value) for value in values["tags"] or ())
 
+    if section_type is FGDRKHSConfig and "levels" in values:
+        values["levels"] = (
+            tuple(int(value) for value in values["levels"])
+            if values["levels"] is not None
+            else None
+        )
+
     return section_type(**values)
 
 
@@ -276,6 +295,7 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         "lr_scheduler",
         "fgd_approx",
         "secant_fgd",
+        "fgd_rkhs",
         "scaling_line_search",
         "growth_schedule",
         "wandb",
@@ -294,6 +314,7 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         lr_scheduler=_section_dataclass("lr_scheduler", LRSchedulerConfig, raw),
         fgd_approx=_section_dataclass("fgd_approx", FGDApproxConfig, raw),
         secant_fgd=_section_dataclass("secant_fgd", SecantFGDConfig, raw),
+        fgd_rkhs=_section_dataclass("fgd_rkhs", FGDRKHSConfig, raw),
         scaling_line_search=_section_dataclass(
             "scaling_line_search",
             ScalingLineSearchConfig,
@@ -1133,6 +1154,671 @@ def config_payload(config: PipelineConfig) -> dict[str, Any]:
     return _json_safe(asdict(config))
 
 
+def _materialize_dataset(
+    data_loader: torch.utils.data.DataLoader,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Concatenate one full pass of a loader into fixed design tensors."""
+    xs: list[torch.Tensor] = []
+    ys: list[torch.Tensor] = []
+    for x, y in data_loader:
+        xs.append(x.to(device))
+        ys.append(y.to(device))
+    if not xs:
+        raise ValueError("Cannot materialize an empty data loader.")
+    return torch.cat(xs), torch.cat(ys)
+
+
+def _run_fgd_rkhs_pipeline(
+    *,
+    config: PipelineConfig,
+    device: torch.device,
+    train_loader: torch.utils.data.DataLoader,
+    validation_loader: torch.utils.data.DataLoader,
+    test_loader: torch.utils.data.DataLoader,
+    classification: bool,
+    wandb_logger: Any,
+    progress: ProgressFn | None,
+) -> PipelineResult:
+    """Standalone certified RKHS FGD training loop (third training method).
+
+    Implements Algorithm 1 of arXiv:2606.16926 over the fixed kernel
+    dictionary structure; see ``stable_tiny.fgd_rkhs`` for the theory
+    mapping. The network structure is fixed for the whole run: no GroMo
+    growth, no optimizer, no learning-rate schedule -- the learning rate is
+    the certified constant of Proposition 3.8.
+    """
+    loss_function = torch.nn.MSELoss()
+    train_x, train_y = _materialize_dataset(train_loader, device)
+    trainer = FGDRKHSTrainer(
+        train_x=train_x,
+        train_y=train_y,
+        config=config.fgd_rkhs,
+        device=device,
+    )
+    model = trainer.model
+    theory = trainer.theory
+
+    if progress is not None:
+        progress(f"Using device: {device}")
+        progress(f"Training method: {config.training.method}")
+        if wandb_logger.enabled:
+            progress(
+                f"W&B logging enabled: project={config.wandb.project}, "
+                f"run={config.wandb.run_name or config.run.name}"
+            )
+        progress("Model (fixed structure):")
+        progress(str(model))
+        kernel_note = (
+            f"gamma={theory.kernel_gamma:.6g}"
+            if theory.kernel_kind == "gaussian"
+            else f"feature_dim={theory.feature_dimension}"
+        )
+        progress(
+            "[RKHS] certified constants: "
+            f"n={theory.train_points}, kernel={theory.kernel_kind}, "
+            f"{kernel_note}, "
+            f"K_s={theory.smoothness:.6g}, alpha={theory.alpha:.3g}, "
+            f"beta={theory.beta:.3g}, lambda_min={theory.kernel_lambda_min:.3e}, "
+            f"mu={theory.pl_mu:.3e}, L*={theory.loss_star:.6e}, "
+            f"eps_bar={theory.epsilon_bar:.4f}, "
+            f"lr={theory.learning_rate:.6g} "
+            f"(< bound {theory.learning_rate_upper_bound:.6g}), "
+            f"r={theory.descent_coefficient:.6g}, "
+            f"contraction={theory.contraction:.12g}, "
+            f"PL_certificate={'valid' if theory.pl_certificate_valid else 'vacuous'}"
+        )
+        if not theory.pl_certificate_valid:
+            progress(
+                "[RKHS] warning: the smallest Gram eigenvalue is numerically "
+                "zero, so the global-optimality envelope of Prop. 3.8 is "
+                "vacuous for this structure. Descent and stationary-point "
+                "certificates (Lemma 3.5, Prop. 3.6) still hold. Increase "
+                "fgd_rkhs.kernel_gamma (Gaussian kernel), change "
+                "fgd_rkhs.feature_seed (linear kernel), or deduplicate "
+                "inputs to obtain a non-trivial PL constant."
+            )
+
+    def metrics(loader: torch.utils.data.DataLoader):
+        return evaluate_regression_metrics(
+            model,
+            loader,
+            loss_function,
+            device=device,
+            accuracy_tolerance=config.training.accuracy_tolerance,
+            classification=classification,
+        )
+
+    history: list[HistoryEntry] = []
+    train_metrics = metrics(train_loader)
+    validation_metrics = metrics(validation_loader)
+    test_metrics = metrics(test_loader)
+    init_entry = HistoryEntry(
+        step=0,
+        step_type="INIT",
+        train_loss=train_metrics.loss,
+        validation_loss=validation_metrics.loss,
+        test_loss=test_metrics.loss,
+        train_accuracy=train_metrics.accuracy,
+        validation_accuracy=validation_metrics.accuracy,
+        test_accuracy=test_metrics.accuracy,
+        learning_rate=theory.learning_rate,
+        num_params=count_parameters(model),
+        fgd_approximation_kind="rkhs_dictionary",
+        fgd_rkhs_functional_loss=theory.initial_loss,
+    )
+    history.append(init_entry)
+    wandb_logger.log_history_entry(init_entry)
+    if progress is not None:
+        progress(
+            f"[INIT] Epoch 0, train_loss={train_metrics.loss:.4f}, "
+            f"validation_loss={validation_metrics.loss:.4f}, "
+            f"test_loss={test_metrics.loss:.4f}, "
+            f"train_acc={train_metrics.accuracy:.3f}, "
+            f"validation_acc={validation_metrics.accuracy:.3f}, "
+            f"test_acc={test_metrics.accuracy:.3f}"
+        )
+
+    last_test_loss = test_metrics.loss
+    for epoch in range(1, config.training.epochs + 1):
+        epoch_result = trainer.run_epoch()
+        last_record = epoch_result.step_records[-1]
+        train_metrics = metrics(train_loader)
+        validation_metrics = metrics(validation_loader)
+        test_metrics = metrics(test_loader)
+        epoch_entry = HistoryEntry(
+            step=epoch,
+            step_type="RKHS",
+            train_loss=train_metrics.loss,
+            validation_loss=validation_metrics.loss,
+            test_loss=test_metrics.loss,
+            train_accuracy=train_metrics.accuracy,
+            validation_accuracy=validation_metrics.accuracy,
+            test_accuracy=test_metrics.accuracy,
+            learning_rate=theory.learning_rate,
+            num_params=count_parameters(model),
+            rel_error=last_record.relative_error,
+            fgd_learning_rate_upper_bound=theory.learning_rate_upper_bound,
+            fgd_learning_rate_interval_valid=True,
+            fgd_relative_error_condition_valid=(
+                last_record.relative_error_condition_valid
+            ),
+            fgd_loss_descent_valid=all(
+                record.descent_valid for record in epoch_result.step_records
+            ),
+            fgd_gradient_sq_norm=last_record.gradient_sq_norm,
+            fgd_theory_descent_coefficient=theory.descent_coefficient,
+            fgd_global_bound=epoch_result.global_bound,
+            fgd_global_bound_valid=epoch_result.global_bound_valid,
+            fgd_global_contraction=theory.contraction,
+            fgd_approximation_kind="rkhs_dictionary",
+            fgd_rkhs_dictionary_size=last_record.dictionary_size,
+            fgd_rkhs_functional_loss=epoch_result.train_functional_loss,
+        )
+        history.append(epoch_entry)
+        wandb_logger.log_history_entry(epoch_entry)
+
+        if progress is not None and should_log_epoch(epoch, config):
+            delta = test_metrics.loss - last_test_loss
+            bound_msg = (
+                f", global_bound={epoch_result.global_bound:.4e}"
+                f" ({'ok' if epoch_result.global_bound_valid else 'VIOLATED'})"
+                if epoch_result.global_bound is not None
+                else ""
+            )
+            progress(
+                f"[RKHS] Epoch {epoch}, "
+                f"train_loss={train_metrics.loss:.4f}, "
+                f"validation_loss={validation_metrics.loss:.4f}, "
+                f"test_loss={test_metrics.loss:.4f} ({delta:+.4f}), "
+                f"train_acc={train_metrics.accuracy:.3f}, "
+                f"validation_acc={validation_metrics.accuracy:.3f}, "
+                f"test_acc={test_metrics.accuracy:.3f}, "
+                f"functional_loss={epoch_result.train_functional_loss:.4e}, "
+                f"rel_err={last_record.relative_error:.4f}, "
+                f"dict={last_record.dictionary_size}/{theory.train_points}"
+                f"{bound_msg}"
+            )
+        last_test_loss = test_metrics.loss
+
+        if epoch_result.global_bound_valid is False and progress is not None:
+            progress(
+                "[RKHS] warning: measured loss exceeded the Prop. 3.8 "
+                "envelope; this indicates a numerical-precision issue."
+            )
+        if epoch_result.converged:
+            if progress is not None:
+                progress(
+                    f"[RKHS] converged at epoch {epoch}: functional gradient "
+                    "norm is numerically zero, so by the PL condition "
+                    "(Assumption 3.7) the iterate is a global minimizer."
+                )
+            break
+
+    return PipelineResult(
+        config=config,
+        history=history,
+        growth_events=[],
+        model=model,
+        device=str(device),
+    )
+
+
+def _frozen_feature_map_from_grown_mlp(mlp: GrowingMLP) -> FrozenAffineFeatureMap:
+    """Snapshot the hidden layers of a grown MLP as the frozen feature map.
+
+    The constant-1 feature is appended so the certified head is exactly an
+    affine output layer (weight + bias): the certified optimum is the true
+    global optimum of the donor network's output layer given its current
+    hidden weights.
+    """
+    weights: list[torch.Tensor] = []
+    biases: list[torch.Tensor | None] = []
+    activations: list[torch.nn.Module] = []
+    for module in list(mlp.layers)[:-1]:
+        linear = module.layer
+        weights.append(linear.weight.detach().clone())
+        biases.append(
+            linear.bias.detach().clone() if linear.bias is not None else None
+        )
+        activations.append(copy.deepcopy(module.post_layer_function))
+    return FrozenAffineFeatureMap(weights, biases, activations, append_one=True)
+
+
+def _apply_certified_head(mlp: GrowingMLP, kernel_model: KernelDictionaryModel) -> None:
+    """Write the certified-optimal head into the grown network's output layer."""
+    head = kernel_model.linear_head_weight()
+    output_layer = mlp.layers[-1].layer
+    hidden_width = output_layer.weight.shape[1]
+    with torch.no_grad():
+        output_layer.weight.copy_(
+            head[:hidden_width].T.to(
+                dtype=output_layer.weight.dtype,
+                device=output_layer.weight.device,
+            )
+        )
+        if output_layer.bias is not None:
+            if head.shape[0] > hidden_width:
+                output_layer.bias.copy_(
+                    head[hidden_width].to(
+                        dtype=output_layer.bias.dtype,
+                        device=output_layer.bias.device,
+                    )
+                )
+            else:
+                output_layer.bias.zero_()
+
+
+def _select_rkhs_growth_layer(
+    mlp: GrowingMLP,
+    growth_count: int,
+    config: PipelineConfig,
+) -> int | None:
+    """Next growable layer, skipping hidden blocks at the width cap."""
+    growable = getattr(mlp, "_growable_layers", None)
+    if not growable:
+        return None
+    preferred = layer_index_for_growth(
+        growth_count=growth_count,
+        number_hidden_layers=config.model.number_hidden_layers,
+        config=config.growth_schedule,
+    ) % len(growable)
+    cap = config.fgd_rkhs.growth_max_hidden_size
+    for offset in range(len(growable)):
+        index = (preferred + offset) % len(growable)
+        # Growing growable layer ``index`` widens hidden block ``index``,
+        # whose current width is the output size of layers[index].
+        width = mlp.layers[index].layer.out_features
+        if cap is None or width < cap:
+            return index
+    return None
+
+
+def _run_fgd_rkhs_grow_pipeline(
+    *,
+    config: PipelineConfig,
+    device: torch.device,
+    train_loader: torch.utils.data.DataLoader,
+    validation_loader: torch.utils.data.DataLoader,
+    test_loader: torch.utils.data.DataLoader,
+    classification: bool,
+    wandb_logger: Any,
+    progress: ProgressFn | None,
+) -> PipelineResult:
+    """Certified train-and-grow cycle (training.method: fgd_rkhs_grow).
+
+    Each cycle freezes the grown network's hidden layers as the fixed
+    structure, trains the output layer to the certified global optimum of
+    that structure (Algorithm 1 of arXiv:2606.16926 with exact constants),
+    writes the optimal head back into the network, and then grows one GroMo
+    layer. The cycle stops when the closed-form ceiling ``L*`` of the newly
+    grown structure stops improving (relative improvement below
+    ``fgd_rkhs.growth_min_ceiling_improvement``), when every hidden block
+    reached ``fgd_rkhs.growth_max_hidden_size``, or after
+    ``fgd_rkhs.growth_max_cycles`` growth events. The certificate is
+    conditional: it certifies the best possible output layer for the hidden
+    weights the growth produced, never the nonconvex full-weight optimum.
+    """
+    rkhs_config = config.fgd_rkhs
+    if rkhs_config.growth_max_cycles < 0:
+        raise ValueError("fgd_rkhs.growth_max_cycles must be >= 0.")
+    if rkhs_config.growth_epochs_per_cycle < 1:
+        raise ValueError("fgd_rkhs.growth_epochs_per_cycle must be >= 1.")
+    if rkhs_config.growth_min_ceiling_improvement < 0.0:
+        raise ValueError(
+            "fgd_rkhs.growth_min_ceiling_improvement must be >= 0."
+        )
+    if (
+        rkhs_config.growth_max_hidden_size is not None
+        and rkhs_config.growth_max_hidden_size < 1
+    ):
+        raise ValueError("fgd_rkhs.growth_max_hidden_size must be >= 1.")
+
+    loss_function = torch.nn.MSELoss()
+    torch.manual_seed(config.model.model_seed)
+    mlp = GrowingMLP(
+        in_features=config.data.in_features,
+        out_features=config.data.out_features,
+        hidden_size=config.model.hidden_size,
+        number_hidden_layers=config.model.number_hidden_layers,
+        device=device,
+    )
+    train_x, train_y = _materialize_dataset(train_loader, device)
+
+    def metrics(loader: torch.utils.data.DataLoader):
+        return evaluate_regression_metrics(
+            mlp,
+            loader,
+            loss_function,
+            device=device,
+            accuracy_tolerance=config.training.accuracy_tolerance,
+            classification=classification,
+        )
+
+    def hidden_widths() -> list[int]:
+        return [module.layer.out_features for module in list(mlp.layers)[:-1]]
+
+    if progress is not None:
+        progress(f"Using device: {device}")
+        progress(f"Training method: {config.training.method}")
+        if wandb_logger.enabled:
+            progress(
+                f"W&B logging enabled: project={config.wandb.project}, "
+                f"run={config.wandb.run_name or config.run.name}"
+            )
+        progress("Original model:")
+        progress(str(mlp))
+
+    history: list[HistoryEntry] = []
+    growth_events: list[GrowthResult] = []
+    train_metrics = metrics(train_loader)
+    validation_metrics = metrics(validation_loader)
+    test_metrics = metrics(test_loader)
+    init_entry = HistoryEntry(
+        step=0,
+        step_type="INIT",
+        train_loss=train_metrics.loss,
+        validation_loss=validation_metrics.loss,
+        test_loss=test_metrics.loss,
+        train_accuracy=train_metrics.accuracy,
+        validation_accuracy=validation_metrics.accuracy,
+        test_accuracy=test_metrics.accuracy,
+        learning_rate=0.0,
+        num_params=count_parameters(mlp),
+        fgd_approximation_kind="rkhs_grown_head",
+    )
+    history.append(init_entry)
+    wandb_logger.log_history_entry(init_entry)
+
+    epoch = 0
+    growth_count = 0
+    previous_ceiling: float | None = None
+    stop_growing = False
+    last_test_loss = test_metrics.loss
+
+    while True:
+        feature_map = _frozen_feature_map_from_grown_mlp(mlp)
+        trainer = FGDRKHSTrainer(
+            train_x=train_x,
+            train_y=train_y,
+            config=rkhs_config,
+            device=device,
+            feature_map=feature_map,
+        )
+        theory = trainer.theory
+        ceiling = theory.loss_star
+        if progress is not None:
+            progress(
+                f"[RKHS-GROW] cycle {growth_count}: structure "
+                f"{config.data.in_features}->"
+                f"{'->'.join(str(w) for w in hidden_widths())}->"
+                f"{config.data.out_features} (hidden frozen), "
+                f"certified ceiling L*={ceiling:.6e}, "
+                f"K_s={theory.smoothness:.6g}, mu={theory.pl_mu:.3e}, "
+                f"lr={theory.learning_rate:.6g}, "
+                f"contraction={theory.contraction:.6g}, "
+                f"PL_certificate="
+                f"{'valid' if theory.pl_certificate_valid else 'vacuous'}"
+            )
+        if previous_ceiling is not None:
+            improvement = (previous_ceiling - ceiling) / max(
+                previous_ceiling,
+                rkhs_config.eps,
+            )
+            if progress is not None:
+                progress(
+                    f"[RKHS-GROW] ceiling improvement after growth: "
+                    f"{improvement:+.4%} "
+                    f"(threshold {rkhs_config.growth_min_ceiling_improvement:.4%})"
+                )
+            if improvement < rkhs_config.growth_min_ceiling_improvement:
+                stop_growing = True
+                if progress is not None:
+                    progress(
+                        "[RKHS-GROW] growth no longer improves the certified "
+                        "ceiling; this is the final structure."
+                    )
+        previous_ceiling = ceiling
+
+        converged = False
+        for _ in range(rkhs_config.growth_epochs_per_cycle):
+            if epoch >= config.training.epochs:
+                break
+            epoch += 1
+            epoch_result = trainer.run_epoch()
+            last_record = epoch_result.step_records[-1]
+            _apply_certified_head(mlp, trainer.model)
+            train_metrics = metrics(train_loader)
+            validation_metrics = metrics(validation_loader)
+            test_metrics = metrics(test_loader)
+            epoch_entry = HistoryEntry(
+                step=epoch,
+                step_type="RKHS",
+                train_loss=train_metrics.loss,
+                validation_loss=validation_metrics.loss,
+                test_loss=test_metrics.loss,
+                train_accuracy=train_metrics.accuracy,
+                validation_accuracy=validation_metrics.accuracy,
+                test_accuracy=test_metrics.accuracy,
+                learning_rate=theory.learning_rate,
+                num_params=count_parameters(mlp),
+                rel_error=last_record.relative_error,
+                fgd_learning_rate_upper_bound=theory.learning_rate_upper_bound,
+                fgd_learning_rate_interval_valid=True,
+                fgd_relative_error_condition_valid=(
+                    last_record.relative_error_condition_valid
+                ),
+                fgd_loss_descent_valid=all(
+                    record.descent_valid for record in epoch_result.step_records
+                ),
+                fgd_gradient_sq_norm=last_record.gradient_sq_norm,
+                fgd_theory_descent_coefficient=theory.descent_coefficient,
+                fgd_global_bound=epoch_result.global_bound,
+                fgd_global_bound_valid=epoch_result.global_bound_valid,
+                fgd_global_contraction=theory.contraction,
+                fgd_approximation_kind="rkhs_grown_head",
+                fgd_rkhs_dictionary_size=last_record.dictionary_size,
+                fgd_rkhs_functional_loss=epoch_result.train_functional_loss,
+                fgd_rkhs_loss_star=ceiling,
+            )
+            history.append(epoch_entry)
+            wandb_logger.log_history_entry(epoch_entry)
+            if progress is not None and should_log_epoch(epoch, config):
+                delta = test_metrics.loss - last_test_loss
+                progress(
+                    f"[RKHS-GROW] Epoch {epoch}, "
+                    f"train_loss={train_metrics.loss:.4f}, "
+                    f"validation_loss={validation_metrics.loss:.4f}, "
+                    f"test_loss={test_metrics.loss:.4f} ({delta:+.4f}), "
+                    f"train_acc={train_metrics.accuracy:.3f}, "
+                    f"validation_acc={validation_metrics.accuracy:.3f}, "
+                    f"test_acc={test_metrics.accuracy:.3f}, "
+                    f"functional_loss="
+                    f"{epoch_result.train_functional_loss:.4e}, "
+                    f"ceiling={ceiling:.4e}, "
+                    f"rel_err={last_record.relative_error:.4f}"
+                )
+            last_test_loss = test_metrics.loss
+            if epoch_result.converged:
+                converged = True
+                if progress is not None:
+                    progress(
+                        f"[RKHS-GROW] cycle {growth_count} reached the "
+                        "certified global optimum of the current fixed "
+                        "structure (functional gradient numerically zero)."
+                    )
+                break
+        if not converged and progress is not None:
+            progress(
+                f"[RKHS-GROW] cycle {growth_count} epoch budget reached "
+                "before certified convergence; growing anyway."
+            )
+
+        if (
+            stop_growing
+            or growth_count >= rkhs_config.growth_max_cycles
+            or epoch >= config.training.epochs
+        ):
+            break
+        layer_index = _select_rkhs_growth_layer(mlp, growth_count, config)
+        if layer_index is None:
+            if progress is not None:
+                progress(
+                    "[RKHS-GROW] every hidden block reached "
+                    f"growth_max_hidden_size="
+                    f"{rkhs_config.growth_max_hidden_size}; stopping growth."
+                )
+            break
+        growth_result = grow_layer(
+            model=mlp,
+            train_loader=train_loader,
+            layer_index=layer_index,
+            device=device,
+            line_search_config=config.scaling_line_search,
+            optimal_update_kwargs=None,
+            progress=None,
+        )
+        growth_count += 1
+        growth_events.append(growth_result)
+        wandb_logger.log_growth_event(
+            event=growth_result,
+            epoch=epoch,
+            growth_count=growth_count,
+        )
+        train_metrics = metrics(train_loader)
+        validation_metrics = metrics(validation_loader)
+        test_metrics = metrics(test_loader)
+        growth_entry = HistoryEntry(
+            step=epoch,
+            step_type="GRO",
+            train_loss=train_metrics.loss,
+            validation_loss=validation_metrics.loss,
+            test_loss=test_metrics.loss,
+            train_accuracy=train_metrics.accuracy,
+            validation_accuracy=validation_metrics.accuracy,
+            test_accuracy=test_metrics.accuracy,
+            learning_rate=0.0,
+            num_params=count_parameters(mlp),
+            layer_index=layer_index,
+            scaling_factor=growth_result.best_scaling_factor,
+            fgd_approximation_kind="rkhs_grown_head",
+            fgd_rkhs_loss_star=ceiling,
+        )
+        history.append(growth_entry)
+        wandb_logger.log_history_entry(growth_entry)
+        if progress is not None:
+            progress(
+                f"[RKHS-GROW] growth {growth_count}: layer {layer_index}, "
+                f"widths={hidden_widths()}, "
+                f"params={count_parameters(mlp)}"
+            )
+
+    return PipelineResult(
+        config=config,
+        history=history,
+        growth_events=growth_events,
+        model=mlp,
+        device=str(device),
+    )
+
+
+@dataclass(frozen=True)
+class _RKHSPhaseResult:
+    """Outcome of one certified head-optimization phase (secant replacement)."""
+
+    trainer: FGDRKHSTrainer
+    steps: int
+    accepted: bool
+    converged: bool
+    model_loss_before: float
+    functional_loss_after: float
+    last_record: FGDRKHSStepRecord | None
+    descent_valid: bool
+    global_bound: float | None
+    global_bound_valid: bool | None
+
+
+def _run_rkhs_head_phase(
+    *,
+    model: GrowingMLP,
+    train_batches: list[tuple[torch.Tensor, torch.Tensor]],
+    config: PipelineConfig,
+    device: torch.device,
+) -> _RKHSPhaseResult:
+    """Certified head optimization of the current fixed structure.
+
+    Replaces the Hilbert-secant search of the original flow: when the
+    tangent-space approximation stops certifying and a growth probe does
+    not improve the certificate, the network's hidden layers are frozen as
+    the fixed structure and the output layer is driven to the certified
+    global optimum of that structure (Algorithm 1 of arXiv:2606.16926 with
+    exact constants; see ``stable_tiny.fgd_rkhs``). The phase is accepted
+    iff it improves the model's functional train loss beyond the numerical
+    certificate tolerance; a rejection therefore certifies that the output
+    layer is already at the global optimum of the fixed structure, i.e.
+    the architecture is exhausted and only growth can help. The model is
+    NOT modified here; the caller applies the certified head only on
+    acceptance.
+    """
+    train_x = torch.cat([x for x, _ in train_batches]).to(device)
+    train_y = torch.cat([y for _, y in train_batches]).to(device)
+    feature_map = _frozen_feature_map_from_grown_mlp(model)
+    # The phase certifies the output layer of the fixed structure, so the
+    # kernel is always the linear one over the frozen hidden activations
+    # regardless of how fgd_rkhs is configured for the standalone methods.
+    rkhs_config = replace(
+        config.fgd_rkhs,
+        kernel="linear",
+        feature_hidden_layers=0,
+        feature_hidden_size=0,
+    )
+    trainer = FGDRKHSTrainer(
+        train_x=train_x,
+        train_y=train_y,
+        config=rkhs_config,
+        device=device,
+        feature_map=feature_map,
+    )
+    with torch.no_grad():
+        predictions = model(trainer.train_x.to(torch.float32)).to(torch.float64)
+        residual = predictions - trainer.train_y
+        model_loss_before = float(residual.square().sum().item()) / (
+            2.0 * residual.shape[0]
+        )
+
+    epoch_results: list[FGDRKHSEpochResult] = []
+    for _ in range(max(1, config.fgd_rkhs.growth_epochs_per_cycle)):
+        epoch_result = trainer.run_epoch()
+        epoch_results.append(epoch_result)
+        if epoch_result.converged:
+            break
+    final_loss = epoch_results[-1].train_functional_loss
+    last_record = (
+        epoch_results[-1].step_records[-1]
+        if epoch_results[-1].step_records
+        else None
+    )
+    tolerance = trainer.certificate_tolerance * (1.0 + abs(model_loss_before))
+    accepted = final_loss < model_loss_before - tolerance
+    descent_valid = all(
+        record.descent_valid
+        for result in epoch_results
+        for record in result.step_records
+    )
+    return _RKHSPhaseResult(
+        trainer=trainer,
+        steps=trainer.total_steps,
+        accepted=accepted,
+        converged=trainer.converged,
+        model_loss_before=model_loss_before,
+        functional_loss_after=final_loss,
+        last_record=last_record,
+        descent_valid=descent_valid,
+        global_bound=epoch_results[-1].global_bound,
+        global_bound_valid=epoch_results[-1].global_bound_valid,
+    )
+
+
 def run_pipeline(
     config: PipelineConfig,
     progress: ProgressFn | None = print,
@@ -1146,6 +1832,28 @@ def run_pipeline(
     device = select_device(config.training.device)
     train_loader, validation_loader, test_loader = build_dataloaders(config, device)
     classification = is_classification_task(config)
+    if config.training.method in ("fgd_rkhs", "fgd_rkhs_grow"):
+        runner = (
+            _run_fgd_rkhs_pipeline
+            if config.training.method == "fgd_rkhs"
+            else _run_fgd_rkhs_grow_pipeline
+        )
+        try:
+            result = runner(
+                config=config,
+                device=device,
+                train_loader=train_loader,
+                validation_loader=validation_loader,
+                test_loader=test_loader,
+                classification=classification,
+                wandb_logger=wandb_logger,
+                progress=progress,
+            )
+        except Exception:
+            wandb_logger.abort()
+            raise
+        wandb_logger.finish(history=result.history)
+        return result
     model = build_model(config, device)
     loss_function = torch.nn.MSELoss()
     optimizer = build_optimizer(model, config.optimizer)
@@ -1388,9 +2096,9 @@ def run_pipeline(
             fgd_approximation_kind: str | None = (
                 "tangent" if config.training.method == "fgd_approx" else None
             )
-            fgd_secant_attempted = False
-            fgd_secant_accepted: bool | None = None
-            fgd_secant_trials = 0
+            fgd_rkhs_phase_attempted = False
+            fgd_rkhs_phase_accepted: bool | None = None
+            fgd_rkhs_phase_steps = 0
             fgd_growth_probe_improved: bool | None = None
             entry_learning_rate = current_learning_rate(optimizer)
             if config.training.method == "normal":
@@ -1672,7 +2380,7 @@ def run_pipeline(
             else:
                 raise ValueError(
                     f"Unsupported training method '{config.training.method}'. "
-                    "Use one of: normal, fgd_approx."
+                    "Use one of: normal, fgd_approx, fgd_rkhs, fgd_rkhs_grow."
                 )
 
             validation_metrics = evaluate_regression_metrics(
@@ -1724,9 +2432,9 @@ def run_pipeline(
                 fgd_candidate_accepted=fgd_candidate_accepted,
                 fgd_lr_search_trials=fgd_lr_search_trials,
                 fgd_approximation_kind=fgd_approximation_kind,
-                fgd_secant_attempted=fgd_secant_attempted,
-                fgd_secant_accepted=fgd_secant_accepted,
-                fgd_secant_trials=fgd_secant_trials,
+                fgd_rkhs_phase_attempted=fgd_rkhs_phase_attempted,
+                fgd_rkhs_phase_accepted=fgd_rkhs_phase_accepted,
+                fgd_rkhs_phase_steps=fgd_rkhs_phase_steps,
                 fgd_growth_probe_improved=fgd_growth_probe_improved,
             )
             history.append(epoch_entry)
@@ -1844,42 +2552,58 @@ def run_pipeline(
                     growth_probe is not None and growth_probe.improves_fgd
                 )
                 if not fgd_growth_probe_improved:
-                    fgd_secant_attempted = config.secant_fgd.enabled
-                    secant_theory_state = _FGDTheoryState(
-                        epoch_count=fgd_epoch_count,
-                        min_gradient_sq_norm=fgd_min_gradient_sq_norm,
-                        min_positive_learning_rate=fgd_min_positive_learning_rate,
-                        min_descent_coefficient=fgd_min_descent_coefficient,
-                        global_contraction_product=fgd_global_contraction_product,
-                        previous_validation_functional_loss=(
-                            previous_validation_functional_loss
-                        ),
-                    )
-                    secant_search = _search_secant_fgd_candidate(
-                        model=model,
-                        train_batches=growth_train_batches,
-                        validation_loader=validation_loader,
-                        loss_function=loss_function,
-                        device=device,
-                        accuracy_tolerance=config.training.accuracy_tolerance,
-                        config=config,
-                        projection_group_size=current_projection_group_size,
-                        classification=classification,
-                        theory_state=secant_theory_state,
-                        initial_functional_gap=initial_functional_gap,
-                        theory_loss_star=theory_loss_star,
-                    )
-                    fgd_secant_trials = secant_search.trial_count
-                    secant_trial = secant_search.accepted
-                    fgd_secant_accepted = secant_trial is not None
+                    fgd_rkhs_phase_attempted = config.secant_fgd.enabled
                     growth_triggered = False
+                    phase: _RKHSPhaseResult | None = None
+                    if fgd_rkhs_phase_attempted:
+                        phase = _run_rkhs_head_phase(
+                            model=model,
+                            train_batches=growth_train_batches,
+                            config=config,
+                            device=device,
+                        )
+                        fgd_rkhs_phase_steps = phase.steps
+                        fgd_rkhs_phase_accepted = phase.accepted
 
-                    if secant_trial is not None:
-                        model = secant_trial.model
-                        secant_certificate = secant_trial.certificate
-                        secant_test_metrics = evaluate_regression_metrics(
+                    if phase is not None and phase.accepted:
+                        _apply_certified_head(model, phase.trainer.model)
+                        optimizer = build_optimizer(model, config.optimizer)
+                        validation_certificate_for_next_epoch = (
+                            evaluate_fgd_validation_certificate(
+                                model=model,
+                                data_loader=validation_loader,
+                                device=device,
+                                config=config.fgd_approx,
+                                learning_rate=None,
+                                projection_group_size=(
+                                    current_projection_group_size
+                                ),
+                            )
+                        )
+                        certified_learning_rate = (
+                            certified_validation_learning_rate(
+                                validation_certificate_for_next_epoch,
+                                config.fgd_approx,
+                            )
+                        )
+                        if certified_learning_rate is not None:
+                            current_fgd_learning_rate = certified_learning_rate
+                        apply_learning_rate(
+                            optimizer,
+                            current_fgd_learning_rate,
+                        )
+                        previous_validation_functional_loss = (
+                            evaluate_functional_loss(
+                                model,
+                                validation_loader,
+                                device,
+                            )
+                        )
+                        phase_theory = phase.trainer.theory
+                        phase_record = phase.last_record
+                        phase_train_metrics = evaluate_regression_metrics(
                             model,
-                            test_loader,
+                            train_loader,
                             loss_function,
                             device=device,
                             accuracy_tolerance=(
@@ -1887,7 +2611,7 @@ def run_pipeline(
                             ),
                             classification=classification,
                         )
-                        secant_validation_metrics = evaluate_regression_metrics(
+                        phase_validation_metrics = evaluate_regression_metrics(
                             model,
                             validation_loader,
                             loss_function,
@@ -1897,129 +2621,95 @@ def run_pipeline(
                             ),
                             classification=classification,
                         )
-                        secant_epoch_result = replace(
-                            secant_trial.epoch_result,
-                            test_loss=secant_test_metrics.loss,
-                            test_accuracy=secant_test_metrics.accuracy,
-                        )
-                        accepted_state = secant_trial.theory_state
-                        fgd_epoch_count = accepted_state.epoch_count
-                        fgd_min_gradient_sq_norm = (
-                            accepted_state.min_gradient_sq_norm
-                        )
-                        fgd_min_positive_learning_rate = (
-                            accepted_state.min_positive_learning_rate
-                        )
-                        fgd_min_descent_coefficient = (
-                            accepted_state.min_descent_coefficient
-                        )
-                        fgd_global_contraction_product = (
-                            accepted_state.global_contraction_product
-                        )
-                        previous_validation_functional_loss = (
-                            accepted_state.previous_validation_functional_loss
-                        )
-                        current_fgd_learning_rate = (
-                            secant_epoch_result.min_positive_learning_rate
-                            or config.fgd_approx.theory_lr_initial
-                        )
-                        validation_certificate_for_next_epoch = (
-                            secant_certificate
-                        )
-                        optimizer = build_optimizer(model, config.optimizer)
-                        apply_learning_rate(
-                            optimizer,
-                            current_fgd_learning_rate,
-                        )
-                        secant_entry = HistoryEntry(
-                            step=epoch,
-                            step_type="SEC",
-                            train_loss=secant_epoch_result.train_loss,
-                            validation_loss=secant_validation_metrics.loss,
-                            test_loss=secant_test_metrics.loss,
-                            train_accuracy=secant_epoch_result.train_accuracy,
-                            validation_accuracy=(
-                                secant_validation_metrics.accuracy
+                        phase_test_metrics = evaluate_regression_metrics(
+                            model,
+                            test_loader,
+                            loss_function,
+                            device=device,
+                            accuracy_tolerance=(
+                                config.training.accuracy_tolerance
                             ),
-                            test_accuracy=secant_test_metrics.accuracy,
+                            classification=classification,
+                        )
+                        rkhs_entry = HistoryEntry(
+                            step=epoch,
+                            step_type="RKHS",
+                            train_loss=phase_train_metrics.loss,
+                            validation_loss=phase_validation_metrics.loss,
+                            test_loss=phase_test_metrics.loss,
+                            train_accuracy=phase_train_metrics.accuracy,
+                            validation_accuracy=(
+                                phase_validation_metrics.accuracy
+                            ),
+                            test_accuracy=phase_test_metrics.accuracy,
                             learning_rate=current_fgd_learning_rate,
                             num_params=count_parameters(model),
-                            rel_error=secant_certificate.relative_error,
-                            fgd_output_rel_error=(
-                                secant_certificate.output_relative_error
+                            rel_error=(
+                                phase_record.relative_error
+                                if phase_record is not None
+                                else None
                             ),
                             fgd_learning_rate_upper_bound=(
-                                secant_certificate.learning_rate_upper_bound
+                                phase_theory.learning_rate_upper_bound
                             ),
-                            fgd_max_valid_learning_rate=(
-                                secant_certificate.max_valid_learning_rate
-                            ),
-                            fgd_learning_rate_interval_valid=(
-                                secant_certificate.learning_rate_interval_valid
-                            ),
-                            fgd_skipped_batches=(
-                                secant_certificate.skipped_batches
-                            ),
+                            fgd_learning_rate_interval_valid=True,
                             fgd_relative_error_condition_valid=(
-                                secant_certificate.relative_error_condition_valid
+                                phase_record.relative_error_condition_valid
+                                if phase_record is not None
+                                else None
                             ),
-                            fgd_loss_descent_valid=(
-                                secant_trial.loss_descent_valid
-                            ),
+                            fgd_loss_descent_valid=phase.descent_valid,
                             fgd_gradient_sq_norm=(
-                                secant_certificate.gradient_sq_norm
-                            ),
-                            fgd_min_gradient_sq_norm=(
-                                fgd_min_gradient_sq_norm
+                                phase_record.gradient_sq_norm
+                                if phase_record is not None
+                                else None
                             ),
                             fgd_theory_descent_coefficient=(
-                                secant_certificate.theory_descent_coefficient
+                                phase_theory.descent_coefficient
                             ),
-                            fgd_stationary_bound=secant_trial.stationary_bound,
-                            fgd_stationary_bound_valid=(
-                                secant_trial.stationary_bound_valid
-                            ),
-                            fgd_global_bound=secant_trial.global_bound,
-                            fgd_global_bound_valid=(
-                                secant_trial.global_bound_valid
-                            ),
-                            fgd_global_contraction=(
-                                secant_trial.global_contraction
-                            ),
-                            fgd_sensor_valid=secant_certificate.sensor_valid,
-                            fgd_sensor_invalid_batches=(
-                                secant_certificate.sensor_invalid_batches
-                            ),
+                            fgd_global_bound=phase.global_bound,
+                            fgd_global_bound_valid=phase.global_bound_valid,
+                            fgd_global_contraction=phase_theory.contraction,
                             fgd_candidate_accepted=True,
-                            fgd_approximation_kind="secant",
-                            fgd_secant_attempted=True,
-                            fgd_secant_accepted=True,
-                            fgd_secant_trials=fgd_secant_trials,
+                            fgd_approximation_kind="rkhs_head",
+                            fgd_rkhs_phase_attempted=True,
+                            fgd_rkhs_phase_accepted=True,
+                            fgd_rkhs_phase_steps=fgd_rkhs_phase_steps,
                             fgd_growth_probe_improved=False,
+                            fgd_rkhs_dictionary_size=(
+                                phase_record.dictionary_size
+                                if phase_record is not None
+                                else None
+                            ),
+                            fgd_rkhs_functional_loss=(
+                                phase.functional_loss_after
+                            ),
+                            fgd_rkhs_loss_star=phase_theory.loss_star,
                         )
-                        history.append(secant_entry)
-                        wandb_logger.log_history_entry(secant_entry)
+                        history.append(rkhs_entry)
+                        wandb_logger.log_history_entry(rkhs_entry)
                         if progress is not None:
                             progress(
-                                f"[SEC] Epoch {epoch}, "
-                                f"train_loss={secant_entry.train_loss:.4f}, "
-                                f"validation_loss="
-                                f"{secant_entry.validation_loss:.4f}, "
-                                f"test_loss={secant_entry.test_loss:.4f}, "
-                                f"lr={secant_entry.learning_rate:.4g}, "
-                                f"rel_err={secant_entry.rel_error:.3f}"
+                                f"[RKHS] Epoch {epoch}: certified head phase "
+                                "accepted (structure "
+                                "not exhausted); functional loss "
+                                f"{phase.model_loss_before:.4e} -> "
+                                f"{phase.functional_loss_after:.4e} "
+                                f"(ceiling L*={phase_theory.loss_star:.4e}, "
+                                f"steps={phase.steps}, "
+                                f"converged={phase.converged})"
                             )
-                        last_test_loss = secant_test_metrics.loss
+                        last_test_loss = phase_test_metrics.loss
                     else:
-                        diagnostic_secant = secant_search.last_trial
-                        diagnostic_certificate = (
-                            diagnostic_secant.certificate
-                            if diagnostic_secant is not None
-                            else None
+                        phase_theory = (
+                            phase.trainer.theory if phase is not None else None
                         )
-                        rejected_secant_entry = HistoryEntry(
+                        phase_record = (
+                            phase.last_record if phase is not None else None
+                        )
+                        rejected_rkhs_entry = HistoryEntry(
                             step=epoch,
-                            step_type="SEC",
+                            step_type="RKHS",
                             train_loss=epoch_result.train_loss,
                             validation_loss=validation_metrics.loss,
                             test_loss=epoch_result.test_loss,
@@ -2029,85 +2719,57 @@ def run_pipeline(
                             learning_rate=0.0,
                             num_params=count_parameters(model),
                             rel_error=(
-                                diagnostic_certificate.relative_error
-                                if diagnostic_certificate is not None
-                                else None
-                            ),
-                            fgd_output_rel_error=(
-                                diagnostic_certificate.output_relative_error
-                                if diagnostic_certificate is not None
-                                else None
-                            ),
-                            fgd_learning_rate_upper_bound=(
-                                diagnostic_certificate.learning_rate_upper_bound
-                                if diagnostic_certificate is not None
-                                else None
-                            ),
-                            fgd_max_valid_learning_rate=(
-                                diagnostic_certificate.max_valid_learning_rate
-                                if diagnostic_certificate is not None
-                                else None
-                            ),
-                            fgd_learning_rate_interval_valid=(
-                                diagnostic_certificate.learning_rate_interval_valid
-                                if diagnostic_certificate is not None
+                                phase_record.relative_error
+                                if phase_record is not None
                                 else None
                             ),
                             fgd_relative_error_condition_valid=(
-                                diagnostic_certificate.relative_error_condition_valid
-                                if diagnostic_certificate is not None
+                                phase_record.relative_error_condition_valid
+                                if phase_record is not None
                                 else None
                             ),
                             fgd_loss_descent_valid=(
-                                diagnostic_secant.loss_descent_valid
-                                if diagnostic_secant is not None
-                                else None
-                            ),
-                            fgd_stationary_bound=(
-                                diagnostic_secant.stationary_bound
-                                if diagnostic_secant is not None
-                                else None
-                            ),
-                            fgd_stationary_bound_valid=(
-                                diagnostic_secant.stationary_bound_valid
-                                if diagnostic_secant is not None
+                                phase.descent_valid
+                                if phase is not None
                                 else None
                             ),
                             fgd_global_bound=(
-                                diagnostic_secant.global_bound
-                                if diagnostic_secant is not None
+                                phase.global_bound
+                                if phase is not None
                                 else None
                             ),
                             fgd_global_bound_valid=(
-                                diagnostic_secant.global_bound_valid
-                                if diagnostic_secant is not None
+                                phase.global_bound_valid
+                                if phase is not None
                                 else None
-                            ),
-                            fgd_sensor_valid=(
-                                diagnostic_certificate.sensor_valid
-                                if diagnostic_certificate is not None
-                                else None
-                            ),
-                            fgd_sensor_invalid_batches=(
-                                diagnostic_certificate.sensor_invalid_batches
-                                if diagnostic_certificate is not None
-                                else 0
                             ),
                             fgd_candidate_accepted=False,
-                            fgd_approximation_kind="secant",
-                            fgd_secant_attempted=fgd_secant_attempted,
-                            fgd_secant_accepted=False,
-                            fgd_secant_trials=fgd_secant_trials,
+                            fgd_approximation_kind="rkhs_head",
+                            fgd_rkhs_phase_attempted=fgd_rkhs_phase_attempted,
+                            fgd_rkhs_phase_accepted=False,
+                            fgd_rkhs_phase_steps=fgd_rkhs_phase_steps,
                             fgd_growth_probe_improved=False,
+                            fgd_rkhs_functional_loss=(
+                                phase.functional_loss_after
+                                if phase is not None
+                                else None
+                            ),
+                            fgd_rkhs_loss_star=(
+                                phase_theory.loss_star
+                                if phase_theory is not None
+                                else None
+                            ),
                         )
-                        history.append(rejected_secant_entry)
-                        wandb_logger.log_history_entry(rejected_secant_entry)
+                        history.append(rejected_rkhs_entry)
+                        wandb_logger.log_history_entry(rejected_rkhs_entry)
                         if progress is not None:
                             progress(
-                                f"[SEC-WARN] Epoch {epoch}: growth did not "
-                                "improve the FGD certificate and no "
-                                "fixed-architecture Hilbert secant satisfied "
-                                "all validation conditions"
+                                f"[RKHS-WARN] Epoch {epoch}: growth did not "
+                                "improve the FGD certificate and the output "
+                                "layer is already at the certified global "
+                                "optimum of the fixed structure "
+                                "(the architecture is exhausted at this "
+                                "point)"
                             )
 
             if growth_triggered:
@@ -2319,9 +2981,9 @@ def run_pipeline(
                     fgd_candidate_accepted=fgd_candidate_accepted,
                     fgd_lr_search_trials=fgd_lr_search_trials,
                     fgd_approximation_kind=fgd_approximation_kind,
-                    fgd_secant_attempted=fgd_secant_attempted,
-                    fgd_secant_accepted=fgd_secant_accepted,
-                    fgd_secant_trials=fgd_secant_trials,
+                    fgd_rkhs_phase_attempted=fgd_rkhs_phase_attempted,
+                    fgd_rkhs_phase_accepted=fgd_rkhs_phase_accepted,
+                    fgd_rkhs_phase_steps=fgd_rkhs_phase_steps,
                     fgd_growth_probe_improved=fgd_growth_probe_improved,
                 )
                 history.append(growth_entry)

@@ -83,6 +83,13 @@ fgd_approx:
   tiny_numerical_threshold: 1.0e-6
   tiny_statistical_threshold: 1.0e-3
 
+# The RKHS head phase replaced the Hilbert-secant search: when the
+# tangent-space certificate stalls and a growth probe does not improve
+# it, the hidden layers are frozen and the output layer is driven to
+# the CERTIFIED global optimum of the fixed structure (fgd_rkhs
+# section below). 'enabled' gates that phase and the growth_min_*
+# thresholds still govern the growth probe; the inner_*/search knobs
+# of the old secant are unused.
 secant_fgd:
   enabled: true
   inner_steps: 8
@@ -94,6 +101,18 @@ secant_fgd:
   min_learning_rate_factor: 0.01
   growth_min_relative_error_improvement: 0.001
   growth_min_learning_rate_improvement: 0.05
+
+fgd_rkhs:
+  # Certified head phase (linear kernel over the frozen hidden
+  # activations is forced internally; whitening sharpens the
+  # contraction). Budget per phase: growth_epochs_per_cycle epochs of
+  # steps_per_epoch certified steps.
+  feature_whitening: true
+  epsilon: 0.25
+  lr_safety: 0.9
+  steps_per_epoch: 10
+  max_train_points: 4096
+  growth_epochs_per_cycle: 30
 
 scaling_line_search:
   method: golden_section
