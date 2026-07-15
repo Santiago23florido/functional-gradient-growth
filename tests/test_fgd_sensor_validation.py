@@ -269,10 +269,11 @@ def test_secant_search_keeps_architecture_fixed() -> None:
     )
 
 
-def test_pipeline_uses_secant_when_growth_does_not_improve_fgd(
+def test_pipeline_uses_rkhs_phase_when_growth_does_not_improve_fgd(
     monkeypatch,
     tmp_path,
 ) -> None:
+    """The certified RKHS head phase replaces the Hilbert-secant search."""
     config = load_pipeline_config("configs/fgd/default.yaml")
     config = replace(
         config,
@@ -319,13 +320,16 @@ def test_pipeline_uses_secant_when_growth_does_not_improve_fgd(
     result = run_pipeline(config, progress=None)
 
     initial_entry = next(entry for entry in result.history if entry.step_type == "INIT")
-    secant_entry = next(entry for entry in result.history if entry.step_type == "SEC")
+    phase_entry = next(entry for entry in result.history if entry.step_type == "RKHS")
     assert result.growth_events == []
-    assert secant_entry.fgd_growth_probe_improved is False
-    assert secant_entry.fgd_secant_attempted is True
-    assert secant_entry.fgd_secant_accepted is True
-    assert secant_entry.fgd_candidate_accepted is True
-    assert secant_entry.num_params == initial_entry.num_params
+    assert phase_entry.fgd_growth_probe_improved is False
+    assert phase_entry.fgd_rkhs_phase_attempted is True
+    assert phase_entry.fgd_rkhs_phase_accepted is True
+    assert phase_entry.fgd_candidate_accepted is True
+    assert phase_entry.fgd_approximation_kind == "rkhs_head"
+    assert phase_entry.fgd_rkhs_loss_star is not None
+    # The phase never changes the architecture: same parameter count.
+    assert phase_entry.num_params == initial_entry.num_params
 
 
 def test_build_dataloaders_returns_distinct_validation_split() -> None:
