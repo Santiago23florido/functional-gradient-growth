@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from stable_tiny.gromo_setup import ensure_gromo_importable
+from fgdlib.gromo_setup import ensure_gromo_importable
 
 
 ensure_gromo_importable()

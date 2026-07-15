@@ -42,20 +42,20 @@ from stable_tiny.fgd_rkhs import (
     FrozenAffineFeatureMap,
     KernelDictionaryModel,
 )
-from stable_tiny.gromo_setup import ensure_gromo_importable
+from fgdlib.gromo_setup import ensure_gromo_importable
 from stable_tiny.grow import GrowthResult, ScalingLineSearchConfig, grow_layer
-from stable_tiny.growth_schedule import (
+from fgdlib.growth_schedule import (
     GrowthScheduleConfig,
     layer_index_for_growth,
     should_grow,
 )
-from stable_tiny.lr_scheduler import (
+from fgdlib.lr_scheduler import (
     LRSchedulerConfig,
     apply_learning_rate,
     learning_rate_for_epoch,
 )
-from stable_tiny.optim import OptimizerConfig, build_optimizer, current_learning_rate
-from stable_tiny.train import (
+from fgdlib.optim import OptimizerConfig, build_optimizer, current_learning_rate
+from fgdlib.training import (
     count_parameters,
     evaluate_regression_metrics,
     train_one_epoch,

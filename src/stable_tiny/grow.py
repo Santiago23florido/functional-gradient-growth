@@ -7,7 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from stable_tiny.gromo_setup import ensure_gromo_importable
+from fgdlib.gromo_setup import ensure_gromo_importable
 
 
 ensure_gromo_importable()

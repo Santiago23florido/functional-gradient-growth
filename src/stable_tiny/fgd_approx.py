@@ -8,9 +8,9 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Callable, Literal
 
-from stable_tiny.gromo_setup import ensure_gromo_importable
+from fgdlib.gromo_setup import ensure_gromo_importable
 from stable_tiny.grow import ScalingLineSearchConfig, grow_layer
-from stable_tiny.train import RegressionMetrics, evaluate_regression_metrics
+from fgdlib.training import RegressionMetrics, evaluate_regression_metrics
 
 
 ensure_gromo_importable()
