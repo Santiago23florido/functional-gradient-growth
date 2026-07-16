@@ -182,6 +182,8 @@ class WandbRunLogger:
             ("fgd_rkhs_dictionary_size", "fgd/rkhs_dictionary_size"),
             ("fgd_rkhs_functional_loss", "fgd/rkhs_functional_loss"),
             ("fgd_rkhs_loss_star", "fgd/rkhs_loss_star"),
+            ("fgd_pl_mu", "fgd/pl_mu"),
+            ("fgd_pl_backtracks", "fgd/pl_backtracks"),
         ):
             value = getattr(entry, attribute_name, None)
             if value is not None:
