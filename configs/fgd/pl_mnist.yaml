@@ -23,9 +23,12 @@ data:
   out_features: 10
   batch_size: 256
   train_seed: 0
-  mnist_train_samples: 2048
-  mnist_validation_samples: 512
-  mnist_test_samples: 512
+  # Full-batch training is cheap; more data is the primary defense
+  # against interpolation-driven overfitting (the certificate targets the
+  # empirical optimum by design).
+  mnist_train_samples: 8192
+  mnist_validation_samples: 1000
+  mnist_test_samples: 1000
 
 model:
   hidden_size: 2
@@ -46,15 +49,25 @@ fgd_pl:
   max_backtracks: 12
   lr_recovery: 1.25
   steps_per_epoch: 10
-  # The certificate applies to the empirical loss on this subset; with 128
-  # points and 10 outputs the Gram has 1280 rows, so the certificate can
-  # switch on once the parameter count exceeds ~1280 (measured, honest).
-  certificate_points: 128
+  # The certificate applies to the empirical loss on this subset; with 64
+  # points and 10 outputs the Gram has 640 rows. Fewer rows means a
+  # larger measured lambda_min (eigenvalue interlacing), so the
+  # certificate switches on earlier -- the honest trade-off is that it
+  # certifies a smaller subset.
+  certificate_points: 64
   certificate_seed: 0
   mu_collapse_threshold: 1.0e-8
   growth_cooldown_epochs: 3
   growth_max_events: 10
   growth_max_hidden_size: 18
+  # F = L + (ridge/2)||theta||^2. Keep 0.0 to retain the global vs-zero
+  # envelope; a small positive value tames output magnitudes at the cost
+  # of downgrading the certificate to sufficient descent + stationarity.
+  ridge: 0.0
+  max_rejected_steps: 3
+  # The returned model is the best-validation snapshot along the
+  # certified trajectory (deployment choice; certificates unaffected).
+  keep_best_validation: true
 
 scaling_line_search:
   method: golden_section

@@ -1835,6 +1835,8 @@ def _run_fgd_pl_pipeline(
     last_test_loss = test_metrics.loss
     growth_count = 0
     epochs_since_growth = pl_config.growth_cooldown_epochs
+    best_validation_loss = validation_metrics.loss
+    best_model: GrowingMLP | None = None
     for epoch in range(1, config.training.epochs + 1):
         epoch_result = trainer.run_epoch()
         last_record = epoch_result.step_records[-1]
@@ -1858,7 +1860,9 @@ def _run_fgd_pl_pipeline(
             fgd_gradient_sq_norm=last_record.gradient_sq_norm,
             fgd_theory_descent_coefficient=last_record.descent_coefficient,
             fgd_global_bound=(
-                epoch_result.envelope if epoch_result.mu_valid else None
+                epoch_result.envelope
+                if (epoch_result.mu_valid and epoch_result.envelope_enabled)
+                else None
             ),
             fgd_global_bound_valid=epoch_result.envelope_valid,
             fgd_approximation_kind="empirical_pl",
@@ -1871,12 +1875,15 @@ def _run_fgd_pl_pipeline(
         wandb_logger.log_history_entry(epoch_entry)
         if progress is not None and should_log_epoch(epoch, config):
             delta = test_metrics.loss - last_test_loss
-            envelope_msg = (
-                f", envelope={epoch_result.envelope:.4e}"
-                f" ({'ok' if epoch_result.envelope_valid else 'VIOLATED'})"
-                if epoch_result.mu_valid
-                else ", envelope=off (mu collapsed)"
-            )
+            if not epoch_result.envelope_enabled:
+                envelope_msg = ", envelope=off (ridge active)"
+            elif epoch_result.mu_valid:
+                envelope_msg = (
+                    f", envelope={epoch_result.envelope:.4e}"
+                    f" ({'ok' if epoch_result.envelope_valid else 'VIOLATED'})"
+                )
+            else:
+                envelope_msg = ", envelope=off (mu collapsed)"
             progress(
                 f"[PL] Epoch {epoch}, "
                 f"train_loss={train_metrics.loss:.4f}, "
@@ -1892,6 +1899,14 @@ def _run_fgd_pl_pipeline(
             )
         last_test_loss = test_metrics.loss
         epochs_since_growth += 1
+
+        if (
+            pl_config.keep_best_validation
+            and validation_metrics.loss < best_validation_loss
+        ):
+            best_validation_loss = validation_metrics.loss
+            _clear_inaccessible_tensor_caches(mlp)
+            best_model = copy.deepcopy(mlp)
 
         if epoch_result.converged:
             if progress is not None:
@@ -1984,11 +1999,37 @@ def _run_fgd_pl_pipeline(
                         "per-structure certificate."
                     )
 
+    final_model = mlp
+    if (
+        pl_config.keep_best_validation
+        and best_model is not None
+        and best_validation_loss < validation_metrics.loss
+    ):
+        # Deployment choice, outside the certificates: the certified
+        # trajectory targets the empirical optimum; the returned model is
+        # the best-validation snapshot along it.
+        final_model = best_model
+        if progress is not None:
+            final_metrics = evaluate_regression_metrics(
+                final_model,
+                test_loader,
+                loss_function,
+                device=device,
+                accuracy_tolerance=config.training.accuracy_tolerance,
+                classification=classification,
+            )
+            progress(
+                "[PL] returning the best-validation snapshot "
+                f"(validation_loss={best_validation_loss:.4f}); its "
+                f"test_loss={final_metrics.loss:.4f}, "
+                f"test_acc={final_metrics.accuracy:.3f}"
+            )
+
     return PipelineResult(
         config=config,
         history=history,
         growth_events=growth_events,
-        model=mlp,
+        model=final_model,
         device=str(device),
     )
 
