@@ -75,7 +75,7 @@ class EmpiricalPLConfig:
     r_min: float = 0.5
     backtrack_factor: float = 0.5
     max_backtracks: int = 12
-    lr_recovery: float = 1.25
+    lr_recovery: float = 2.0
     steps_per_epoch: int = 10
     certificate_points: int = 256
     certificate_seed: int = 0

@@ -50,7 +50,7 @@ fgd_pl:
   r_min: 0.25
   backtrack_factor: 0.5
   max_backtracks: 12
-  lr_recovery: 1.25
+  lr_recovery: 2.0
   steps_per_epoch: 10
   # The certificate applies to the empirical loss on this subset; with 64
   # points and 10 outputs the Gram has 640 rows. Fewer rows means a
