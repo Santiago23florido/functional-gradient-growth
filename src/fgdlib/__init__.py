@@ -17,6 +17,12 @@ NOT part of the library; they consume it (see ``stable_tiny.pipeline``).
 
 from __future__ import annotations
 
+from fgdlib.empirical_pl import (
+    EmpiricalPLConfig,
+    EmpiricalPLEpochResult,
+    EmpiricalPLStepRecord,
+    EmpiricalPLTrainer,
+)
 from fgdlib.gromo_setup import ensure_gromo_importable
 from fgdlib.growth import (
     GrowthResult,
@@ -66,6 +72,11 @@ from fgdlib.training import (
 __all__ = [
     "__version__",
     "ensure_gromo_importable",
+    # empirical-PL certified full-weight training
+    "EmpiricalPLConfig",
+    "EmpiricalPLEpochResult",
+    "EmpiricalPLStepRecord",
+    "EmpiricalPLTrainer",
     # growth
     "GrowthResult",
     "ScalingLineSearchConfig",
