@@ -91,11 +91,15 @@ class EmpiricalPLConfig:
     # current structure stopped paying off). This changes only the growth
     # timing; the per-step descent certificates are untouched.
     growth_min_progress: float = 0.01
-    # Growth is ARBITRATED by the certified ceiling: every eligible layer
-    # is trial-grown and the candidate with the lowest closed-form head
-    # optimum L* wins; growth is skipped when no candidate improves the
-    # current ceiling by at least this relative amount.
+    # Growth is VETOED by the certified ceiling: the chosen candidate must
+    # improve the closed-form head optimum L* by at least this relative
+    # amount, else growth is skipped.
     growth_min_ceiling_improvement: float = 0.0
+    # Which layer to grow: "round_robin" (measured best: earlier layers
+    # improve feature quality that the head ceiling under-values) or
+    # "ceiling" (argmin L* over trial-grown candidates; biased toward the
+    # last hidden layer because L* lives on its features).
+    growth_layer_policy: str = "round_robin"
     # Optional ridge term: the objective becomes F = L + (ridge/2)||theta||^2.
     # HONEST certificate semantics: the global vs-zero envelope
     # L_0 prod(1 - 2 eta mu r) is only available for the pure data loss
@@ -189,6 +193,11 @@ class EmpiricalPLTrainer:
             )
         if config.learning_rate_floor <= 0.0:
             raise ValueError("fgd_pl.learning_rate_floor must be positive.")
+        if config.growth_layer_policy not in ("round_robin", "ceiling"):
+            raise ValueError(
+                "fgd_pl.growth_layer_policy must be 'round_robin' or "
+                "'ceiling'."
+            )
 
         self.config = config
         device = device or next(model.parameters()).device

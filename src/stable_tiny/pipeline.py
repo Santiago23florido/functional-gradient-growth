@@ -1976,12 +1976,31 @@ def _run_fgd_pl_pipeline(
             ]
             best_candidate = None
             if eligible:
-                # Ceiling arbiter: trial-grow every eligible layer and keep
-                # the candidate whose certified head optimum L* (closed
-                # form) is lowest.
                 current_ceiling = _structure_ceiling(mlp, train_x, train_y)
                 _clear_inaccessible_tensor_caches(mlp)
-                for index in eligible:
+                if pl_config.growth_layer_policy == "round_robin":
+                    # Measured best: rotate through layers (earlier layers
+                    # improve feature quality that the head ceiling
+                    # under-values). The ceiling still acts as a veto.
+                    preferred = layer_index_for_growth(
+                        growth_count=growth_count,
+                        number_hidden_layers=(
+                            config.model.number_hidden_layers
+                        ),
+                        config=config.growth_schedule,
+                    ) % len(growable)
+                    order = [
+                        (preferred + offset) % len(growable)
+                        for offset in range(len(growable))
+                    ]
+                    candidates = [
+                        index for index in order if index in eligible
+                    ][:1]
+                else:
+                    # Ceiling arbiter: trial-grow every eligible layer and
+                    # keep the lowest certified head optimum L*.
+                    candidates = eligible
+                for index in candidates:
                     trial = copy.deepcopy(mlp)
                     trial_result = grow_layer(
                         model=trial,
