@@ -94,9 +94,48 @@ fgd_approx:
   tiny_statistical_threshold: 1.0e-3
   growth_function_preserving: true
   growth_preservation_tolerance: 1.0e-6
+  # Ordered ladder of approximation families, evaluated top to bottom.
+  # "tangent" must come first (it is the epoch's main transactional
+  # search). Each following family is consulted only after every family
+  # above it fails to certify, and structural growth is probed only after
+  # ALL listed families fail. Every family commits through the same full
+  # FGD certificate (Crel, LR interval, descent, Cstat, Cglob).
+  # Uncomment a family to enable it, same pattern as
+  # growth_function_preserving:
+  family_order:
+    - tangent
+    # - rkhs_head       # certified RKHS head phase as an in-ladder family
+    # - parametric_gd   # calibrated parametric-GD secant (see section below)
+
+# Parametric-GD secant family. Only consulted when "parametric_gd" is
+# listed in fgd_approx.family_order. A disposable clone is trained
+# parametrically toward the functional target f - eta*r; the realized
+# output displacement Delta = F(base) - F(candidate) is screened on
+# validation by its directional cosine against the functional gradient
+# (min_cosine) and then certified at the scale-optimal declared rate
+# eta* = <Delta, r> / |r|^2, which is the fix for the historical scale
+# mismatch of this family. With eta* the best achievable relative error
+# is exactly sqrt(1 - cos^2), so cosines below sqrt(1 - 0.5^2) = 0.866
+# can never satisfy Crel < 0.5: candidates that fail the screen are
+# discarded BEFORE certification and the ladder simply moves on, so a
+# misaligned family can no longer push the flow into nonstop growth.
+# Measured on MNIST (widths 2-16, fresh and mid-training): best cosine
+# ~0.8 -> minimal RelErr ~0.6 > 0.5, so expect this family to decline
+# on MNIST at these widths; it is safe to enable and only fires when
+# its projection is genuinely admissible.
+parametric_gd:
+  optimizer: sgd            # sgd | adam (adam measured consistently less aligned)
+  inner_learning_rate: 0.05
+  inner_steps: [16, 64]     # coarse-to-fine inner budgets per candidate
+  functional_learning_rates: [0.2, 0.05]
+  min_cosine: 0.9           # mathematical floor for Crel<0.5 is 0.866
+  parameter_penalty: 1.0e-6
+  gradient_clip_norm: 1.0
 
 # Tangent projection only: the certified RKHS head phase is off, so the
 # growth_min_* thresholds below still govern the growth probe gate.
+# (With "rkhs_head" listed in family_order the phase runs as an in-ladder
+# family regardless of this flag.)
 secant_fgd:
   enabled: false
   inner_steps: 8

@@ -86,6 +86,84 @@ class FGDApproxConfig:
     # delta and no scaling line search, so growth never changes the function.
     growth_function_preserving: bool = False
     growth_preservation_tolerance: float = 1e-6
+    # Ordered ladder of approximation families. "tangent" must come first (it
+    # is the epoch's main transactional search); the remaining entries are
+    # tried in the listed order only after the previous family fails to
+    # certify, and structural growth is probed only after every listed family
+    # fails. Every family commits through the same full FGD certificate.
+    # Supported: "tangent", "rkhs_head", "parametric_gd".
+    family_order: tuple[str, ...] = ("tangent",)
+
+
+SUPPORTED_FGD_FAMILIES = ("tangent", "rkhs_head", "parametric_gd")
+
+
+def validate_family_order(family_order: tuple[str, ...]) -> None:
+    """Reject malformed fgd_approx.family_order values early."""
+    if not family_order:
+        raise ValueError("fgd_approx.family_order cannot be empty.")
+    if family_order[0] != "tangent":
+        raise ValueError(
+            "fgd_approx.family_order must start with 'tangent' (the epoch's "
+            "main transactional search)."
+        )
+    unknown = sorted(set(family_order) - set(SUPPORTED_FGD_FAMILIES))
+    if unknown:
+        raise ValueError(
+            "Unsupported fgd_approx.family_order entries: "
+            + ", ".join(unknown)
+            + f". Supported: {', '.join(SUPPORTED_FGD_FAMILIES)}."
+        )
+    if len(set(family_order)) != len(family_order):
+        raise ValueError("fgd_approx.family_order entries must be unique.")
+
+
+@dataclass(frozen=True)
+class ParametricGDConfig:
+    """Parametric-GD secant family (calibrated projection at the output).
+
+    A disposable clone is trained parametrically toward the functional target
+    f - eta_nominal * r. The realized output displacement Delta = F(base) -
+    F(candidate) is then screened on validation: its directional cosine
+    against the functional gradient must reach ``min_cosine`` (with the
+    scale-optimal declared learning rate eta* = <Delta, r>/|r|^2 the best
+    achievable relative error is exactly sqrt(1 - cos^2), so cosines below
+    sqrt(1 - eps^2) can never satisfy Crel). Surviving candidates are
+    certified at eta* with the SAME secant certificate and full transactional
+    conditions as every other family.
+    """
+
+    optimizer: str = "sgd"
+    inner_learning_rate: float = 0.05
+    inner_steps: tuple[int, ...] = (16, 64)
+    functional_learning_rates: tuple[float, ...] = (0.2, 0.05)
+    min_cosine: float = 0.9
+    parameter_penalty: float = 1e-6
+    gradient_clip_norm: float | None = 1.0
+
+    def validate(self) -> None:
+        if self.optimizer not in ("sgd", "adam"):
+            raise ValueError("parametric_gd.optimizer must be 'sgd' or 'adam'.")
+        if self.inner_learning_rate <= 0.0:
+            raise ValueError(
+                "parametric_gd.inner_learning_rate must be positive."
+            )
+        if not self.inner_steps or any(v < 1 for v in self.inner_steps):
+            raise ValueError(
+                "parametric_gd.inner_steps must contain positive integers."
+            )
+        if not self.functional_learning_rates or any(
+            v <= 0.0 for v in self.functional_learning_rates
+        ):
+            raise ValueError(
+                "parametric_gd.functional_learning_rates must be positive."
+            )
+        if not 0.0 < self.min_cosine <= 1.0:
+            raise ValueError("parametric_gd.min_cosine must lie in (0, 1].")
+        if self.parameter_penalty < 0.0:
+            raise ValueError(
+                "parametric_gd.parameter_penalty must be non-negative."
+            )
 
 
 @dataclass(frozen=True)

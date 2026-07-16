@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
@@ -23,6 +24,7 @@ from fgdlib.tangent import (
     FGDLayerRelError,
     FGDOutputRelError,
     FGDValidationCertificate,
+    ParametricGDConfig,
     SecantFGDConfig,
     _clear_inaccessible_tensor_caches,
     batch_functional_mse_loss,
@@ -33,6 +35,7 @@ from fgdlib.tangent import (
     should_trigger_fgd_growth,
     tiny_optimal_update_kwargs,
     train_one_epoch_fgd_approx,
+    validate_family_order,
 )
 from fgdlib.rkhs import (
     FGDRKHSConfig,
@@ -137,6 +140,7 @@ class PipelineConfig:
     lr_scheduler: LRSchedulerConfig = field(default_factory=LRSchedulerConfig)
     fgd_approx: FGDApproxConfig = field(default_factory=FGDApproxConfig)
     secant_fgd: SecantFGDConfig = field(default_factory=SecantFGDConfig)
+    parametric_gd: ParametricGDConfig = field(default_factory=ParametricGDConfig)
     fgd_rkhs: FGDRKHSConfig = field(default_factory=FGDRKHSConfig)
     scaling_line_search: ScalingLineSearchConfig = field(
         default_factory=ScalingLineSearchConfig
@@ -277,6 +281,21 @@ def _section_dataclass(
             else None
         )
 
+    if section_type is FGDApproxConfig and "family_order" in values:
+        values["family_order"] = tuple(
+            str(value) for value in values["family_order"] or ()
+        )
+
+    if section_type is ParametricGDConfig:
+        if "inner_steps" in values:
+            values["inner_steps"] = tuple(
+                int(value) for value in values["inner_steps"] or ()
+            )
+        if "functional_learning_rates" in values:
+            values["functional_learning_rates"] = tuple(
+                float(value) for value in values["functional_learning_rates"] or ()
+            )
+
     return section_type(**values)
 
 
@@ -295,6 +314,7 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         "lr_scheduler",
         "fgd_approx",
         "secant_fgd",
+        "parametric_gd",
         "fgd_rkhs",
         "scaling_line_search",
         "growth_schedule",
@@ -306,7 +326,7 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         joined = ", ".join(unknown_sections)
         raise ValueError(f"Unknown config sections in {config_path}: {joined}")
 
-    return PipelineConfig(
+    config = PipelineConfig(
         data=_section_dataclass("data", DataConfig, raw),
         model=_section_dataclass("model", ModelConfig, raw),
         training=_section_dataclass("training", TrainingConfig, raw),
@@ -314,6 +334,11 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         lr_scheduler=_section_dataclass("lr_scheduler", LRSchedulerConfig, raw),
         fgd_approx=_section_dataclass("fgd_approx", FGDApproxConfig, raw),
         secant_fgd=_section_dataclass("secant_fgd", SecantFGDConfig, raw),
+        parametric_gd=_section_dataclass(
+            "parametric_gd",
+            ParametricGDConfig,
+            raw,
+        ),
         fgd_rkhs=_section_dataclass("fgd_rkhs", FGDRKHSConfig, raw),
         scaling_line_search=_section_dataclass(
             "scaling_line_search",
@@ -328,6 +353,9 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         wandb=_section_dataclass("wandb", WandbConfig, raw),
         run=_section_dataclass("run", RunConfig, raw),
     )
+    validate_family_order(config.fgd_approx.family_order)
+    config.parametric_gd.validate()
+    return config
 
 
 def with_run_overrides(
@@ -1140,6 +1168,265 @@ def _search_secant_fgd_candidate(
         evaluate_trial=evaluate_trial,
         config=search_config,
     )
+
+
+def _measure_secant_projection(
+    *,
+    base_model: GrowingMLP,
+    candidate_model: GrowingMLP,
+    validation_loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    eps: float,
+) -> tuple[float, float] | None:
+    """Aggregate (cosine, eta*) of the realized output displacement.
+
+    Delta = F(base) - F(candidate) is compared against the functional
+    gradient r = 2(F(base) - Y) on validation. eta* = <Delta, r> / |r|^2 is
+    the declared functional learning rate that minimizes the secant relative
+    error; at eta* that error equals sqrt(1 - cos^2) exactly, so the cosine
+    is the scale-invariant admissibility measure of the family.
+    """
+    base_model.eval()
+    candidate_model.eval()
+    dot = 0.0
+    delta_sq = 0.0
+    target_sq = 0.0
+    with torch.no_grad():
+        for x, y in validation_loader:
+            x = x.to(device)
+            y = y.to(device)
+            base_output = base_model(x).to(torch.float64)
+            candidate_output = candidate_model(x).to(torch.float64)
+            target = mse_functional_gradient(base_output, y.to(torch.float64))
+            delta = base_output - candidate_output
+            if not (
+                torch.isfinite(delta).all() and torch.isfinite(target).all()
+            ):
+                return None
+            dot += float(torch.sum(delta * target).item())
+            delta_sq += float(torch.sum(delta * delta).item())
+            target_sq += float(torch.sum(target * target).item())
+    if delta_sq <= eps or target_sq <= eps:
+        return None
+    cosine = dot / math.sqrt(delta_sq * target_sq)
+    eta_star = dot / target_sq
+    return cosine, eta_star
+
+
+def _train_parametric_gd_candidate(
+    *,
+    base_model: GrowingMLP,
+    train_batches: list[tuple[torch.Tensor, torch.Tensor]],
+    device: torch.device,
+    functional_learning_rate: float,
+    steps: int,
+    config: ParametricGDConfig,
+) -> GrowingMLP | None:
+    """Train a disposable clone toward the functional target f - eta * r."""
+    trial_model = copy.deepcopy(base_model)
+    base_model.eval()
+    trial_model.train()
+    base_parameters = {
+        name: parameter.detach().clone()
+        for name, parameter in base_model.named_parameters()
+    }
+    trainable = [
+        parameter
+        for parameter in trial_model.parameters()
+        if parameter.requires_grad
+    ]
+    if config.optimizer == "sgd":
+        optimizer = torch.optim.SGD(trainable, lr=config.inner_learning_rate)
+    else:
+        optimizer = torch.optim.Adam(trainable, lr=config.inner_learning_rate)
+
+    for _ in range(max(1, steps)):
+        for x, y in train_batches:
+            x = x.to(device)
+            y = y.to(device)
+            with torch.no_grad():
+                base_output = base_model(x)
+                functional_target = (
+                    base_output
+                    - functional_learning_rate
+                    * mse_functional_gradient(base_output, y)
+                )
+            optimizer.zero_grad(set_to_none=True)
+            candidate_output = trial_model(x)
+            objective = torch.mean((candidate_output - functional_target) ** 2)
+            if config.parameter_penalty > 0.0:
+                penalty = torch.zeros((), device=device)
+                for name, parameter in trial_model.named_parameters():
+                    penalty = penalty + torch.mean(
+                        (parameter - base_parameters[name]) ** 2
+                    )
+                objective = objective + config.parameter_penalty * penalty
+            if not torch.isfinite(objective):
+                return None
+            objective.backward()
+            if (
+                config.gradient_clip_norm is not None
+                and config.gradient_clip_norm > 0.0
+            ):
+                torch.nn.utils.clip_grad_norm_(
+                    trial_model.parameters(),
+                    config.gradient_clip_norm,
+                )
+            optimizer.step()
+    trial_model.eval()
+    return trial_model
+
+
+def _evaluate_parametric_gd_trial(
+    *,
+    base_model: GrowingMLP,
+    train_batches: list[tuple[torch.Tensor, torch.Tensor]],
+    validation_loader: torch.utils.data.DataLoader,
+    loss_function: torch.nn.Module,
+    device: torch.device,
+    functional_learning_rate: float,
+    steps: int,
+    accuracy_tolerance: float,
+    config: PipelineConfig,
+    projection_group_size: int,
+    classification: bool,
+    theory_state: _FGDTheoryState,
+    initial_functional_gap: float,
+    theory_loss_star: float,
+) -> _FGDTrial | None:
+    """One calibrated parametric-GD secant; None if the cosine screen fails.
+
+    The declared learning rate is NOT the nominal target rate: it is the
+    scale-optimal eta* measured from the realized displacement, which is the
+    fix for the historical scale mismatch of this family. Candidates whose
+    projection cosine falls below parametric_gd.min_cosine are discarded
+    before certification, so a misaligned family can never reach the
+    growth path with a corrupted certificate.
+    """
+    candidate = _train_parametric_gd_candidate(
+        base_model=base_model,
+        train_batches=train_batches,
+        device=device,
+        functional_learning_rate=functional_learning_rate,
+        steps=steps,
+        config=config.parametric_gd,
+    )
+    if candidate is None:
+        return None
+    projection = _measure_secant_projection(
+        base_model=base_model,
+        candidate_model=candidate,
+        validation_loader=validation_loader,
+        device=device,
+        eps=config.fgd_approx.eps,
+    )
+    if projection is None:
+        return None
+    cosine, eta_star = projection
+    if cosine < config.parametric_gd.min_cosine:
+        return None
+    if eta_star <= config.fgd_approx.theory_lr_min + config.fgd_approx.eps:
+        return None
+
+    train_metrics = evaluate_regression_metrics(
+        candidate,
+        train_batches,
+        loss_function,
+        device=device,
+        accuracy_tolerance=accuracy_tolerance,
+        classification=classification,
+    )
+    epoch_result = FGDApproxEpochResult(
+        train_loss=train_metrics.loss,
+        train_accuracy=train_metrics.accuracy,
+        test_loss=float("nan"),
+        test_accuracy=float("nan"),
+        learning_rate=eta_star,
+        next_learning_rate=None,
+        learning_rate_upper_bound=None,
+        learning_rate_interval_valid=None,
+        learning_rate_clipped_batches=0,
+        skipped_batches=0,
+        relative_error_condition_valid=None,
+        loss_descent_valid=None,
+        loss_non_descent_batches=0,
+        gradient_sq_norm=None,
+        theory_descent_coefficient=None,
+        min_positive_learning_rate=eta_star,
+        relative_error=None,
+        selected_layer_index=None,
+        layer_relative_errors=[],
+        output_relative_error=None,
+        sensor_valid=True,
+        sensor_invalid_batches=0,
+    )
+    certificate = evaluate_secant_validation_certificate(
+        base_model=base_model,
+        candidate_model=candidate,
+        data_loader=validation_loader,
+        device=device,
+        config=config.fgd_approx,
+        learning_rate=eta_star,
+        projection_group_size=projection_group_size,
+    )
+    return _certify_fgd_candidate(
+        candidate_model=candidate,
+        epoch_result=epoch_result,
+        certificate=certificate,
+        validation_loader=validation_loader,
+        device=device,
+        config=config,
+        theory_state=theory_state,
+        initial_functional_gap=initial_functional_gap,
+        theory_loss_star=theory_loss_star,
+    )
+
+
+def _search_parametric_gd_candidate(
+    *,
+    base_model: GrowingMLP,
+    train_batches: list[tuple[torch.Tensor, torch.Tensor]],
+    validation_loader: torch.utils.data.DataLoader,
+    loss_function: torch.nn.Module,
+    device: torch.device,
+    accuracy_tolerance: float,
+    config: PipelineConfig,
+    projection_group_size: int,
+    classification: bool,
+    theory_state: _FGDTheoryState,
+    initial_functional_gap: float,
+    theory_loss_star: float,
+) -> _FGDSearchResult:
+    """Search calibrated parametric-GD secants over the configured budgets."""
+    trial_count = 0
+    last_trial: _FGDTrial | None = None
+    for functional_learning_rate in (
+        config.parametric_gd.functional_learning_rates
+    ):
+        for steps in config.parametric_gd.inner_steps:
+            trial = _evaluate_parametric_gd_trial(
+                base_model=base_model,
+                train_batches=train_batches,
+                validation_loader=validation_loader,
+                loss_function=loss_function,
+                device=device,
+                functional_learning_rate=functional_learning_rate,
+                steps=steps,
+                accuracy_tolerance=accuracy_tolerance,
+                config=config,
+                projection_group_size=projection_group_size,
+                classification=classification,
+                theory_state=theory_state,
+                initial_functional_gap=initial_functional_gap,
+                theory_loss_star=theory_loss_star,
+            )
+            trial_count += 1
+            if trial is None:
+                continue
+            last_trial = trial
+            if trial.all_conditions_valid:
+                return _FGDSearchResult(trial, trial, trial_count, False)
+    return _FGDSearchResult(None, last_trial, trial_count, False)
 
 
 def _json_safe(value: Any) -> Any:
@@ -2541,23 +2828,25 @@ def run_pipeline(
                 and config.fgd_approx.learning_rate_policy == "theory_interval"
             ):
                 growth_train_batches = list(train_loader)
-                growth_probe = _probe_fgd_growth(
-                    model=model,
-                    train_batches=growth_train_batches,
-                    validation_loader=validation_loader,
-                    base_certificate=validation_certificate,
-                    selected_layer_index=selected_layer_index,
-                    growth_count=growth_count,
-                    device=device,
-                    config=config,
-                    projection_group_size=current_projection_group_size,
-                )
-                fgd_growth_probe_improved = bool(
-                    growth_probe is not None and growth_probe.improves_fgd
-                )
-                if not fgd_growth_probe_improved:
-                    fgd_rkhs_phase_attempted = config.secant_fgd.enabled
-                    growth_triggered = False
+
+                def _attempt_rkhs_head_stage(in_ladder: bool) -> bool:
+                    """Certified RKHS head phase; True iff a head was committed.
+
+                    In the family ladder (in_ladder=True) the phase runs before any
+                    growth probing and a rejection simply passes control to the next
+                    family. In the legacy position (in_ladder=False) it runs only
+                    after a failed growth probe, gated by secant_fgd.enabled,
+                    exactly as before family_order existed.
+                    """
+                    nonlocal fgd_rkhs_phase_attempted, fgd_rkhs_phase_steps
+                    nonlocal fgd_rkhs_phase_accepted, model, optimizer
+                    nonlocal validation_certificate_for_next_epoch
+                    nonlocal current_fgd_learning_rate
+                    nonlocal previous_validation_functional_loss
+                    nonlocal last_test_loss
+                    fgd_rkhs_phase_attempted = (
+                        True if in_ladder else config.secant_fgd.enabled
+                    )
                     phase: _RKHSPhaseResult | None = None
                     if fgd_rkhs_phase_attempted:
                         phase = _run_rkhs_head_phase(
@@ -2704,6 +2993,7 @@ def run_pipeline(
                                 f"converged={phase.converged})"
                             )
                         last_test_loss = phase_test_metrics.loss
+                        return True
                     else:
                         phase_theory = (
                             phase.trainer.theory if phase is not None else None
@@ -2767,14 +3057,220 @@ def run_pipeline(
                         history.append(rejected_rkhs_entry)
                         wandb_logger.log_history_entry(rejected_rkhs_entry)
                         if progress is not None:
+                            if in_ladder:
+                                progress(
+                                    f"[RKHS] Epoch {epoch}: certified head phase did "
+                                    "not certify an improvement; trying the next "
+                                    "family"
+                                )
+                            else:
+                                progress(
+                                    f"[RKHS-WARN] Epoch {epoch}: growth did not "
+                                    "improve the FGD certificate and the output "
+                                    "layer is already at the certified global "
+                                    "optimum of the fixed structure "
+                                    "(the architecture is exhausted at this "
+                                    "point)"
+                                )
+                        return False
+
+                def _attempt_parametric_gd_stage() -> bool:
+                    """Calibrated parametric-GD secant family; True iff committed.
+
+                    Candidates are screened by the output-projection cosine and
+                    certified at the scale-optimal declared learning rate eta*;
+                    acceptance requires the same full transactional conditions as
+                    the tangent family (Crel, interval, descent, Cstat, Cglob).
+                    """
+                    nonlocal model, optimizer
+                    nonlocal validation_certificate_for_next_epoch
+                    nonlocal current_fgd_learning_rate
+                    nonlocal previous_validation_functional_loss
+                    nonlocal fgd_epoch_count, fgd_min_gradient_sq_norm
+                    nonlocal fgd_min_positive_learning_rate
+                    nonlocal fgd_min_descent_coefficient
+                    nonlocal fgd_global_contraction_product
+                    nonlocal last_test_loss
+                    stage_theory_state = _FGDTheoryState(
+                        epoch_count=fgd_epoch_count,
+                        min_gradient_sq_norm=fgd_min_gradient_sq_norm,
+                        min_positive_learning_rate=fgd_min_positive_learning_rate,
+                        min_descent_coefficient=fgd_min_descent_coefficient,
+                        global_contraction_product=fgd_global_contraction_product,
+                        previous_validation_functional_loss=(
+                            previous_validation_functional_loss
+                        ),
+                    )
+                    stage_search = _search_parametric_gd_candidate(
+                        base_model=model,
+                        train_batches=growth_train_batches,
+                        validation_loader=validation_loader,
+                        loss_function=loss_function,
+                        device=device,
+                        accuracy_tolerance=config.training.accuracy_tolerance,
+                        config=config,
+                        projection_group_size=current_projection_group_size,
+                        classification=classification,
+                        theory_state=stage_theory_state,
+                        initial_functional_gap=initial_functional_gap,
+                        theory_loss_star=theory_loss_star,
+                    )
+                    stage_trial = stage_search.accepted
+                    if stage_trial is None:
+                        if progress is not None:
                             progress(
-                                f"[RKHS-WARN] Epoch {epoch}: growth did not "
-                                "improve the FGD certificate and the output "
-                                "layer is already at the certified global "
-                                "optimum of the fixed structure "
-                                "(the architecture is exhausted at this "
-                                "point)"
+                                f"[PGD] Epoch {epoch}: no parametric-GD secant "
+                                "passed the cosine/scale screen and the full "
+                                f"certificate ({stage_search.trial_count} "
+                                "candidate(s) evaluated); trying the next family"
                             )
+                        return False
+                    model = stage_trial.model
+                    optimizer = build_optimizer(model, config.optimizer)
+                    accepted_state = stage_trial.theory_state
+                    fgd_epoch_count = accepted_state.epoch_count
+                    fgd_min_gradient_sq_norm = accepted_state.min_gradient_sq_norm
+                    fgd_min_positive_learning_rate = (
+                        accepted_state.min_positive_learning_rate
+                    )
+                    fgd_min_descent_coefficient = (
+                        accepted_state.min_descent_coefficient
+                    )
+                    fgd_global_contraction_product = (
+                        accepted_state.global_contraction_product
+                    )
+                    previous_validation_functional_loss = (
+                        accepted_state.previous_validation_functional_loss
+                    )
+                    validation_certificate_for_next_epoch = (
+                        evaluate_fgd_validation_certificate(
+                            model=model,
+                            data_loader=validation_loader,
+                            device=device,
+                            config=config.fgd_approx,
+                            learning_rate=None,
+                            projection_group_size=current_projection_group_size,
+                        )
+                    )
+                    certified_learning_rate = certified_validation_learning_rate(
+                        validation_certificate_for_next_epoch,
+                        config.fgd_approx,
+                    )
+                    if certified_learning_rate is not None:
+                        current_fgd_learning_rate = certified_learning_rate
+                    apply_learning_rate(optimizer, current_fgd_learning_rate)
+                    stage_validation_metrics = evaluate_regression_metrics(
+                        model,
+                        validation_loader,
+                        loss_function,
+                        device=device,
+                        accuracy_tolerance=config.training.accuracy_tolerance,
+                        classification=classification,
+                    )
+                    stage_test_metrics = evaluate_regression_metrics(
+                        model,
+                        test_loader,
+                        loss_function,
+                        device=device,
+                        accuracy_tolerance=config.training.accuracy_tolerance,
+                        classification=classification,
+                    )
+                    secant_entry = HistoryEntry(
+                        step=epoch,
+                        step_type="SEC",
+                        train_loss=stage_trial.epoch_result.train_loss,
+                        validation_loss=stage_validation_metrics.loss,
+                        test_loss=stage_test_metrics.loss,
+                        train_accuracy=stage_trial.epoch_result.train_accuracy,
+                        validation_accuracy=stage_validation_metrics.accuracy,
+                        test_accuracy=stage_test_metrics.accuracy,
+                        learning_rate=stage_trial.epoch_result.learning_rate,
+                        num_params=count_parameters(model),
+                        rel_error=stage_trial.certificate.relative_error,
+                        fgd_learning_rate_upper_bound=(
+                            stage_trial.certificate.learning_rate_upper_bound
+                        ),
+                        fgd_max_valid_learning_rate=(
+                            stage_trial.certificate.max_valid_learning_rate
+                        ),
+                        fgd_learning_rate_interval_valid=(
+                            stage_trial.certificate.learning_rate_interval_valid
+                        ),
+                        fgd_relative_error_condition_valid=(
+                            stage_trial.certificate.relative_error_condition_valid
+                        ),
+                        fgd_loss_descent_valid=stage_trial.loss_descent_valid,
+                        fgd_gradient_sq_norm=stage_trial.certificate.gradient_sq_norm,
+                        fgd_theory_descent_coefficient=(
+                            stage_trial.certificate.theory_descent_coefficient
+                        ),
+                        fgd_stationary_bound=stage_trial.stationary_bound,
+                        fgd_stationary_bound_valid=stage_trial.stationary_bound_valid,
+                        fgd_global_bound=stage_trial.global_bound,
+                        fgd_global_bound_valid=stage_trial.global_bound_valid,
+                        fgd_global_contraction=stage_trial.global_contraction,
+                        fgd_sensor_valid=True,
+                        fgd_candidate_accepted=True,
+                        fgd_approximation_kind="parametric_gd",
+                        fgd_growth_probe_improved=False,
+                    )
+                    history.append(secant_entry)
+                    wandb_logger.log_history_entry(secant_entry)
+                    if progress is not None:
+                        progress(
+                            f"[PGD] Epoch {epoch}: parametric-GD secant accepted "
+                            f"(eta*={stage_trial.epoch_result.learning_rate:.4g}, "
+                            f"rel_err={stage_trial.certificate.relative_error:.4f})"
+                        )
+                    last_test_loss = stage_test_metrics.loss
+                    return True
+
+                # Fallback approximation families run in the configured order;
+                # structural growth is probed only after every family fails.
+                fallback_families = tuple(
+                    name
+                    for name in config.fgd_approx.family_order
+                    if name != "tangent"
+                )
+                for family_name in fallback_families:
+                    if not growth_triggered:
+                        break
+                    if family_name == "rkhs_head":
+                        if _attempt_rkhs_head_stage(in_ladder=True):
+                            growth_triggered = False
+                    elif family_name == "parametric_gd":
+                        if _attempt_parametric_gd_stage():
+                            growth_triggered = False
+
+                if growth_triggered:
+                    growth_probe = _probe_fgd_growth(
+                        model=model,
+                        train_batches=growth_train_batches,
+                        validation_loader=validation_loader,
+                        base_certificate=validation_certificate,
+                        selected_layer_index=selected_layer_index,
+                        growth_count=growth_count,
+                        device=device,
+                        config=config,
+                        projection_group_size=current_projection_group_size,
+                    )
+                    fgd_growth_probe_improved = bool(
+                        growth_probe is not None and growth_probe.improves_fgd
+                    )
+                    if not fgd_growth_probe_improved:
+                        growth_triggered = False
+                        if "rkhs_head" in fallback_families:
+                            # The head phase already failed inside the ladder;
+                            # re-running it here would duplicate the attempt.
+                            if progress is not None:
+                                progress(
+                                    f"[FGD-STALL] Epoch {epoch}: every configured "
+                                    "approximation family failed and the growth "
+                                    "probe did not improve the certificate; "
+                                    "model unchanged"
+                                )
+                        else:
+                            _attempt_rkhs_head_stage(in_ladder=False)
 
             if growth_triggered:
                 if config.training.method == "fgd_approx":
