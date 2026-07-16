@@ -142,6 +142,63 @@ def test_mu_is_zero_when_underparametrized() -> None:
     assert not valid  # certificate honestly off -> growth trigger
 
 
+def test_ridge_gradient_and_envelope_semantics() -> None:
+    """With ridge: gradient includes lambda*theta; envelope honestly off."""
+    x, y = _problem(n=10, seed=11)
+    model = _mlp(seed=11)
+    ridge = 0.05
+    trainer = EmpiricalPLTrainer(
+        model,
+        x,
+        y,
+        EmpiricalPLConfig(certificate_points=10, ridge=ridge),
+    )
+    assert trainer.envelope_enabled is False
+    objective, gradients = trainer._loss_and_gradients()
+    # Brute-force gradient of F = L + (ridge/2)||theta||^2.
+    predictions = model(trainer.train_x)
+    data_loss = (predictions - trainer.train_y).square().sum() / (
+        2.0 * trainer.train_x.shape[0]
+    )
+    penalty = 0.5 * ridge * sum(
+        p.square().sum() for p in model.parameters()
+    )
+    expected = torch.autograd.grad(data_loss + penalty, list(model.parameters()))
+    for got, want in zip(gradients, expected):
+        assert torch.allclose(got, want, atol=1e-6)
+    assert objective == pytest.approx(
+        float((data_loss + penalty).item()), rel=1e-5
+    )
+    trainer.measure_mu()
+    result = trainer.run_epoch()
+    assert result.envelope_enabled is False
+    assert result.envelope_valid is None
+    # Certified sufficient descent still holds on the regularized objective.
+    assert all(r.accepted for r in result.step_records)
+
+
+def test_stall_declares_stationarity() -> None:
+    """Consecutive fully-rejected steps mark convergence at precision."""
+    x, y = _problem(n=10, seed=13)
+    model = _mlp(seed=13)
+    trainer = EmpiricalPLTrainer(
+        model,
+        x,
+        y,
+        EmpiricalPLConfig(
+            learning_rate=1e6,
+            max_backtracks=0,  # every oversized step is rejected outright
+            max_rejected_steps=3,
+            certificate_points=10,
+        ),
+    )
+    trainer.measure_mu()
+    for _ in range(3):
+        record = trainer.step()
+        assert not record.accepted
+    assert trainer.converged
+
+
 def test_config_validation() -> None:
     x, y = _problem()
     model = _mlp()
@@ -153,6 +210,8 @@ def test_config_validation() -> None:
         {"steps_per_epoch": 0},
         {"certificate_points": 0},
         {"lr_recovery": 0.5},
+        {"ridge": -0.1},
+        {"max_rejected_steps": 0},
     ):
         with pytest.raises(ValueError):
             EmpiricalPLTrainer(

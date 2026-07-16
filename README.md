@@ -177,7 +177,27 @@ certificate honestly switches off — and that collapse is the
 certificate-driven trigger for growing the network (`growth` on
 `mu_collapse`, with cooldown, event cap and width cap). Certificates are
 per structure and apply to the empirical loss on the certificate subset
-(`certificate_points`).
+(`certificate_points`; by eigenvalue interlacing, fewer certificate rows
+can only raise the measured `λ_min`, at the honest price of certifying a
+smaller subset).
+
+Practical notes with certified semantics:
+
+- Losses for the acceptance test are measured in **float64**; when even
+  full backtracking cannot realize a measurable descent, the trainer
+  declares stationarity at the achievable precision instead of stalling.
+- **Ridge** (`F = L + (ridge/2)‖θ‖²`) is available for output-magnitude
+  control, with an honest downgrade: the global vs-zero envelope is
+  exclusive to the pure data loss (zero is its universal lower bound and
+  the Gram identity compares against it; the augmented residual's Gram is
+  rank deficient in that comparison). With ridge on, the certified
+  statements are per-step sufficient descent and stationarity of `F`.
+- The certificate targets the **empirical** optimum, so driving the train
+  loss toward zero on few samples overfits *by design*; the primary
+  defenses are more data and the best-validation snapshot the pipeline
+  returns (a deployment choice along the certified trajectory —
+  certificates are unaffected). Generalization is not, and cannot be,
+  covered by an optimization certificate.
 
 ### Honest limitations
 
