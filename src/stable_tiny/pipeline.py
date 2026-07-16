@@ -1981,7 +1981,9 @@ def _run_fgd_pl_pipeline(
                 if pl_config.growth_layer_policy == "round_robin":
                     # Measured best: rotate through layers (earlier layers
                     # improve feature quality that the head ceiling
-                    # under-values). The ceiling still acts as a veto.
+                    # under-values; a strict ceiling veto starves them, so
+                    # the veto is informational by default). On a veto the
+                    # rotation ADVANCES to the next eligible layer.
                     preferred = layer_index_for_growth(
                         growth_count=growth_count,
                         number_hidden_layers=(
@@ -1995,11 +1997,13 @@ def _run_fgd_pl_pipeline(
                     ]
                     candidates = [
                         index for index in order if index in eligible
-                    ][:1]
+                    ]
+                    first_qualifying = True
                 else:
                     # Ceiling arbiter: trial-grow every eligible layer and
                     # keep the lowest certified head optimum L*.
                     candidates = eligible
+                    first_qualifying = False
                 for index in candidates:
                     trial = copy.deepcopy(mlp)
                     trial_result = grow_layer(
@@ -2012,23 +2016,41 @@ def _run_fgd_pl_pipeline(
                         progress=None,
                     )
                     ceiling = _structure_ceiling(trial, train_x, train_y)
-                    if best_candidate is None or ceiling < best_candidate[0]:
+                    improvement = (current_ceiling - ceiling) / max(
+                        current_ceiling,
+                        pl_config.eps,
+                    )
+                    if first_qualifying:
+                        if (
+                            improvement
+                            >= pl_config.growth_min_ceiling_improvement
+                        ):
+                            best_candidate = (
+                                ceiling,
+                                index,
+                                trial,
+                                trial_result,
+                            )
+                            break
+                    elif best_candidate is None or ceiling < best_candidate[0]:
                         best_candidate = (ceiling, index, trial, trial_result)
-                ceiling_improvement = (
-                    current_ceiling - best_candidate[0]
-                ) / max(current_ceiling, pl_config.eps)
-                if (
-                    ceiling_improvement
-                    < pl_config.growth_min_ceiling_improvement
-                ):
+                if best_candidate is not None and not first_qualifying:
+                    ceiling_improvement = (
+                        current_ceiling - best_candidate[0]
+                    ) / max(current_ceiling, pl_config.eps)
+                    if (
+                        ceiling_improvement
+                        < pl_config.growth_min_ceiling_improvement
+                    ):
+                        best_candidate = None
+                if best_candidate is None:
                     if progress is not None:
                         progress(
-                            "[PL] growth skipped: no candidate lowers the "
-                            f"certified ceiling (best {best_candidate[0]:.4e}"
-                            f" vs current {current_ceiling:.4e}, "
-                            f"improvement {ceiling_improvement:+.4%})."
+                            "[PL] growth skipped: no candidate improved the "
+                            f"certified ceiling (current "
+                            f"{current_ceiling:.4e}) by at least "
+                            f"{pl_config.growth_min_ceiling_improvement:.2%}."
                         )
-                    best_candidate = None
                     epochs_since_growth = 0  # retry only after cooldown
             elif progress is not None:
                 progress(

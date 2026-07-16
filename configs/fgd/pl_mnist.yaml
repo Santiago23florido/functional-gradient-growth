@@ -66,9 +66,11 @@ fgd_pl:
   # Growth must be earned: fires only when mu is collapsed AND the
   # relative per-epoch loss improvement drops below this threshold.
   growth_min_progress: 0.01
-  # Ceiling VETO: the grown candidate must improve the closed-form head
-  # optimum L* by at least this relative amount, else growth is skipped.
-  growth_min_ceiling_improvement: 0.01
+  # Ceiling veto threshold. Keep 0.0 (informational): early-layer growth
+  # barely moves the head ceiling because downstream narrow layers
+  # throttle it, so a strict veto starves exactly the growth that trains
+  # best; the certified ceiling is still recorded on every GRO event.
+  growth_min_ceiling_improvement: 0.0
   # round_robin measured best (the "ceiling" argmin policy is biased
   # toward the last hidden layer and produced stiffer, worse-training
   # networks); the ceiling still vetoes useless growth either way.
