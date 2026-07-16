@@ -86,6 +86,21 @@ class EmpiricalPLConfig:
     growth_cooldown_epochs: int = 3
     growth_max_events: int = 8
     growth_max_hidden_size: int | None = None
+    # Optional ridge term: the objective becomes F = L + (ridge/2)||theta||^2.
+    # HONEST certificate semantics: the global vs-zero envelope
+    # L_0 prod(1 - 2 eta mu r) is only available for the pure data loss
+    # (ridge = 0); with ridge > 0 the augmented residual's Gram is rank
+    # deficient in the vs-zero comparison, so what remains certified is
+    # per-step sufficient descent of F (r_t >= r_min) and convergence to
+    # stationarity, while mu keeps being measured on the data Gram as the
+    # growth sensor.
+    ridge: float = 0.0
+    # Declare convergence after this many consecutive fully-rejected steps
+    # (descent below measurement resolution: stationary at precision).
+    max_rejected_steps: int = 3
+    # Keep a snapshot of the best-validation model (deployment choice made
+    # by the pipeline; does not alter the certified trajectory).
+    keep_best_validation: bool = True
 
 
 @dataclass(frozen=True)
@@ -111,6 +126,7 @@ class EmpiricalPLEpochResult:
     mu_collapsed: bool = True
     train_loss: float = 0.0
     envelope: float = 0.0
+    envelope_enabled: bool = True
     envelope_valid: bool | None = None
     converged: bool = False
 
@@ -147,6 +163,10 @@ class EmpiricalPLTrainer:
             raise ValueError("fgd_pl.certificate_points must be >= 1.")
         if config.lr_recovery < 1.0:
             raise ValueError("fgd_pl.lr_recovery must be >= 1.")
+        if config.ridge < 0.0:
+            raise ValueError("fgd_pl.ridge must be >= 0.")
+        if config.max_rejected_steps < 1:
+            raise ValueError("fgd_pl.max_rejected_steps must be >= 1.")
 
         self.config = config
         device = device or next(model.parameters()).device
@@ -169,6 +189,12 @@ class EmpiricalPLTrainer:
         self.learning_rate = config.learning_rate
         self.total_steps = 0
         self.converged = False
+        # The global vs-zero envelope is only sound for the pure data loss
+        # (zero is its universal lower bound and the Gram identity compares
+        # against it); with ridge the certified statements are per-step
+        # sufficient descent and stationarity.
+        self.envelope_enabled = config.ridge == 0.0
+        self._consecutive_rejections = 0
         self.initial_loss = self._loss()
         # Measured Prop. 3.8-style envelope: L0 * prod (1 - 2 eta mu r).
         self.contraction_product = 1.0
@@ -178,20 +204,44 @@ class EmpiricalPLTrainer:
     # ------------------------------------------------------------------
     # Loss and gradient primitives (full batch, exact).
     # ------------------------------------------------------------------
+    def _ridge_penalty(self) -> float:
+        if self.config.ridge == 0.0:
+            return 0.0
+        return 0.5 * self.config.ridge * float(
+            sum(
+                parameter.detach().to(torch.float64).square().sum().item()
+                for parameter in self.model.parameters()
+            )
+        )
+
     @torch.no_grad()
     def _loss(self) -> float:
-        predictions = self.model(self.train_x)
-        residual = predictions.reshape(self.train_y.shape) - self.train_y
-        return float(residual.square().sum().item()) / (
+        """Objective value measured in float64.
+
+        float64 measurement keeps the acceptance test meaningful for
+        descents below float32 resolution (which otherwise stall the run
+        as spurious rejections).
+        """
+        predictions = self.model(self.train_x).to(torch.float64)
+        residual = predictions.reshape(self.train_y.shape) - self.train_y.to(
+            torch.float64
+        )
+        data_loss = float(residual.square().sum().item()) / (
             2.0 * residual.shape[0]
         )
+        return data_loss + self._ridge_penalty()
 
     def _loss_and_gradients(self) -> tuple[float, list[torch.Tensor]]:
         self.model.zero_grad(set_to_none=True)
         predictions = self.model(self.train_x)
         residual = predictions.reshape(self.train_y.shape) - self.train_y
-        loss = residual.square().sum() / (2.0 * residual.shape[0])
-        loss.backward()
+        objective = residual.square().sum() / (2.0 * residual.shape[0])
+        if self.config.ridge > 0.0:
+            objective = objective + 0.5 * self.config.ridge * sum(
+                parameter.square().sum()
+                for parameter in self.model.parameters()
+            )
+        objective.backward()
         gradients = [
             (
                 parameter.grad.detach().clone()
@@ -200,7 +250,7 @@ class EmpiricalPLTrainer:
             )
             for parameter in self.model.parameters()
         ]
-        return float(loss.item()), gradients
+        return self._loss(), gradients
 
     # ------------------------------------------------------------------
     # The measured PL constant: mu = lambda_min(J J^T) / n_cert.
@@ -305,13 +355,21 @@ class EmpiricalPLTrainer:
             learning_rate *= config.backtrack_factor
 
         if accepted and learning_rate > 0.0:
+            self._consecutive_rejections = 0
             self.learning_rate = learning_rate * config.lr_recovery
-            # Measured contraction factor of the Prop. 3.8-style envelope.
-            factor = 1.0 - 2.0 * learning_rate * self.current_mu * max(
-                descent,
-                0.0,
-            )
-            self.contraction_product *= min(max(factor, 0.0), 1.0)
+            if self.envelope_enabled:
+                # Measured contraction factor of the Prop. 3.8 envelope.
+                factor = 1.0 - 2.0 * learning_rate * self.current_mu * max(
+                    descent,
+                    0.0,
+                )
+                self.contraction_product *= min(max(factor, 0.0), 1.0)
+        else:
+            self._consecutive_rejections += 1
+            if self._consecutive_rejections >= config.max_rejected_steps:
+                # Descent is below measurement resolution even after full
+                # backtracking: stationary at the achievable precision.
+                self.converged = True
         self.total_steps += 1
         return EmpiricalPLStepRecord(
             step=self.total_steps,
@@ -335,13 +393,15 @@ class EmpiricalPLTrainer:
         for _ in range(self.config.steps_per_epoch):
             record = self.step()
             records.append(record)
-            if record.converged:
+            if record.converged or self.converged:
                 break
         train_loss = records[-1].loss_after if records else self._loss()
         bound = self.envelope()
         tolerance = self.config.eps * (1.0 + self.initial_loss)
         envelope_valid = (
-            train_loss <= bound + tolerance if mu_valid else None
+            train_loss <= bound + tolerance
+            if (mu_valid and self.envelope_enabled)
+            else None
         )
         return EmpiricalPLEpochResult(
             step_records=records,
@@ -350,6 +410,7 @@ class EmpiricalPLTrainer:
             mu_collapsed=not mu_valid,
             train_loss=train_loss,
             envelope=bound,
+            envelope_enabled=self.envelope_enabled,
             envelope_valid=envelope_valid,
             converged=self.converged,
         )
