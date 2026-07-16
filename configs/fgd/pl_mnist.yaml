@@ -83,6 +83,11 @@ fgd_pl:
   # The returned model is the best-validation snapshot along the
   # certified trajectory (deployment choice; certificates unaffected).
   keep_best_validation: true
+  # STRICT theory mode: descent runs ONLY while the measured PL property
+  # holds; a collapsed mu forbids stepping (grow instead), and when
+  # growth is exhausted the run finishes with the exact RKHS head phase
+  # and stops. No uncertified descent is ever executed.
+  strict_certificates: true
 
 scaling_line_search:
   method: golden_section

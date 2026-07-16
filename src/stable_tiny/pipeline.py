@@ -17,6 +17,14 @@ from stable_tiny.data import (
     make_cifar10_dataloaders,
     make_mnist_dataloaders,
 )
+from fgdlib.adaptive import (
+    AdaptiveFGDAttemptRecord,
+    AdaptiveFGDConfig,
+    AdaptiveGrowthResult,
+    empirical_model_functional_loss,
+    grow_layer_function_preserving,
+    search_adaptive_fgd_step,
+)
 from fgdlib.tangent import (
     FGDApproxConfig,
     FGDApproxEpochResult,
@@ -81,6 +89,7 @@ TrainingMethod = Literal[
     "fgd_rkhs",
     "fgd_rkhs_grow",
     "fgd_pl",
+    "fgd_adaptive_grow",
 ]
 StepType = Literal["INIT", "SGD", "FGD", "SEC", "GRO", "RKHS", "PL"]
 DataKind = Literal["multi_sin", "smooth_sin", "cifar10", "mnist"]
@@ -149,6 +158,7 @@ class PipelineConfig:
     secant_fgd: SecantFGDConfig = field(default_factory=SecantFGDConfig)
     fgd_rkhs: FGDRKHSConfig = field(default_factory=FGDRKHSConfig)
     fgd_pl: EmpiricalPLConfig = field(default_factory=EmpiricalPLConfig)
+    fgd_adaptive: AdaptiveFGDConfig = field(default_factory=AdaptiveFGDConfig)
     scaling_line_search: ScalingLineSearchConfig = field(
         default_factory=ScalingLineSearchConfig
     )
@@ -206,15 +216,23 @@ class HistoryEntry:
     fgd_rkhs_loss_star: float | None = None
     fgd_pl_mu: float | None = None
     fgd_pl_backtracks: int | None = None
+    fgd_adaptive_status: str | None = None
+    fgd_adaptive_family: str | None = None
+    fgd_adaptive_subspace: str | None = None
+    fgd_adaptive_error_upper_bound: float | None = None
+    fgd_adaptive_algorithm_margin: float | None = None
+    fgd_adaptive_directional_cosine: float | None = None
 
 
 @dataclass
 class PipelineResult:
     config: PipelineConfig
     history: list[HistoryEntry]
-    growth_events: list[GrowthResult]
+    growth_events: list[GrowthResult | AdaptiveGrowthResult]
     model: GrowingMLP
     device: str
+    certificate_attempts: list[AdaptiveFGDAttemptRecord] = field(default_factory=list)
+    termination_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -290,6 +308,16 @@ def _section_dataclass(
             else None
         )
 
+    if section_type is AdaptiveFGDConfig:
+        for key, converter in (
+            ("family_order", str),
+            ("tangent_damping", float),
+            ("tangent_cg_iterations", int),
+            ("nonlinear_steps", int),
+        ):
+            if key in values:
+                values[key] = tuple(converter(value) for value in values[key])
+
     return section_type(**values)
 
 
@@ -310,6 +338,7 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         "secant_fgd",
         "fgd_rkhs",
         "fgd_pl",
+        "fgd_adaptive",
         "scaling_line_search",
         "growth_schedule",
         "wandb",
@@ -330,6 +359,7 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         secant_fgd=_section_dataclass("secant_fgd", SecantFGDConfig, raw),
         fgd_rkhs=_section_dataclass("fgd_rkhs", FGDRKHSConfig, raw),
         fgd_pl=_section_dataclass("fgd_pl", EmpiricalPLConfig, raw),
+        fgd_adaptive=_section_dataclass("fgd_adaptive", AdaptiveFGDConfig, raw),
         scaling_line_search=_section_dataclass(
             "scaling_line_search",
             ScalingLineSearchConfig,
@@ -544,8 +574,10 @@ def build_model(config: PipelineConfig, device: torch.device) -> GrowingMLP:
 
 def should_log_epoch(epoch: int, config: PipelineConfig) -> bool:
     log_every = config.training.log_every
-    return epoch == 1 or epoch == config.training.epochs or (
-        log_every > 0 and epoch % log_every == 0
+    return (
+        epoch == 1
+        or epoch == config.training.epochs
+        or (log_every > 0 and epoch % log_every == 0)
     )
 
 
@@ -615,8 +647,7 @@ def _certify_fgd_candidate(
     )
     loss_descent_valid = (
         validation_functional_loss
-        <= theory_state.previous_validation_functional_loss
-        + config.fgd_approx.eps
+        <= theory_state.previous_validation_functional_loss + config.fgd_approx.eps
     )
 
     epoch_count = theory_state.epoch_count
@@ -660,24 +691,16 @@ def _certify_fgd_candidate(
         and min_descent_coefficient > 0.0
     ):
         stationary_bound = initial_functional_gap / (
-            epoch_count
-            * min_positive_learning_rate
-            * min_descent_coefficient
+            epoch_count * min_positive_learning_rate * min_descent_coefficient
         )
         stationary_bound_valid = (
             min_gradient_sq_norm is not None
-            and min_gradient_sq_norm
-            <= stationary_bound + config.fgd_approx.eps
+            and min_gradient_sq_norm <= stationary_bound + config.fgd_approx.eps
         )
 
         beta = config.fgd_approx.theory_beta
         mu = config.fgd_approx.theory_mu
-        if (
-            eta is not None
-            and descent_coefficient is not None
-            and beta > 0
-            and mu > 0
-        ):
+        if eta is not None and descent_coefficient is not None and beta > 0 and mu > 0:
             global_contraction = 1.0 - (
                 2.0 * eta * mu * descent_coefficient / (beta**2)
             )
@@ -687,9 +710,7 @@ def _certify_fgd_candidate(
                 validation_functional_loss - theory_loss_star,
                 0.0,
             )
-            global_bound_valid = (
-                current_gap <= global_bound + config.fgd_approx.eps
-            )
+            global_bound_valid = current_gap <= global_bound + config.fgd_approx.eps
 
     updated_state = _FGDTheoryState(
         epoch_count=epoch_count,
@@ -815,9 +836,7 @@ def _evaluate_secant_fgd_trial(
             with torch.no_grad():
                 base_output = base_model(x)
                 functional_gradient = mse_functional_gradient(base_output, y)
-                functional_target = (
-                    base_output - learning_rate * functional_gradient
-                )
+                functional_target = base_output - learning_rate * functional_gradient
 
             optimizer.zero_grad(set_to_none=True)
             candidate_output = trial_model(x)
@@ -828,10 +847,7 @@ def _evaluate_secant_fgd_trial(
                     penalty = penalty + torch.mean(
                         (parameter - base_parameters[name]) ** 2
                     )
-                objective = (
-                    objective
-                    + config.secant_fgd.parameter_penalty * penalty
-                )
+                objective = objective + config.secant_fgd.parameter_penalty * penalty
             if not torch.isfinite(objective):
                 numerical_failure = True
                 break
@@ -870,9 +886,7 @@ def _evaluate_secant_fgd_trial(
         loss_non_descent_batches=0,
         gradient_sq_norm=None,
         theory_descent_coefficient=None,
-        min_positive_learning_rate=(
-            None if numerical_failure else learning_rate
-        ),
+        min_positive_learning_rate=(None if numerical_failure else learning_rate),
         relative_error=None,
         selected_layer_index=None,
         layer_relative_errors=[],
@@ -946,9 +960,9 @@ def _search_fgd_certified_trial(
             candidate = maximum_learning_rate
         else:
             fraction = index / (steps - 1)
-            candidate = maximum_learning_rate * (
-                minimum / maximum_learning_rate
-            ) ** fraction
+            candidate = (
+                maximum_learning_rate * (minimum / maximum_learning_rate) ** fraction
+            )
         trial = run(candidate)
         if not sensor_valid(trial):
             return _FGDSearchResult(None, last_trial, trial_count, True)
@@ -1393,9 +1407,7 @@ def _frozen_feature_map_from_grown_mlp(mlp: GrowingMLP) -> FrozenAffineFeatureMa
     for module in list(mlp.layers)[:-1]:
         linear = module.layer
         weights.append(linear.weight.detach().clone())
-        biases.append(
-            linear.bias.detach().clone() if linear.bias is not None else None
-        )
+        biases.append(linear.bias.detach().clone() if linear.bias is not None else None)
         activations.append(copy.deepcopy(module.post_layer_function))
     return FrozenAffineFeatureMap(weights, biases, activations, append_one=True)
 
@@ -1480,9 +1492,7 @@ def _run_fgd_rkhs_grow_pipeline(
     if rkhs_config.growth_epochs_per_cycle < 1:
         raise ValueError("fgd_rkhs.growth_epochs_per_cycle must be >= 1.")
     if rkhs_config.growth_min_ceiling_improvement < 0.0:
-        raise ValueError(
-            "fgd_rkhs.growth_min_ceiling_improvement must be >= 0."
-        )
+        raise ValueError("fgd_rkhs.growth_min_ceiling_improvement must be >= 0.")
     if (
         rkhs_config.growth_max_hidden_size is not None
         and rkhs_config.growth_max_hidden_size < 1
@@ -1861,18 +1871,22 @@ def _run_fgd_pl_pipeline(
     for epoch in range(1, config.training.epochs + 1):
         epoch_result = trainer.run_epoch()
         # Growth must be earned: the current structure counts as exploited
-        # only when the certified descent stopped paying off.
-        if previous_epoch_loss is None:
+        # only when the certified descent stopped paying off. In strict
+        # mode a collapsed mu forbids descent entirely, so the structure
+        # is exploited by definition.
+        if pl_config.strict_certificates and epoch_result.mu_collapsed:
+            progress_stalled = True
+        elif previous_epoch_loss is None:
             progress_stalled = False
         else:
             relative_improvement = (
                 previous_epoch_loss - epoch_result.train_loss
             ) / max(previous_epoch_loss, pl_config.eps)
-            progress_stalled = (
-                relative_improvement < pl_config.growth_min_progress
-            )
+            progress_stalled = relative_improvement < pl_config.growth_min_progress
         previous_epoch_loss = epoch_result.train_loss
-        last_record = epoch_result.step_records[-1]
+        last_record = (
+            epoch_result.step_records[-1] if epoch_result.step_records else None
+        )
         train_metrics = metrics(train_loader)
         validation_metrics = metrics(validation_loader)
         test_metrics = metrics(test_loader)
@@ -1885,13 +1899,19 @@ def _run_fgd_pl_pipeline(
             train_accuracy=train_metrics.accuracy,
             validation_accuracy=validation_metrics.accuracy,
             test_accuracy=test_metrics.accuracy,
-            learning_rate=last_record.learning_rate,
+            learning_rate=(
+                last_record.learning_rate if last_record is not None else 0.0
+            ),
             num_params=count_parameters(mlp),
             fgd_loss_descent_valid=all(
                 record.accepted for record in epoch_result.step_records
             ),
-            fgd_gradient_sq_norm=last_record.gradient_sq_norm,
-            fgd_theory_descent_coefficient=last_record.descent_coefficient,
+            fgd_gradient_sq_norm=(
+                last_record.gradient_sq_norm if last_record is not None else None
+            ),
+            fgd_theory_descent_coefficient=(
+                last_record.descent_coefficient if last_record is not None else None
+            ),
             fgd_global_bound=(
                 epoch_result.envelope
                 if (epoch_result.mu_valid and epoch_result.envelope_enabled)
@@ -1926,9 +1946,13 @@ def _run_fgd_pl_pipeline(
                 f"validation_acc={validation_metrics.accuracy:.3f}, "
                 f"test_acc={test_metrics.accuracy:.3f}, "
                 f"mu={epoch_result.mu:.3e}, "
-                f"lr={last_record.learning_rate:.4g}, "
-                f"r_t={last_record.descent_coefficient:.3f}"
-                f"{envelope_msg}"
+                + (
+                    f"lr={last_record.learning_rate:.4g}, "
+                    f"r_t={last_record.descent_coefficient:.3f}"
+                    if last_record is not None
+                    else "no steps (strict: PL property not held)"
+                )
+                + f"{envelope_msg}"
             )
         last_test_loss = test_metrics.loss
         epochs_since_growth += 1
@@ -1959,6 +1983,7 @@ def _run_fgd_pl_pipeline(
                 progress(f"[PL] converged at epoch {epoch}: {reason}")
             break
 
+        growth_blocked = False
         should_grow_now = (
             config.growth_schedule.enabled
             and epoch_result.mu_collapsed
@@ -1986,18 +2011,14 @@ def _run_fgd_pl_pipeline(
                     # rotation ADVANCES to the next eligible layer.
                     preferred = layer_index_for_growth(
                         growth_count=growth_count,
-                        number_hidden_layers=(
-                            config.model.number_hidden_layers
-                        ),
+                        number_hidden_layers=(config.model.number_hidden_layers),
                         config=config.growth_schedule,
                     ) % len(growable)
                     order = [
                         (preferred + offset) % len(growable)
                         for offset in range(len(growable))
                     ]
-                    candidates = [
-                        index for index in order if index in eligible
-                    ]
+                    candidates = [index for index in order if index in eligible]
                     first_qualifying = True
                 else:
                     # Ceiling arbiter: trial-grow every eligible layer and
@@ -2021,10 +2042,7 @@ def _run_fgd_pl_pipeline(
                         pl_config.eps,
                     )
                     if first_qualifying:
-                        if (
-                            improvement
-                            >= pl_config.growth_min_ceiling_improvement
-                        ):
+                        if improvement >= pl_config.growth_min_ceiling_improvement:
                             best_candidate = (
                                 ceiling,
                                 index,
@@ -2035,15 +2053,13 @@ def _run_fgd_pl_pipeline(
                     elif best_candidate is None or ceiling < best_candidate[0]:
                         best_candidate = (ceiling, index, trial, trial_result)
                 if best_candidate is not None and not first_qualifying:
-                    ceiling_improvement = (
-                        current_ceiling - best_candidate[0]
-                    ) / max(current_ceiling, pl_config.eps)
-                    if (
-                        ceiling_improvement
-                        < pl_config.growth_min_ceiling_improvement
-                    ):
+                    ceiling_improvement = (current_ceiling - best_candidate[0]) / max(
+                        current_ceiling, pl_config.eps
+                    )
+                    if ceiling_improvement < pl_config.growth_min_ceiling_improvement:
                         best_candidate = None
                 if best_candidate is None:
+                    growth_blocked = True
                     if progress is not None:
                         progress(
                             "[PL] growth skipped: no candidate improved the "
@@ -2052,11 +2068,13 @@ def _run_fgd_pl_pipeline(
                             f"{pl_config.growth_min_ceiling_improvement:.2%}."
                         )
                     epochs_since_growth = 0  # retry only after cooldown
-            elif progress is not None:
-                progress(
-                    "[PL] mu collapsed but every hidden block reached "
-                    "the width cap; continuing without growth."
-                )
+            else:
+                growth_blocked = True
+                if progress is not None:
+                    progress(
+                        "[PL] mu collapsed but every hidden block reached "
+                        "the width cap; continuing without growth."
+                    )
             if best_candidate is not None:
                 best_ceiling, layer_index, mlp, growth_result = best_candidate
                 growth_count += 1
@@ -2101,6 +2119,66 @@ def _run_fgd_pl_pipeline(
                         "per-structure certificate."
                     )
 
+        strict_exhausted = (
+            pl_config.strict_certificates
+            and epoch_result.mu_collapsed
+            and (
+                growth_blocked
+                or growth_count >= pl_config.growth_max_events
+                or not config.growth_schedule.enabled
+            )
+        )
+        if strict_exhausted:
+            # No theory-compliant full-weight descent exists for this
+            # structure (mu collapsed) and growth is exhausted: finish
+            # with the exact RKHS head phase -- where every paper
+            # property holds -- and stop honestly.
+            phase = _run_rkhs_head_phase(
+                model=mlp,
+                train_batches=list(train_loader),
+                config=config,
+                device=device,
+            )
+            if phase.accepted:
+                _apply_certified_head(mlp, phase.trainer.model)
+            train_metrics = metrics(train_loader)
+            validation_metrics = metrics(validation_loader)
+            test_metrics = metrics(test_loader)
+            phase_entry = HistoryEntry(
+                step=epoch,
+                step_type="RKHS",
+                train_loss=train_metrics.loss,
+                validation_loss=validation_metrics.loss,
+                test_loss=test_metrics.loss,
+                train_accuracy=train_metrics.accuracy,
+                validation_accuracy=validation_metrics.accuracy,
+                test_accuracy=test_metrics.accuracy,
+                learning_rate=phase.trainer.theory.learning_rate,
+                num_params=count_parameters(mlp),
+                fgd_candidate_accepted=phase.accepted,
+                fgd_approximation_kind="rkhs_head",
+                fgd_rkhs_functional_loss=phase.functional_loss_after,
+                fgd_rkhs_loss_star=phase.trainer.theory.loss_star,
+            )
+            history.append(phase_entry)
+            wandb_logger.log_history_entry(phase_entry)
+            if (
+                pl_config.keep_best_validation
+                and validation_metrics.loss < best_validation_loss
+            ):
+                best_validation_loss = validation_metrics.loss
+                best_model = None  # current model IS the best
+            if progress is not None:
+                progress(
+                    f"[PL] strict mode: structure exhausted at epoch "
+                    f"{epoch} (mu collapsed, growth unavailable); finished "
+                    "with the exact RKHS head phase "
+                    f"(L*={phase.trainer.theory.loss_star:.4e}, "
+                    f"accepted={phase.accepted}) and stopped -- no "
+                    "uncertified descent was ever executed."
+                )
+            break
+
     final_model = mlp
     if (
         pl_config.keep_best_validation
@@ -2133,6 +2211,383 @@ def _run_fgd_pl_pipeline(
         growth_events=growth_events,
         model=final_model,
         device=str(device),
+    )
+
+
+def _run_fgd_adaptive_pipeline(
+    *,
+    config: PipelineConfig,
+    device: torch.device,
+    train_loader: torch.utils.data.DataLoader,
+    validation_loader: torch.utils.data.DataLoader,
+    test_loader: torch.utils.data.DataLoader,
+    classification: bool,
+    wandb_logger: Any,
+    progress: ProgressFn | None,
+) -> PipelineResult:
+    """Strict Algorithm-1 train-and-grow over the full empirical train set."""
+    adaptive = config.fgd_adaptive
+    adaptive.validate()
+    model = build_model(config, device)
+    # Keep the fixed empirical design on CPU.  The adaptive backend streams
+    # bounded chunks to the accelerator while aggregating the exact full-train
+    # Hilbert-space quantities in float64.
+    train_x, train_y = _materialize_dataset(train_loader, torch.device("cpu"))
+    loss_function = torch.nn.MSELoss()
+
+    def metrics(loader: torch.utils.data.DataLoader):
+        return evaluate_regression_metrics(
+            model,
+            loader,
+            loss_function,
+            device=device,
+            accuracy_tolerance=config.training.accuracy_tolerance,
+            classification=classification,
+        )
+
+    def functional_loss() -> float:
+        return empirical_model_functional_loss(
+            model,
+            train_x,
+            train_y,
+            batch_size=adaptive.computation_batch_size,
+        )
+
+    train_metrics = metrics(train_loader)
+    validation_metrics = metrics(validation_loader)
+    test_metrics = metrics(test_loader)
+    initial_loss = functional_loss()
+    envelope = initial_loss
+    history: list[HistoryEntry] = [
+        HistoryEntry(
+            step=0,
+            step_type="INIT",
+            train_loss=train_metrics.loss,
+            validation_loss=validation_metrics.loss,
+            test_loss=test_metrics.loss,
+            train_accuracy=train_metrics.accuracy,
+            validation_accuracy=validation_metrics.accuracy,
+            test_accuracy=test_metrics.accuracy,
+            learning_rate=0.0,
+            num_params=count_parameters(model),
+            fgd_global_bound=envelope,
+            fgd_global_bound_valid=True,
+            fgd_approximation_kind="adaptive_empirical_l2",
+            fgd_adaptive_status="initialized",
+        )
+    ]
+    wandb_logger.log_history_entry(history[0])
+    attempts: list[AdaptiveFGDAttemptRecord] = []
+    growth_events: list[AdaptiveGrowthResult] = []
+    growth_count = 0
+    retry_growth_layer_index: int | None = None
+    termination_reason: str | None = None
+
+    def retain_attempts(
+        records: list[AdaptiveFGDAttemptRecord],
+        *,
+        growth_layer_index: int | None = None,
+    ) -> list[AdaptiveFGDAttemptRecord]:
+        retained: list[AdaptiveFGDAttemptRecord] = []
+        for record in records:
+            normalized = replace(
+                record,
+                attempt=len(attempts) + 1,
+                growth_layer_index=growth_layer_index,
+            )
+            attempts.append(normalized)
+            retained.append(normalized)
+            wandb_logger.log_adaptive_attempt(normalized)
+        return retained
+
+    if progress is not None:
+        progress(f"Using device: {device}")
+        progress("Training method: fgd_adaptive_grow")
+        progress(
+            "[ADAPT] strict empirical Algorithm 1: "
+            f"train_points={train_x.shape[0]}, epsilon={adaptive.epsilon}, "
+            "K=alpha=beta=mu=1"
+        )
+
+    step = 1
+    while step <= config.training.epochs:
+        search = search_adaptive_fgd_step(
+            model=model,
+            train_x=train_x,
+            train_y=train_y,
+            config=adaptive,
+            step=step,
+            progress=progress,
+        )
+        retained = retain_attempts(
+            search.attempts,
+            growth_layer_index=retry_growth_layer_index,
+        )
+        retry_growth_layer_index = None
+        if search.converged:
+            termination_reason = "globally_optimal"
+            if progress is not None:
+                progress(
+                    f"[ADAPT] converged before step {step}: empirical "
+                    "functional gradient is numerically zero."
+                )
+            break
+
+        if search.model is not None and search.certificate is not None:
+            certificate = search.certificate
+            contraction = certificate.contraction
+            if contraction is None:
+                raise RuntimeError("Accepted adaptive step has no contraction.")
+            next_envelope = envelope * contraction
+            tolerance = adaptive.numerical_tolerance * (1.0 + initial_loss)
+            if certificate.loss_after > next_envelope + tolerance:
+                raise RuntimeError(
+                    "Accepted adaptive step violated the accumulated global "
+                    f"envelope ({certificate.loss_after:.6e} > "
+                    f"{next_envelope:.6e})."
+                )
+            accepted_record = next(
+                record
+                for record in reversed(retained)
+                if record.certificate.accepted
+                and record.certificate_scope == "full_train"
+            )
+            model = search.model  # the only state-changing optimization action
+            envelope = next_envelope
+            train_metrics = metrics(train_loader)
+            validation_metrics = metrics(validation_loader)
+            test_metrics = metrics(test_loader)
+            output_error = FGDOutputRelError(
+                relative_error=certificate.relative_error,
+                approximation_norm=certificate.approximation_norm,
+                target_norm=certificate.target_norm,
+                directional_cosine=(
+                    certificate.directional_cosine
+                    if certificate.directional_cosine is not None
+                    else float("nan")
+                ),
+            )
+            entry = HistoryEntry(
+                step=step,
+                step_type="FGD",
+                train_loss=train_metrics.loss,
+                validation_loss=validation_metrics.loss,
+                test_loss=test_metrics.loss,
+                train_accuracy=train_metrics.accuracy,
+                validation_accuracy=validation_metrics.accuracy,
+                test_accuracy=test_metrics.accuracy,
+                learning_rate=certificate.learning_rate,
+                num_params=count_parameters(model),
+                rel_error=certificate.relative_error,
+                fgd_output_rel_error=output_error,
+                fgd_learning_rate_upper_bound=(certificate.learning_rate_upper_bound),
+                fgd_max_valid_learning_rate=(certificate.learning_rate_upper_bound),
+                fgd_learning_rate_interval_valid=(certificate.learning_rate_valid),
+                fgd_relative_error_condition_valid=(certificate.relative_error_valid),
+                fgd_loss_descent_valid=(certificate.sufficient_descent_valid),
+                fgd_gradient_sq_norm=certificate.target_norm**2,
+                fgd_theory_descent_coefficient=(certificate.descent_coefficient),
+                fgd_global_bound=envelope,
+                fgd_global_bound_valid=True,
+                fgd_global_contraction=contraction,
+                fgd_sensor_valid=True,
+                fgd_candidate_accepted=True,
+                fgd_lr_search_trials=len(retained),
+                fgd_approximation_kind=accepted_record.family,
+                fgd_adaptive_status="accepted",
+                fgd_adaptive_family=accepted_record.family,
+                fgd_adaptive_subspace=accepted_record.subspace,
+                fgd_adaptive_error_upper_bound=(certificate.error_upper_bound),
+                fgd_adaptive_algorithm_margin=certificate.algorithm_margin,
+                fgd_adaptive_directional_cosine=(certificate.directional_cosine),
+            )
+            history.append(entry)
+            wandb_logger.log_history_entry(entry)
+            if progress is not None and should_log_epoch(step, config):
+                progress(
+                    f"[ADAPT] Step {step}: family={accepted_record.family}, "
+                    f"space={accepted_record.subspace}, "
+                    f"eta={certificate.learning_rate:.4g}, "
+                    f"q={certificate.relative_error:.4f}, "
+                    f"cos={certificate.directional_cosine}, "
+                    f"L={certificate.loss_after:.6e}, "
+                    f"envelope={envelope:.6e}"
+                )
+            step += 1
+            continue
+
+        growth_unavailable = (
+            not config.growth_schedule.enabled
+            or growth_count >= adaptive.max_growth_events
+        )
+        growable = getattr(model, "_growable_layers", [])
+        eligible: list[int] = []
+        if not growth_unavailable:
+            for index in range(len(growable)):
+                current_width = model.layers[index].layer.out_features
+                if (
+                    adaptive.max_hidden_size is None
+                    or current_width < adaptive.max_hidden_size
+                ):
+                    eligible.append(index)
+
+        if eligible:
+            preferred = layer_index_for_growth(
+                growth_count=growth_count,
+                number_hidden_layers=len(growable),
+                config=config.growth_schedule,
+            ) % len(growable)
+            growth_order = [
+                index
+                for offset in range(len(growable))
+                if (index := (preferred + offset) % len(growable)) in eligible
+            ]
+        else:
+            growth_order = []
+
+        selected_growth: tuple[GrowingMLP, AdaptiveGrowthResult] | None = None
+        # A representation refinement is itself certified by function
+        # preservation.  Probe only the scheduled layer, commit its structure,
+        # and retry the same FGD step instead of running the full approximation
+        # ladder on every possible grown architecture.
+        for layer_index in growth_order:
+            try:
+                grown_model, drift, added = grow_layer_function_preserving(
+                    model=model,
+                    train_x=train_x,
+                    train_y=train_y,
+                    layer_index=layer_index,
+                    config=adaptive,
+                )
+            except Exception as error:
+                if progress is not None:
+                    progress(
+                        f"[ADAPT] rejected growth of layer {layer_index}: "
+                        f"{type(error).__name__}: {error}"
+                    )
+                continue
+            grown_loss = empirical_model_functional_loss(
+                grown_model,
+                train_x,
+                train_y,
+                batch_size=adaptive.computation_batch_size,
+            )
+            growth_envelope_tolerance = adaptive.numerical_tolerance * (
+                1.0 + initial_loss
+            )
+            if grown_loss > envelope + growth_envelope_tolerance:
+                if progress is not None:
+                    progress(
+                        f"[ADAPT] rejected growth of layer {layer_index}: "
+                        "the numerical function drift violated the current "
+                        "global envelope."
+                    )
+                continue
+            event = AdaptiveGrowthResult(
+                layer_index=layer_index,
+                added_parameters=added,
+                output_drift=drift,
+                certified_candidate_available=False,
+                best_relative_error=None,
+            )
+            selected_growth = (grown_model, event)
+            break
+
+        if selected_growth is None:
+            termination_reason = "representation_exhausted"
+            train_metrics = metrics(train_loader)
+            validation_metrics = metrics(validation_loader)
+            test_metrics = metrics(test_loader)
+            stop_entry = HistoryEntry(
+                step=step,
+                step_type="FGD",
+                train_loss=train_metrics.loss,
+                validation_loss=validation_metrics.loss,
+                test_loss=test_metrics.loss,
+                train_accuracy=train_metrics.accuracy,
+                validation_accuracy=validation_metrics.accuracy,
+                test_accuracy=test_metrics.accuracy,
+                learning_rate=0.0,
+                num_params=count_parameters(model),
+                fgd_global_bound=envelope,
+                fgd_global_bound_valid=(
+                    functional_loss() <= envelope + adaptive.numerical_tolerance
+                ),
+                fgd_candidate_accepted=False,
+                fgd_approximation_kind="adaptive_empirical_l2",
+                fgd_adaptive_status=termination_reason,
+            )
+            history.append(stop_entry)
+            wandb_logger.log_history_entry(stop_entry)
+            if progress is not None:
+                progress(
+                    f"[ADAPT] stopped before step {step}: every "
+                    "approximation failed and no function-preserving growth "
+                    "remains; no uncertified step was executed."
+                )
+            break
+
+        model, growth_event = selected_growth
+        retry_growth_layer_index = growth_event.layer_index
+        if functional_loss() > envelope + adaptive.numerical_tolerance * (
+            1.0 + initial_loss
+        ):
+            raise RuntimeError(
+                "Function-preserving growth violated the accumulated envelope."
+            )
+        growth_count += 1
+        growth_events.append(growth_event)
+        wandb_logger.log_adaptive_growth_event(
+            event=growth_event,
+            step=step,
+            growth_count=growth_count,
+        )
+        train_metrics = metrics(train_loader)
+        validation_metrics = metrics(validation_loader)
+        test_metrics = metrics(test_loader)
+        growth_entry = HistoryEntry(
+            step=step,
+            step_type="GRO",
+            train_loss=train_metrics.loss,
+            validation_loss=validation_metrics.loss,
+            test_loss=test_metrics.loss,
+            train_accuracy=train_metrics.accuracy,
+            validation_accuracy=validation_metrics.accuracy,
+            test_accuracy=test_metrics.accuracy,
+            learning_rate=0.0,
+            num_params=count_parameters(model),
+            layer_index=growth_event.layer_index,
+            scaling_factor=0.0,
+            rel_error=growth_event.best_relative_error,
+            fgd_global_bound=envelope,
+            fgd_global_bound_valid=(
+                functional_loss() <= envelope + adaptive.numerical_tolerance
+            ),
+            fgd_candidate_accepted=False,
+            fgd_approximation_kind="function_preserving_growth",
+            fgd_adaptive_status="representation_refined",
+        )
+        history.append(growth_entry)
+        wandb_logger.log_history_entry(growth_entry)
+        if progress is not None:
+            progress(
+                f"[ADAPT] growth {growth_count} before step {step}: "
+                f"layer={growth_event.layer_index}, "
+                f"added={growth_event.added_parameters}, "
+                f"drift={growth_event.output_drift:.3e}; retrying the same "
+                "functional iterate."
+            )
+
+    if termination_reason is None:
+        termination_reason = "max_steps_reached"
+    return PipelineResult(
+        config=config,
+        history=history,
+        growth_events=growth_events,
+        model=model,
+        device=str(device),
+        certificate_attempts=attempts,
+        termination_reason=termination_reason,
     )
 
 
@@ -2208,9 +2663,7 @@ def _run_rkhs_head_phase(
             break
     final_loss = epoch_results[-1].train_functional_loss
     last_record = (
-        epoch_results[-1].step_records[-1]
-        if epoch_results[-1].step_records
-        else None
+        epoch_results[-1].step_records[-1] if epoch_results[-1].step_records else None
     )
     tolerance = trainer.certificate_tolerance * (1.0 + abs(model_loss_before))
     accepted = final_loss < model_loss_before - tolerance
@@ -2246,11 +2699,17 @@ def run_pipeline(
     device = select_device(config.training.device)
     train_loader, validation_loader, test_loader = build_dataloaders(config, device)
     classification = is_classification_task(config)
-    if config.training.method in ("fgd_rkhs", "fgd_rkhs_grow", "fgd_pl"):
+    if config.training.method in (
+        "fgd_rkhs",
+        "fgd_rkhs_grow",
+        "fgd_pl",
+        "fgd_adaptive_grow",
+    ):
         runner = {
             "fgd_rkhs": _run_fgd_rkhs_pipeline,
             "fgd_rkhs_grow": _run_fgd_rkhs_grow_pipeline,
             "fgd_pl": _run_fgd_pl_pipeline,
+            "fgd_adaptive_grow": _run_fgd_adaptive_pipeline,
         }[config.training.method]
         try:
             result = runner(
@@ -2358,15 +2817,13 @@ def run_pipeline(
             and config.fgd_approx.learning_rate_policy == "theory_interval"
             and config.fgd_approx.projection_solver != "gromo_layer"
         ):
-            validation_certificate_for_next_epoch = (
-                evaluate_fgd_validation_certificate(
-                    model=model,
-                    data_loader=validation_loader,
-                    device=device,
-                    config=config.fgd_approx,
-                    learning_rate=current_fgd_learning_rate,
-                    projection_group_size=current_projection_group_size,
-                )
+            validation_certificate_for_next_epoch = evaluate_fgd_validation_certificate(
+                model=model,
+                data_loader=validation_loader,
+                device=device,
+                config=config.fgd_approx,
+                learning_rate=current_fgd_learning_rate,
+                projection_group_size=current_projection_group_size,
             )
 
         def reset_fgd_certificate() -> None:
@@ -2396,6 +2853,7 @@ def run_pipeline(
             fgd_previous_train_loss = None
             fgd_stalled_epochs = 0
             validation_certificate_for_next_epoch = None
+
         init_entry = HistoryEntry(
             step=0,
             step_type="INIT",
@@ -2447,8 +2905,7 @@ def run_pipeline(
                 )
                 if certified_learning_rate is not None:
                     current_lr_in_interval = (
-                        current_fgd_learning_rate
-                        > config.fgd_approx.theory_lr_min
+                        current_fgd_learning_rate > config.fgd_approx.theory_lr_min
                         and current_fgd_learning_rate
                         <= certified_learning_rate + config.fgd_approx.eps
                     )
@@ -2457,10 +2914,7 @@ def run_pipeline(
                         or not current_lr_in_interval
                     ):
                         learning_rate_clipped_by_validation = (
-                            abs(
-                                current_fgd_learning_rate
-                                - certified_learning_rate
-                            )
+                            abs(current_fgd_learning_rate - certified_learning_rate)
                             > config.fgd_approx.eps
                         )
                         current_fgd_learning_rate = certified_learning_rate
@@ -2484,9 +2938,7 @@ def run_pipeline(
             fgd_learning_rate_upper_bound: float | None = None
             fgd_max_valid_learning_rate: float | None = None
             fgd_learning_rate_interval_valid: bool | None = None
-            fgd_learning_rate_clipped_batches = int(
-                learning_rate_clipped_by_validation
-            )
+            fgd_learning_rate_clipped_batches = int(learning_rate_clipped_by_validation)
             fgd_skipped_batches = 0
             fgd_relative_error_condition_valid: bool | None = None
             fgd_loss_descent_valid: bool | None = None
@@ -2597,12 +3049,9 @@ def run_pipeline(
                         )
                         epoch_result = fgd_epoch_result
                         validation_certificate = accepted_trial.certificate
-                        validation_certificate_for_next_epoch = (
-                            validation_certificate
-                        )
+                        validation_certificate_for_next_epoch = validation_certificate
                         current_fgd_learning_rate = (
-                            fgd_epoch_result.min_positive_learning_rate
-                            or learning_rate
+                            fgd_epoch_result.min_positive_learning_rate or learning_rate
                         )
                         optimizer = build_optimizer(model, config.optimizer)
                         apply_learning_rate(optimizer, current_fgd_learning_rate)
@@ -2616,9 +3065,7 @@ def run_pipeline(
 
                         accepted_state = accepted_trial.theory_state
                         fgd_epoch_count = accepted_state.epoch_count
-                        fgd_min_gradient_sq_norm = (
-                            accepted_state.min_gradient_sq_norm
-                        )
+                        fgd_min_gradient_sq_norm = accepted_state.min_gradient_sq_norm
                         fgd_min_positive_learning_rate = (
                             accepted_state.min_positive_learning_rate
                         )
@@ -2631,20 +3078,14 @@ def run_pipeline(
                         previous_validation_functional_loss = (
                             accepted_state.previous_validation_functional_loss
                         )
-                        fgd_loss_descent_valid = (
-                            accepted_trial.loss_descent_valid
-                        )
+                        fgd_loss_descent_valid = accepted_trial.loss_descent_valid
                         fgd_stationary_bound = accepted_trial.stationary_bound
                         fgd_stationary_bound_valid = (
                             accepted_trial.stationary_bound_valid
                         )
                         fgd_global_bound = accepted_trial.global_bound
-                        fgd_global_bound_valid = (
-                            accepted_trial.global_bound_valid
-                        )
-                        fgd_global_contraction = (
-                            accepted_trial.global_contraction
-                        )
+                        fgd_global_bound_valid = accepted_trial.global_bound_valid
+                        fgd_global_contraction = accepted_trial.global_contraction
                     else:
                         base_train_metrics = evaluate_regression_metrics(
                             model,
@@ -2707,22 +3148,14 @@ def run_pipeline(
                                 selected_layer_index=selected_layer_index,
                             )
                         if diagnostic_trial is not None:
-                            fgd_loss_descent_valid = (
-                                diagnostic_trial.loss_descent_valid
-                            )
-                            fgd_stationary_bound = (
-                                diagnostic_trial.stationary_bound
-                            )
+                            fgd_loss_descent_valid = diagnostic_trial.loss_descent_valid
+                            fgd_stationary_bound = diagnostic_trial.stationary_bound
                             fgd_stationary_bound_valid = (
                                 diagnostic_trial.stationary_bound_valid
                             )
                             fgd_global_bound = diagnostic_trial.global_bound
-                            fgd_global_bound_valid = (
-                                diagnostic_trial.global_bound_valid
-                            )
-                            fgd_global_contraction = (
-                                diagnostic_trial.global_contraction
-                            )
+                            fgd_global_bound_valid = diagnostic_trial.global_bound_valid
+                            fgd_global_contraction = diagnostic_trial.global_contraction
                 else:
                     fgd_epoch_result = train_one_epoch_fgd_approx(
                         model=model,
@@ -2787,15 +3220,13 @@ def run_pipeline(
                     rel_error = None
                     fgd_output_rel_error = None
                     fgd_relative_error_condition_valid = None
-                fgd_loss_non_descent_batches = int(
-                    fgd_loss_descent_valid is False
-                )
+                fgd_loss_non_descent_batches = int(fgd_loss_descent_valid is False)
                 step_type = "FGD"
             else:
                 raise ValueError(
                     f"Unsupported training method '{config.training.method}'. "
                     "Use one of: normal, fgd_approx, fgd_rkhs, "
-                    "fgd_rkhs_grow, fgd_pl."
+                    "fgd_rkhs_grow, fgd_pl, fgd_adaptive_grow."
                 )
 
             validation_metrics = evaluate_regression_metrics(
@@ -2826,9 +3257,7 @@ def run_pipeline(
                 fgd_learning_rate_interval_valid=fgd_learning_rate_interval_valid,
                 fgd_learning_rate_clipped_batches=fgd_learning_rate_clipped_batches,
                 fgd_skipped_batches=fgd_skipped_batches,
-                fgd_relative_error_condition_valid=(
-                    fgd_relative_error_condition_valid
-                ),
+                fgd_relative_error_condition_valid=(fgd_relative_error_condition_valid),
                 fgd_loss_descent_valid=fgd_loss_descent_valid,
                 fgd_loss_non_descent_batches=fgd_loss_non_descent_batches,
                 fgd_gradient_sq_norm=fgd_gradient_sq_norm,
@@ -2839,9 +3268,7 @@ def run_pipeline(
                 fgd_global_bound=fgd_global_bound,
                 fgd_global_bound_valid=fgd_global_bound_valid,
                 fgd_global_contraction=fgd_global_contraction,
-                fgd_theory_learning_rate_adjusted=(
-                    fgd_theory_learning_rate_adjusted
-                ),
+                fgd_theory_learning_rate_adjusted=(fgd_theory_learning_rate_adjusted),
                 fgd_sensor_valid=fgd_sensor_valid,
                 fgd_sensor_invalid_batches=fgd_sensor_invalid_batches,
                 fgd_candidate_accepted=fgd_candidate_accepted,
@@ -2887,9 +3314,7 @@ def run_pipeline(
                     config.fgd_approx.learning_rate_policy == "theory_interval"
                     and config.fgd_approx.theory_lr_follow_bound
                 ):
-                    warnings.append(
-                        "learning-rate clipped by validation certificate"
-                    )
+                    warnings.append("learning-rate clipped by validation certificate")
                 if fgd_skipped_batches > 0:
                     warnings.append(
                         "validation certificate rejected "
@@ -2990,16 +3415,12 @@ def run_pipeline(
                                 device=device,
                                 config=config.fgd_approx,
                                 learning_rate=None,
-                                projection_group_size=(
-                                    current_projection_group_size
-                                ),
+                                projection_group_size=(current_projection_group_size),
                             )
                         )
-                        certified_learning_rate = (
-                            certified_validation_learning_rate(
-                                validation_certificate_for_next_epoch,
-                                config.fgd_approx,
-                            )
+                        certified_learning_rate = certified_validation_learning_rate(
+                            validation_certificate_for_next_epoch,
+                            config.fgd_approx,
                         )
                         if certified_learning_rate is not None:
                             current_fgd_learning_rate = certified_learning_rate
@@ -3007,12 +3428,10 @@ def run_pipeline(
                             optimizer,
                             current_fgd_learning_rate,
                         )
-                        previous_validation_functional_loss = (
-                            evaluate_functional_loss(
-                                model,
-                                validation_loader,
-                                device,
-                            )
+                        previous_validation_functional_loss = evaluate_functional_loss(
+                            model,
+                            validation_loader,
+                            device,
                         )
                         phase_theory = phase.trainer.theory
                         phase_record = phase.last_record
@@ -3021,9 +3440,7 @@ def run_pipeline(
                             train_loader,
                             loss_function,
                             device=device,
-                            accuracy_tolerance=(
-                                config.training.accuracy_tolerance
-                            ),
+                            accuracy_tolerance=(config.training.accuracy_tolerance),
                             classification=classification,
                         )
                         phase_validation_metrics = evaluate_regression_metrics(
@@ -3031,9 +3448,7 @@ def run_pipeline(
                             validation_loader,
                             loss_function,
                             device=device,
-                            accuracy_tolerance=(
-                                config.training.accuracy_tolerance
-                            ),
+                            accuracy_tolerance=(config.training.accuracy_tolerance),
                             classification=classification,
                         )
                         phase_test_metrics = evaluate_regression_metrics(
@@ -3041,9 +3456,7 @@ def run_pipeline(
                             test_loader,
                             loss_function,
                             device=device,
-                            accuracy_tolerance=(
-                                config.training.accuracy_tolerance
-                            ),
+                            accuracy_tolerance=(config.training.accuracy_tolerance),
                             classification=classification,
                         )
                         rkhs_entry = HistoryEntry(
@@ -3053,9 +3466,7 @@ def run_pipeline(
                             validation_loss=phase_validation_metrics.loss,
                             test_loss=phase_test_metrics.loss,
                             train_accuracy=phase_train_metrics.accuracy,
-                            validation_accuracy=(
-                                phase_validation_metrics.accuracy
-                            ),
+                            validation_accuracy=(phase_validation_metrics.accuracy),
                             test_accuracy=phase_test_metrics.accuracy,
                             learning_rate=current_fgd_learning_rate,
                             num_params=count_parameters(model),
@@ -3096,9 +3507,7 @@ def run_pipeline(
                                 if phase_record is not None
                                 else None
                             ),
-                            fgd_rkhs_functional_loss=(
-                                phase.functional_loss_after
-                            ),
+                            fgd_rkhs_functional_loss=(phase.functional_loss_after),
                             fgd_rkhs_loss_star=phase_theory.loss_star,
                         )
                         history.append(rkhs_entry)
@@ -3119,9 +3528,7 @@ def run_pipeline(
                         phase_theory = (
                             phase.trainer.theory if phase is not None else None
                         )
-                        phase_record = (
-                            phase.last_record if phase is not None else None
-                        )
+                        phase_record = phase.last_record if phase is not None else None
                         rejected_rkhs_entry = HistoryEntry(
                             step=epoch,
                             step_type="RKHS",
@@ -3144,19 +3551,13 @@ def run_pipeline(
                                 else None
                             ),
                             fgd_loss_descent_valid=(
-                                phase.descent_valid
-                                if phase is not None
-                                else None
+                                phase.descent_valid if phase is not None else None
                             ),
                             fgd_global_bound=(
-                                phase.global_bound
-                                if phase is not None
-                                else None
+                                phase.global_bound if phase is not None else None
                             ),
                             fgd_global_bound_valid=(
-                                phase.global_bound_valid
-                                if phase is not None
-                                else None
+                                phase.global_bound_valid if phase is not None else None
                             ),
                             fgd_candidate_accepted=False,
                             fgd_approximation_kind="rkhs_head",
@@ -3224,9 +3625,7 @@ def run_pipeline(
                             line_search_config=config.scaling_line_search,
                             optimal_update_kwargs=tiny_optimal_update_kwargs(
                                 config.fgd_approx,
-                                compute_delta=(
-                                    config.fgd_approx.growth_compute_delta
-                                ),
+                                compute_delta=(config.fgd_approx.growth_compute_delta),
                             ),
                             progress=progress,
                         )
@@ -3237,9 +3636,7 @@ def run_pipeline(
                         config=config.growth_schedule,
                     )
                     if progress is not None:
-                        progress(
-                            f"[GRO] Growing layer {layer_index} at epoch {epoch}"
-                        )
+                        progress(f"[GRO] Growing layer {layer_index} at epoch {epoch}")
                     growth_result = grow_layer(
                         model=model,
                         train_loader=train_loader,
@@ -3288,21 +3685,13 @@ def run_pipeline(
                         fgd_max_valid_learning_rate = (
                             post_growth_certified_learning_rate
                         )
-                        rel_error = (
-                            validation_certificate_for_next_epoch.relative_error
-                        )
+                        rel_error = validation_certificate_for_next_epoch.relative_error
                         fgd_output_rel_error = (
                             validation_certificate_for_next_epoch.output_relative_error
                         )
-                        fgd_learning_rate_upper_bound = (
-                            validation_certificate_for_next_epoch.learning_rate_upper_bound
-                        )
-                        fgd_learning_rate_interval_valid = (
-                            validation_certificate_for_next_epoch.learning_rate_interval_valid
-                        )
-                        fgd_relative_error_condition_valid = (
-                            validation_certificate_for_next_epoch.relative_error_condition_valid
-                        )
+                        fgd_learning_rate_upper_bound = validation_certificate_for_next_epoch.learning_rate_upper_bound
+                        fgd_learning_rate_interval_valid = validation_certificate_for_next_epoch.learning_rate_interval_valid
+                        fgd_relative_error_condition_valid = validation_certificate_for_next_epoch.relative_error_condition_valid
                         fgd_sensor_valid = (
                             validation_certificate_for_next_epoch.sensor_valid
                         )
@@ -3314,8 +3703,7 @@ def run_pipeline(
                     current_fgd_learning_rate
                     if (
                         config.training.method == "fgd_approx"
-                        and config.fgd_approx.learning_rate_policy
-                        == "theory_interval"
+                        and config.fgd_approx.learning_rate_policy == "theory_interval"
                     )
                     else scheduled_learning_rate(
                         config,
@@ -3380,9 +3768,7 @@ def run_pipeline(
                     fgd_loss_non_descent_batches=fgd_loss_non_descent_batches,
                     fgd_gradient_sq_norm=fgd_gradient_sq_norm,
                     fgd_min_gradient_sq_norm=fgd_min_gradient_sq_norm,
-                    fgd_theory_descent_coefficient=(
-                        fgd_theory_descent_coefficient
-                    ),
+                    fgd_theory_descent_coefficient=(fgd_theory_descent_coefficient),
                     fgd_stationary_bound=fgd_stationary_bound,
                     fgd_stationary_bound_valid=fgd_stationary_bound_valid,
                     fgd_global_bound=fgd_global_bound,
@@ -3440,6 +3826,10 @@ def result_payload(result: PipelineResult) -> dict[str, Any]:
         "model": str(result.model),
         "history": [asdict(entry) for entry in result.history],
         "growth_events": [asdict(event) for event in result.growth_events],
+        "certificate_attempts": [
+            asdict(attempt) for attempt in result.certificate_attempts
+        ],
+        "termination_reason": result.termination_reason,
     }
 
 
@@ -3487,11 +3877,17 @@ def write_outputs(result: PipelineResult) -> dict[str, Path]:
             output_paths["parameters_plot"] = saved_parameters_plot
 
         rel_error_path = run_config.results_dir / f"{run_config.name}_rel_error.png"
+        relative_error_threshold = (
+            result.config.fgd_adaptive.epsilon
+            / (1.0 + result.config.fgd_adaptive.epsilon)
+            if result.config.training.method == "fgd_adaptive_grow"
+            else result.config.fgd_approx.rel_error_threshold
+        )
         saved_rel_error_plot = plot_relative_error(
             result.history,
             output_path=rel_error_path,
             show=run_config.show_plot,
-            threshold=result.config.fgd_approx.rel_error_threshold,
+            threshold=relative_error_threshold,
         )
         if saved_rel_error_plot is not None:
             output_paths["rel_error_plot"] = saved_rel_error_plot

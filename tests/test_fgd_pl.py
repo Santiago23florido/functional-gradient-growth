@@ -133,6 +133,23 @@ def test_envelope_certifies_overparametrized_convergence() -> None:
     assert result.envelope < initial  # the envelope actually contracted
 
 
+def test_strict_mode_refuses_descent_without_pl() -> None:
+    """Strict mode: no descent step may run while mu is collapsed."""
+    x, y = _problem(n=40, d=3, m=2, seed=19)
+    model = _mlp(hidden=2, seed=19)  # underparametrized -> mu = 0
+    trainer = EmpiricalPLTrainer(
+        model,
+        x,
+        y,
+        EmpiricalPLConfig(certificate_points=40, strict_certificates=True),
+    )
+    loss_before = trainer.initial_loss
+    result = trainer.run_epoch()
+    assert result.mu_collapsed
+    assert result.step_records == []  # not a single uncertified step
+    assert result.train_loss == pytest.approx(loss_before, rel=1e-12)
+
+
 def test_mu_is_zero_when_underparametrized() -> None:
     x, y = _problem(n=40, d=3, m=2, seed=9)
     model = _mlp(hidden=2, seed=9)  # P = 3*2+2+2*2+2 = 14 < 40*2 rows
@@ -342,6 +359,8 @@ def test_growth_must_be_earned(tmp_path) -> None:
             growth_cooldown_epochs=1,
             growth_max_events=2,
             growth_min_progress=0.0,
+            # The earned-progress gate only governs non-strict mode.
+            strict_certificates=False,
         ),
         run=replace(config.run, results_dir=tmp_path, save_plot=False),
     )

@@ -22,12 +22,13 @@ The repository has two layers:
 ## Training methods
 
 | `training.method` | Trains | Certificate |
-|---|---|---|
+| --- | --- | --- |
 | `normal` | all weights (SGD) | none |
 | `fgd_approx` | all weights (tangent-space FGD) + RKHS head phase + growth | per-epoch tangent validation; certified head optimum per structure |
 | `fgd_rkhs` | linear head over a fixed structure | global optimum of the fixed structure (exact constants) |
 | `fgd_rkhs_grow` | certified head per structure + GroMo growth | per-structure global optimum; growth arbitrated by the closed-form ceiling `L*` |
 | `fgd_pl` | **all weights** (full-batch descent) + growth on `mu` collapse | measured-PL envelope, validated each epoch |
+| `fgd_adaptive_grow` | all weights through finite secants + representation-only growth | strict Algorithm 1 relative error and global envelope on the full empirical train set |
 
 Run any config with:
 
@@ -50,7 +51,7 @@ and approximate gradients `g_t` with certified relative error
 `(1+ε)U_t < ε‖g_t‖` of Algorithm 1), Proposition 3.8 gives **global**
 linear convergence:
 
-```
+```text
 L(f_T) − L* ≤ (1 − 2 η β⁻² μ r)^T · (L(f_0) − L*),   r = α − Kη/2 − (β + 3Kη/2)·ε̄/(1−ε̄)
 ```
 
@@ -131,7 +132,7 @@ All certificates control the loss. With one-hot MSE there is a rigorous
 bridge: if `‖f(x) − y‖² < 1/2` the argmax is necessarily correct, so by
 Markov
 
-```
+```text
 accuracy ≥ 1 − 4·L
 ```
 
@@ -152,7 +153,7 @@ whole network": replace assumed constants with **measured** ones.
 
 For the MSE, `∇_θ L = Jᵀ r / n` exactly, so
 
-```
+```text
 ‖∇_θ L‖² = (1/n²) rᵀ (J Jᵀ) r ≥ (2 λ_min(K_t)/n) · L,    K_t = J_t J_tᵀ
 ```
 
@@ -163,7 +164,7 @@ Gram. Each full-batch step must realize a descent coefficient
 absorbs the second-order remainder of the parametrization a posteriori.
 The run then carries the measured analogue of Proposition 3.8,
 
-```
+```text
 L_T ≤ L_0 · Π_t (1 − 2 η_t μ_t r_t),
 ```
 
@@ -186,6 +187,14 @@ per structure and apply to the empirical loss on the certificate subset
 can only raise the measured `λ_min`, at the honest price of certifying a
 smaller subset).
 
+**Strict theory mode** (`strict_certificates`, default on): a descent step
+is executed **only while the measured PL property holds**. When `μ` is
+collapsed the trainer refuses to step — the theory-prescribed responses
+are growing the structure (immediately, certificate-driven) or, once
+growth is exhausted, finishing with the exact RKHS head phase (where
+every paper property holds) and stopping. No uncertified descent is ever
+executed, so the trajectory never leaves the theory.
+
 Practical notes with certified semantics:
 
 - Losses for the acceptance test are measured in **float64**; when even
@@ -203,6 +212,56 @@ Practical notes with certified semantics:
   returns (a deployment choice along the certified trajectory —
   certificates are unaffected). Generalization is not, and cannot be,
   covered by an optimization certificate.
+
+### 6. Strict adaptive train-and-grow (`fgd_adaptive_grow`)
+
+This method applies Algorithm 1 directly to the finite empirical output
+space on the **complete training set**:
+
+```text
+H = B = R^(n x m),   <u,v> = (1/n) sum_i <u_i,v_i>,
+L(f) = (1/2)||f-y||_B^2,   K = alpha = beta = mu = 1,   L* = 0.
+```
+
+The constants are consequences of this geometry and cannot be supplied as
+hyperparameters. Parameter gradients, tangent projections and nonlinear
+target fitting only generate disposable candidates. Before any candidate
+can replace the live model, the trainer measures its actual finite secant
+
+```text
+g_t = (f_theta_t - f_theta_candidate) / eta
+```
+
+on every training point and requires the paper's strict acceptance test
+`(1 + epsilon) U_t < epsilon ||g_t||_B`, where
+`U_t = ||g_t - grad L(f_t)||_B` is exact in this finite space. It also checks
+the general learning-rate ceiling, positive descent coefficient, sufficient
+descent and the accumulated global envelope. Norms, relative error and the
+directional cosine are recorded for accepted and rejected attempts.
+
+All full-train quantities are computed as exact reductions of bounded
+minibatches. The implementation never performs a full-train accelerator
+forward or materializes a full Jacobian: losses, norms and inner products are
+accumulated in `float64`; exact tangent proposals accumulate `J_b^T J_b` and
+`J_b^T grad_b`; large tangent problems use matrix-free chunked CG.
+
+The MNIST reference config uses a fast strict path: the affine head and one
+64-iteration tangent solve are proposed on a fixed 256-point training screen.
+Only screen-valid candidates are promoted to the complete-train certificate;
+the screen can never commit a model. If no candidate certifies, one scheduled
+function-preserving layer is grown and the same functional step is retried.
+
+If the affine head, projected parameter gradient, nested tangent spaces and
+nonlinear secants all fail, GroMo may add neurons with useful incoming
+features and exactly zero outgoing weights. This changes the representation
+without changing `f_t`; the same functional iteration is then retried. If no
+such refinement remains, training stops with `representation_exhausted` and
+does not execute an uncertified fallback. See
+`configs/fgd/adaptive_grow_mnist.yaml` for the reference configuration.
+
+The guarantee is strictly **empirical**. A finite training set is compact,
+but this does not certify a continuous input domain, validation performance
+or generalization.
 
 ### Honest limitations
 

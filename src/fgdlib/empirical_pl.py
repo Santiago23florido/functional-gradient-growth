@@ -119,6 +119,12 @@ class EmpiricalPLConfig:
     # Keep a snapshot of the best-validation model (deployment choice made
     # by the pipeline; does not alter the certified trajectory).
     keep_best_validation: bool = True
+    # STRICT theory mode (default): descent steps are executed ONLY while
+    # the measured PL property holds (mu above the numerical-zero
+    # threshold). When mu is collapsed the trainer refuses to step -- the
+    # theory-prescribed responses are growing the structure or the exact
+    # RKHS head phase, never uncertified descent.
+    strict_certificates: bool = True
 
 
 @dataclass(frozen=True)
@@ -483,6 +489,21 @@ class EmpiricalPLTrainer:
     def run_epoch(self) -> EmpiricalPLEpochResult:
         mu, mu_valid = self.measure_mu()
         records: list[EmpiricalPLStepRecord] = []
+        if self.config.strict_certificates and not mu_valid:
+            # The PL property does not hold on this structure: refuse to
+            # descend (a step here would leave the theory). The caller
+            # must grow the structure or switch to the exact head phase.
+            return EmpiricalPLEpochResult(
+                step_records=[],
+                mu=mu,
+                mu_valid=False,
+                mu_collapsed=True,
+                train_loss=self._loss(),
+                envelope=self.envelope(),
+                envelope_enabled=self.envelope_enabled,
+                envelope_valid=None,
+                converged=self.converged,
+            )
         for _ in range(self.config.steps_per_epoch):
             record = self.step()
             records.append(record)

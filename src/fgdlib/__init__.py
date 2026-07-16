@@ -2,6 +2,9 @@
 
 The library owns everything that trains the network:
 
+- ``fgdlib.adaptive`` -- strict Algorithm-1 FGD over the complete finite
+  empirical output space, with disposable proposal families and
+  function-preserving representation growth.
 - ``fgdlib.tangent``  -- tangent-space FGD approximation with validation
   certificates (relative error, learning-rate interval, sensor checks).
 - ``fgdlib.rkhs``     -- certified RKHS FGD (arXiv:2606.16926) with exact
@@ -17,6 +20,21 @@ NOT part of the library; they consume it (see ``stable_tiny.pipeline``).
 
 from __future__ import annotations
 
+from fgdlib.adaptive import (
+    AdaptiveFGDAttemptRecord,
+    AdaptiveFGDCertificate,
+    AdaptiveFGDConfig,
+    AdaptiveFGDSearchResult,
+    AdaptiveGrowthResult,
+    certify_empirical_secant,
+    certify_empirical_secant_models,
+    empirical_functional_loss,
+    empirical_inner_product,
+    empirical_model_functional_loss,
+    empirical_norm,
+    grow_layer_function_preserving,
+    search_adaptive_fgd_step,
+)
 from fgdlib.empirical_pl import (
     EmpiricalPLConfig,
     EmpiricalPLEpochResult,
@@ -72,6 +90,20 @@ from fgdlib.training import (
 __all__ = [
     "__version__",
     "ensure_gromo_importable",
+    # strict empirical adaptive FGD
+    "AdaptiveFGDAttemptRecord",
+    "AdaptiveFGDCertificate",
+    "AdaptiveFGDConfig",
+    "AdaptiveFGDSearchResult",
+    "AdaptiveGrowthResult",
+    "certify_empirical_secant",
+    "certify_empirical_secant_models",
+    "empirical_functional_loss",
+    "empirical_inner_product",
+    "empirical_model_functional_loss",
+    "empirical_norm",
+    "grow_layer_function_preserving",
+    "search_adaptive_fgd_step",
     # empirical-PL certified full-weight training
     "EmpiricalPLConfig",
     "EmpiricalPLEpochResult",

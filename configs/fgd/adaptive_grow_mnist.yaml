@@ -1,0 +1,72 @@
+# Strict Algorithm-1 adaptive FGD on the complete empirical MNIST train set.
+# The certificate lives in H = B = R^(n x 10) with the empirical L2 norm;
+# K = alpha = beta = mu = 1 are derived and cannot be overridden.
+
+run:
+  name: fgd_adaptive_grow_mnist
+  results_dir: results
+  save_plot: false
+  show_plot: false
+
+data:
+  kind: mnist
+  in_features: 784
+  out_features: 10
+  batch_size: 64
+  train_seed: 0
+  mnist_train_samples: 4096
+  mnist_validation_samples: 1000
+  mnist_test_samples: 1000
+
+model:
+  hidden_size: 2
+  number_hidden_layers: 3
+  model_seed: 0
+
+training:
+  method: fgd_adaptive_grow
+  epochs: 300
+  accuracy_tolerance: 0.001
+  log_every: 1
+  device: auto
+
+fgd_adaptive:
+  epsilon: 0.9
+  learning_rate_initial: 0.5
+  learning_rate_backtrack: 0.5
+  learning_rate_min: 1.0e-6
+  learning_rate_trials: 7
+  screening_points: 256
+  family_order:
+    - head_closed_form
+    - tangent_least_squares
+  tangent_damping: [0.1, 0.001]
+  tangent_cg_iterations: [64]
+  # The tangent solve runs in the model dtype.  A 1e-8 relative residual is
+  # below the useful resolution of CUDA float32 and only wastes CG iterations.
+  tangent_cg_tolerance: 1.0e-6
+  exact_jacobian_max_elements: 2000000
+  computation_batch_size: 512
+  # The certificate itself is evaluated in float64, but its secant comes from
+  # float32 forwards.  These margins reflect that numerical floor while all
+  # theoretical inequalities remain strict.
+  certificate_margin: 1.0e-7
+  numerical_tolerance: 1.0e-6
+  gradient_tolerance: 1.0e-7
+  preservation_tolerance: 1.0e-6
+  max_growth_events: 32
+  max_hidden_size: 18
+  growth_neurons_per_event: 1
+
+growth_schedule:
+  enabled: true
+  layer_policy: round_robin
+
+wandb:
+  enabled: false
+  project: stable-tiny
+  group: fgd-adaptive
+  job_type: train
+  tags: [fgd_adaptive_grow, algorithm_1, strict_secant, mnist]
+  mode: online
+  dir: results

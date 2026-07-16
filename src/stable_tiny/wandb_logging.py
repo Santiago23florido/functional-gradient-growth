@@ -45,6 +45,18 @@ class NullWandbLogger:
     ) -> None:
         return None
 
+    def log_adaptive_attempt(self, record: Any) -> None:
+        return None
+
+    def log_adaptive_growth_event(
+        self,
+        *,
+        event: Any,
+        step: int,
+        growth_count: int,
+    ) -> None:
+        return None
+
     def finish(self, *, history: list[Any] | None = None) -> None:
         return None
 
@@ -108,6 +120,7 @@ class WandbRunLogger:
             "model/*",
             "fgd/*",
             "growth/*",
+            "fgd_adaptive/*",
         ):
             self._run.define_metric(pattern, step_metric="epoch")
 
@@ -215,9 +228,7 @@ class WandbRunLogger:
             or global_bound_valid is not None
             or getattr(entry, "fgd_sensor_valid", None) is not None
         ):
-            payload["fgd/theory_learning_rate_adjusted"] = (
-                theory_learning_rate_adjusted
-            )
+            payload["fgd/theory_learning_rate_adjusted"] = theory_learning_rate_adjusted
 
         if fgd_payload_active:
             payload["fgd/learning_rate_clipped_by_validation"] = bool(
@@ -305,6 +316,27 @@ class WandbRunLogger:
         if entry.scaling_factor is not None:
             payload["growth/scaling_factor"] = entry.scaling_factor
 
+        for attribute_name, metric_name in (
+            ("fgd_adaptive_status", "fgd_adaptive/status"),
+            ("fgd_adaptive_family", "fgd_adaptive/family"),
+            ("fgd_adaptive_subspace", "fgd_adaptive/subspace"),
+            (
+                "fgd_adaptive_error_upper_bound",
+                "fgd_adaptive/error_upper_bound",
+            ),
+            (
+                "fgd_adaptive_algorithm_margin",
+                "fgd_adaptive/algorithm_margin",
+            ),
+            (
+                "fgd_adaptive_directional_cosine",
+                "fgd_adaptive/cosine",
+            ),
+        ):
+            value = getattr(entry, attribute_name, None)
+            if value is not None:
+                payload[metric_name] = value
+
         self._run.log(payload)
 
     def log_growth_event(
@@ -345,6 +377,78 @@ class WandbRunLogger:
                 "growth/event": 1,
                 "growth/best_scaling_factor": event.best_scaling_factor,
                 "growth/best_train_loss": event.best_train_loss,
+            }
+        )
+
+    def log_adaptive_attempt(self, record: Any) -> None:
+        """Log every strict certificate attempt, including rejections."""
+        if self._run is None:
+            return
+        certificate = record.certificate
+        payload = {
+            "epoch": record.step,
+            "fgd_adaptive/attempt": record.attempt,
+            "fgd_adaptive/family": record.family,
+            "fgd_adaptive/subspace": record.subspace,
+            "fgd_adaptive/certificate_scope": record.certificate_scope,
+            "fgd_adaptive/accepted": (
+                certificate.accepted and record.certificate_scope == "full_train"
+            ),
+            "fgd_adaptive/scope_condition_passed": certificate.accepted,
+            "fgd_adaptive/learning_rate": certificate.learning_rate,
+            "fgd_adaptive/error_upper_bound": (certificate.error_upper_bound),
+            "fgd_adaptive/approximation_norm": (certificate.approximation_norm),
+            "fgd_adaptive/target_norm": certificate.target_norm,
+            "fgd_adaptive/relative_error": certificate.relative_error,
+            "fgd_adaptive/algorithm_margin": certificate.algorithm_margin,
+            "fgd_adaptive/K": certificate.smoothness,
+            "fgd_adaptive/alpha": certificate.alpha,
+            "fgd_adaptive/beta": certificate.beta,
+            "fgd_adaptive/mu": certificate.mu,
+            "fgd_adaptive/loss_before": certificate.loss_before,
+            "fgd_adaptive/loss_after": certificate.loss_after,
+        }
+        optional = {
+            "fgd_adaptive/cosine": certificate.directional_cosine,
+            "fgd_adaptive/lr_upper_bound": (certificate.learning_rate_upper_bound),
+            "fgd_adaptive/descent_coefficient": (certificate.descent_coefficient),
+            "fgd_adaptive/contraction": certificate.contraction,
+            "fgd_adaptive/predicted_loss_upper_bound": (
+                certificate.predicted_loss_upper_bound
+            ),
+            "fgd_adaptive/rejection_reason": certificate.rejection_reason,
+            "fgd_adaptive/solver": record.solver,
+            "fgd_adaptive/damping": record.damping,
+            "fgd_adaptive/solver_iterations": record.solver_iterations,
+            "fgd_adaptive/growth_probe_layer": record.growth_layer_index,
+            "fgd_adaptive/certificate_points": record.certificate_points,
+        }
+        payload.update(
+            {key: value for key, value in optional.items() if value is not None}
+        )
+        self._run.log(payload)
+
+    def log_adaptive_growth_event(
+        self,
+        *,
+        event: Any,
+        step: int,
+        growth_count: int,
+    ) -> None:
+        if self._run is None:
+            return
+        self._run.log(
+            {
+                "epoch": step,
+                "growth/count": growth_count,
+                "growth/event": 1,
+                "growth/layer_index": event.layer_index,
+                "growth/added_parameters": event.added_parameters,
+                "growth/output_drift": event.output_drift,
+                "growth/certified_candidate_available": (
+                    event.certified_candidate_available
+                ),
+                "growth/best_relative_error": event.best_relative_error,
             }
         )
 
