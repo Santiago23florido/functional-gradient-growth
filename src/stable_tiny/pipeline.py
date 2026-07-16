@@ -1943,16 +1943,20 @@ def _run_fgd_pl_pipeline(
 
         if epoch_result.converged:
             if progress is not None:
-                progress(
-                    f"[PL] converged at epoch {epoch}: loss/gradient at "
-                    "numerical zero"
-                    + (
+                if trainer.converged_reason == "numerical_zero":
+                    reason = "loss/gradient at numerical zero" + (
                         " with the measured PL certificate active -- the "
                         "run is certified globally optimal."
                         if epoch_result.mu_valid
                         else "."
                     )
-                )
+                else:
+                    reason = (
+                        "no measurable certified descent at any admissible "
+                        "learning rate (stationary at the achievable "
+                        "precision)."
+                    )
+                progress(f"[PL] converged at epoch {epoch}: {reason}")
             break
 
         should_grow_now = (

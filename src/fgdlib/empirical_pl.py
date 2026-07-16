@@ -106,8 +106,12 @@ class EmpiricalPLConfig:
     # growth sensor.
     ridge: float = 0.0
     # Declare convergence after this many consecutive fully-rejected steps
-    # (descent below measurement resolution: stationary at precision).
+    # (descent below measurement resolution: stationary at precision). A
+    # fully-rejected step CONTINUES the eta search: the persistent
+    # learning rate keeps shrinking across steps until acceptance or the
+    # floor below.
     max_rejected_steps: int = 3
+    learning_rate_floor: float = 1e-12
     # Keep a snapshot of the best-validation model (deployment choice made
     # by the pipeline; does not alter the certified trajectory).
     keep_best_validation: bool = True
@@ -183,6 +187,8 @@ class EmpiricalPLTrainer:
             raise ValueError(
                 "fgd_pl.growth_min_ceiling_improvement must be >= 0."
             )
+        if config.learning_rate_floor <= 0.0:
+            raise ValueError("fgd_pl.learning_rate_floor must be positive.")
 
         self.config = config
         device = device or next(model.parameters()).device
@@ -211,6 +217,7 @@ class EmpiricalPLTrainer:
         # sufficient descent and stationarity.
         self.envelope_enabled = config.ridge == 0.0
         self._consecutive_rejections = 0
+        self.converged_reason = ""
         self.initial_loss = self._loss()
         # Measured Prop. 3.8-style envelope: L0 * prod (1 - 2 eta mu r).
         self.contraction_product = 1.0
@@ -380,6 +387,7 @@ class EmpiricalPLTrainer:
             or loss_before <= config.loss_tolerance
         ):
             self.converged = True
+            self.converged_reason = "numerical_zero"
             return EmpiricalPLStepRecord(
                 step=self.total_steps,
                 learning_rate=0.0,
@@ -393,6 +401,7 @@ class EmpiricalPLTrainer:
             )
 
         learning_rate = self.learning_rate
+        last_tried_rate = learning_rate
         backtracks = 0
         while True:
             self._apply_update(gradients, -learning_rate)
@@ -407,6 +416,7 @@ class EmpiricalPLTrainer:
             # the second-order remainder of the parametrization, so this
             # loop terminates for small enough eta (descent -> 1).
             self._apply_update(gradients, learning_rate)
+            last_tried_rate = learning_rate
             backtracks += 1
             if backtracks > config.max_backtracks:
                 accepted = False
@@ -428,10 +438,22 @@ class EmpiricalPLTrainer:
                 self.contraction_product *= min(max(factor, 0.0), 1.0)
         else:
             self._consecutive_rejections += 1
-            if self._consecutive_rejections >= config.max_rejected_steps:
-                # Descent is below measurement resolution even after full
-                # backtracking: stationary at the achievable precision.
+            # Continue the eta search where it left off: the next step
+            # starts below the smallest rate just rejected, so consecutive
+            # rejections keep shrinking eta instead of retrying the same
+            # cascade.
+            self.learning_rate = max(
+                last_tried_rate * config.backtrack_factor,
+                config.learning_rate_floor,
+            )
+            if (
+                self.learning_rate <= config.learning_rate_floor
+                or self._consecutive_rejections >= config.max_rejected_steps
+            ):
+                # No measurable certified descent at any admissible eta:
+                # stationary at the achievable precision.
                 self.converged = True
+                self.converged_reason = "stationary_at_precision"
         self.total_steps += 1
         return EmpiricalPLStepRecord(
             step=self.total_steps,
