@@ -1737,6 +1737,26 @@ def _run_fgd_rkhs_grow_pipeline(
     )
 
 
+def _structure_ceiling(
+    mlp: GrowingMLP,
+    train_x: torch.Tensor,
+    train_y: torch.Tensor,
+) -> float:
+    """Closed-form certified ceiling L* of a structure's output layer.
+
+    Exact least-squares optimum of the affine head over the frozen hidden
+    activations -- the same quantity the RKHS phase certifies, computable
+    without training, used to arbitrate growth candidates.
+    """
+    feature_map = _frozen_feature_map_from_grown_mlp(mlp)
+    with torch.no_grad():
+        features = feature_map(train_x).cpu()
+        targets = train_y.reshape(train_y.shape[0], -1).to(torch.float64).cpu()
+        solution = torch.linalg.lstsq(features, targets).solution
+        residual = features @ solution - targets
+        return float(residual.square().sum().item()) / (2.0 * targets.shape[0])
+
+
 def _run_fgd_pl_pipeline(
     *,
     config: PipelineConfig,
@@ -1945,35 +1965,55 @@ def _run_fgd_pl_pipeline(
         if should_grow_now:
             growable = getattr(mlp, "_growable_layers", [])
             cap = pl_config.growth_max_hidden_size
-            layer_index = None
-            if growable:
-                preferred = layer_index_for_growth(
-                    growth_count=growth_count,
-                    number_hidden_layers=config.model.number_hidden_layers,
-                    config=config.growth_schedule,
-                ) % len(growable)
-                for offset in range(len(growable)):
-                    candidate = (preferred + offset) % len(growable)
-                    width = mlp.layers[candidate].layer.out_features
-                    if cap is None or width < cap:
-                        layer_index = candidate
-                        break
-            if layer_index is None:
-                if progress is not None:
-                    progress(
-                        "[PL] mu collapsed but every hidden block reached "
-                        "the width cap; continuing without growth."
+            eligible = [
+                index
+                for index in range(len(growable))
+                if cap is None or mlp.layers[index].layer.out_features < cap
+            ]
+            best_candidate = None
+            if eligible:
+                # Ceiling arbiter: trial-grow every eligible layer and keep
+                # the candidate whose certified head optimum L* (closed
+                # form) is lowest.
+                current_ceiling = _structure_ceiling(mlp, train_x, train_y)
+                _clear_inaccessible_tensor_caches(mlp)
+                for index in eligible:
+                    trial = copy.deepcopy(mlp)
+                    trial_result = grow_layer(
+                        model=trial,
+                        train_loader=train_loader,
+                        layer_index=index,
+                        device=device,
+                        line_search_config=config.scaling_line_search,
+                        optimal_update_kwargs=None,
+                        progress=None,
                     )
-            else:
-                growth_result = grow_layer(
-                    model=mlp,
-                    train_loader=train_loader,
-                    layer_index=layer_index,
-                    device=device,
-                    line_search_config=config.scaling_line_search,
-                    optimal_update_kwargs=None,
-                    progress=None,
+                    ceiling = _structure_ceiling(trial, train_x, train_y)
+                    if best_candidate is None or ceiling < best_candidate[0]:
+                        best_candidate = (ceiling, index, trial, trial_result)
+                ceiling_improvement = (
+                    current_ceiling - best_candidate[0]
+                ) / max(current_ceiling, pl_config.eps)
+                if (
+                    ceiling_improvement
+                    < pl_config.growth_min_ceiling_improvement
+                ):
+                    if progress is not None:
+                        progress(
+                            "[PL] growth skipped: no candidate lowers the "
+                            f"certified ceiling (best {best_candidate[0]:.4e}"
+                            f" vs current {current_ceiling:.4e}, "
+                            f"improvement {ceiling_improvement:+.4%})."
+                        )
+                    best_candidate = None
+                    epochs_since_growth = 0  # retry only after cooldown
+            elif progress is not None:
+                progress(
+                    "[PL] mu collapsed but every hidden block reached "
+                    "the width cap; continuing without growth."
                 )
+            if best_candidate is not None:
+                best_ceiling, layer_index, mlp, growth_result = best_candidate
                 growth_count += 1
                 epochs_since_growth = 0
                 growth_events.append(growth_result)
@@ -2002,6 +2042,7 @@ def _run_fgd_pl_pipeline(
                     scaling_factor=growth_result.best_scaling_factor,
                     fgd_approximation_kind="empirical_pl",
                     fgd_pl_mu=epoch_result.mu,
+                    fgd_rkhs_loss_star=best_ceiling,
                 )
                 history.append(growth_entry)
                 wandb_logger.log_history_entry(growth_entry)
@@ -2009,7 +2050,8 @@ def _run_fgd_pl_pipeline(
                     progress(
                         f"[PL] growth {growth_count} at epoch {epoch}: mu "
                         "collapsed AND certified descent stopped paying "
-                        f"off; grew layer {layer_index}, "
+                        f"off; ceiling arbiter grew layer {layer_index} "
+                        f"(certified ceiling L*={best_ceiling:.4e}), "
                         f"params={count_parameters(mlp)}; fresh "
                         "per-structure certificate."
                     )

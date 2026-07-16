@@ -91,6 +91,11 @@ class EmpiricalPLConfig:
     # current structure stopped paying off). This changes only the growth
     # timing; the per-step descent certificates are untouched.
     growth_min_progress: float = 0.01
+    # Growth is ARBITRATED by the certified ceiling: every eligible layer
+    # is trial-grown and the candidate with the lowest closed-form head
+    # optimum L* wins; growth is skipped when no candidate improves the
+    # current ceiling by at least this relative amount.
+    growth_min_ceiling_improvement: float = 0.0
     # Optional ridge term: the objective becomes F = L + (ridge/2)||theta||^2.
     # HONEST certificate semantics: the global vs-zero envelope
     # L_0 prod(1 - 2 eta mu r) is only available for the pure data loss
@@ -174,6 +179,10 @@ class EmpiricalPLTrainer:
             raise ValueError("fgd_pl.max_rejected_steps must be >= 1.")
         if config.growth_min_progress < 0.0:
             raise ValueError("fgd_pl.growth_min_progress must be >= 0.")
+        if config.growth_min_ceiling_improvement < 0.0:
+            raise ValueError(
+                "fgd_pl.growth_min_ceiling_improvement must be >= 0."
+            )
 
         self.config = config
         device = device or next(model.parameters()).device
@@ -267,21 +276,11 @@ class EmpiricalPLTrainer:
         for parameter, gradient in zip(self.model.parameters(), gradients):
             parameter.add_(gradient, alpha=scale)
 
-    def measure_mu(self) -> tuple[float, bool]:
-        """Exact smallest eigenvalue of the tangent Gram on the certificate set.
-
-        Builds the per-(sample, output) Jacobian rows by plain autograd
-        (robust for any module, including GroMo layers) and returns
-        ``(mu, valid)`` with ``mu = lambda_min(J J^T)/n_cert``. The Gram is
-        rank deficient whenever the parameter count is smaller than
-        ``n_cert * out_features`` -- then ``mu = 0`` and the certificate is
-        honestly off (underparametrized structure).
-        """
+    def _jacobian_rows_loop(self, x: torch.Tensor) -> torch.Tensor:
+        """Per-(sample, output) Jacobian rows by plain autograd (robust)."""
         parameters = [p for p in self.model.parameters() if p.requires_grad]
-        x = self.train_x[self.certificate_indices]
-        n_cert = x.shape[0]
         rows: list[torch.Tensor] = []
-        for i in range(n_cert):
+        for i in range(x.shape[0]):
             output = self.model(x[i : i + 1]).reshape(-1)
             for c in range(output.shape[0]):
                 grads = torch.autograd.grad(
@@ -301,7 +300,63 @@ class EmpiricalPLTrainer:
                     ]
                 ).to(torch.float64)
                 rows.append(row)
-        jacobian = torch.stack(rows)  # (n_cert * m, P)
+        return torch.stack(rows)
+
+    def _jacobian_rows_fast(self, x: torch.Tensor) -> torch.Tensor:
+        """Vectorized Jacobian rows via torch.func (vmap + jacrev)."""
+        from torch.func import functional_call, jacrev, vmap
+
+        params = {
+            name: parameter
+            for name, parameter in self.model.named_parameters()
+            if parameter.requires_grad
+        }
+
+        def network(p: dict, sample: torch.Tensor) -> torch.Tensor:
+            return functional_call(
+                self.model,
+                p,
+                (sample.unsqueeze(0),),
+            ).reshape(-1)
+
+        jac = vmap(jacrev(network), in_dims=(None, 0))(params, x)
+        n = x.shape[0]
+        m = self.train_y.shape[1]
+        # jac[name]: (n, m, *param.shape) -> rows ordered (sample, channel),
+        # columns concatenated in parameter registration order (same layout
+        # as the autograd loop).
+        blocks = [jac[name].reshape(n, m, -1) for name in params]
+        jacobian = torch.cat(blocks, dim=2).reshape(n * m, -1)
+        return jacobian.to(torch.float64)
+
+    def _jacobian_rows(self, x: torch.Tensor) -> torch.Tensor:
+        try:
+            return self._jacobian_rows_fast(x)
+        except Exception:
+            # torch.func can fail on exotic modules; the loop is always
+            # correct, just slower.
+            return self._jacobian_rows_loop(x)
+
+    def measure_mu(self) -> tuple[float, bool]:
+        """Exact smallest eigenvalue of the tangent Gram on the certificate set.
+
+        Returns ``(mu, valid)`` with ``mu = lambda_min(J J^T)/n_cert``.
+        Rank shortcut: the Gram has ``n_cert * out_features`` rows and rank
+        at most the parameter count ``P``; when ``P`` is smaller,
+        ``lambda_min = 0`` exactly and no Jacobian needs to be built (the
+        certificate is honestly off: underparametrized structure).
+        """
+        parameters = [p for p in self.model.parameters() if p.requires_grad]
+        parameter_count = sum(p.numel() for p in parameters)
+        x = self.train_x[self.certificate_indices]
+        n_cert = x.shape[0]
+        gram_rows = n_cert * self.train_y.shape[1]
+        if parameter_count < gram_rows:
+            self.current_mu = 0.0
+            self.current_mu_valid = False
+            return 0.0, False
+
+        jacobian = self._jacobian_rows(x)  # (n_cert * m, P)
         gram = jacobian @ jacobian.T
         eigenvalues = torch.linalg.eigvalsh(gram)
         lambda_min = max(float(eigenvalues.min().item()), 0.0)

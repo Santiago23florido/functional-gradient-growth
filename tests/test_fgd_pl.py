@@ -65,7 +65,9 @@ def test_measured_mu_matches_bruteforce() -> None:
     )
     mu, valid = trainer.measure_mu()
     expected = _brute_force_mu(model, trainer.train_x[trainer.certificate_indices])
-    assert mu == pytest.approx(expected, rel=1e-8, abs=1e-15)
+    # The vectorized and looped Jacobians differ by float32 accumulation
+    # order; the eigenvalue agrees to that precision.
+    assert mu == pytest.approx(expected, rel=1e-4, abs=1e-12)
     # Overparametrized here: P = 3*8+8+8*2+2 = 50 >= 12*2 = 24 rows.
     assert valid and mu > 0.0
 
@@ -140,6 +142,40 @@ def test_mu_is_zero_when_underparametrized() -> None:
     mu, valid = trainer.measure_mu()
     assert mu == pytest.approx(0.0, abs=1e-10)
     assert not valid  # certificate honestly off -> growth trigger
+
+
+def test_fast_jacobian_matches_autograd_loop() -> None:
+    """The vectorized torch.func path must match the plain autograd loop."""
+    x, y = _problem(n=6, seed=15)
+    model = _mlp(seed=15)
+    trainer = EmpiricalPLTrainer(
+        model, x, y, EmpiricalPLConfig(certificate_points=6)
+    )
+    subset = trainer.train_x[trainer.certificate_indices]
+    fast = trainer._jacobian_rows_fast(subset)
+    loop = trainer._jacobian_rows_loop(subset)
+    assert fast.shape == loop.shape
+    assert torch.allclose(fast, loop, atol=1e-6)
+
+
+def test_rank_shortcut_skips_jacobian_when_underparametrized() -> None:
+    """P < certificate rows => mu = 0 exactly, without building J."""
+    x, y = _problem(n=40, seed=17)
+    model = _mlp(hidden=2, seed=17)  # P = 14 < 80 rows
+    trainer = EmpiricalPLTrainer(
+        model, x, y, EmpiricalPLConfig(certificate_points=40)
+    )
+    calls = {"count": 0}
+    original = trainer._jacobian_rows
+
+    def counting(*args, **kwargs):
+        calls["count"] += 1
+        return original(*args, **kwargs)
+
+    trainer._jacobian_rows = counting  # type: ignore[method-assign]
+    mu, valid = trainer.measure_mu()
+    assert mu == 0.0 and not valid
+    assert calls["count"] == 0  # the shortcut avoided all Jacobian work
 
 
 def test_ridge_gradient_and_envelope_semantics() -> None:
@@ -267,6 +303,10 @@ def test_pipeline_dispatch_fgd_pl_with_growth(tmp_path) -> None:
     # -> the certificate-driven growth trigger must have fired.
     assert "GRO" in step_types
     assert len(result.growth_events) >= 1
+    # The ceiling arbiter records the certified L* of the grown structure.
+    growth_entries = [e for e in result.history if e.step_type == "GRO"]
+    for entry in growth_entries:
+        assert entry.fgd_rkhs_loss_star is not None
     assert result.history[-1].train_loss <= result.history[0].train_loss
 
 

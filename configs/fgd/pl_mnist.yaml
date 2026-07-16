@@ -66,6 +66,10 @@ fgd_pl:
   # Growth must be earned: fires only when mu is collapsed AND the
   # relative per-epoch loss improvement drops below this threshold.
   growth_min_progress: 0.01
+  # Ceiling arbiter: every eligible layer is trial-grown and the lowest
+  # closed-form head optimum L* wins; skip growth when no candidate
+  # improves the current ceiling by at least this relative amount.
+  growth_min_ceiling_improvement: 0.01
   # F = L + (ridge/2)||theta||^2. Keep 0.0 to retain the global vs-zero
   # envelope; a small positive value tames output magnitudes at the cost
   # of downgrading the certificate to sufficient descent + stationarity.
