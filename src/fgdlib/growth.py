@@ -21,6 +21,10 @@ from gromo.utils.training_utils import compute_statistics, evaluate_model
 ProgressFn = Callable[[str], None]
 LineSearchMethod = Literal["golden_section"]
 
+# Sample cap for the function-preservation drift check; inputs are cached
+# before growth so a shuffling loader cannot invalidate the comparison.
+_PRESERVATION_CHECK_SAMPLES = 4096
+
 
 @dataclass(frozen=True)
 class LineSearchPoint:
@@ -165,6 +169,100 @@ def _golden_section_line_search(
     return best_point.scaling_factor, best_point.train_loss, line_search
 
 
+def _function_preserving_growth(
+    model: GrowingMLP,
+    train_loader: torch.utils.data.DataLoader,
+    layer_index: int,
+    device: torch.device,
+    optimal_update_kwargs: dict[str, Any],
+    preservation_tolerance: float,
+    progress: ProgressFn | None,
+) -> GrowthResult:
+    """Grow one layer without changing the represented function.
+
+    TINY statistics still select the incoming weights of the new neurons,
+    but their outgoing weights are exactly zero and no delta touches the
+    existing weights, so the committed function is unchanged: growth only
+    refines the representation (enlarges the tangent image) and is not an
+    optimization step. The measured output drift must stay within
+    ``preservation_tolerance``.
+    """
+    criterion_sum = torch.nn.MSELoss(reduction="sum")
+    criterion_mean = torch.nn.MSELoss(reduction="mean")
+
+    model.eval()
+    reference: list[tuple[torch.Tensor, torch.Tensor]] = []
+    cached_samples = 0
+    with torch.no_grad():
+        for batch_x, _ in train_loader:
+            batch_x = batch_x.to(device)
+            reference.append((batch_x, model(batch_x).detach().clone()))
+            cached_samples += batch_x.shape[0]
+            if cached_samples >= _PRESERVATION_CHECK_SAMPLES:
+                break
+
+    model.set_growing_layers(index=layer_index)
+    compute_statistics(
+        model,
+        train_loader,
+        loss_function=criterion_sum,
+        device=device,
+    )
+    model.compute_optimal_updates(
+        **{
+            **optimal_update_kwargs,
+            "compute_delta": False,
+            "omega_zero": True,
+        }
+    )
+    model.reset_computation()
+    model.dummy_select_update()
+
+    growing_layer = model.currently_updated_layer
+    growing_layer.apply_change(
+        apply_delta=False,
+        apply_extension=True,
+        input_extension_scaling=1.0,
+        output_extension_scaling=1.0,
+    )
+    growing_layer.delete_update()
+    model.currently_updated_layer_index = None
+
+    model.eval()
+    drift = 0.0
+    with torch.no_grad():
+        for batch_x, output_before in reference:
+            batch_drift = float(
+                torch.max(torch.abs(model(batch_x) - output_before)).item()
+            )
+            drift = max(drift, batch_drift)
+    if not math.isfinite(drift) or drift > preservation_tolerance:
+        raise RuntimeError(
+            "Function-preserving growth exceeded its output tolerance: "
+            f"{drift:.3e} > {preservation_tolerance:.3e}."
+        )
+
+    train_loss, _ = evaluate_model(
+        model,
+        train_loader,
+        criterion_mean,
+        use_extended_model=False,
+        device=device,
+    )
+    point = LineSearchPoint(scaling_factor=1.0, train_loss=float(train_loss))
+    if progress is not None:
+        progress(
+            f"  function-preserving growth: drift={drift:.3e}, "
+            f"train_loss={point.train_loss:.4f}"
+        )
+    return GrowthResult(
+        layer_index=layer_index,
+        best_scaling_factor=1.0,
+        best_train_loss=float(train_loss),
+        line_search=[point],
+    )
+
+
 def grow_layer(
     model: GrowingMLP,
     train_loader: torch.utils.data.DataLoader,
@@ -173,12 +271,27 @@ def grow_layer(
     line_search_config: ScalingLineSearchConfig,
     optimal_update_kwargs: dict[str, Any] | None = None,
     progress: ProgressFn | None = None,
+    function_preserving: bool = False,
+    preservation_tolerance: float = 1e-6,
 ) -> GrowthResult:
     """Grow one GroMo layer and apply the best line-search update.
 
     ``layer_index`` follows GroMo's local API: it is zero-based over
-    ``model._growable_layers``.
+    ``model._growable_layers``. With ``function_preserving=True`` the
+    scaling line search is skipped and the extension is applied with zero
+    outgoing weights, leaving the represented function exactly unchanged.
     """
+    if function_preserving:
+        return _function_preserving_growth(
+            model=model,
+            train_loader=train_loader,
+            layer_index=layer_index,
+            device=device,
+            optimal_update_kwargs=dict(optimal_update_kwargs or {}),
+            preservation_tolerance=preservation_tolerance,
+            progress=progress,
+        )
+
     criterion_sum = torch.nn.MSELoss(reduction="sum")
     criterion_mean = torch.nn.MSELoss(reduction="mean")
 

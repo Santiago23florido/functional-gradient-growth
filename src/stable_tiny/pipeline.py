@@ -1048,6 +1048,10 @@ def _probe_fgd_growth(
             line_search_config=config.scaling_line_search,
             optimal_update_kwargs=optimal_update_kwargs,
             progress=None,
+            function_preserving=config.fgd_approx.growth_function_preserving,
+            preservation_tolerance=(
+                config.fgd_approx.growth_preservation_tolerance
+            ),
         )
         certificate = evaluate_fgd_validation_certificate(
             model=trial_model,
@@ -2814,6 +2818,12 @@ def run_pipeline(
                                 ),
                             ),
                             progress=progress,
+                            function_preserving=(
+                                config.fgd_approx.growth_function_preserving
+                            ),
+                            preservation_tolerance=(
+                                config.fgd_approx.growth_preservation_tolerance
+                            ),
                         )
                 else:
                     layer_index = layer_index_for_growth(

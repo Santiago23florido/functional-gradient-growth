@@ -82,6 +82,10 @@ class FGDApproxConfig:
     tiny_maximum_added_neurons: int | None = None
     tiny_numerical_threshold: float = 1e-6
     tiny_statistical_threshold: float = 1e-3
+    # Function-preserving growth: new neurons keep zero outgoing weights, no
+    # delta and no scaling line search, so growth never changes the function.
+    growth_function_preserving: bool = False
+    growth_preservation_tolerance: float = 1e-6
 
 
 @dataclass(frozen=True)
