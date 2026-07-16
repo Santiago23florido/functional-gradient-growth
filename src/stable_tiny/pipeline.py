@@ -34,6 +34,10 @@ from fgdlib.tangent import (
     tiny_optimal_update_kwargs,
     train_one_epoch_fgd_approx,
 )
+from fgdlib.empirical_pl import (
+    EmpiricalPLConfig,
+    EmpiricalPLTrainer,
+)
 from fgdlib.rkhs import (
     FGDRKHSConfig,
     FGDRKHSEpochResult,
@@ -71,8 +75,14 @@ from gromo.containers.growing_mlp import GrowingMLP
 
 
 ProgressFn = Callable[[str], None]
-TrainingMethod = Literal["normal", "fgd_approx", "fgd_rkhs", "fgd_rkhs_grow"]
-StepType = Literal["INIT", "SGD", "FGD", "SEC", "GRO", "RKHS"]
+TrainingMethod = Literal[
+    "normal",
+    "fgd_approx",
+    "fgd_rkhs",
+    "fgd_rkhs_grow",
+    "fgd_pl",
+]
+StepType = Literal["INIT", "SGD", "FGD", "SEC", "GRO", "RKHS", "PL"]
 DataKind = Literal["multi_sin", "smooth_sin", "cifar10", "mnist"]
 
 
@@ -138,6 +148,7 @@ class PipelineConfig:
     fgd_approx: FGDApproxConfig = field(default_factory=FGDApproxConfig)
     secant_fgd: SecantFGDConfig = field(default_factory=SecantFGDConfig)
     fgd_rkhs: FGDRKHSConfig = field(default_factory=FGDRKHSConfig)
+    fgd_pl: EmpiricalPLConfig = field(default_factory=EmpiricalPLConfig)
     scaling_line_search: ScalingLineSearchConfig = field(
         default_factory=ScalingLineSearchConfig
     )
@@ -193,6 +204,8 @@ class HistoryEntry:
     fgd_rkhs_dictionary_size: int | None = None
     fgd_rkhs_functional_loss: float | None = None
     fgd_rkhs_loss_star: float | None = None
+    fgd_pl_mu: float | None = None
+    fgd_pl_backtracks: int | None = None
 
 
 @dataclass
@@ -296,6 +309,7 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         "fgd_approx",
         "secant_fgd",
         "fgd_rkhs",
+        "fgd_pl",
         "scaling_line_search",
         "growth_schedule",
         "wandb",
@@ -315,6 +329,7 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         fgd_approx=_section_dataclass("fgd_approx", FGDApproxConfig, raw),
         secant_fgd=_section_dataclass("secant_fgd", SecantFGDConfig, raw),
         fgd_rkhs=_section_dataclass("fgd_rkhs", FGDRKHSConfig, raw),
+        fgd_pl=_section_dataclass("fgd_pl", EmpiricalPLConfig, raw),
         scaling_line_search=_section_dataclass(
             "scaling_line_search",
             ScalingLineSearchConfig,
@@ -1722,6 +1737,262 @@ def _run_fgd_rkhs_grow_pipeline(
     )
 
 
+def _run_fgd_pl_pipeline(
+    *,
+    config: PipelineConfig,
+    device: torch.device,
+    train_loader: torch.utils.data.DataLoader,
+    validation_loader: torch.utils.data.DataLoader,
+    test_loader: torch.utils.data.DataLoader,
+    classification: bool,
+    wandb_logger: Any,
+    progress: ProgressFn | None,
+) -> PipelineResult:
+    """Empirical-PL certified full-weight training (training.method: fgd_pl).
+
+    Trains ALL the network's weights with full-batch descent under measured
+    certificates (see ``fgdlib.empirical_pl``): the PL constant
+    ``mu_t = lambda_min(J J^T)/n`` is measured, never assumed; steps are
+    accepted only when the realized descent coefficient exceeds ``r_min``;
+    and the measured envelope ``L_0 prod(1 - 2 eta mu r)`` is validated
+    every epoch. When ``mu`` collapses (rank-deficient tangent Gram: the
+    structure is too small to certify global descent) and growth is
+    enabled, one GroMo layer is grown and a fresh per-structure certificate
+    starts. Certificates are per structure and a-posteriori
+    (conditional-but-verified), which is the honest maximum for nonconvex
+    full-weight training.
+    """
+    pl_config = config.fgd_pl
+    loss_function = torch.nn.MSELoss()
+    torch.manual_seed(config.model.model_seed)
+    mlp = GrowingMLP(
+        in_features=config.data.in_features,
+        out_features=config.data.out_features,
+        hidden_size=config.model.hidden_size,
+        number_hidden_layers=config.model.number_hidden_layers,
+        device=device,
+    )
+    train_x, train_y = _materialize_dataset(train_loader, device)
+
+    def build_trainer() -> EmpiricalPLTrainer:
+        return EmpiricalPLTrainer(
+            model=mlp,
+            train_x=train_x,
+            train_y=train_y,
+            config=pl_config,
+            device=device,
+        )
+
+    def metrics(loader: torch.utils.data.DataLoader):
+        return evaluate_regression_metrics(
+            mlp,
+            loader,
+            loss_function,
+            device=device,
+            accuracy_tolerance=config.training.accuracy_tolerance,
+            classification=classification,
+        )
+
+    trainer = build_trainer()
+    if progress is not None:
+        progress(f"Using device: {device}")
+        progress(f"Training method: {config.training.method}")
+        if wandb_logger.enabled:
+            progress(
+                f"W&B logging enabled: project={config.wandb.project}, "
+                f"run={config.wandb.run_name or config.run.name}"
+            )
+        progress("Original model:")
+        progress(str(mlp))
+        progress(
+            "[PL] certified full-weight training: "
+            f"certificate_points={len(trainer.certificate_indices)}, "
+            f"r_min={pl_config.r_min}, "
+            f"mu_collapse_threshold={pl_config.mu_collapse_threshold:g}"
+        )
+
+    history: list[HistoryEntry] = []
+    growth_events: list[GrowthResult] = []
+    train_metrics = metrics(train_loader)
+    validation_metrics = metrics(validation_loader)
+    test_metrics = metrics(test_loader)
+    init_entry = HistoryEntry(
+        step=0,
+        step_type="INIT",
+        train_loss=train_metrics.loss,
+        validation_loss=validation_metrics.loss,
+        test_loss=test_metrics.loss,
+        train_accuracy=train_metrics.accuracy,
+        validation_accuracy=validation_metrics.accuracy,
+        test_accuracy=test_metrics.accuracy,
+        learning_rate=pl_config.learning_rate,
+        num_params=count_parameters(mlp),
+        fgd_approximation_kind="empirical_pl",
+    )
+    history.append(init_entry)
+    wandb_logger.log_history_entry(init_entry)
+
+    last_test_loss = test_metrics.loss
+    growth_count = 0
+    epochs_since_growth = pl_config.growth_cooldown_epochs
+    for epoch in range(1, config.training.epochs + 1):
+        epoch_result = trainer.run_epoch()
+        last_record = epoch_result.step_records[-1]
+        train_metrics = metrics(train_loader)
+        validation_metrics = metrics(validation_loader)
+        test_metrics = metrics(test_loader)
+        epoch_entry = HistoryEntry(
+            step=epoch,
+            step_type="PL",
+            train_loss=train_metrics.loss,
+            validation_loss=validation_metrics.loss,
+            test_loss=test_metrics.loss,
+            train_accuracy=train_metrics.accuracy,
+            validation_accuracy=validation_metrics.accuracy,
+            test_accuracy=test_metrics.accuracy,
+            learning_rate=last_record.learning_rate,
+            num_params=count_parameters(mlp),
+            fgd_loss_descent_valid=all(
+                record.accepted for record in epoch_result.step_records
+            ),
+            fgd_gradient_sq_norm=last_record.gradient_sq_norm,
+            fgd_theory_descent_coefficient=last_record.descent_coefficient,
+            fgd_global_bound=(
+                epoch_result.envelope if epoch_result.mu_valid else None
+            ),
+            fgd_global_bound_valid=epoch_result.envelope_valid,
+            fgd_approximation_kind="empirical_pl",
+            fgd_pl_mu=epoch_result.mu,
+            fgd_pl_backtracks=sum(
+                record.backtracks for record in epoch_result.step_records
+            ),
+        )
+        history.append(epoch_entry)
+        wandb_logger.log_history_entry(epoch_entry)
+        if progress is not None and should_log_epoch(epoch, config):
+            delta = test_metrics.loss - last_test_loss
+            envelope_msg = (
+                f", envelope={epoch_result.envelope:.4e}"
+                f" ({'ok' if epoch_result.envelope_valid else 'VIOLATED'})"
+                if epoch_result.mu_valid
+                else ", envelope=off (mu collapsed)"
+            )
+            progress(
+                f"[PL] Epoch {epoch}, "
+                f"train_loss={train_metrics.loss:.4f}, "
+                f"validation_loss={validation_metrics.loss:.4f}, "
+                f"test_loss={test_metrics.loss:.4f} ({delta:+.4f}), "
+                f"train_acc={train_metrics.accuracy:.3f}, "
+                f"validation_acc={validation_metrics.accuracy:.3f}, "
+                f"test_acc={test_metrics.accuracy:.3f}, "
+                f"mu={epoch_result.mu:.3e}, "
+                f"lr={last_record.learning_rate:.4g}, "
+                f"r_t={last_record.descent_coefficient:.3f}"
+                f"{envelope_msg}"
+            )
+        last_test_loss = test_metrics.loss
+        epochs_since_growth += 1
+
+        if epoch_result.converged:
+            if progress is not None:
+                progress(
+                    f"[PL] converged at epoch {epoch}: loss/gradient at "
+                    "numerical zero"
+                    + (
+                        " with the measured PL certificate active -- the "
+                        "run is certified globally optimal."
+                        if epoch_result.mu_valid
+                        else "."
+                    )
+                )
+            break
+
+        should_grow_now = (
+            config.growth_schedule.enabled
+            and epoch_result.mu_collapsed
+            and epochs_since_growth >= pl_config.growth_cooldown_epochs
+            and growth_count < pl_config.growth_max_events
+        )
+        if should_grow_now:
+            growable = getattr(mlp, "_growable_layers", [])
+            cap = pl_config.growth_max_hidden_size
+            layer_index = None
+            if growable:
+                preferred = layer_index_for_growth(
+                    growth_count=growth_count,
+                    number_hidden_layers=config.model.number_hidden_layers,
+                    config=config.growth_schedule,
+                ) % len(growable)
+                for offset in range(len(growable)):
+                    candidate = (preferred + offset) % len(growable)
+                    width = mlp.layers[candidate].layer.out_features
+                    if cap is None or width < cap:
+                        layer_index = candidate
+                        break
+            if layer_index is None:
+                if progress is not None:
+                    progress(
+                        "[PL] mu collapsed but every hidden block reached "
+                        "the width cap; continuing without growth."
+                    )
+            else:
+                growth_result = grow_layer(
+                    model=mlp,
+                    train_loader=train_loader,
+                    layer_index=layer_index,
+                    device=device,
+                    line_search_config=config.scaling_line_search,
+                    optimal_update_kwargs=None,
+                    progress=None,
+                )
+                growth_count += 1
+                epochs_since_growth = 0
+                growth_events.append(growth_result)
+                wandb_logger.log_growth_event(
+                    event=growth_result,
+                    epoch=epoch,
+                    growth_count=growth_count,
+                )
+                trainer = build_trainer()
+                train_metrics = metrics(train_loader)
+                validation_metrics = metrics(validation_loader)
+                test_metrics = metrics(test_loader)
+                growth_entry = HistoryEntry(
+                    step=epoch,
+                    step_type="GRO",
+                    train_loss=train_metrics.loss,
+                    validation_loss=validation_metrics.loss,
+                    test_loss=test_metrics.loss,
+                    train_accuracy=train_metrics.accuracy,
+                    validation_accuracy=validation_metrics.accuracy,
+                    test_accuracy=test_metrics.accuracy,
+                    learning_rate=0.0,
+                    num_params=count_parameters(mlp),
+                    layer_index=layer_index,
+                    scaling_factor=growth_result.best_scaling_factor,
+                    fgd_approximation_kind="empirical_pl",
+                    fgd_pl_mu=epoch_result.mu,
+                )
+                history.append(growth_entry)
+                wandb_logger.log_history_entry(growth_entry)
+                if progress is not None:
+                    progress(
+                        f"[PL] growth {growth_count} at epoch {epoch}: mu "
+                        "collapsed (structure cannot certify global "
+                        f"descent); grew layer {layer_index}, "
+                        f"params={count_parameters(mlp)}; fresh "
+                        "per-structure certificate."
+                    )
+
+    return PipelineResult(
+        config=config,
+        history=history,
+        growth_events=growth_events,
+        model=mlp,
+        device=str(device),
+    )
+
+
 @dataclass(frozen=True)
 class _RKHSPhaseResult:
     """Outcome of one certified head-optimization phase (secant replacement)."""
@@ -1832,12 +2103,12 @@ def run_pipeline(
     device = select_device(config.training.device)
     train_loader, validation_loader, test_loader = build_dataloaders(config, device)
     classification = is_classification_task(config)
-    if config.training.method in ("fgd_rkhs", "fgd_rkhs_grow"):
-        runner = (
-            _run_fgd_rkhs_pipeline
-            if config.training.method == "fgd_rkhs"
-            else _run_fgd_rkhs_grow_pipeline
-        )
+    if config.training.method in ("fgd_rkhs", "fgd_rkhs_grow", "fgd_pl"):
+        runner = {
+            "fgd_rkhs": _run_fgd_rkhs_pipeline,
+            "fgd_rkhs_grow": _run_fgd_rkhs_grow_pipeline,
+            "fgd_pl": _run_fgd_pl_pipeline,
+        }[config.training.method]
         try:
             result = runner(
                 config=config,
@@ -2380,7 +2651,8 @@ def run_pipeline(
             else:
                 raise ValueError(
                     f"Unsupported training method '{config.training.method}'. "
-                    "Use one of: normal, fgd_approx, fgd_rkhs, fgd_rkhs_grow."
+                    "Use one of: normal, fgd_approx, fgd_rkhs, "
+                    "fgd_rkhs_grow, fgd_pl."
                 )
 
             validation_metrics = evaluate_regression_metrics(
