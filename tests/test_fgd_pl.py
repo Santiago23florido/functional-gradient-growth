@@ -248,6 +248,9 @@ def test_pipeline_dispatch_fgd_pl_with_growth(tmp_path) -> None:
             growth_cooldown_epochs=1,
             growth_max_events=2,
             growth_max_hidden_size=8,
+            # Declare any progress "stalled" so the mu trigger drives
+            # growth in this short run.
+            growth_min_progress=10.0,
         ),
         run=replace(config.run, results_dir=tmp_path, save_plot=False),
     )
@@ -265,6 +268,47 @@ def test_pipeline_dispatch_fgd_pl_with_growth(tmp_path) -> None:
     assert "GRO" in step_types
     assert len(result.growth_events) >= 1
     assert result.history[-1].train_loss <= result.history[0].train_loss
+
+
+def test_growth_must_be_earned(tmp_path) -> None:
+    """With growth_min_progress=0 the loss never counts as stalled
+    (relative improvement >= 0 on accepted steps), so mu collapse alone
+    must NOT trigger growth."""
+    config = load_pipeline_config("configs/fgd/rkhs_default.yaml")
+    config = replace(
+        config,
+        data=replace(
+            config.data,
+            train_batches=2,
+            validation_batches=1,
+            test_batches=1,
+            batch_size=24,
+            in_features=4,
+            out_features=2,
+            active_features=2,
+        ),
+        model=replace(config.model, hidden_size=2, number_hidden_layers=2),
+        training=replace(
+            config.training,
+            method="fgd_pl",
+            epochs=6,
+            device="cpu",
+            log_every=1,
+        ),
+        fgd_pl=replace(
+            config.fgd_pl,
+            certificate_points=24,
+            steps_per_epoch=5,
+            growth_cooldown_epochs=1,
+            growth_max_events=2,
+            growth_min_progress=0.0,
+        ),
+        run=replace(config.run, results_dir=tmp_path, save_plot=False),
+    )
+    result = run_pipeline(config=config, progress=None)
+    step_types = [entry.step_type for entry in result.history]
+    assert "GRO" not in step_types
+    assert result.growth_events == []
 
 
 def test_pl_config_yaml_roundtrip(tmp_path) -> None:

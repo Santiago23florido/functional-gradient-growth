@@ -174,8 +174,13 @@ bounded away from zero down to numerically zero loss, the run is
 here *verified instead of assumed*. When the structure is too small, the
 Gram is rank deficient (`P < n·m` certificate rows), `μ_t = 0`, the
 certificate honestly switches off — and that collapse is the
-certificate-driven trigger for growing the network (`growth` on
-`mu_collapse`, with cooldown, event cap and width cap). Certificates are
+certificate-driven trigger for growing the network. Growth must
+additionally be *earned*: it fires only when `mu` is collapsed **and**
+the relative per-epoch loss improvement fell below
+`growth_min_progress` (the structure stopped paying off), with cooldown,
+event cap and width cap — otherwise a permanently collapsed `mu` (e.g.
+under a tight width cap) would grow the network on cadence rather than
+by need. Certificates are
 per structure and apply to the empirical loss on the certificate subset
 (`certificate_points`; by eigenvalue interlacing, fewer certificate rows
 can only raise the measured `λ_min`, at the honest price of certifying a

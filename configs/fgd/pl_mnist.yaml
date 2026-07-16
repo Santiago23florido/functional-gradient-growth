@@ -44,7 +44,10 @@ training:
 
 fgd_pl:
   learning_rate: 1.0
-  r_min: 0.5
+  # Accepted steps must realize at least this fraction of the first-order
+  # predicted descent (still a certified sufficient-descent condition);
+  # 0.25 allows larger certified steps than 0.5.
+  r_min: 0.25
   backtrack_factor: 0.5
   max_backtracks: 12
   lr_recovery: 1.25
@@ -60,6 +63,9 @@ fgd_pl:
   growth_cooldown_epochs: 3
   growth_max_events: 10
   growth_max_hidden_size: 18
+  # Growth must be earned: fires only when mu is collapsed AND the
+  # relative per-epoch loss improvement drops below this threshold.
+  growth_min_progress: 0.01
   # F = L + (ridge/2)||theta||^2. Keep 0.0 to retain the global vs-zero
   # envelope; a small positive value tames output magnitudes at the cost
   # of downgrading the certificate to sufficient descent + stationarity.

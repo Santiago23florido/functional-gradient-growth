@@ -86,6 +86,11 @@ class EmpiricalPLConfig:
     growth_cooldown_epochs: int = 3
     growth_max_events: int = 8
     growth_max_hidden_size: int | None = None
+    # Growth must be EARNED: it fires only when mu is collapsed AND the
+    # relative per-epoch loss improvement fell below this threshold (the
+    # current structure stopped paying off). This changes only the growth
+    # timing; the per-step descent certificates are untouched.
+    growth_min_progress: float = 0.01
     # Optional ridge term: the objective becomes F = L + (ridge/2)||theta||^2.
     # HONEST certificate semantics: the global vs-zero envelope
     # L_0 prod(1 - 2 eta mu r) is only available for the pure data loss
@@ -167,6 +172,8 @@ class EmpiricalPLTrainer:
             raise ValueError("fgd_pl.ridge must be >= 0.")
         if config.max_rejected_steps < 1:
             raise ValueError("fgd_pl.max_rejected_steps must be >= 1.")
+        if config.growth_min_progress < 0.0:
+            raise ValueError("fgd_pl.growth_min_progress must be >= 0.")
 
         self.config = config
         device = device or next(model.parameters()).device

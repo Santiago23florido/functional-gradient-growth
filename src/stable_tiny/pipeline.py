@@ -1837,8 +1837,21 @@ def _run_fgd_pl_pipeline(
     epochs_since_growth = pl_config.growth_cooldown_epochs
     best_validation_loss = validation_metrics.loss
     best_model: GrowingMLP | None = None
+    previous_epoch_loss: float | None = None
     for epoch in range(1, config.training.epochs + 1):
         epoch_result = trainer.run_epoch()
+        # Growth must be earned: the current structure counts as exploited
+        # only when the certified descent stopped paying off.
+        if previous_epoch_loss is None:
+            progress_stalled = False
+        else:
+            relative_improvement = (
+                previous_epoch_loss - epoch_result.train_loss
+            ) / max(previous_epoch_loss, pl_config.eps)
+            progress_stalled = (
+                relative_improvement < pl_config.growth_min_progress
+            )
+        previous_epoch_loss = epoch_result.train_loss
         last_record = epoch_result.step_records[-1]
         train_metrics = metrics(train_loader)
         validation_metrics = metrics(validation_loader)
@@ -1925,6 +1938,7 @@ def _run_fgd_pl_pipeline(
         should_grow_now = (
             config.growth_schedule.enabled
             and epoch_result.mu_collapsed
+            and progress_stalled
             and epochs_since_growth >= pl_config.growth_cooldown_epochs
             and growth_count < pl_config.growth_max_events
         )
@@ -1969,6 +1983,7 @@ def _run_fgd_pl_pipeline(
                     growth_count=growth_count,
                 )
                 trainer = build_trainer()
+                previous_epoch_loss = None  # fresh structure, fresh gate
                 train_metrics = metrics(train_loader)
                 validation_metrics = metrics(validation_loader)
                 test_metrics = metrics(test_loader)
@@ -1993,8 +2008,8 @@ def _run_fgd_pl_pipeline(
                 if progress is not None:
                     progress(
                         f"[PL] growth {growth_count} at epoch {epoch}: mu "
-                        "collapsed (structure cannot certify global "
-                        f"descent); grew layer {layer_index}, "
+                        "collapsed AND certified descent stopped paying "
+                        f"off; grew layer {layer_index}, "
                         f"params={count_parameters(mlp)}; fresh "
                         "per-structure certificate."
                     )
