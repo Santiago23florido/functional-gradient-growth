@@ -2537,6 +2537,11 @@ def run_pipeline(
         fgd_global_contraction_product = 1.0
         fgd_previous_train_loss: float | None = None
         fgd_stalled_epochs = 0
+        # A family rejected at the current architecture stays skipped until a
+        # growth event changes the structure: the same structure re-offers
+        # the same (already refused) approximation capacity, so retrying
+        # every epoch only burns compute and hides structure exhaustion.
+        families_rejected_at_structure: set[str] = set()
         projection_group_limit = max(
             1,
             config.fgd_approx.projection_group_max
@@ -3631,18 +3636,35 @@ def run_pipeline(
                     for name in config.fgd_approx.family_order
                     if name != "tangent"
                 )
+                skipped_families = [
+                    name
+                    for name in fallback_families
+                    if name in families_rejected_at_structure
+                ]
+                if skipped_families and progress is not None:
+                    progress(
+                        f"[FGD] Epoch {epoch}: skipping "
+                        + ", ".join(skipped_families)
+                        + " (rejected at this structure; retried after growth)"
+                    )
                 for family_name in fallback_families:
                     if not growth_triggered:
                         break
+                    if family_name in families_rejected_at_structure:
+                        continue
                     if family_name == "rkhs_head":
                         if _attempt_rkhs_head_stage(in_ladder=True):
                             growth_triggered = False
+                        else:
+                            families_rejected_at_structure.add(family_name)
                     elif family_name in (
                         "parametric_gd",
                         "parametric_descent",
                     ):
                         if _attempt_parametric_stage(family_name):
                             growth_triggered = False
+                        else:
+                            families_rejected_at_structure.add(family_name)
 
                 if growth_triggered:
                     growth_probe = _probe_fgd_growth(
@@ -3754,7 +3776,10 @@ def run_pipeline(
                 if config.training.method == "fgd_approx":
                     # Growth is a mode switch: the accumulated stationary and
                     # global bounds certify a fixed architecture, so restart
-                    # them from the post-growth loss.
+                    # them from the post-growth loss. The new structure also
+                    # re-offers approximation capacity, so families rejected
+                    # at the previous structure become eligible again.
+                    families_rejected_at_structure.clear()
                     reset_fgd_certificate()
                     if config.fgd_approx.learning_rate_policy == "theory_interval":
                         validation_certificate_for_next_epoch = (
