@@ -29,8 +29,11 @@ from fgdlib.tangent import (
     SecantFGDConfig,
     _clear_inaccessible_tensor_caches,
     batch_functional_mse_loss,
+    build_projection_probe,
+    certificate_from_projection_stats,
     evaluate_fgd_validation_certificate,
     evaluate_secant_validation_certificate,
+    measure_direction_projection,
     mse_functional_gradient,
     select_tiny_growth_layer_index,
     should_trigger_fgd_growth,
@@ -760,7 +763,7 @@ def _evaluate_fgd_trial(
     learning_rate: float,
     accuracy_tolerance: float,
     config: PipelineConfig,
-    projection_group_size: int,
+    probe: tuple[torch.Tensor, torch.Tensor] | None,
     classification: bool,
     theory_state: _FGDTheoryState,
     initial_functional_gap: float,
@@ -777,7 +780,6 @@ def _evaluate_fgd_trial(
         learning_rate=learning_rate,
         accuracy_tolerance=accuracy_tolerance,
         config=config.fgd_approx,
-        projection_group_size=projection_group_size,
         classification=classification,
         evaluate_test=False,
     )
@@ -787,7 +789,7 @@ def _evaluate_fgd_trial(
         device=device,
         config=config.fgd_approx,
         learning_rate=epoch_result.min_positive_learning_rate,
-        projection_group_size=projection_group_size,
+        probe=probe,
     )
     return _certify_fgd_candidate(
         candidate_model=trial_model,
@@ -812,7 +814,7 @@ def _evaluate_secant_fgd_trial(
     learning_rate: float,
     accuracy_tolerance: float,
     config: PipelineConfig,
-    projection_group_size: int,
+    probe: tuple[torch.Tensor, torch.Tensor] | None,
     classification: bool,
     theory_state: _FGDTheoryState,
     initial_functional_gap: float,
@@ -911,7 +913,7 @@ def _evaluate_secant_fgd_trial(
         device=device,
         config=config.fgd_approx,
         learning_rate=learning_rate,
-        projection_group_size=projection_group_size,
+        probe=probe,
     )
     return _certify_fgd_candidate(
         candidate_model=trial_model,
@@ -1052,7 +1054,7 @@ def _probe_fgd_growth(
     growth_count: int,
     device: torch.device,
     config: PipelineConfig,
-    projection_group_size: int,
+    probe: tuple[torch.Tensor, torch.Tensor] | None,
 ) -> _GrowthProbe | None:
     """Trial growth on clones and retain the best FGD certificate change."""
     growable_layers = getattr(model, "_growable_layers", None)
@@ -1098,7 +1100,7 @@ def _probe_fgd_growth(
             device=device,
             config=config.fgd_approx,
             learning_rate=None,
-            projection_group_size=projection_group_size,
+            probe=probe,
         )
         probes.append(
             _GrowthProbe(
@@ -1137,7 +1139,7 @@ def _search_secant_fgd_candidate(
     device: torch.device,
     accuracy_tolerance: float,
     config: PipelineConfig,
-    projection_group_size: int,
+    probe: tuple[torch.Tensor, torch.Tensor] | None = None,
     classification: bool,
     theory_state: _FGDTheoryState,
     initial_functional_gap: float,
@@ -1167,7 +1169,7 @@ def _search_secant_fgd_candidate(
             learning_rate=learning_rate,
             accuracy_tolerance=accuracy_tolerance,
             config=config,
-            projection_group_size=projection_group_size,
+            probe=probe,
             classification=classification,
             theory_state=theory_state,
             initial_functional_gap=initial_functional_gap,
@@ -1303,7 +1305,7 @@ def _evaluate_parametric_gd_trial(
     steps: int,
     accuracy_tolerance: float,
     config: PipelineConfig,
-    projection_group_size: int,
+    probe: tuple[torch.Tensor, torch.Tensor] | None = None,
     classification: bool,
     theory_state: _FGDTheoryState,
     initial_functional_gap: float,
@@ -1382,7 +1384,7 @@ def _evaluate_parametric_gd_trial(
         device=device,
         config=config.fgd_approx,
         learning_rate=eta_star,
-        projection_group_size=projection_group_size,
+        probe=probe,
     )
     return _certify_fgd_candidate(
         candidate_model=candidate,
@@ -1737,7 +1739,7 @@ def _search_parametric_gd_candidate(
     device: torch.device,
     accuracy_tolerance: float,
     config: PipelineConfig,
-    projection_group_size: int,
+    probe: tuple[torch.Tensor, torch.Tensor] | None = None,
     classification: bool,
     theory_state: _FGDTheoryState,
     initial_functional_gap: float,
@@ -1766,7 +1768,7 @@ def _search_parametric_gd_candidate(
                 steps=steps,
                 accuracy_tolerance=accuracy_tolerance,
                 config=config,
-                projection_group_size=projection_group_size,
+                probe=probe,
                 classification=classification,
                 theory_state=theory_state,
                 initial_functional_gap=initial_functional_gap,
@@ -2585,16 +2587,22 @@ def run_pipeline(
         # the same (already refused) approximation capacity, so retrying
         # every epoch only burns compute and hides structure exhaustion.
         families_rejected_at_structure: set[str] = set()
-        projection_group_limit = max(
-            1,
-            config.fgd_approx.projection_group_max
-            if config.fgd_approx.projection_group_max is not None
-            else max(len(train_loader), len(validation_loader)),
-        )
-        current_projection_group_size = max(
-            1,
-            min(config.fgd_approx.projection_group_size, projection_group_limit),
-        )
+        # FIXED certification probes, materialized once for the whole run:
+        # every certificate, family comparison and growth-layer trial solves
+        # one joint shared-direction projection over the same sample.
+        fgd_validation_probe: tuple[torch.Tensor, torch.Tensor] | None = None
+        fgd_train_probe: tuple[torch.Tensor, torch.Tensor] | None = None
+        if config.training.method == "fgd_approx":
+            fgd_validation_probe = build_projection_probe(
+                validation_loader,
+                config.fgd_approx.probe_batches,
+                device,
+            )
+            fgd_train_probe = build_projection_probe(
+                train_loader,
+                config.fgd_approx.probe_batches,
+                device,
+            )
         validation_certificate_for_next_epoch = None
         if (
             config.training.method == "fgd_approx"
@@ -2608,7 +2616,7 @@ def run_pipeline(
                     device=device,
                     config=config.fgd_approx,
                     learning_rate=current_fgd_learning_rate,
-                    projection_group_size=current_projection_group_size,
+                    probe=fgd_validation_probe,
                 )
             )
 
@@ -2680,7 +2688,7 @@ def run_pipeline(
                             device=device,
                             config=config.fgd_approx,
                             learning_rate=current_fgd_learning_rate,
-                            projection_group_size=current_projection_group_size,
+                            probe=fgd_validation_probe,
                         )
                     )
                 lr_certificate = validation_certificate_for_next_epoch
@@ -2801,7 +2809,7 @@ def run_pipeline(
                             learning_rate=candidate_learning_rate,
                             accuracy_tolerance=config.training.accuracy_tolerance,
                             config=config,
-                            projection_group_size=current_projection_group_size,
+                            probe=fgd_validation_probe,
                             classification=classification,
                             theory_state=theory_state,
                             initial_functional_gap=initial_functional_gap,
@@ -2976,7 +2984,10 @@ def run_pipeline(
                         learning_rate=learning_rate,
                         accuracy_tolerance=config.training.accuracy_tolerance,
                         config=config.fgd_approx,
-                        projection_group_size=current_projection_group_size,
+                        projection_group_size=max(
+                            1,
+                            config.fgd_approx.projection_group_size,
+                        ),
                         classification=classification,
                     )
                     epoch_result = fgd_epoch_result
@@ -2986,7 +2997,7 @@ def run_pipeline(
                         device=device,
                         config=config.fgd_approx,
                         learning_rate=None,
-                        projection_group_size=current_projection_group_size,
+                        probe=fgd_validation_probe,
                     )
 
                 selected_layer_index = epoch_result.selected_layer_index
@@ -3285,9 +3296,7 @@ def run_pipeline(
                                 device=device,
                                 config=config.fgd_approx,
                                 learning_rate=None,
-                                projection_group_size=(
-                                    current_projection_group_size
-                                ),
+                                probe=fgd_validation_probe,
                             )
                         )
                         certified_learning_rate = (
@@ -3533,9 +3542,7 @@ def run_pipeline(
                                 config.training.accuracy_tolerance
                             ),
                             config=config,
-                            projection_group_size=(
-                                current_projection_group_size
-                            ),
+                            probe=fgd_validation_probe,
                             classification=classification,
                             theory_state=stage_theory_state,
                             initial_functional_gap=initial_functional_gap,
@@ -3595,7 +3602,7 @@ def run_pipeline(
                             device=device,
                             config=config.fgd_approx,
                             learning_rate=None,
-                            projection_group_size=current_projection_group_size,
+                            probe=fgd_validation_probe,
                         )
                     )
                     certified_learning_rate = certified_validation_learning_rate(
@@ -3728,7 +3735,7 @@ def run_pipeline(
                         growth_count=growth_count,
                         device=device,
                         config=config,
-                        projection_group_size=current_projection_group_size,
+                        probe=fgd_validation_probe,
                     )
                     fgd_growth_probe_improved = bool(
                         growth_probe is not None and growth_probe.improves_fgd
@@ -3841,7 +3848,7 @@ def run_pipeline(
                                 device=device,
                                 config=config.fgd_approx,
                                 learning_rate=None,
-                                projection_group_size=current_projection_group_size,
+                                probe=fgd_validation_probe,
                             )
                         )
                         post_growth_certified_learning_rate = (

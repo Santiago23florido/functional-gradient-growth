@@ -249,7 +249,6 @@ def test_secant_search_keeps_architecture_fixed() -> None:
         device=device,
         accuracy_tolerance=config.training.accuracy_tolerance,
         config=config,
-        projection_group_size=1,
         classification=False,
         theory_state=_FGDTheoryState(
             0,

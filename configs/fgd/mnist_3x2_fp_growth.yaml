@@ -82,6 +82,11 @@ fgd_approx:
   projection_group_size: 1
   projection_group_auto: true
   projection_group_max:
+  # Joint certification probe: number of mini-batches concatenated into the
+  # FIXED probe on which every certificate solves ONE shared-direction
+  # projection (the projection_group_* keys above are deprecated: they used
+  # to aggregate independent per-batch projections).
+  probe_batches: 4
   eps: 1.0e-12
   tiny_use_covariance: true
   tiny_alpha_zero: false

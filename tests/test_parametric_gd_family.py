@@ -27,9 +27,7 @@ ensure_gromo_importable()
 
 from gromo.containers.growing_mlp import GrowingMLP  # noqa: E402
 
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
-
 
 class _FixedOutputModel(torch.nn.Module):
     def __init__(self, output: torch.Tensor) -> None:
@@ -38,7 +36,6 @@ class _FixedOutputModel(torch.nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.output
-
 
 def test_validate_family_order_rules() -> None:
     validate_family_order(("tangent",))
@@ -52,7 +49,6 @@ def test_validate_family_order_rules() -> None:
     with pytest.raises(ValueError):
         validate_family_order(("tangent", "rkhs_head", "rkhs_head"))
 
-
 def test_parametric_gd_config_validation() -> None:
     ParametricGDConfig().validate()
     with pytest.raises(ValueError):
@@ -61,7 +57,6 @@ def test_parametric_gd_config_validation() -> None:
         ParametricGDConfig(min_cosine=0.0).validate()
     with pytest.raises(ValueError):
         ParametricGDConfig(inner_steps=()).validate()
-
 
 def test_secant_projection_matches_exact_values() -> None:
     """cos and eta* must match the closed-form aggregates exactly."""
@@ -100,7 +95,6 @@ def test_secant_projection_matches_exact_values() -> None:
         math.sqrt(max(0.0, 1.0 - expected_cosine**2)), abs=1e-9
     )
 
-
 def _pgd_problem(
     min_cosine: float,
 ) -> tuple[GrowingMLP, list, PipelineConfig, _FGDTheoryState, float]:
@@ -138,7 +132,6 @@ def _pgd_problem(
     )
     return model, batches, config, state, loss
 
-
 def test_parametric_gd_search_certifies_a_well_aligned_secant() -> None:
     """An overparameterized fit realizes the functional step and certifies."""
     model, batches, config, state, loss = _pgd_problem(min_cosine=0.9)
@@ -150,7 +143,7 @@ def test_parametric_gd_search_certifies_a_well_aligned_secant() -> None:
         device=torch.device("cpu"),
         accuracy_tolerance=0.1,
         config=config,
-        projection_group_size=1,
+
         classification=False,
         theory_state=state,
         initial_functional_gap=loss,
@@ -173,7 +166,6 @@ def test_parametric_gd_search_certifies_a_well_aligned_secant() -> None:
     assert trial.certificate.max_valid_learning_rate is not None
     assert eta_star <= trial.certificate.max_valid_learning_rate + 1e-12
 
-
 def test_parametric_gd_cosine_screen_rejects_before_certification() -> None:
     """An unreachable min_cosine must reject every candidate at the screen."""
     model, batches, config, state, loss = _pgd_problem(min_cosine=1.0)
@@ -185,7 +177,7 @@ def test_parametric_gd_cosine_screen_rejects_before_certification() -> None:
         device=torch.device("cpu"),
         accuracy_tolerance=0.1,
         config=config,
-        projection_group_size=1,
+
         classification=False,
         theory_state=state,
         initial_functional_gap=loss,
@@ -197,7 +189,6 @@ def test_parametric_gd_cosine_screen_rejects_before_certification() -> None:
     assert result.last_trial is None
     assert result.trial_count == 1
 
-
 def test_fp_growth_config_wires_families_and_parametric_gd() -> None:
     config = load_pipeline_config(
         REPO_ROOT / "configs" / "fgd" / "mnist_3x2_fp_growth.yaml"
@@ -207,7 +198,6 @@ def test_fp_growth_config_wires_families_and_parametric_gd() -> None:
     assert config.parametric_gd.inner_steps == (16, 64)
     assert config.parametric_gd.functional_learning_rates == (0.2, 0.05)
     assert config.parametric_gd.min_cosine == pytest.approx(0.9)
-
 
 def test_family_order_yaml_validation(tmp_path: Path) -> None:
     source = (
