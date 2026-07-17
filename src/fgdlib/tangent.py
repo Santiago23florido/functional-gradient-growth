@@ -1625,18 +1625,30 @@ def select_certifying_growth_layer_index(
 
     certifying_trials = [trial for trial in trials if bool(trial["certified"])]
     if certifying_trials:
+        # Explicit certified policy: fewest added parameters, then lowest
+        # relative error, then layer index (deterministic).
         chosen = min(
             certifying_trials,
             key=lambda trial: (
                 int(trial["added_parameters"]),
                 float(trial["relative_error"]),
+                int(trial["layer_index"]),
             ),
         )
     else:
         valid_trials = [trial for trial in trials if bool(trial["sensor_valid"])]
         if not valid_trials:
             return None
-        chosen = min(valid_trials, key=lambda trial: float(trial["relative_error"]))
+        # No candidate certifies: the lowest post-growth relative error
+        # wins; parameter count is only a tie-breaker.
+        chosen = min(
+            valid_trials,
+            key=lambda trial: (
+                float(trial["relative_error"]),
+                int(trial["added_parameters"]),
+                int(trial["layer_index"]),
+            ),
+        )
     return int(chosen["layer_index"])
 
 

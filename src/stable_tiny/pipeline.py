@@ -1164,17 +1164,47 @@ def _probe_fgd_growth(
             )
         )
 
+    return _select_growth_probe(probes)
+
+
+def _probe_relative_error(probe: _GrowthProbe) -> float:
+    relative_error = probe.certificate.relative_error
+    return relative_error if relative_error is not None else float("inf")
+
+
+def _probe_parameter_count(probe: _GrowthProbe) -> int:
+    return sum(parameter.numel() for parameter in probe.model.parameters())
+
+
+def _select_growth_probe(probes: list[_GrowthProbe]) -> _GrowthProbe | None:
+    """Deterministic growth-layer choice.
+
+    Among probes that improve the FGD certificate the policy stays
+    frugal-first: fewest total parameters, then lowest post-growth relative
+    error, then layer index. When NO probe reaches the improvement
+    threshold the priority inverts: lowest post-growth relative error
+    first, parameter count only as a tie-breaker — growth exists to restore
+    approximation capacity, so a smaller architecture must never outrank a
+    better certificate.
+    """
     if not probes:
         return None
     improving = [probe for probe in probes if probe.improves_fgd]
-    candidates = improving if improving else probes
+    if improving:
+        return min(
+            improving,
+            key=lambda probe: (
+                _probe_parameter_count(probe),
+                _probe_relative_error(probe),
+                probe.result.layer_index,
+            ),
+        )
     return min(
-        candidates,
+        probes,
         key=lambda probe: (
-            sum(parameter.numel() for parameter in probe.model.parameters()),
-            probe.certificate.relative_error
-            if probe.certificate.relative_error is not None
-            else float("inf"),
+            _probe_relative_error(probe),
+            _probe_parameter_count(probe),
+            probe.result.layer_index,
         ),
     )
 
