@@ -93,6 +93,13 @@ class FGDApproxConfig:
     # fails. Every family commits through the same full FGD certificate.
     # Supported: "tangent", "rkhs_head", "parametric_gd".
     family_order: tuple[str, ...] = ("tangent",)
+    # In-ladder rkhs_head acceptance margin: the committed head must improve
+    # the FULL validation functional loss by at least this relative amount.
+    # The phase's internal acceptance compares subsampled train losses
+    # (fgd_rkhs.max_train_points), so without this external margin the
+    # per-epoch subsample jitter re-certifies an epsilon "improvement"
+    # forever and starves every family below rkhs_head in the ladder.
+    rkhs_family_min_relative_improvement: float = 1e-3
 
 
 SUPPORTED_FGD_FAMILIES = (

@@ -104,6 +104,10 @@ fgd_approx:
     - rkhs_head
     - parametric_gd
     - parametric_descent
+  # In-ladder rkhs_head margin: the head must improve the FULL validation
+  # functional by this relative amount (filters the train-subsample jitter
+  # that otherwise re-accepts an epsilon improvement forever).
+  rkhs_family_min_relative_improvement: 1.0e-3
 
 # Parametric-GD secant family. Only consulted when "parametric_gd" is
 # listed in fgd_approx.family_order. A disposable clone is trained

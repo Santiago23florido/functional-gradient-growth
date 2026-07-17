@@ -3176,7 +3176,58 @@ def run_pipeline(
                         fgd_rkhs_phase_steps = phase.steps
                         fgd_rkhs_phase_accepted = phase.accepted
 
-                    if phase is not None and phase.accepted:
+                    # In-ladder external gate: the phase's internal
+                    # acceptance compares losses on its own (subsampled,
+                    # reshuffled) train points, so an epoch-to-epoch
+                    # subsample change can re-certify an epsilon
+                    # "improvement" forever. The family only commits when
+                    # the head genuinely improves the FULL validation
+                    # functional by the configured relative margin —
+                    # consistent with every other family gating on
+                    # validation.
+                    ladder_gate_declined = False
+                    if in_ladder and phase is not None and phase.accepted:
+                        gate_loss_before = evaluate_functional_loss(
+                            model,
+                            validation_loader,
+                            device,
+                        )
+                        gate_candidate = copy.deepcopy(model)
+                        _apply_certified_head(
+                            gate_candidate,
+                            phase.trainer.model,
+                        )
+                        gate_loss_after = evaluate_functional_loss(
+                            gate_candidate,
+                            validation_loader,
+                            device,
+                        )
+                        required_improvement = (
+                            config.fgd_approx
+                            .rkhs_family_min_relative_improvement
+                            * max(gate_loss_before, config.fgd_approx.eps)
+                        )
+                        gate_improvement = gate_loss_before - gate_loss_after
+                        if not (
+                            math.isfinite(gate_improvement)
+                            and gate_improvement >= required_improvement
+                        ):
+                            ladder_gate_declined = True
+                            fgd_rkhs_phase_accepted = False
+                            if progress is not None:
+                                progress(
+                                    f"[RKHS] Epoch {epoch}: head phase "
+                                    "validation improvement "
+                                    f"{gate_improvement:.3e} is below the "
+                                    "family margin "
+                                    f"{required_improvement:.3e}; declining"
+                                )
+
+                    if (
+                        phase is not None
+                        and phase.accepted
+                        and not ladder_gate_declined
+                    ):
                         _apply_certified_head(model, phase.trainer.model)
                         optimizer = build_optimizer(model, config.optimizer)
                         validation_certificate_for_next_epoch = (
