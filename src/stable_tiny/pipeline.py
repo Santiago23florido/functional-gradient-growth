@@ -798,11 +798,17 @@ def _evaluate_fgd_outer_trial(
     than the one applied. The stepped clone is then checked transactionally
     (validation functional loss before vs after, Cstat, Cglob); rejection
     rolls back by discarding the clone.
+
+    u is the projection on the TRAIN probe; on the validation probe it is a
+    general Hilbert direction, so only finiteness is sensor-checked here
+    (the exact-projector invariants do not apply) and Crel/the LR interval
+    are the binding admissibility gates, as in Lemma 3.5.
     """
     certificate = certificate_from_projection_stats(
         stats=direction_stats,
         learning_rate=learning_rate,
         config=config.fgd_approx,
+        projection_sensor=False,
     )
     trial_model = copy.deepcopy(base_model)
     _apply_shared_direction_step(trial_model, direction, learning_rate)
@@ -2930,11 +2936,15 @@ def run_pipeline(
                             fgd_validation_probe[1],
                             config.fgd_approx,
                         )
+                        # The direction is only a projection on the TRAIN
+                        # probe; on validation it is certified like a secant
+                        # (finiteness sensor, Crel/interval as gates).
                         direction_certificate = (
                             certificate_from_projection_stats(
                                 stats=direction_stats,
                                 learning_rate=None,
                                 config=config.fgd_approx,
+                                projection_sensor=False,
                             )
                         )
                         if direction_certificate.sensor_valid:
