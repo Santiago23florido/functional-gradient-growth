@@ -639,16 +639,25 @@ def _certify_fgd_candidate(
     initial_functional_gap: float,
     theory_loss_star: float,
 ) -> _FGDTrial:
-    """Evaluate accumulated FGD conditions for a realizable candidate."""
+    """Evaluate the FGD acceptance conditions for a realizable candidate.
+
+    Acceptance is decided by the four LOCAL conditions of the current outer
+    step (sensor, Crel, LR interval, strict realized descent). The
+    stationary and global convergence bounds are still computed and logged,
+    but only as diagnostics of the ACCUMULATED trajectory guarantees.
+    """
     validation_functional_loss = evaluate_functional_loss(
         candidate_model,
         validation_loader,
         device,
     )
+    # Local condition 4: STRICT realized descent of the validation
+    # functional loss, L(f_{t+1}) < L(f_t), up to the numerical eps only.
     loss_descent_valid = (
-        validation_functional_loss
-        <= theory_state.previous_validation_functional_loss
-        + config.fgd_approx.eps
+        math.isfinite(validation_functional_loss)
+        and theory_state.previous_validation_functional_loss
+        - validation_functional_loss
+        > config.fgd_approx.eps
     )
 
     epoch_count = theory_state.epoch_count
@@ -679,6 +688,9 @@ def _certify_fgd_candidate(
             else min(min_descent_coefficient, descent_coefficient)
         )
 
+    # Trajectory diagnostics: the stationary and global bounds monitor the
+    # ACCUMULATED theoretical guarantees over the committed steps. They are
+    # computed and logged for every trial but are NOT acceptance gates.
     stationary_bound: float | None = None
     stationary_bound_valid: bool | None = None
     global_bound: float | None = None
@@ -731,6 +743,15 @@ def _certify_fgd_candidate(
         global_contraction_product=contraction_product,
         previous_validation_functional_loss=validation_functional_loss,
     )
+    # LOCAL acceptance conditions — these four decide whether THIS outer
+    # step commits:
+    #   1. the projection and numerical sensor are valid;
+    #   2. Crel: relative_error < min(rel_error_threshold, 0.5), strict;
+    #   3. LR interval: theory_lr_min < eta < safe upper bound eta_bar,
+    #      strict up to the configured eps;
+    #   4. strict realized descent of the validation functional loss.
+    # stationary_bound_valid / global_bound_valid are intentionally ABSENT:
+    # they describe the accumulated trajectory, not this step.
     all_conditions_valid = (
         epoch_result.sensor_valid
         and epoch_result.skipped_batches == 0
@@ -738,8 +759,6 @@ def _certify_fgd_candidate(
         and certificate.relative_error_condition_valid is True
         and certificate.learning_rate_interval_valid is True
         and loss_descent_valid
-        and stationary_bound_valid is True
-        and global_bound_valid is True
     )
     return _FGDTrial(
         model=candidate_model,
@@ -1584,6 +1603,8 @@ def _certify_measured_descent_candidate(
             * min_positive_learning_rate
             * min_descent_coefficient
         )
+        # Trajectory diagnostics only (never acceptance gates), as in
+        # _certify_fgd_candidate.
         stationary_bound_valid = (
             min_gradient_sq_norm is not None
             and min_gradient_sq_norm <= stationary_bound + eps
@@ -1656,13 +1677,15 @@ def _certify_measured_descent_candidate(
         global_contraction_product=contraction_product,
         previous_validation_functional_loss=validation_loss_after,
     )
+    # LOCAL acceptance conditions for the measured-descent family: strict
+    # realized descent, the Cprog floor and a positive measured coefficient
+    # decide whether THIS step commits. The stationary and global bounds
+    # above are trajectory diagnostics, never acceptance gates.
     all_conditions_valid = (
         loss_descent_valid
         and progress_valid
         and descent_coefficient is not None
         and descent_coefficient > 0.0
-        and stationary_bound_valid is True
-        and global_bound_valid is True
     )
     return _FGDTrial(
         model=candidate_model,
@@ -3377,9 +3400,15 @@ def run_pipeline(
                         f"{fgd_sensor_invalid_batches} validation batch(es)"
                     )
                 if fgd_stationary_bound_valid is False:
-                    warnings.append("stationary-point bound failed")
+                    warnings.append(
+                        "stationary-point bound failed "
+                        "(trajectory diagnostic, not an acceptance gate)"
+                    )
                 if fgd_global_bound_valid is False:
-                    warnings.append("global-convergence bound failed")
+                    warnings.append(
+                        "global-convergence bound failed "
+                        "(trajectory diagnostic, not an acceptance gate)"
+                    )
                 if fgd_theory_learning_rate_adjusted:
                     warnings.append(
                         "maximum validation-certified learning rate accepted "

@@ -187,6 +187,157 @@ def test_accepted_outer_step_decreases_the_evaluated_loss() -> None:
     assert trial.all_conditions_valid
 
 
+def test_local_conditions_accept_even_when_trajectory_bounds_fail() -> None:
+    """Cstat/Cglob are trajectory diagnostics, never acceptance gates."""
+    problem = _outer_problem()
+    model, batches, config, state, loss, direction, direction_stats = problem
+    # A poisoned accumulated history: the near-zero contraction product
+    # makes the global bound unreachable and the long tiny-progress history
+    # makes the stationary bound fail — neither may block a step whose four
+    # LOCAL conditions hold.
+    poisoned_state = _FGDTheoryState(
+        epoch_count=1000,
+        min_gradient_sq_norm=direction_stats.target_sq_norm,
+        min_positive_learning_rate=1.0,
+        min_descent_coefficient=1.0,
+        global_contraction_product=1e-12,
+        previous_validation_functional_loss=loss,
+    )
+    certificate = certificate_from_projection_stats(
+        stats=direction_stats,
+        learning_rate=None,
+        config=config.fgd_approx,
+    )
+    assert certificate.max_valid_learning_rate is not None
+    learning_rate = 0.03 * certificate.max_valid_learning_rate
+    trial = _run_outer_trial(
+        model,
+        batches,
+        config,
+        poisoned_state,
+        loss,
+        direction,
+        direction_stats,
+        learning_rate=learning_rate,
+    )
+
+    # The four local conditions hold...
+    assert trial.certificate.sensor_valid is True
+    assert trial.certificate.relative_error_condition_valid is True
+    assert trial.certificate.learning_rate_interval_valid is True
+    assert trial.loss_descent_valid is True
+    # ...the trajectory bounds are computed, logged, and FAILING...
+    assert trial.stationary_bound is not None
+    assert trial.stationary_bound_valid is False
+    assert trial.global_bound is not None
+    assert trial.global_bound_valid is False
+    assert trial.global_contraction is not None
+    # ...and the step is accepted anyway.
+    assert trial.all_conditions_valid is True
+
+
+def test_relative_error_condition_failure_rejects_the_step() -> None:
+    problem = _outer_problem()
+    model, batches, config, state, loss, direction, direction_stats = problem
+    # Tighten the threshold below the direction's measured relative error:
+    # only Crel fails (the LR interval still derives from the measured
+    # relative error and the small step still strictly descends).
+    from dataclasses import replace
+
+    strict_config = replace(
+        config,
+        fgd_approx=replace(
+            config.fgd_approx,
+            rel_error_threshold=direction_stats.output_error.relative_error
+            / 2.0,
+        ),
+    )
+    trial = _run_outer_trial(
+        model,
+        batches,
+        strict_config,
+        state,
+        loss,
+        direction,
+        direction_stats,
+        learning_rate=0.02,
+    )
+    assert trial.certificate.relative_error_condition_valid is False
+    assert trial.certificate.learning_rate_interval_valid is True
+    assert trial.loss_descent_valid is True
+    assert trial.all_conditions_valid is False
+
+
+def test_learning_rate_outside_the_interval_rejects_the_step() -> None:
+    problem = _outer_problem()
+    model, batches, config, state, loss, direction, direction_stats = problem
+    certificate = certificate_from_projection_stats(
+        stats=direction_stats,
+        learning_rate=None,
+        config=config.fgd_approx,
+    )
+    assert certificate.max_valid_learning_rate is not None
+    # Above the safe upper bound: eta < eta_bar fails.
+    above = _run_outer_trial(
+        model,
+        batches,
+        config,
+        state,
+        loss,
+        direction,
+        direction_stats,
+        learning_rate=2.0 * certificate.max_valid_learning_rate,
+    )
+    assert above.certificate.learning_rate_interval_valid is False
+    assert above.all_conditions_valid is False
+    # Below theory_lr_min: eta > theory_lr_min fails while the step itself
+    # still strictly descends.
+    from dataclasses import replace
+
+    floor_config = replace(
+        config,
+        fgd_approx=replace(config.fgd_approx, theory_lr_min=0.05),
+    )
+    below = _run_outer_trial(
+        model,
+        batches,
+        floor_config,
+        state,
+        loss,
+        direction,
+        direction_stats,
+        learning_rate=0.02,
+    )
+    assert below.certificate.learning_rate_interval_valid is False
+    assert below.loss_descent_valid is True
+    assert below.all_conditions_valid is False
+
+
+def test_invalid_sensor_rejects_the_step() -> None:
+    problem = _outer_problem()
+    model, batches, config, state, loss, direction, direction_stats = problem
+    from fgdlib.tangent import _FunctionalStepStats
+
+    corrupted_stats = _FunctionalStepStats(
+        output_error=direction_stats.output_error,
+        dot_product=float("nan"),
+        approximation_sq_norm=direction_stats.approximation_sq_norm,
+        target_sq_norm=direction_stats.target_sq_norm,
+    )
+    trial = _run_outer_trial(
+        model,
+        batches,
+        config,
+        state,
+        loss,
+        direction,
+        corrupted_stats,
+        learning_rate=0.02,
+    )
+    assert trial.certificate.sensor_valid is False
+    assert trial.all_conditions_valid is False
+
+
 def test_outer_step_rejects_when_the_step_ascends() -> None:
     """Moving AGAINST the certified direction fails the descent gate."""
     problem = _outer_problem()

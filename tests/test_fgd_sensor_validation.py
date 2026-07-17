@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-import pytest
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -55,12 +54,21 @@ def _assert_projection_invariants(
     )
 
 
-def _direction_mocks(monkeypatch, *, direction_value: float, rel_error_stats):
+def _direction_mocks(
+    monkeypatch,
+    *,
+    rel_error_stats,
+    direction_value: float | None = None,
+    direction_from_gradient: bool = False,
+):
     """Mock the shared-direction solve and its validation measurement.
 
     ``rel_error_stats`` is a (dot, approx_sq, target_sq) triple describing
     the direction's image on the validation probe; the certificate and the
-    learning-rate search derive everything else from it.
+    learning-rate search derive everything else from it. The direction is
+    either a constant fill (``direction_value``) or the true loss gradient
+    at the probe (``direction_from_gradient``), which guarantees strict
+    descent of theta - eta * u for small eta.
     """
     dot, approx_sq, target_sq = rel_error_stats
     stats = _FunctionalStepStats(
@@ -76,12 +84,22 @@ def _direction_mocks(monkeypatch, *, direction_value: float, rel_error_stats):
     )
 
     def direction_step(*, model, x, y, config):
-        del x, y, config
-        updates = tuple(
-            torch.full_like(parameter, direction_value)
+        del config
+        parameters = [
+            parameter
             for parameter in model.parameters()
             if parameter.requires_grad
-        )
+        ]
+        if direction_from_gradient:
+            output = model(x)
+            loss = torch.sum((output - y) ** 2)
+            gradients = torch.autograd.grad(loss, parameters)
+            updates = tuple(gradient.detach() for gradient in gradients)
+        else:
+            updates = tuple(
+                torch.full_like(parameter, direction_value)
+                for parameter in parameters
+            )
         return _TangentProjectionStep(
             output_error=stats.output_error,
             parameter_updates=updates,
@@ -613,8 +631,8 @@ def test_pipeline_clips_learning_rate_from_validation_certificate(
             theory_lr_initial=0.01,
             theory_lr_follow_bound=False,
             theory_mu=1e-15,
-            theory_lr_search_steps=1,
-            theory_lr_search_refinements=0,
+            theory_lr_search_steps=6,
+            theory_lr_search_refinements=2,
             global_bound_action="ignore",
         ),
         growth_schedule=replace(config.growth_schedule, enabled=False),
@@ -629,8 +647,11 @@ def test_pipeline_clips_learning_rate_from_validation_certificate(
     generator = torch.Generator().manual_seed(7)
     x = torch.randn(4, config.data.in_features, generator=generator)
     y = torch.randn(4, config.data.out_features, generator=generator)
+    # Train and validation share the SAME tensors so the gradient direction
+    # mocked below strictly descends the validation functional at small eta
+    # (the strict-descent gate would reject a do-nothing direction).
     train_loader = DataLoader(TensorDataset(x, y), batch_size=4)
-    validation_loader = DataLoader(TensorDataset(x + 1.0, y), batch_size=4)
+    validation_loader = DataLoader(TensorDataset(x, y), batch_size=4)
     test_loader = DataLoader(TensorDataset(x + 2.0, y), batch_size=4)
     monkeypatch.setattr(
         "stable_tiny.pipeline.build_dataloaders",
@@ -669,7 +690,7 @@ def test_pipeline_clips_learning_rate_from_validation_certificate(
     )
     stats = _direction_mocks(
         monkeypatch,
-        direction_value=0.0,
+        direction_from_gradient=True,
         rel_error_stats=(0.9, 0.81, 1.0),
     )
 
@@ -679,21 +700,19 @@ def test_pipeline_clips_learning_rate_from_validation_certificate(
     assert certificate_loaders
     assert all(loader is validation_loader for loader in certificate_loaders)
     assert result.history[1].fgd_learning_rate_clipped_batches == 1
-    # The committed step is ONE outer update at the rate certified for the
-    # ACTUAL direction (its validation relative error), not an epoch of
-    # training at the state-certified rate.
+    # The committed step is ONE outer update at a rate inside the interval
+    # certified for the ACTUAL direction (its validation relative error),
+    # not an epoch of training at the state-certified rate.
     direction_bound = theoretical_learning_rate_upper_bound(
         stats.output_error.relative_error,
         config.fgd_approx,
     )
     assert direction_bound is not None
-    expected_learning_rate = config.fgd_approx.theory_lr_safety * direction_bound
+    maximum_learning_rate = config.fgd_approx.theory_lr_safety * direction_bound
     assert result.history[1].fgd_candidate_accepted is True
-    assert result.history[1].learning_rate == pytest.approx(
-        expected_learning_rate,
-        rel=1e-9,
-    )
-    assert result.history[1].fgd_update_norm == 0.0
+    accepted_learning_rate = result.history[1].learning_rate
+    assert 0.0 < accepted_learning_rate <= maximum_learning_rate + 1e-12
+    assert result.history[1].fgd_update_norm > 0.0
     assert result.history[1].fgd_loss_descent_valid is True
     assert result.history[1].fgd_loss_non_descent_batches == 0
 
@@ -713,9 +732,6 @@ def test_failed_lr_trials_do_not_modify_the_committed_model(
             theory_lr_search_steps=2,
             theory_lr_search_refinements=0,
             global_bound_action="lr_then_growth",
-            # A huge mu makes the required Cglob contraction unreachable, so
-            # every outer-step candidate is rejected.
-            theory_mu=100.0,
         ),
         growth_schedule=replace(config.growth_schedule, enabled=False),
         wandb=replace(config.wandb, enabled=False),
@@ -726,11 +742,16 @@ def test_failed_lr_trials_do_not_modify_the_committed_model(
             show_plot=False,
         ),
     )
-    x = torch.zeros(4, config.data.in_features)
-    y = torch.ones(4, config.data.out_features)
+    # Targets equal the initial model's own outputs: the base loss is
+    # exactly zero, so NO perturbation can strictly descend and every
+    # candidate fails the local descent gate.
+    generator = torch.Generator().manual_seed(11)
+    x = torch.randn(4, config.data.in_features, generator=generator)
+    with torch.no_grad():
+        y = build_model(config, torch.device("cpu"))(x).detach()
     train_loader = DataLoader(TensorDataset(x, y), batch_size=4)
-    validation_loader = DataLoader(TensorDataset(x + 1.0, y), batch_size=4)
-    test_loader = DataLoader(TensorDataset(x + 2.0, y), batch_size=4)
+    validation_loader = DataLoader(TensorDataset(x, y), batch_size=4)
+    test_loader = DataLoader(TensorDataset(x, y), batch_size=4)
     monkeypatch.setattr(
         "stable_tiny.pipeline.build_dataloaders",
         lambda *_: (train_loader, validation_loader, test_loader),

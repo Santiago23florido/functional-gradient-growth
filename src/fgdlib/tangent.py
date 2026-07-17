@@ -1746,10 +1746,12 @@ def certificate_from_projection_stats(
             if interval_ok:
                 max_valid_learning_rate = safe_upper_bound
             if learning_rate is not None and learning_rate > config.eps:
+                # Strict interval: theory_lr_min < eta < eta_bar, with eps
+                # as the only numerical tolerance.
                 interval_ok = (
                     interval_ok
                     and learning_rate > config.theory_lr_min
-                    and learning_rate <= safe_upper_bound + config.eps
+                    and learning_rate < safe_upper_bound + config.eps
                 )
             learning_rate_interval_valid = interval_ok
             if not interval_ok:
