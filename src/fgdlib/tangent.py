@@ -103,6 +103,14 @@ class FGDApproxConfig:
     # fails. Every family commits through the same full FGD certificate.
     # Supported: "tangent", "rkhs_head", "parametric_gd".
     family_order: tuple[str, ...] = ("tangent",)
+    # Acceptance mode. When true, an outer step commits on its four LOCAL
+    # conditions only — valid sensor, strict Crel, strict LR interval
+    # (theory_lr_min < eta < eta_bar), and STRICT realized descent of the
+    # validation functional loss — while the stationary and global bounds
+    # are computed and logged as trajectory diagnostics. When false (the
+    # default), the legacy gates apply: non-strict descent and Cstat/Cglob
+    # as acceptance conditions.
+    local_acceptance_conditions: bool = False
     # Cooldown for rejected fallback families, measured in ACCEPTED outer
     # steps: a family rejected at theta_t is skipped until this many model
     # updates have been committed since the rejection (weight updates change
@@ -1746,12 +1754,20 @@ def certificate_from_projection_stats(
             if interval_ok:
                 max_valid_learning_rate = safe_upper_bound
             if learning_rate is not None and learning_rate > config.eps:
-                # Strict interval: theory_lr_min < eta < eta_bar, with eps
-                # as the only numerical tolerance.
+                if config.local_acceptance_conditions:
+                    # Strict interval: theory_lr_min < eta < eta_bar, with
+                    # eps as the only numerical tolerance.
+                    upper_bound_ok = (
+                        learning_rate < safe_upper_bound + config.eps
+                    )
+                else:
+                    upper_bound_ok = (
+                        learning_rate <= safe_upper_bound + config.eps
+                    )
                 interval_ok = (
                     interval_ok
                     and learning_rate > config.theory_lr_min
-                    and learning_rate < safe_upper_bound + config.eps
+                    and upper_bound_ok
                 )
             learning_rate_interval_valid = interval_ok
             if not interval_ok:

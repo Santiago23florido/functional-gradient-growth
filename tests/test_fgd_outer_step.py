@@ -24,7 +24,7 @@ ensure_gromo_importable()
 from gromo.containers.growing_mlp import GrowingMLP  # noqa: E402
 
 
-def _outer_problem():
+def _outer_problem(local_acceptance: bool = True):
     torch.manual_seed(0)
     model = GrowingMLP(
         in_features=2,
@@ -44,6 +44,7 @@ def _outer_problem():
             # A tiny mu keeps Cglob lenient so the deterministic descent
             # assertion below is the binding check.
             theory_mu=1e-9,
+            local_acceptance_conditions=local_acceptance,
         ),
     )
     model.eval()
@@ -234,6 +235,69 @@ def test_local_conditions_accept_even_when_trajectory_bounds_fail() -> None:
     assert trial.global_contraction is not None
     # ...and the step is accepted anyway.
     assert trial.all_conditions_valid is True
+
+
+def test_flag_off_restores_legacy_trajectory_gates() -> None:
+    """Without the config flag the accumulated bounds gate acceptance."""
+    # The flag defaults to OFF: existing configs keep the old behavior.
+    assert FGDApproxConfig().local_acceptance_conditions is False
+
+    problem = _outer_problem(local_acceptance=False)
+    model, batches, config, state, loss, direction, direction_stats = problem
+    poisoned_state = _FGDTheoryState(
+        epoch_count=1000,
+        min_gradient_sq_norm=direction_stats.target_sq_norm,
+        min_positive_learning_rate=1.0,
+        min_descent_coefficient=1.0,
+        global_contraction_product=1e-12,
+        previous_validation_functional_loss=loss,
+    )
+    certificate = certificate_from_projection_stats(
+        stats=direction_stats,
+        learning_rate=None,
+        config=config.fgd_approx,
+    )
+    assert certificate.max_valid_learning_rate is not None
+    trial = _run_outer_trial(
+        model,
+        batches,
+        config,
+        poisoned_state,
+        loss,
+        direction,
+        direction_stats,
+        learning_rate=0.03 * certificate.max_valid_learning_rate,
+    )
+    # Same step, same failing bounds — but in legacy mode they REJECT it.
+    assert trial.loss_descent_valid is True
+    assert trial.stationary_bound_valid is False
+    assert trial.global_bound_valid is False
+    assert trial.all_conditions_valid is False
+
+
+def test_descent_strictness_follows_the_flag() -> None:
+    """A no-progress step passes the legacy gate and fails the strict one."""
+    for local_acceptance, expected_descent_valid in (
+        (False, True),
+        (True, False),
+    ):
+        problem = _outer_problem(local_acceptance=local_acceptance)
+        model, batches, config, state, loss, direction, stats = problem
+        zero_direction = tuple(
+            torch.zeros_like(update) for update in direction
+        )
+        trial = _run_outer_trial(
+            model,
+            batches,
+            config,
+            state,
+            loss,
+            zero_direction,
+            stats,
+            learning_rate=0.02,
+        )
+        assert trial.validation_functional_loss == pytest.approx(loss)
+        assert trial.loss_descent_valid is expected_descent_valid
 
 
 def test_relative_error_condition_failure_rejects_the_step() -> None:

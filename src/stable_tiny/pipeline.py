@@ -641,24 +641,37 @@ def _certify_fgd_candidate(
 ) -> _FGDTrial:
     """Evaluate the FGD acceptance conditions for a realizable candidate.
 
-    Acceptance is decided by the four LOCAL conditions of the current outer
-    step (sensor, Crel, LR interval, strict realized descent). The
-    stationary and global convergence bounds are still computed and logged,
-    but only as diagnostics of the ACCUMULATED trajectory guarantees.
+    With fgd_approx.local_acceptance_conditions enabled, acceptance is
+    decided by the four LOCAL conditions of the current outer step (sensor,
+    Crel, LR interval, strict realized descent) and the stationary/global
+    convergence bounds are computed and logged only as diagnostics of the
+    ACCUMULATED trajectory guarantees. With the flag off (default), the
+    legacy gates apply: non-strict descent and Cstat/Cglob as acceptance
+    conditions.
     """
+    local_acceptance = config.fgd_approx.local_acceptance_conditions
     validation_functional_loss = evaluate_functional_loss(
         candidate_model,
         validation_loader,
         device,
     )
-    # Local condition 4: STRICT realized descent of the validation
-    # functional loss, L(f_{t+1}) < L(f_t), up to the numerical eps only.
-    loss_descent_valid = (
-        math.isfinite(validation_functional_loss)
-        and theory_state.previous_validation_functional_loss
-        - validation_functional_loss
-        > config.fgd_approx.eps
-    )
+    if local_acceptance:
+        # Local condition 4: STRICT realized descent of the validation
+        # functional loss, L(f_{t+1}) < L(f_t), up to the numerical eps
+        # only.
+        loss_descent_valid = (
+            math.isfinite(validation_functional_loss)
+            and theory_state.previous_validation_functional_loss
+            - validation_functional_loss
+            > config.fgd_approx.eps
+        )
+    else:
+        # Legacy gate: non-strict descent (a no-progress step passes).
+        loss_descent_valid = (
+            validation_functional_loss
+            <= theory_state.previous_validation_functional_loss
+            + config.fgd_approx.eps
+        )
 
     epoch_count = theory_state.epoch_count
     min_gradient_sq_norm = theory_state.min_gradient_sq_norm
@@ -750,8 +763,6 @@ def _certify_fgd_candidate(
     #   3. LR interval: theory_lr_min < eta < safe upper bound eta_bar,
     #      strict up to the configured eps;
     #   4. strict realized descent of the validation functional loss.
-    # stationary_bound_valid / global_bound_valid are intentionally ABSENT:
-    # they describe the accumulated trajectory, not this step.
     all_conditions_valid = (
         epoch_result.sensor_valid
         and epoch_result.skipped_batches == 0
@@ -760,6 +771,16 @@ def _certify_fgd_candidate(
         and certificate.learning_rate_interval_valid is True
         and loss_descent_valid
     )
+    if not local_acceptance:
+        # Legacy mode: the accumulated stationary and global bounds also
+        # gate acceptance. Under local_acceptance_conditions they are
+        # intentionally ABSENT — they describe the trajectory, not this
+        # step.
+        all_conditions_valid = (
+            all_conditions_valid
+            and stationary_bound_valid is True
+            and global_bound_valid is True
+        )
     return _FGDTrial(
         model=candidate_model,
         epoch_result=epoch_result,
@@ -1679,14 +1700,21 @@ def _certify_measured_descent_candidate(
     )
     # LOCAL acceptance conditions for the measured-descent family: strict
     # realized descent, the Cprog floor and a positive measured coefficient
-    # decide whether THIS step commits. The stationary and global bounds
-    # above are trajectory diagnostics, never acceptance gates.
+    # decide whether THIS step commits.
     all_conditions_valid = (
         loss_descent_valid
         and progress_valid
         and descent_coefficient is not None
         and descent_coefficient > 0.0
     )
+    if not config.fgd_approx.local_acceptance_conditions:
+        # Legacy mode: Cstat/Cglob also gate. Under
+        # local_acceptance_conditions they are trajectory diagnostics only.
+        all_conditions_valid = (
+            all_conditions_valid
+            and stationary_bound_valid is True
+            and global_bound_valid is True
+        )
     return _FGDTrial(
         model=candidate_model,
         epoch_result=epoch_result,
@@ -3399,15 +3427,20 @@ def run_pipeline(
                         f"sensor invalid on "
                         f"{fgd_sensor_invalid_batches} validation batch(es)"
                     )
+                diagnostic_bound_suffix = (
+                    " (trajectory diagnostic, not an acceptance gate)"
+                    if config.fgd_approx.local_acceptance_conditions
+                    else ""
+                )
                 if fgd_stationary_bound_valid is False:
                     warnings.append(
-                        "stationary-point bound failed "
-                        "(trajectory diagnostic, not an acceptance gate)"
+                        "stationary-point bound failed"
+                        + diagnostic_bound_suffix
                     )
                 if fgd_global_bound_valid is False:
                     warnings.append(
-                        "global-convergence bound failed "
-                        "(trajectory diagnostic, not an acceptance gate)"
+                        "global-convergence bound failed"
+                        + diagnostic_bound_suffix
                     )
                 if fgd_theory_learning_rate_adjusted:
                     warnings.append(
