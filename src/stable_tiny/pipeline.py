@@ -1800,6 +1800,24 @@ def _search_parametric_descent_candidate(
     )
 
 
+def _family_rejection_active(
+    rejected_at_step: int | None,
+    accepted_outer_steps: int,
+    cooldown: int,
+) -> bool:
+    """Whether a family rejection is still in effect.
+
+    The cooldown counts ACCEPTED outer steps committed since the rejection:
+    ordinary weight updates change the tangent space and the behavior of
+    every family, so a rejection at theta_t must never be permanent while
+    the architecture stays fixed. Growth clears rejection state entirely;
+    cooldown <= 0 disables the memory.
+    """
+    if rejected_at_step is None or cooldown <= 0:
+        return False
+    return accepted_outer_steps - rejected_at_step < cooldown
+
+
 def _certified_trial_progress(trial: _FGDTrial) -> float:
     """Certified progress eta r of a trial (the Cprog mass of the step)."""
     coefficient = trial.certificate.theory_descent_coefficient
@@ -2661,11 +2679,14 @@ def run_pipeline(
         fgd_global_contraction_product = 1.0
         fgd_previous_train_loss: float | None = None
         fgd_stalled_epochs = 0
-        # A family rejected at the current architecture stays skipped until a
-        # growth event changes the structure: the same structure re-offers
-        # the same (already refused) approximation capacity, so retrying
-        # every epoch only burns compute and hides structure exhaustion.
-        families_rejected_at_structure: set[str] = set()
+        # A rejected fallback family is skipped for a COOLDOWN of accepted
+        # outer steps (family_rejection_cooldown), not forever: weight
+        # updates change the tangent space, so the same architecture can
+        # re-admit a family once the parameters have moved. Growth clears
+        # all rejection state immediately.
+        fgd_accepted_outer_steps = 0
+        family_rejection_step: dict[str, int] = {}
+        family_rejection_cooldown = config.fgd_approx.family_rejection_cooldown
         # FIXED certification probes, materialized once for the whole run:
         # every certificate, family comparison and growth-layer trial solves
         # one joint shared-direction projection over the same sample.
@@ -3047,6 +3068,7 @@ def run_pipeline(
                         apply_learning_rate(optimizer, current_fgd_learning_rate)
                         entry_learning_rate = current_fgd_learning_rate
                         fgd_candidate_accepted = True
+                        fgd_accepted_outer_steps += 1
                         fgd_theory_learning_rate_adjusted = (
                             abs(current_fgd_learning_rate - learning_rate)
                             > config.fgd_approx.eps
@@ -3410,6 +3432,7 @@ def run_pipeline(
                     nonlocal current_fgd_learning_rate
                     nonlocal previous_validation_functional_loss
                     nonlocal last_test_loss
+                    nonlocal fgd_accepted_outer_steps
                     fgd_rkhs_phase_attempted = (
                         True if in_ladder else config.secant_fgd.enabled
                     )
@@ -3608,6 +3631,8 @@ def run_pipeline(
                                 f"converged={phase.converged})"
                             )
                         last_test_loss = phase_test_metrics.loss
+                        fgd_accepted_outer_steps += 1
+                        family_rejection_step.pop("rkhs_head", None)
                         return True
                     else:
                         phase_theory = (
@@ -3710,6 +3735,7 @@ def run_pipeline(
                     nonlocal fgd_min_descent_coefficient
                     nonlocal fgd_global_contraction_product
                     nonlocal last_test_loss
+                    nonlocal fgd_accepted_outer_steps
                     stage_theory_state = _FGDTheoryState(
                         epoch_count=fgd_epoch_count,
                         min_gradient_sq_norm=fgd_min_gradient_sq_norm,
@@ -3875,6 +3901,8 @@ def run_pipeline(
                             f"rel_err={stage_rel_error:.4f})"
                         )
                     last_test_loss = stage_test_metrics.loss
+                    fgd_accepted_outer_steps += 1
+                    family_rejection_step.pop(family_name, None)
                     return True
 
                 # Fallback approximation families run in the configured order;
@@ -3884,27 +3912,38 @@ def run_pipeline(
                     for name in config.fgd_approx.family_order
                     if name != "tangent"
                 )
+                def _family_on_cooldown(name: str) -> bool:
+                    return _family_rejection_active(
+                        family_rejection_step.get(name),
+                        fgd_accepted_outer_steps,
+                        family_rejection_cooldown,
+                    )
+
                 skipped_families = [
                     name
                     for name in fallback_families
-                    if name in families_rejected_at_structure
+                    if _family_on_cooldown(name)
                 ]
                 if skipped_families and progress is not None:
                     progress(
                         f"[FGD] Epoch {epoch}: skipping "
                         + ", ".join(skipped_families)
-                        + " (rejected at this structure; retried after growth)"
+                        + " (rejected recently; retried after "
+                        f"{family_rejection_cooldown} accepted outer step(s) "
+                        "or growth)"
                     )
                 for family_name in fallback_families:
                     if not growth_triggered:
                         break
-                    if family_name in families_rejected_at_structure:
+                    if _family_on_cooldown(family_name):
                         continue
                     if family_name == "rkhs_head":
                         if _attempt_rkhs_head_stage(in_ladder=True):
                             growth_triggered = False
                         else:
-                            families_rejected_at_structure.add(family_name)
+                            family_rejection_step[family_name] = (
+                                fgd_accepted_outer_steps
+                            )
                     elif family_name in (
                         "parametric_gd",
                         "parametric_descent",
@@ -3912,7 +3951,9 @@ def run_pipeline(
                         if _attempt_parametric_stage(family_name):
                             growth_triggered = False
                         else:
-                            families_rejected_at_structure.add(family_name)
+                            family_rejection_step[family_name] = (
+                                fgd_accepted_outer_steps
+                            )
 
                 if growth_triggered:
                     growth_probe = _probe_fgd_growth(
@@ -4025,9 +4066,9 @@ def run_pipeline(
                     # Growth is a mode switch: the accumulated stationary and
                     # global bounds certify a fixed architecture, so restart
                     # them from the post-growth loss. The new structure also
-                    # re-offers approximation capacity, so families rejected
-                    # at the previous structure become eligible again.
-                    families_rejected_at_structure.clear()
+                    # re-offers approximation capacity, so all stale family
+                    # rejections are cleared immediately.
+                    family_rejection_step.clear()
                     reset_fgd_certificate()
                     if config.fgd_approx.learning_rate_policy == "theory_interval":
                         validation_certificate_for_next_epoch = (

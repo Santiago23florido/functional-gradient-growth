@@ -103,6 +103,13 @@ class FGDApproxConfig:
     # fails. Every family commits through the same full FGD certificate.
     # Supported: "tangent", "rkhs_head", "parametric_gd".
     family_order: tuple[str, ...] = ("tangent",)
+    # Cooldown for rejected fallback families, measured in ACCEPTED outer
+    # steps: a family rejected at theta_t is skipped until this many model
+    # updates have been committed since the rejection (weight updates change
+    # the tangent space, so rejection must never be permanent at a fixed
+    # architecture). Growth clears all rejection state immediately; 0
+    # disables the memory (families are retried every epoch).
+    family_rejection_cooldown: int = 5
     # In-ladder rkhs_head acceptance margin: the committed head must improve
     # the FULL validation functional loss by at least this relative amount.
     # The phase's internal acceptance compares subsampled train losses

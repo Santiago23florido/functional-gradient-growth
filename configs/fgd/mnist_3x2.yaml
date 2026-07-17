@@ -79,6 +79,11 @@ fgd_approx:
   # projection (the projection_group_* keys above are deprecated: they used
   # to aggregate independent per-batch projections).
   probe_batches: 4
+  # A rejected fallback family is skipped until this many ACCEPTED outer
+  # steps have been committed since the rejection (weight updates change the
+  # tangent space, so rejection is never permanent at a fixed architecture).
+  # Growth clears all rejection state immediately; 0 retries every epoch.
+  family_rejection_cooldown: 5
   eps: 1.0e-12
   tiny_use_covariance: true
   tiny_alpha_zero: false
