@@ -27,7 +27,11 @@ from fgdlib.tangent import (
     ParametricDescentConfig,
     ParametricGDConfig,
     SecantFGDConfig,
+    _FunctionalStepStats,
     _clear_inaccessible_tensor_caches,
+    _compute_tangent_projection_step,
+    _projection_step_sensor_valid,
+    _trainable_named_parameters,
     batch_functional_mse_loss,
     build_projection_probe,
     certificate_from_projection_stats,
@@ -194,6 +198,7 @@ class HistoryEntry:
     fgd_theory_learning_rate_adjusted: bool = False
     fgd_sensor_valid: bool | None = None
     fgd_sensor_invalid_batches: int = 0
+    fgd_update_norm: float | None = None
     fgd_candidate_accepted: bool | None = None
     fgd_lr_search_trials: int = 0
     fgd_approximation_kind: str | None = None
@@ -752,44 +757,88 @@ def _certify_fgd_candidate(
     )
 
 
-def _evaluate_fgd_trial(
+def _apply_shared_direction_step(
+    model: GrowingMLP,
+    direction: tuple[torch.Tensor, ...],
+    learning_rate: float,
+) -> None:
+    """Apply theta <- theta - eta * u for the shared probe direction u."""
+    parameters = tuple(_trainable_named_parameters(model).values())
+    if len(parameters) != len(direction):
+        raise RuntimeError(
+            "Shared-direction update does not match the trainable parameters."
+        )
+    with torch.no_grad():
+        for parameter, update in zip(parameters, direction):
+            parameter.add_(update.to(parameter.device), alpha=-learning_rate)
+
+
+def _evaluate_fgd_outer_trial(
     *,
     base_model: GrowingMLP,
+    direction: tuple[torch.Tensor, ...],
+    direction_stats: _FunctionalStepStats,
     train_batches: list[tuple[torch.Tensor, torch.Tensor]],
-    test_loader: torch.utils.data.DataLoader,
     validation_loader: torch.utils.data.DataLoader,
     loss_function: torch.nn.Module,
     device: torch.device,
     learning_rate: float,
     accuracy_tolerance: float,
     config: PipelineConfig,
-    probe: tuple[torch.Tensor, torch.Tensor] | None,
     classification: bool,
     theory_state: _FGDTheoryState,
     initial_functional_gap: float,
     theory_loss_star: float,
 ) -> _FGDTrial:
-    """Train a disposable model and certify every condition on validation."""
-    trial_model = copy.deepcopy(base_model)
-    epoch_result = train_one_epoch_fgd_approx(
-        model=trial_model,
-        train_loader=train_batches,
-        test_loader=test_loader,
-        loss_function=loss_function,
-        device=device,
+    """One genuine FGD outer step: theta - eta * u with the shared direction.
+
+    The relative-error certificate comes from ``direction_stats``, measured
+    at the CURRENT model f_t for the exact direction u that moves it — never
+    at the endpoint of a training epoch, and never for a direction other
+    than the one applied. The stepped clone is then checked transactionally
+    (validation functional loss before vs after, Cstat, Cglob); rejection
+    rolls back by discarding the clone.
+    """
+    certificate = certificate_from_projection_stats(
+        stats=direction_stats,
         learning_rate=learning_rate,
-        accuracy_tolerance=accuracy_tolerance,
         config=config.fgd_approx,
-        classification=classification,
-        evaluate_test=False,
     )
-    certificate = evaluate_fgd_validation_certificate(
-        model=trial_model,
-        data_loader=validation_loader,
+    trial_model = copy.deepcopy(base_model)
+    _apply_shared_direction_step(trial_model, direction, learning_rate)
+    train_metrics = evaluate_regression_metrics(
+        trial_model,
+        train_batches,
+        loss_function,
         device=device,
-        config=config.fgd_approx,
-        learning_rate=epoch_result.min_positive_learning_rate,
-        probe=probe,
+        accuracy_tolerance=accuracy_tolerance,
+        classification=classification,
+    )
+    epoch_result = FGDApproxEpochResult(
+        train_loss=train_metrics.loss,
+        train_accuracy=train_metrics.accuracy,
+        test_loss=float("nan"),
+        test_accuracy=float("nan"),
+        learning_rate=learning_rate,
+        next_learning_rate=None,
+        learning_rate_upper_bound=certificate.learning_rate_upper_bound,
+        learning_rate_interval_valid=certificate.learning_rate_interval_valid,
+        learning_rate_clipped_batches=0,
+        skipped_batches=0,
+        relative_error_condition_valid=(
+            certificate.relative_error_condition_valid
+        ),
+        loss_descent_valid=None,
+        loss_non_descent_batches=0,
+        gradient_sq_norm=certificate.gradient_sq_norm,
+        theory_descent_coefficient=certificate.theory_descent_coefficient,
+        min_positive_learning_rate=learning_rate,
+        relative_error=certificate.relative_error,
+        selected_layer_index=None,
+        layer_relative_errors=[],
+        output_relative_error=certificate.output_relative_error,
+        sensor_valid=certificate.sensor_valid,
+        sensor_invalid_batches=certificate.sensor_invalid_batches,
     )
     return _certify_fgd_candidate(
         candidate_model=trial_model,
@@ -2753,6 +2802,7 @@ def run_pipeline(
             fgd_theory_learning_rate_adjusted = False
             fgd_sensor_valid: bool | None = None
             fgd_sensor_invalid_batches = 0
+            fgd_update_norm: float | None = None
             fgd_trial_sensor_failure = False
             diagnostic_trial: _FGDTrial | None = None
             fgd_growth_requested = False
@@ -2793,23 +2843,76 @@ def run_pipeline(
                     )
                     _clear_inaccessible_tensor_caches(model)
                     frozen_train_batches = list(train_loader)
-                    maximum_learning_rate = certified_validation_learning_rate(
-                        lr_certificate,
-                        config.fgd_approx,
+
+                    # One genuine outer step per epoch: solve the SHARED
+                    # direction u* on the fixed train probe at the current
+                    # model f_t, certify THAT direction on the fixed
+                    # validation probe BEFORE any update, then search the
+                    # step size eta for the single update theta - eta * u*.
+                    tangent_direction: tuple[torch.Tensor, ...] | None = None
+                    direction_stats: _FunctionalStepStats | None = None
+                    maximum_learning_rate: float | None = None
+                    direction_sensor_failure = False
+                    direction_step = _compute_tangent_projection_step(
+                        model=model,
+                        x=fgd_train_probe[0],
+                        y=fgd_train_probe[1],
+                        config=config.fgd_approx,
                     )
+                    if _projection_step_sensor_valid(
+                        direction_step,
+                        config.fgd_approx,
+                    ):
+                        tangent_direction = direction_step.parameter_updates
+                        fgd_update_norm = math.sqrt(
+                            sum(
+                                float(
+                                    torch.sum(update.detach() ** 2).item()
+                                )
+                                for update in tangent_direction
+                            )
+                        )
+                        direction_stats = measure_direction_projection(
+                            model,
+                            tangent_direction,
+                            fgd_validation_probe[0],
+                            fgd_validation_probe[1],
+                            config.fgd_approx,
+                        )
+                        direction_certificate = (
+                            certificate_from_projection_stats(
+                                stats=direction_stats,
+                                learning_rate=None,
+                                config=config.fgd_approx,
+                            )
+                        )
+                        if direction_certificate.sensor_valid:
+                            maximum_learning_rate = (
+                                certified_validation_learning_rate(
+                                    direction_certificate,
+                                    config.fgd_approx,
+                                )
+                            )
+                        else:
+                            direction_sensor_failure = True
+                            direction_stats = None
+                    else:
+                        direction_sensor_failure = True
 
                     def evaluate_trial(candidate_learning_rate: float) -> _FGDTrial:
-                        return _evaluate_fgd_trial(
+                        assert tangent_direction is not None
+                        assert direction_stats is not None
+                        return _evaluate_fgd_outer_trial(
                             base_model=model,
+                            direction=tangent_direction,
+                            direction_stats=direction_stats,
                             train_batches=frozen_train_batches,
-                            test_loader=test_loader,
                             validation_loader=validation_loader,
                             loss_function=loss_function,
                             device=device,
                             learning_rate=candidate_learning_rate,
                             accuracy_tolerance=config.training.accuracy_tolerance,
                             config=config,
-                            probe=fgd_validation_probe,
                             classification=classification,
                             theory_state=theory_state,
                             initial_functional_gap=initial_functional_gap,
@@ -2823,12 +2926,65 @@ def run_pipeline(
                             config=config.fgd_approx,
                         )
                         if maximum_learning_rate is not None
-                        else _FGDSearchResult(None, None, 0, False)
+                        and direction_stats is not None
+                        else _FGDSearchResult(
+                            None,
+                            None,
+                            0,
+                            direction_sensor_failure,
+                        )
                     )
                     fgd_lr_search_trials = search_result.trial_count
                     fgd_trial_sensor_failure = search_result.sensor_failure
                     accepted_trial = search_result.accepted
                     diagnostic_trial = search_result.last_trial
+
+                    outer_step_trial = (
+                        accepted_trial
+                        if accepted_trial is not None
+                        else diagnostic_trial
+                    )
+                    if progress is not None and outer_step_trial is not None:
+                        step_error = (
+                            outer_step_trial.certificate.output_relative_error
+                        )
+                        step_rel_error = (
+                            outer_step_trial.certificate.relative_error
+                        )
+                        progress(
+                            f"[FGD-STEP] Epoch {epoch}: "
+                            "loss_before="
+                            f"{theory_state.previous_validation_functional_loss:.6e}, "
+                            "loss_after="
+                            f"{outer_step_trial.validation_functional_loss:.6e}, "
+                            "rel_err_before="
+                            + (
+                                f"{step_rel_error:.4f}"
+                                if step_rel_error is not None
+                                else "n/a"
+                            )
+                            + ", |r|="
+                            + (
+                                f"{step_error.target_norm:.4e}"
+                                if step_error is not None
+                                else "n/a"
+                            )
+                            + ", |g|="
+                            + (
+                                f"{step_error.approximation_norm:.4e}"
+                                if step_error is not None
+                                else "n/a"
+                            )
+                            + ", |u|="
+                            + (
+                                f"{fgd_update_norm:.4e}"
+                                if fgd_update_norm is not None
+                                else "n/a"
+                            )
+                            + ", eta="
+                            f"{outer_step_trial.epoch_result.learning_rate:.4g}, "
+                            f"accepted={accepted_trial is not None}"
+                        )
 
                     if accepted_trial is not None:
                         model = accepted_trial.model
@@ -2847,10 +3003,12 @@ def run_pipeline(
                             test_accuracy=test_metrics.accuracy,
                         )
                         epoch_result = fgd_epoch_result
+                        # The committed certificate describes the DIRECTION
+                        # that moved f_t; the next epoch's state certificate
+                        # must be measured at f_{t+1}, so it is recomputed
+                        # lazily at the top of the next epoch.
                         validation_certificate = accepted_trial.certificate
-                        validation_certificate_for_next_epoch = (
-                            validation_certificate
-                        )
+                        validation_certificate_for_next_epoch = None
                         current_fgd_learning_rate = (
                             fgd_epoch_result.min_positive_learning_rate
                             or learning_rate
@@ -3097,6 +3255,7 @@ def run_pipeline(
                 ),
                 fgd_sensor_valid=fgd_sensor_valid,
                 fgd_sensor_invalid_batches=fgd_sensor_invalid_batches,
+                fgd_update_norm=fgd_update_norm,
                 fgd_candidate_accepted=fgd_candidate_accepted,
                 fgd_lr_search_trials=fgd_lr_search_trials,
                 fgd_approximation_kind=fgd_approximation_kind,
