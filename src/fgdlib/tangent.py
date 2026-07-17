@@ -95,7 +95,12 @@ class FGDApproxConfig:
     family_order: tuple[str, ...] = ("tangent",)
 
 
-SUPPORTED_FGD_FAMILIES = ("tangent", "rkhs_head", "parametric_gd")
+SUPPORTED_FGD_FAMILIES = (
+    "tangent",
+    "rkhs_head",
+    "parametric_gd",
+    "parametric_descent",
+)
 
 
 def validate_family_order(family_order: tuple[str, ...]) -> None:
@@ -163,6 +168,71 @@ class ParametricGDConfig:
         if self.parameter_penalty < 0.0:
             raise ValueError(
                 "parametric_gd.parameter_penalty must be non-negative."
+            )
+
+
+@dataclass(frozen=True)
+class ParametricDescentConfig:
+    """Parametric family certified by MEASURED functional descent.
+
+    Same candidate generation as parametric_gd (clone trained toward the
+    functional target f - eta_nominal * r; note eta_nominal = 0.5 makes the
+    target exactly y, i.e. plain parametric loss descent). Acceptance does
+    NOT go through the relative-error route: for the empirical sum-MSE
+    functional the function-space PL inequality is the exact identity
+    |grad L|^2 = 4 L (mu = 2, L* = 0, the configured theory constants), so
+    Proposition 3.8's contraction only needs the per-step descent
+    inequality — which is MEASURED on validation instead of lower-bounded
+    via epsilon. The measured descent coefficient
+    r_t = (L_t - L_{t+1}) / (eta* |grad L_t|^2) plugs into the same Cprog,
+    Cstat and Cglob accumulators; the contraction it certifies equals the
+    realized loss ratio exactly.
+    """
+
+    optimizer: str = "sgd"
+    inner_learning_rate: float = 0.05
+    inner_steps: tuple[int, ...] = (16, 64)
+    functional_learning_rates: tuple[float, ...] = (0.5, 0.2)
+    # Optional direction screen. 0.0 only requires a descent direction in
+    # function space (eta* > 0); raise it to demand tangent-like alignment.
+    min_cosine: float = 0.0
+    parameter_penalty: float = 1e-6
+    gradient_clip_norm: float | None = 1.0
+    # Cprog floor on the measured progress eta* r_t = D_t / |grad L_t|^2.
+    min_progress: float = 1e-6
+
+    def validate(self) -> None:
+        if self.optimizer not in ("sgd", "adam"):
+            raise ValueError(
+                "parametric_descent.optimizer must be 'sgd' or 'adam'."
+            )
+        if self.inner_learning_rate <= 0.0:
+            raise ValueError(
+                "parametric_descent.inner_learning_rate must be positive."
+            )
+        if not self.inner_steps or any(v < 1 for v in self.inner_steps):
+            raise ValueError(
+                "parametric_descent.inner_steps must contain positive "
+                "integers."
+            )
+        if not self.functional_learning_rates or any(
+            v <= 0.0 for v in self.functional_learning_rates
+        ):
+            raise ValueError(
+                "parametric_descent.functional_learning_rates must be "
+                "positive."
+            )
+        if not 0.0 <= self.min_cosine <= 1.0:
+            raise ValueError(
+                "parametric_descent.min_cosine must lie in [0, 1]."
+            )
+        if self.parameter_penalty < 0.0:
+            raise ValueError(
+                "parametric_descent.parameter_penalty must be non-negative."
+            )
+        if self.min_progress <= 0.0:
+            raise ValueError(
+                "parametric_descent.min_progress must be positive."
             )
 
 

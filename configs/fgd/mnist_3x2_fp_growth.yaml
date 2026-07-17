@@ -104,8 +104,9 @@ fgd_approx:
   # growth_function_preserving:
   family_order:
     - tangent
-    # - rkhs_head       # certified RKHS head phase as an in-ladder family
-    # - parametric_gd   # calibrated parametric-GD secant (see section below)
+    # - rkhs_head          # certified RKHS head phase as an in-ladder family
+    # - parametric_gd      # strict Prop-3.8 secant (Crel<0.5; see section below)
+    # - parametric_descent # measured-descent Prop-3.8 secant (see section below)
 
 # Parametric-GD secant family. Only consulted when "parametric_gd" is
 # listed in fgd_approx.family_order. A disposable clone is trained
@@ -131,6 +132,33 @@ parametric_gd:
   min_cosine: 0.9           # mathematical floor for Crel<0.5 is 0.866
   parameter_penalty: 1.0e-6
   gradient_clip_norm: 1.0
+
+# Measured-descent parametric family. Only consulted when
+# "parametric_descent" is listed in fgd_approx.family_order. Same candidate
+# generation and eta* calibration as parametric_gd, but acceptance follows
+# Prop. 3.8 with the descent coefficient MEASURED on validation instead of
+# lower-bounded through the relative error: for the empirical sum-MSE
+# functional the function-space PL inequality is the exact identity
+# |grad L|^2 = 4 L (the configured theory_mu = 2, theory_loss_star = 0), so
+# the global contraction G_T <= prod(1 - 2 eta mu r_t) G_0 holds with
+# r_t = (L_t - L_{t+1}) / (eta* |grad L_t|^2) and equals the realized loss
+# ratio exactly. Crel and the LR interval are NOT gates here (they are one
+# sufficient mechanism, which the measurement replaces); the secant relative
+# error is still logged as a diagnostic. Cprog (min_progress), Cstat and
+# Cglob use the same accumulators as every other family. Because a merely
+# descending step certifies, this family fires where parametric_gd declines;
+# per-step it certifies realized progress rather than near-gradient
+# direction.
+parametric_descent:
+  optimizer: sgd
+  inner_learning_rate: 0.05
+  inner_steps: [16, 64]
+  # 0.5 makes the functional target exactly y (plain parametric loss descent).
+  functional_learning_rates: [0.5, 0.2]
+  min_cosine: 0.0           # 0 = only require a descent direction (eta* > 0)
+  parameter_penalty: 1.0e-6
+  gradient_clip_norm: 1.0
+  min_progress: 1.0e-6      # Cprog floor on eta* r_t = D_t / |grad L_t|^2
 
 # Tangent projection only: the certified RKHS head phase is off, so the
 # growth_min_* thresholds below still govern the growth probe gate.

@@ -24,6 +24,7 @@ from fgdlib.tangent import (
     FGDLayerRelError,
     FGDOutputRelError,
     FGDValidationCertificate,
+    ParametricDescentConfig,
     ParametricGDConfig,
     SecantFGDConfig,
     _clear_inaccessible_tensor_caches,
@@ -141,6 +142,9 @@ class PipelineConfig:
     fgd_approx: FGDApproxConfig = field(default_factory=FGDApproxConfig)
     secant_fgd: SecantFGDConfig = field(default_factory=SecantFGDConfig)
     parametric_gd: ParametricGDConfig = field(default_factory=ParametricGDConfig)
+    parametric_descent: ParametricDescentConfig = field(
+        default_factory=ParametricDescentConfig
+    )
     fgd_rkhs: FGDRKHSConfig = field(default_factory=FGDRKHSConfig)
     scaling_line_search: ScalingLineSearchConfig = field(
         default_factory=ScalingLineSearchConfig
@@ -286,7 +290,7 @@ def _section_dataclass(
             str(value) for value in values["family_order"] or ()
         )
 
-    if section_type is ParametricGDConfig:
+    if section_type in (ParametricGDConfig, ParametricDescentConfig):
         if "inner_steps" in values:
             values["inner_steps"] = tuple(
                 int(value) for value in values["inner_steps"] or ()
@@ -315,6 +319,7 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         "fgd_approx",
         "secant_fgd",
         "parametric_gd",
+        "parametric_descent",
         "fgd_rkhs",
         "scaling_line_search",
         "growth_schedule",
@@ -339,6 +344,11 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
             ParametricGDConfig,
             raw,
         ),
+        parametric_descent=_section_dataclass(
+            "parametric_descent",
+            ParametricDescentConfig,
+            raw,
+        ),
         fgd_rkhs=_section_dataclass("fgd_rkhs", FGDRKHSConfig, raw),
         scaling_line_search=_section_dataclass(
             "scaling_line_search",
@@ -355,6 +365,7 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
     )
     validate_family_order(config.fgd_approx.family_order)
     config.parametric_gd.validate()
+    config.parametric_descent.validate()
     return config
 
 
@@ -1220,9 +1231,13 @@ def _train_parametric_gd_candidate(
     device: torch.device,
     functional_learning_rate: float,
     steps: int,
-    config: ParametricGDConfig,
+    config: ParametricGDConfig | ParametricDescentConfig,
 ) -> GrowingMLP | None:
-    """Train a disposable clone toward the functional target f - eta * r."""
+    """Train a disposable clone toward the functional target f - eta * r.
+
+    With eta = 0.5 the target f - 0.5 * 2(f - y) is exactly y, so that
+    nominal rate reproduces plain parametric loss descent.
+    """
     trial_model = copy.deepcopy(base_model)
     base_model.eval()
     trial_model.train()
@@ -1380,6 +1395,309 @@ def _evaluate_parametric_gd_trial(
         initial_functional_gap=initial_functional_gap,
         theory_loss_star=theory_loss_star,
     )
+
+
+def _certify_measured_descent_candidate(
+    *,
+    candidate_model: GrowingMLP,
+    base_model: GrowingMLP,
+    train_batches: list[tuple[torch.Tensor, torch.Tensor]],
+    validation_loader: torch.utils.data.DataLoader,
+    loss_function: torch.nn.Module,
+    device: torch.device,
+    eta_star: float,
+    relative_error: float | None,
+    accuracy_tolerance: float,
+    config: PipelineConfig,
+    classification: bool,
+    theory_state: _FGDTheoryState,
+    initial_functional_gap: float,
+    theory_loss_star: float,
+) -> _FGDTrial:
+    """Certify a candidate by its MEASURED functional descent (Prop. 3.8).
+
+    For the empirical sum-MSE functional the function-space PL inequality is
+    the exact identity |grad L|^2 = 4 L (theory_mu = 2, L* = 0), so the
+    global-contraction argument of Proposition 3.8 needs only the per-step
+    descent inequality L_{t+1} <= L_t - eta_t r_t |grad L_t|^2. Here that
+    inequality holds with equality by construction: the descent coefficient
+    r_t = (L_t - L_{t+1}) / (eta* |grad L_t|^2) is measured on validation.
+    The relative-error route (Lemma 3.5 / Crel / LR interval) is a
+    sufficient mechanism this family does not use; the measured relative
+    error is stored for diagnostics only. Cprog, Cstat and Cglob use the
+    same accumulators and algebra as every other family.
+    """
+    validation_loss_before = evaluate_functional_loss(
+        base_model,
+        validation_loader,
+        device,
+    )
+    validation_loss_after = evaluate_functional_loss(
+        candidate_model,
+        validation_loader,
+        device,
+    )
+    descent = validation_loss_before - validation_loss_after
+    # Exact for sum-MSE with L* = 0: |grad L|^2 = |2 (F - Y)|^2 = 4 L.
+    gradient_sq_norm = 4.0 * validation_loss_before
+
+    eps = config.fgd_approx.eps
+    loss_descent_valid = (
+        math.isfinite(validation_loss_after)
+        and validation_loss_after
+        <= theory_state.previous_validation_functional_loss + eps
+        and descent > eps
+    )
+    progress = descent / max(gradient_sq_norm, eps)
+    progress_valid = progress >= config.parametric_descent.min_progress
+    descent_coefficient = (
+        descent / max(eta_star * gradient_sq_norm, eps)
+        if eta_star > 0.0
+        else None
+    )
+
+    epoch_count = theory_state.epoch_count
+    min_gradient_sq_norm = theory_state.min_gradient_sq_norm
+    min_positive_learning_rate = theory_state.min_positive_learning_rate
+    min_descent_coefficient = theory_state.min_descent_coefficient
+    contraction_product = theory_state.global_contraction_product
+
+    if descent_coefficient is not None and descent_coefficient > 0.0:
+        epoch_count += 1
+        min_gradient_sq_norm = (
+            gradient_sq_norm
+            if min_gradient_sq_norm is None
+            else min(min_gradient_sq_norm, gradient_sq_norm)
+        )
+        min_positive_learning_rate = (
+            eta_star
+            if min_positive_learning_rate is None
+            else min(min_positive_learning_rate, eta_star)
+        )
+        min_descent_coefficient = (
+            descent_coefficient
+            if min_descent_coefficient is None
+            else min(min_descent_coefficient, descent_coefficient)
+        )
+
+    stationary_bound: float | None = None
+    stationary_bound_valid: bool | None = None
+    global_bound: float | None = None
+    global_bound_valid: bool | None = None
+    global_contraction: float | None = None
+    if (
+        epoch_count > 0
+        and min_positive_learning_rate is not None
+        and min_descent_coefficient is not None
+        and min_positive_learning_rate > 0.0
+        and min_descent_coefficient > 0.0
+    ):
+        stationary_bound = initial_functional_gap / (
+            epoch_count
+            * min_positive_learning_rate
+            * min_descent_coefficient
+        )
+        stationary_bound_valid = (
+            min_gradient_sq_norm is not None
+            and min_gradient_sq_norm <= stationary_bound + eps
+        )
+
+        beta = config.fgd_approx.theory_beta
+        mu = config.fgd_approx.theory_mu
+        if descent_coefficient is not None and beta > 0 and mu > 0:
+            # With the measured coefficient and the exact MSE constants this
+            # contraction equals the realized loss ratio L_{t+1} / L_t.
+            global_contraction = 1.0 - (
+                2.0 * eta_star * mu * descent_coefficient / (beta**2)
+            )
+            contraction_product *= global_contraction
+            global_bound = contraction_product * initial_functional_gap
+            current_gap = max(validation_loss_after - theory_loss_star, 0.0)
+            global_bound_valid = current_gap <= global_bound + eps
+
+    train_metrics = evaluate_regression_metrics(
+        candidate_model,
+        train_batches,
+        loss_function,
+        device=device,
+        accuracy_tolerance=accuracy_tolerance,
+        classification=classification,
+    )
+    epoch_result = FGDApproxEpochResult(
+        train_loss=train_metrics.loss,
+        train_accuracy=train_metrics.accuracy,
+        test_loss=float("nan"),
+        test_accuracy=float("nan"),
+        learning_rate=eta_star,
+        next_learning_rate=None,
+        learning_rate_upper_bound=None,
+        learning_rate_interval_valid=None,
+        learning_rate_clipped_batches=0,
+        skipped_batches=0,
+        relative_error_condition_valid=None,
+        loss_descent_valid=loss_descent_valid,
+        loss_non_descent_batches=0,
+        gradient_sq_norm=gradient_sq_norm,
+        theory_descent_coefficient=descent_coefficient,
+        min_positive_learning_rate=eta_star,
+        relative_error=relative_error,
+        selected_layer_index=None,
+        layer_relative_errors=[],
+        output_relative_error=None,
+        sensor_valid=True,
+        sensor_invalid_batches=0,
+    )
+    certificate = FGDValidationCertificate(
+        learning_rate_upper_bound=None,
+        max_valid_learning_rate=None,
+        learning_rate_interval_valid=None,
+        skipped_batches=0,
+        # Diagnostic only for this family: acceptance never gates on it.
+        relative_error_condition_valid=None,
+        gradient_sq_norm=gradient_sq_norm,
+        theory_descent_coefficient=descent_coefficient,
+        relative_error=relative_error,
+        output_relative_error=None,
+        sensor_valid=True,
+        sensor_invalid_batches=0,
+    )
+    updated_state = _FGDTheoryState(
+        epoch_count=epoch_count,
+        min_gradient_sq_norm=min_gradient_sq_norm,
+        min_positive_learning_rate=min_positive_learning_rate,
+        min_descent_coefficient=min_descent_coefficient,
+        global_contraction_product=contraction_product,
+        previous_validation_functional_loss=validation_loss_after,
+    )
+    all_conditions_valid = (
+        loss_descent_valid
+        and progress_valid
+        and descent_coefficient is not None
+        and descent_coefficient > 0.0
+        and stationary_bound_valid is True
+        and global_bound_valid is True
+    )
+    return _FGDTrial(
+        model=candidate_model,
+        epoch_result=epoch_result,
+        certificate=certificate,
+        theory_state=updated_state,
+        validation_functional_loss=validation_loss_after,
+        loss_descent_valid=loss_descent_valid,
+        stationary_bound=stationary_bound,
+        stationary_bound_valid=stationary_bound_valid,
+        global_bound=global_bound,
+        global_bound_valid=global_bound_valid,
+        global_contraction=global_contraction,
+        all_conditions_valid=all_conditions_valid,
+    )
+
+
+def _evaluate_parametric_descent_trial(
+    *,
+    base_model: GrowingMLP,
+    train_batches: list[tuple[torch.Tensor, torch.Tensor]],
+    validation_loader: torch.utils.data.DataLoader,
+    loss_function: torch.nn.Module,
+    device: torch.device,
+    functional_learning_rate: float,
+    steps: int,
+    accuracy_tolerance: float,
+    config: PipelineConfig,
+    classification: bool,
+    theory_state: _FGDTheoryState,
+    initial_functional_gap: float,
+    theory_loss_star: float,
+) -> _FGDTrial | None:
+    """One measured-descent candidate; None if the direction screen fails."""
+    descent_config = config.parametric_descent
+    candidate = _train_parametric_gd_candidate(
+        base_model=base_model,
+        train_batches=train_batches,
+        device=device,
+        functional_learning_rate=functional_learning_rate,
+        steps=steps,
+        config=descent_config,
+    )
+    if candidate is None:
+        return None
+    projection = _measure_secant_projection(
+        base_model=base_model,
+        candidate_model=candidate,
+        validation_loader=validation_loader,
+        device=device,
+        eps=config.fgd_approx.eps,
+    )
+    if projection is None:
+        return None
+    cosine, eta_star = projection
+    if eta_star <= config.fgd_approx.eps:
+        return None
+    if cosine < descent_config.min_cosine:
+        return None
+    # Diagnostic secant relative error at eta*: exactly sqrt(1 - cos^2).
+    relative_error = math.sqrt(max(0.0, 1.0 - cosine * cosine))
+    return _certify_measured_descent_candidate(
+        candidate_model=candidate,
+        base_model=base_model,
+        train_batches=train_batches,
+        validation_loader=validation_loader,
+        loss_function=loss_function,
+        device=device,
+        eta_star=eta_star,
+        relative_error=relative_error,
+        accuracy_tolerance=accuracy_tolerance,
+        config=config,
+        classification=classification,
+        theory_state=theory_state,
+        initial_functional_gap=initial_functional_gap,
+        theory_loss_star=theory_loss_star,
+    )
+
+
+def _search_parametric_descent_candidate(
+    *,
+    base_model: GrowingMLP,
+    train_batches: list[tuple[torch.Tensor, torch.Tensor]],
+    validation_loader: torch.utils.data.DataLoader,
+    loss_function: torch.nn.Module,
+    device: torch.device,
+    accuracy_tolerance: float,
+    config: PipelineConfig,
+    classification: bool,
+    theory_state: _FGDTheoryState,
+    initial_functional_gap: float,
+    theory_loss_star: float,
+) -> _FGDSearchResult:
+    """Search measured-descent candidates over the configured budgets."""
+    trial_count = 0
+    last_trial: _FGDTrial | None = None
+    for functional_learning_rate in (
+        config.parametric_descent.functional_learning_rates
+    ):
+        for steps in config.parametric_descent.inner_steps:
+            trial = _evaluate_parametric_descent_trial(
+                base_model=base_model,
+                train_batches=train_batches,
+                validation_loader=validation_loader,
+                loss_function=loss_function,
+                device=device,
+                functional_learning_rate=functional_learning_rate,
+                steps=steps,
+                accuracy_tolerance=accuracy_tolerance,
+                config=config,
+                classification=classification,
+                theory_state=theory_state,
+                initial_functional_gap=initial_functional_gap,
+                theory_loss_star=theory_loss_star,
+            )
+            trial_count += 1
+            if trial is None:
+                continue
+            last_trial = trial
+            if trial.all_conditions_valid:
+                return _FGDSearchResult(trial, trial, trial_count, False)
+    return _FGDSearchResult(None, last_trial, trial_count, False)
 
 
 def _search_parametric_gd_candidate(
@@ -3074,13 +3392,17 @@ def run_pipeline(
                                 )
                         return False
 
-                def _attempt_parametric_gd_stage() -> bool:
-                    """Calibrated parametric-GD secant family; True iff committed.
+                def _attempt_parametric_stage(family_name: str) -> bool:
+                    """Parametric secant families; True iff a step committed.
 
-                    Candidates are screened by the output-projection cosine and
-                    certified at the scale-optimal declared learning rate eta*;
-                    acceptance requires the same full transactional conditions as
-                    the tangent family (Crel, interval, descent, Cstat, Cglob).
+                    parametric_gd: screened by the output-projection cosine
+                    and certified at the scale-optimal eta* through the full
+                    relative-error certificate (Crel, interval, descent,
+                    Cstat, Cglob). parametric_descent: same generation and
+                    eta* calibration, but certified by the MEASURED descent
+                    coefficient (Prop. 3.8 with the exact sum-MSE
+                    function-space constants), with Cprog/Cstat/Cglob on the
+                    same accumulators.
                     """
                     nonlocal model, optimizer
                     nonlocal validation_certificate_for_next_epoch
@@ -3101,28 +3423,53 @@ def run_pipeline(
                             previous_validation_functional_loss
                         ),
                     )
-                    stage_search = _search_parametric_gd_candidate(
-                        base_model=model,
-                        train_batches=growth_train_batches,
-                        validation_loader=validation_loader,
-                        loss_function=loss_function,
-                        device=device,
-                        accuracy_tolerance=config.training.accuracy_tolerance,
-                        config=config,
-                        projection_group_size=current_projection_group_size,
-                        classification=classification,
-                        theory_state=stage_theory_state,
-                        initial_functional_gap=initial_functional_gap,
-                        theory_loss_star=theory_loss_star,
+                    if family_name == "parametric_gd":
+                        stage_search = _search_parametric_gd_candidate(
+                            base_model=model,
+                            train_batches=growth_train_batches,
+                            validation_loader=validation_loader,
+                            loss_function=loss_function,
+                            device=device,
+                            accuracy_tolerance=(
+                                config.training.accuracy_tolerance
+                            ),
+                            config=config,
+                            projection_group_size=(
+                                current_projection_group_size
+                            ),
+                            classification=classification,
+                            theory_state=stage_theory_state,
+                            initial_functional_gap=initial_functional_gap,
+                            theory_loss_star=theory_loss_star,
+                        )
+                    else:
+                        stage_search = _search_parametric_descent_candidate(
+                            base_model=model,
+                            train_batches=growth_train_batches,
+                            validation_loader=validation_loader,
+                            loss_function=loss_function,
+                            device=device,
+                            accuracy_tolerance=(
+                                config.training.accuracy_tolerance
+                            ),
+                            config=config,
+                            classification=classification,
+                            theory_state=stage_theory_state,
+                            initial_functional_gap=initial_functional_gap,
+                            theory_loss_star=theory_loss_star,
+                        )
+                    stage_label = (
+                        "PGD" if family_name == "parametric_gd" else "PDESC"
                     )
                     stage_trial = stage_search.accepted
                     if stage_trial is None:
                         if progress is not None:
                             progress(
-                                f"[PGD] Epoch {epoch}: no parametric-GD secant "
-                                "passed the cosine/scale screen and the full "
-                                f"certificate ({stage_search.trial_count} "
-                                "candidate(s) evaluated); trying the next family"
+                                f"[{stage_label}] Epoch {epoch}: no "
+                                f"{family_name} candidate passed its screen "
+                                "and the full certificate "
+                                f"({stage_search.trial_count} candidate(s) "
+                                "evaluated); trying the next family"
                             )
                         return False
                     model = stage_trial.model
@@ -3211,14 +3558,15 @@ def run_pipeline(
                         fgd_global_contraction=stage_trial.global_contraction,
                         fgd_sensor_valid=True,
                         fgd_candidate_accepted=True,
-                        fgd_approximation_kind="parametric_gd",
+                        fgd_approximation_kind=family_name,
                         fgd_growth_probe_improved=False,
                     )
                     history.append(secant_entry)
                     wandb_logger.log_history_entry(secant_entry)
                     if progress is not None:
                         progress(
-                            f"[PGD] Epoch {epoch}: parametric-GD secant accepted "
+                            f"[{stage_label}] Epoch {epoch}: {family_name} "
+                            "secant accepted "
                             f"(eta*={stage_trial.epoch_result.learning_rate:.4g}, "
                             f"rel_err={stage_trial.certificate.relative_error:.4f})"
                         )
@@ -3238,8 +3586,11 @@ def run_pipeline(
                     if family_name == "rkhs_head":
                         if _attempt_rkhs_head_stage(in_ladder=True):
                             growth_triggered = False
-                    elif family_name == "parametric_gd":
-                        if _attempt_parametric_gd_stage():
+                    elif family_name in (
+                        "parametric_gd",
+                        "parametric_descent",
+                    ):
+                        if _attempt_parametric_stage(family_name):
                             growth_triggered = False
 
                 if growth_triggered:
