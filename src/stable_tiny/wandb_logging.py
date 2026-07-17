@@ -9,6 +9,14 @@ from typing import Any, Literal
 
 WandbMode = Literal["online", "offline", "disabled"]
 
+# Numeric family identity for charting which family committed each epoch.
+FAMILY_INDEX = {
+    "tangent": 0,
+    "rkhs_head": 1,
+    "parametric_gd": 2,
+    "parametric_descent": 3,
+}
+
 
 @dataclass(frozen=True)
 class WandbConfig:
@@ -128,8 +136,27 @@ class WandbRunLogger:
             "event/step_type": entry.step_type,
         }
 
-        if entry.rel_error is not None:
+        # Step-consistent metrics: the fgd/* certificate series describe the
+        # family that actually COMMITTED the step, so an epoch's point comes
+        # only from its accepted entry. The tangent certificate of the
+        # committed state remains available every epoch as a separate state
+        # diagnostic (fgd/tangent_relative_error); without this split the
+        # tangent diagnostic and the acting family's values interleave at
+        # the same epoch and the charts read as sawtooth noise.
+        candidate_accepted = getattr(entry, "fgd_candidate_accepted", None)
+        step_committed = candidate_accepted is True
+        approximation_kind = getattr(entry, "fgd_approximation_kind", None)
+
+        if entry.step_type == "FGD" and entry.rel_error is not None:
+            payload["fgd/tangent_relative_error"] = entry.rel_error
+
+        if step_committed and entry.rel_error is not None:
             payload["fgd/relative_error"] = entry.rel_error
+        if step_committed:
+            payload["fgd/family_index"] = FAMILY_INDEX.get(
+                approximation_kind or "tangent",
+                -1,
+            )
 
         learning_rate_upper_bound = getattr(
             entry,
@@ -169,16 +196,25 @@ class WandbRunLogger:
         if loss_descent_valid is not None:
             payload["fgd/validation_loss_descent_valid"] = loss_descent_valid
 
+        if step_committed:
+            for attribute_name, metric_name in (
+                ("fgd_gradient_sq_norm", "fgd/gradient_sq_norm"),
+                ("fgd_min_gradient_sq_norm", "fgd/min_gradient_sq_norm"),
+                (
+                    "fgd_theory_descent_coefficient",
+                    "fgd/theory_descent_coefficient",
+                ),
+                ("fgd_stationary_bound", "fgd/stationary_bound"),
+                ("fgd_global_bound", "fgd/global_bound"),
+                ("fgd_global_contraction", "fgd/global_contraction"),
+            ):
+                value = getattr(entry, attribute_name, None)
+                if value is not None:
+                    payload[metric_name] = value
+
+        # RKHS phase internals stay in their own namespace regardless of
+        # acceptance: they describe the phase, not the committed step.
         for attribute_name, metric_name in (
-            ("fgd_gradient_sq_norm", "fgd/gradient_sq_norm"),
-            ("fgd_min_gradient_sq_norm", "fgd/min_gradient_sq_norm"),
-            (
-                "fgd_theory_descent_coefficient",
-                "fgd/theory_descent_coefficient",
-            ),
-            ("fgd_stationary_bound", "fgd/stationary_bound"),
-            ("fgd_global_bound", "fgd/global_bound"),
-            ("fgd_global_contraction", "fgd/global_contraction"),
             ("fgd_rkhs_dictionary_size", "fgd/rkhs_dictionary_size"),
             ("fgd_rkhs_functional_loss", "fgd/rkhs_functional_loss"),
             ("fgd_rkhs_loss_star", "fgd/rkhs_loss_star"),
@@ -192,11 +228,11 @@ class WandbRunLogger:
             "fgd_stationary_bound_valid",
             None,
         )
-        if stationary_bound_valid is not None:
+        if step_committed and stationary_bound_valid is not None:
             payload["fgd/stationary_bound_valid"] = stationary_bound_valid
 
         global_bound_valid = getattr(entry, "fgd_global_bound_valid", None)
-        if global_bound_valid is not None:
+        if step_committed and global_bound_valid is not None:
             payload["fgd/global_bound_valid"] = global_bound_valid
 
         theory_learning_rate_adjusted = getattr(

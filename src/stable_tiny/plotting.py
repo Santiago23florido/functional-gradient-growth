@@ -140,28 +140,69 @@ def plot_parameters(
     return saved_path
 
 
+_FAMILY_PLOT_STYLE = {
+    "tangent": ("tab:cyan", "o"),
+    "rkhs_head": ("tab:orange", "s"),
+    "parametric_gd": ("tab:green", "^"),
+    "parametric_descent": ("tab:purple", "D"),
+}
+
+
 def plot_relative_error(
     history: Sequence[HistoryEntryLike],
     output_path: str | Path | None = None,
     show: bool = False,
     threshold: float | None = None,
 ) -> Path | None:
-    """Plot FGD approximation relative error when available."""
+    """Plot the relative error of the family that committed each step.
+
+    Committed steps are drawn as one labeled series per approximation
+    family, so every point reflects the certificate of the family that
+    actually acted that epoch. The tangent certificate of the committed
+    state (the growth-trigger diagnostic, present every FGD epoch even
+    when the transaction was rejected) is drawn as a light reference line.
+    """
     import matplotlib.pyplot as plt
 
-    points = [
-        (entry.step, entry.rel_error)
+    state_points = [
+        (entry.step, float(entry.rel_error))
         for entry in history
-        if entry.rel_error is not None
+        if entry.step_type == "FGD" and entry.rel_error is not None
     ]
-    if not points:
+    committed: dict[str, list[tuple[int, float]]] = {}
+    for entry in history:
+        if getattr(entry, "fgd_candidate_accepted", None) is not True:
+            continue
+        if entry.rel_error is None:
+            continue
+        kind = getattr(entry, "fgd_approximation_kind", None) or "tangent"
+        committed.setdefault(kind, []).append(
+            (entry.step, float(entry.rel_error))
+        )
+    if not state_points and not committed:
         return None
 
-    steps = [step for step, _ in points]
-    rel_errors = [float(rel_error) for _, rel_error in points if rel_error is not None]
-
     fig, ax = plt.subplots(figsize=(10, 5))
-    ax.plot(steps, rel_errors, linewidth=1.8, color="tab:cyan")
+    if state_points:
+        ax.plot(
+            [step for step, _ in state_points],
+            [value for _, value in state_points],
+            linewidth=1.2,
+            color="tab:gray",
+            alpha=0.6,
+            label="tangent certificate (state)",
+        )
+    for kind, points in sorted(committed.items()):
+        color, marker = _FAMILY_PLOT_STYLE.get(kind, ("tab:red", "x"))
+        ax.plot(
+            [step for step, _ in points],
+            [value for _, value in points],
+            linewidth=1.6,
+            marker=marker,
+            markersize=4,
+            color=color,
+            label=f"committed: {kind}",
+        )
     if threshold is not None:
         ax.axhline(
             threshold,
@@ -170,8 +211,8 @@ def plot_relative_error(
             linewidth=1.2,
             label="Growth threshold",
         )
-        ax.legend(loc="best")
-    ax.set_title("FGD Approximation Relative Error")
+    ax.legend(loc="best")
+    ax.set_title("FGD Relative Error by Committed Family")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Relative Error")
     ax.grid(True, alpha=0.25)
