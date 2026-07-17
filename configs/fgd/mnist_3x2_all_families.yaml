@@ -159,12 +159,15 @@ parametric_descent:
   min_cosine: 0.0           # 0 = only require a descent direction (eta* > 0)
   parameter_penalty: 1.0e-6
   gradient_clip_norm: 1.0
-  # Cprog floor on eta* r_t = D_t / |grad L_t|^2 (= D/4L). Steps below it
-  # are REJECTED: this is what lets the family declare the structure
-  # exhausted (and defer to growth) instead of certifying ever-smaller
-  # crumbs forever. 1e-6 stagnated MNIST 3x2 at ~40% accuracy with
-  # eta* halving every step; 1e-4 rejects the crumb regime.
-  min_progress: 1.0e-4
+  # Cprog floor on eta* r_t = D_t / |grad L_t|^2 (= D/4L): every accepted
+  # step must remove at least 4*min_progress of the remaining loss (1e-3 =
+  # 0.4% per step). Steps below it are REJECTED, marking the structure
+  # exhausted for this family so growth takes over. This is the family's
+  # only binding gate besides measured descent: its Cglob envelope is tight
+  # by construction and Cstat loosens as steps shrink, so set this floor to
+  # the smallest per-step progress you consider worth an epoch. 1e-6
+  # stagnated MNIST 3x2 at ~40% accuracy on certified crumbs.
+  min_progress: 1.0e-3
 
 # Tangent projection only: the certified RKHS head phase is off, so the
 # growth_min_* thresholds below still govern the growth probe gate.

@@ -205,8 +205,12 @@ class ParametricDescentConfig:
     min_cosine: float = 0.0
     parameter_penalty: float = 1e-6
     gradient_clip_norm: float | None = 1.0
-    # Cprog floor on the measured progress eta* r_t = D_t / |grad L_t|^2.
-    min_progress: float = 1e-6
+    # Cprog floor on the measured progress eta* r_t = D_t / |grad L_t|^2
+    # (= D/4L). Every accepted step must remove at least 4*min_progress of
+    # the remaining loss; below that the structure is treated as exhausted
+    # for this family, which is what lets growth take over instead of the
+    # family certifying ever-smaller crumbs forever.
+    min_progress: float = 1e-3
 
     def validate(self) -> None:
         if self.optimizer not in ("sgd", "adam"):

@@ -141,6 +141,42 @@ def test_measured_descent_rejects_when_progress_floor_unreachable() -> None:
     assert result.last_trial.all_conditions_valid is False
 
 
+def test_search_commits_the_largest_certified_progress() -> None:
+    """Among certified candidates the search must pick the biggest step."""
+    model, batches, config, state, loss = _descent_problem(
+        inner_steps=(1, 200),
+    )
+    result = _run_search(model, batches, config, state, loss)
+    trial = result.accepted
+    assert trial is not None
+
+    from stable_tiny.pipeline import _evaluate_parametric_descent_trial
+
+    losses_by_budget = {}
+    for steps in (1, 200):
+        candidate = _evaluate_parametric_descent_trial(
+            base_model=model,
+            train_batches=batches,
+            validation_loader=batches,
+            loss_function=torch.nn.MSELoss(),
+            device=torch.device("cpu"),
+            functional_learning_rate=0.5,
+            steps=steps,
+            accuracy_tolerance=0.1,
+            config=config,
+            classification=False,
+            theory_state=state,
+            initial_functional_gap=loss,
+            theory_loss_star=0.0,
+        )
+        assert candidate is not None
+        losses_by_budget[steps] = candidate.validation_functional_loss
+    assert losses_by_budget[200] < losses_by_budget[1]
+    assert trial.validation_functional_loss == pytest.approx(
+        losses_by_budget[200], rel=1e-6
+    )
+
+
 def test_measured_descent_direction_screen_rejects_everything() -> None:
     model, batches, config, state, loss = _descent_problem(min_cosine=1.0)
     result = _run_search(model, batches, config, state, loss)
@@ -161,7 +197,7 @@ def test_all_families_config_wires_the_full_ladder() -> None:
     )
     assert config.fgd_approx.growth_function_preserving is True
     assert config.parametric_descent.functional_learning_rates == (0.5, 0.2)
-    assert config.parametric_descent.min_progress == pytest.approx(1e-4)
+    assert config.parametric_descent.min_progress == pytest.approx(1e-3)
 
 
 def test_base_config_keeps_families_commented() -> None:

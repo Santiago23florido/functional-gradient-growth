@@ -1669,9 +1669,19 @@ def _search_parametric_descent_candidate(
     initial_functional_gap: float,
     theory_loss_star: float,
 ) -> _FGDSearchResult:
-    """Search measured-descent candidates over the configured budgets."""
+    """Search measured-descent candidates over the configured budgets.
+
+    Every configured candidate is evaluated and the certified one with the
+    LARGEST measured progress eta* r_t commits — any certified candidate is
+    valid under Prop. 3.8, so this selection is free in the theory and it
+    tightens the envelope fastest. First-accept semantics previously
+    committed the first crumb even when a bigger certified step existed,
+    which slowed the march toward structure exhaustion.
+    """
     trial_count = 0
     last_trial: _FGDTrial | None = None
+    best_trial: _FGDTrial | None = None
+    best_progress = float("-inf")
     for functional_learning_rate in (
         config.parametric_descent.functional_learning_rates
     ):
@@ -1695,9 +1705,27 @@ def _search_parametric_descent_candidate(
             if trial is None:
                 continue
             last_trial = trial
-            if trial.all_conditions_valid:
-                return _FGDSearchResult(trial, trial, trial_count, False)
-    return _FGDSearchResult(None, last_trial, trial_count, False)
+            if not trial.all_conditions_valid:
+                continue
+            progress = _certified_trial_progress(trial)
+            if progress > best_progress:
+                best_progress = progress
+                best_trial = trial
+    return _FGDSearchResult(
+        best_trial,
+        best_trial if best_trial is not None else last_trial,
+        trial_count,
+        False,
+    )
+
+
+def _certified_trial_progress(trial: _FGDTrial) -> float:
+    """Certified progress eta r of a trial (the Cprog mass of the step)."""
+    coefficient = trial.certificate.theory_descent_coefficient
+    learning_rate = trial.epoch_result.learning_rate
+    if coefficient is None or learning_rate is None:
+        return 0.0
+    return learning_rate * coefficient
 
 
 def _search_parametric_gd_candidate(
@@ -1715,9 +1743,15 @@ def _search_parametric_gd_candidate(
     initial_functional_gap: float,
     theory_loss_star: float,
 ) -> _FGDSearchResult:
-    """Search calibrated parametric-GD secants over the configured budgets."""
+    """Search calibrated parametric-GD secants over the configured budgets.
+
+    Like the measured-descent search, every candidate is evaluated and the
+    certified one with the largest certified progress eta* r commits.
+    """
     trial_count = 0
     last_trial: _FGDTrial | None = None
+    best_trial: _FGDTrial | None = None
+    best_progress = float("-inf")
     for functional_learning_rate in (
         config.parametric_gd.functional_learning_rates
     ):
@@ -1742,9 +1776,18 @@ def _search_parametric_gd_candidate(
             if trial is None:
                 continue
             last_trial = trial
-            if trial.all_conditions_valid:
-                return _FGDSearchResult(trial, trial, trial_count, False)
-    return _FGDSearchResult(None, last_trial, trial_count, False)
+            if not trial.all_conditions_valid:
+                continue
+            progress = _certified_trial_progress(trial)
+            if progress > best_progress:
+                best_progress = progress
+                best_trial = trial
+    return _FGDSearchResult(
+        best_trial,
+        best_trial if best_trial is not None else last_trial,
+        trial_count,
+        False,
+    )
 
 
 def _json_safe(value: Any) -> Any:
@@ -3620,11 +3663,20 @@ def run_pipeline(
                     history.append(secant_entry)
                     wandb_logger.log_history_entry(secant_entry)
                     if progress is not None:
+                        stage_rel_error = (
+                            stage_trial.certificate.relative_error
+                        )
+                        stage_cosine = math.sqrt(
+                            max(0.0, 1.0 - stage_rel_error**2)
+                        )
                         progress(
                             f"[{stage_label}] Epoch {epoch}: {family_name} "
                             "secant accepted "
                             f"(eta*={stage_trial.epoch_result.learning_rate:.4g}, "
-                            f"rel_err={stage_trial.certificate.relative_error:.4f})"
+                            f"cos={stage_cosine:.4f}, "
+                            f"progress={_certified_trial_progress(stage_trial):.3e}, "
+                            f"contraction={stage_trial.global_contraction:.6f}, "
+                            f"rel_err={stage_rel_error:.4f})"
                         )
                     last_test_loss = stage_test_metrics.loss
                     return True
