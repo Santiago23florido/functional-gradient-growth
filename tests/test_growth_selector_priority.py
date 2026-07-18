@@ -135,3 +135,29 @@ def test_missing_relative_error_never_wins_over_a_measured_one() -> None:
 
 def test_empty_probe_list_selects_nothing() -> None:
     assert _select_growth_probe([]) is None
+
+
+def test_prefer_lower_error_grows_the_impactful_expensive_layer() -> None:
+    """With the flag, an improving probe with lower rel_err wins even if big."""
+    cheap_weak = _probe(
+        layer_index=1,
+        parameters=20,
+        relative_error=0.45,
+        improves=True,
+    )
+    expensive_strong = _probe(
+        layer_index=0,
+        parameters=800,
+        relative_error=0.20,
+        improves=True,
+    )
+    # Default frugal-first keeps the cheap layer.
+    assert _select_growth_probe([cheap_weak, expensive_strong]) is cheap_weak
+    # prefer_lower_error picks the most impactful (input) layer.
+    assert (
+        _select_growth_probe(
+            [cheap_weak, expensive_strong],
+            prefer_lower_error=True,
+        )
+        is expensive_strong
+    )

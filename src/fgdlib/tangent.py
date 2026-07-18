@@ -108,6 +108,13 @@ class FGDApproxConfig:
     # (k applications of the same per-step theorem). The epoch stops at the
     # first rejected attempt. 1 = one outer step per epoch (legacy).
     outer_steps_per_epoch: int = 1
+    # Growth layer selection among probes that improve the certificate.
+    # False (default): frugal-first (fewest added parameters, then lowest
+    # post-growth relative error). True: lowest post-growth relative error
+    # first, so growth widens the most impactful layer even when it is the
+    # expensive input layer — required on MNIST, where layer-0 width drives
+    # accuracy and the frugal tie-break otherwise starves it.
+    growth_prefer_lower_error: bool = False
     # Hard parameter budget: once the model has at least this many total
     # parameters, structural growth is suppressed and the flow keeps
     # training the fixed structure through the certified families. None

@@ -1210,7 +1210,10 @@ def _probe_fgd_growth(
             )
         )
 
-    return _select_growth_probe(probes)
+    return _select_growth_probe(
+        probes,
+        prefer_lower_error=config.fgd_approx.growth_prefer_lower_error,
+    )
 
 
 def _probe_relative_error(probe: _GrowthProbe) -> float:
@@ -1222,29 +1225,39 @@ def _probe_parameter_count(probe: _GrowthProbe) -> int:
     return sum(parameter.numel() for parameter in probe.model.parameters())
 
 
-def _select_growth_probe(probes: list[_GrowthProbe]) -> _GrowthProbe | None:
+def _select_growth_probe(
+    probes: list[_GrowthProbe],
+    prefer_lower_error: bool = False,
+) -> _GrowthProbe | None:
     """Deterministic growth-layer choice.
 
-    Among probes that improve the FGD certificate the policy stays
+    Among probes that improve the FGD certificate the default policy is
     frugal-first: fewest total parameters, then lowest post-growth relative
-    error, then layer index. When NO probe reaches the improvement
-    threshold the priority inverts: lowest post-growth relative error
-    first, parameter count only as a tie-breaker — growth exists to restore
-    approximation capacity, so a smaller architecture must never outrank a
-    better certificate.
+    error, then layer index. With ``prefer_lower_error`` the improving case
+    instead ranks by lowest post-growth relative error first (parameter
+    count as a tie-break), so growth widens the most impactful layer even
+    when it is the expensive input layer. When NO probe reaches the
+    improvement threshold the priority is always lowest post-growth relative
+    error first — growth exists to restore approximation capacity, so a
+    smaller architecture must never outrank a better certificate.
     """
     if not probes:
         return None
     improving = [probe for probe in probes if probe.improves_fgd]
     if improving:
-        return min(
-            improving,
-            key=lambda probe: (
+        if prefer_lower_error:
+            improving_key = lambda probe: (
+                _probe_relative_error(probe),
+                _probe_parameter_count(probe),
+                probe.result.layer_index,
+            )
+        else:
+            improving_key = lambda probe: (
                 _probe_parameter_count(probe),
                 _probe_relative_error(probe),
                 probe.result.layer_index,
-            ),
-        )
+            )
+        return min(improving, key=improving_key)
     return min(
         probes,
         key=lambda probe: (
