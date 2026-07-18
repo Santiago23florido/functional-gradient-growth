@@ -108,6 +108,11 @@ class FGDApproxConfig:
     # (k applications of the same per-step theorem). The epoch stops at the
     # first rejected attempt. 1 = one outer step per epoch (legacy).
     outer_steps_per_epoch: int = 1
+    # Hard parameter budget: once the model has at least this many total
+    # parameters, structural growth is suppressed and the flow keeps
+    # training the fixed structure through the certified families. None
+    # means no cap. Keeps a grow-and-train run inside a target budget.
+    max_total_parameters: int | None = None
     # Structure-burst patience: the growth probe runs only after this many
     # CONSECUTIVE epochs in which no family committed a step. With a value
     # above 1, combine with family_rejection_cooldown: 0 so the stochastic

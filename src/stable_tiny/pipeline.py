@@ -3512,6 +3512,21 @@ def run_pipeline(
                         )
                     )
                 )
+                # Hard parameter budget: stop growing once the cap is
+                # reached; the flow keeps training the fixed structure.
+                max_parameters = config.fgd_approx.max_total_parameters
+                if (
+                    growth_triggered
+                    and max_parameters is not None
+                    and count_parameters(model) >= max_parameters
+                ):
+                    growth_triggered = False
+                    if progress is not None:
+                        progress(
+                            f"[FGD] Epoch {epoch}: growth suppressed "
+                            f"(parameter budget {max_parameters} reached: "
+                            f"{count_parameters(model)} params)"
+                        )
 
             if (
                 config.training.method == "fgd_approx"
