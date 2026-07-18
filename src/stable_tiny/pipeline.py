@@ -1379,6 +1379,14 @@ def _train_parametric_gd_candidate(
     ]
     if config.optimizer == "sgd":
         optimizer = torch.optim.SGD(trainable, lr=config.inner_learning_rate)
+    elif config.optimizer == "adamw":
+        # The certificate only sees the realized displacement, so the
+        # candidate generator may be as strong as the dense baseline's
+        # optimizer (decoupled weight decay included).
+        optimizer = torch.optim.AdamW(
+            trainable,
+            lr=config.inner_learning_rate,
+        )
     else:
         optimizer = torch.optim.Adam(trainable, lr=config.inner_learning_rate)
 

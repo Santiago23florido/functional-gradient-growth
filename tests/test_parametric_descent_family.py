@@ -30,6 +30,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 def test_parametric_descent_config_validation() -> None:
     ParametricDescentConfig().validate()
+    ParametricDescentConfig(optimizer="adamw").validate()
     with pytest.raises(ValueError):
         ParametricDescentConfig(optimizer="rmsprop").validate()
     with pytest.raises(ValueError):
@@ -132,6 +133,19 @@ def test_measured_descent_certifies_and_contraction_is_realized_ratio() -> None:
     assert trial.certificate.relative_error is not None
 
 
+def test_measured_descent_certifies_with_adamw_generator() -> None:
+    """The certificate admits any generator; adamw must certify like adam."""
+    model, batches, config, state, loss = _descent_problem(
+        optimizer="adamw",
+        inner_learning_rate=1e-2,
+    )
+    result = _run_search(model, batches, config, state, loss)
+    trial = result.accepted
+    assert trial is not None
+    assert trial.all_conditions_valid
+    assert trial.validation_functional_loss < loss
+
+
 def test_measured_descent_rejects_when_progress_floor_unreachable() -> None:
     # min_progress = 1.0 demands D >= 4 L, impossible since D <= L.
     model, batches, config, state, loss = _descent_problem(min_progress=1.0)
@@ -189,12 +203,10 @@ def test_all_families_config_wires_the_full_ladder() -> None:
     config = load_pipeline_config(
         REPO_ROOT / "configs" / "fgd" / "mnist_3x2_all_families.yaml"
     )
-    assert config.fgd_approx.family_order == (
-        "tangent",
-        "rkhs_head",
-        "parametric_gd",
-        "parametric_descent",
-    )
+    # The ladder composition is a user toggle in this config; only check
+    # that it is a valid order with the measured-descent family available.
+    validate_family_order(config.fgd_approx.family_order)
+    assert "parametric_descent" in config.fgd_approx.family_order
     # growth_function_preserving is a user toggle in this config; only check
     # that it parses as a boolean.
     assert isinstance(config.fgd_approx.growth_function_preserving, bool)

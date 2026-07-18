@@ -179,8 +179,10 @@ class ParametricGDConfig:
     gradient_clip_norm: float | None = 1.0
 
     def validate(self) -> None:
-        if self.optimizer not in ("sgd", "adam"):
-            raise ValueError("parametric_gd.optimizer must be 'sgd' or 'adam'.")
+        if self.optimizer not in ("sgd", "adam", "adamw"):
+            raise ValueError(
+                "parametric_gd.optimizer must be 'sgd', 'adam' or 'adamw'."
+            )
         if self.inner_learning_rate <= 0.0:
             raise ValueError(
                 "parametric_gd.inner_learning_rate must be positive."
@@ -238,9 +240,10 @@ class ParametricDescentConfig:
     min_progress: float = 1e-3
 
     def validate(self) -> None:
-        if self.optimizer not in ("sgd", "adam"):
+        if self.optimizer not in ("sgd", "adam", "adamw"):
             raise ValueError(
-                "parametric_descent.optimizer must be 'sgd' or 'adam'."
+                "parametric_descent.optimizer must be 'sgd', 'adam' or "
+                "'adamw'."
             )
         if self.inner_learning_rate <= 0.0:
             raise ValueError(
