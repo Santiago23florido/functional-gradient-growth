@@ -1382,13 +1382,18 @@ def _train_parametric_gd_candidate(
     elif config.optimizer == "adamw":
         # The certificate only sees the realized displacement, so the
         # candidate generator may be as strong as the dense baseline's
-        # optimizer (decoupled weight decay included).
+        # optimizer (decoupled weight decay for generalization).
         optimizer = torch.optim.AdamW(
             trainable,
             lr=config.inner_learning_rate,
+            weight_decay=config.weight_decay,
         )
     else:
-        optimizer = torch.optim.Adam(trainable, lr=config.inner_learning_rate)
+        optimizer = torch.optim.Adam(
+            trainable,
+            lr=config.inner_learning_rate,
+            weight_decay=config.weight_decay,
+        )
 
     for _ in range(max(1, steps)):
         for x, y in train_batches:

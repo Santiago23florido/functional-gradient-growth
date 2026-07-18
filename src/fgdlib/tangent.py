@@ -188,11 +188,20 @@ class ParametricGDConfig:
     min_cosine: float = 0.9
     parameter_penalty: float = 1e-6
     gradient_clip_norm: float | None = 1.0
+    # Decoupled weight decay for the adam/adamw inner optimizer. Higher
+    # values regularize the generated candidate so its realized
+    # displacement generalizes to validation (closing the train/val gap
+    # that caps the certified acceptance).
+    weight_decay: float = 0.0
 
     def validate(self) -> None:
         if self.optimizer not in ("sgd", "adam", "adamw"):
             raise ValueError(
                 "parametric_gd.optimizer must be 'sgd', 'adam' or 'adamw'."
+            )
+        if self.weight_decay < 0.0:
+            raise ValueError(
+                "parametric_gd.weight_decay must be non-negative."
             )
         if self.inner_learning_rate <= 0.0:
             raise ValueError(
@@ -243,6 +252,11 @@ class ParametricDescentConfig:
     min_cosine: float = 0.0
     parameter_penalty: float = 1e-6
     gradient_clip_norm: float | None = 1.0
+    # Decoupled weight decay for the adam/adamw inner optimizer. Higher
+    # values regularize the generated candidate so its realized
+    # displacement generalizes to validation (closing the train/val gap
+    # that caps the certified acceptance).
+    weight_decay: float = 0.0
     # Cprog floor on the measured progress eta* r_t = D_t / |grad L_t|^2
     # (= D/4L). Every accepted step must remove at least 4*min_progress of
     # the remaining loss; below that the structure is treated as exhausted
@@ -259,6 +273,10 @@ class ParametricDescentConfig:
         if self.inner_learning_rate <= 0.0:
             raise ValueError(
                 "parametric_descent.inner_learning_rate must be positive."
+            )
+        if self.weight_decay < 0.0:
+            raise ValueError(
+                "parametric_descent.weight_decay must be non-negative."
             )
         if not self.inner_steps or any(v < 1 for v in self.inner_steps):
             raise ValueError(
