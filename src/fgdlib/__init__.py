@@ -52,8 +52,11 @@ from fgdlib.tangent import (
     FGDApproxConfig,
     FGDValidationCertificate,
     SecantFGDConfig,
+    build_projection_probe,
+    certificate_from_projection_stats,
     evaluate_fgd_validation_certificate,
     evaluate_secant_validation_certificate,
+    measure_direction_projection,
     train_one_epoch_fgd_approx,
 )
 from fgdlib.training import (
@@ -101,8 +104,11 @@ __all__ = [
     "FGDApproxConfig",
     "FGDValidationCertificate",
     "SecantFGDConfig",
+    "build_projection_probe",
+    "certificate_from_projection_stats",
     "evaluate_fgd_validation_certificate",
     "evaluate_secant_validation_certificate",
+    "measure_direction_projection",
     "train_one_epoch_fgd_approx",
 ]
 

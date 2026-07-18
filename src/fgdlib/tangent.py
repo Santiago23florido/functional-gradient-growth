@@ -67,9 +67,19 @@ class FGDApproxConfig:
     # Retained for config compatibility; only scheduled growth uses timing gates.
     start_epoch: int = 1
     min_epochs_between_growth: int = 1
+    # DEPRECATED: projection_group_* configured independent per-group
+    # projections whose norms were aggregated into one certificate. That is
+    # not a valid shared tangent direction and is no longer computed
+    # anywhere; the fields are parsed for config compatibility only (the
+    # legacy "scheduler" training path still concatenates batches with
+    # projection_group_size). Certificates now use probe_batches.
     projection_group_size: int = 1
     projection_group_auto: bool = True
     projection_group_max: int | None = None
+    # Number of mini-batches concatenated into the FIXED certification
+    # probe. Every certificate solves ONE joint projection over the probe:
+    # a single shared parameter direction for all probe batches.
+    probe_batches: int = 4
     stall_min_epoch_decrease: float = 2e-3
     stall_patience: int = 5
     eps: float = 1e-12
@@ -93,6 +103,21 @@ class FGDApproxConfig:
     # fails. Every family commits through the same full FGD certificate.
     # Supported: "tangent", "rkhs_head", "parametric_gd".
     family_order: tuple[str, ...] = ("tangent",)
+    # Acceptance mode. When true, an outer step commits on its four LOCAL
+    # conditions only — valid sensor, strict Crel, strict LR interval
+    # (theory_lr_min < eta < eta_bar), and STRICT realized descent of the
+    # validation functional loss — while the stationary and global bounds
+    # are computed and logged as trajectory diagnostics. When false (the
+    # default), the legacy gates apply: non-strict descent and Cstat/Cglob
+    # as acceptance conditions.
+    local_acceptance_conditions: bool = False
+    # Cooldown for rejected fallback families, measured in ACCEPTED outer
+    # steps: a family rejected at theta_t is skipped until this many model
+    # updates have been committed since the rejection (weight updates change
+    # the tangent space, so rejection must never be permanent at a fixed
+    # architecture). Growth clears all rejection state immediately; 0
+    # disables the memory (families are retried every epoch).
+    family_rejection_cooldown: int = 5
     # In-ladder rkhs_head acceptance margin: the committed head must improve
     # the FULL validation functional loss by at least this relative amount.
     # The phase's internal acceptance compares subsampled train losses
@@ -1072,6 +1097,41 @@ def _grouped_batches(
         yield torch.cat(xs), torch.cat(ys)
 
 
+def build_projection_probe(
+    data_loader: torch.utils.data.DataLoader,
+    probe_batches: int,
+    device: torch.device | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Concatenate the first ``probe_batches`` mini-batches into one probe.
+
+    The probe is the joint certification sample: every certificate solves a
+    SINGLE shared-direction projection over it (conceptually the stacked
+    system J_probe u = r_probe). Materialize the probe once per data source
+    and pass the same tensors to every certificate evaluation, so family
+    comparisons, growth-layer trials and consecutive epochs all measure on
+    the same fixed probe.
+    """
+    if probe_batches < 1:
+        raise ValueError("fgd_approx.probe_batches must be a positive integer.")
+    xs: list[torch.Tensor] = []
+    ys: list[torch.Tensor] = []
+    for x, y in data_loader:
+        xs.append(x)
+        ys.append(y)
+        if len(xs) == probe_batches:
+            break
+    if not xs:
+        raise ValueError(
+            "Cannot build a projection probe from an empty data loader."
+        )
+    x = torch.cat(xs)
+    y = torch.cat(ys)
+    if device is not None:
+        x = x.to(device)
+        y = y.to(device)
+    return x, y
+
+
 def _compute_tangent_projection_step(
     model: GrowingMLP,
     x: torch.Tensor,
@@ -1512,12 +1572,16 @@ def select_certifying_growth_layer_index(
     device: torch.device,
     config: FGDApproxConfig,
     line_search_config: ScalingLineSearchConfig,
-    projection_group_size: int = 1,
+    probe: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> int | None:
     """Trial-grow with train data and choose by validation certificate."""
     if not getattr(model, "_growable_layers", None):
         return None
 
+    if probe is None:
+        # One fixed probe shared by every layer trial, so their certificates
+        # are directly comparable.
+        probe = build_projection_probe(validation_loader, config.probe_batches)
     _clear_inaccessible_tensor_caches(model)
     _cleanup_tiny_update(model)
     base_parameter_count = _count_all_parameters(model)
@@ -1548,7 +1612,7 @@ def select_certifying_growth_layer_index(
             device=device,
             config=config,
             learning_rate=None,
-            projection_group_size=projection_group_size,
+            probe=probe,
         )
         relative_error = certificate.relative_error
         certified = (
@@ -1576,18 +1640,30 @@ def select_certifying_growth_layer_index(
 
     certifying_trials = [trial for trial in trials if bool(trial["certified"])]
     if certifying_trials:
+        # Explicit certified policy: fewest added parameters, then lowest
+        # relative error, then layer index (deterministic).
         chosen = min(
             certifying_trials,
             key=lambda trial: (
                 int(trial["added_parameters"]),
                 float(trial["relative_error"]),
+                int(trial["layer_index"]),
             ),
         )
     else:
         valid_trials = [trial for trial in trials if bool(trial["sensor_valid"])]
         if not valid_trials:
             return None
-        chosen = min(valid_trials, key=lambda trial: float(trial["relative_error"]))
+        # No candidate certifies: the lowest post-growth relative error
+        # wins; parameter count is only a tie-breaker.
+        chosen = min(
+            valid_trials,
+            key=lambda trial: (
+                float(trial["relative_error"]),
+                int(trial["added_parameters"]),
+                int(trial["layer_index"]),
+            ),
+        )
     return int(chosen["layer_index"])
 
 
@@ -1607,15 +1683,183 @@ def should_trigger_fgd_growth(
     return relative_error >= config.rel_error_threshold
 
 
+def certificate_from_projection_stats(
+    *,
+    stats: _FunctionalStepStats,
+    learning_rate: float | None,
+    config: FGDApproxConfig,
+    projection_sensor: bool = True,
+) -> FGDValidationCertificate:
+    """Build the FGD certificate from ONE joint probe measurement.
+
+    ``stats`` describes a single approximation g of the functional gradient
+    r over the whole probe (one shared direction). ``projection_sensor``
+    additionally enforces the exact-projector invariants (<g, r> >= 0 and
+    |g| <= |r|), which hold for tangent projections but not for general
+    Hilbert secants.
+    """
+    values = (
+        stats.dot_product,
+        stats.approximation_sq_norm,
+        stats.target_sq_norm,
+    )
+    finite = all(math.isfinite(value) for value in values)
+    sensor_valid = finite and (
+        not projection_sensor
+        or _projection_sensor_valid(
+            dot_product=stats.dot_product,
+            approximation_sq_norm=stats.approximation_sq_norm,
+            target_sq_norm=stats.target_sq_norm,
+            eps=config.eps,
+        )
+    )
+    if not sensor_valid:
+        return FGDValidationCertificate(
+            learning_rate_upper_bound=None,
+            max_valid_learning_rate=None,
+            learning_rate_interval_valid=None,
+            skipped_batches=0,
+            relative_error_condition_valid=None,
+            gradient_sq_norm=None,
+            theory_descent_coefficient=None,
+            relative_error=None,
+            output_relative_error=None,
+            sensor_valid=False,
+            sensor_invalid_batches=1,
+        )
+
+    output_error = stats.output_error
+    relative_error = output_error.relative_error
+    relative_error_condition_valid = relative_error < min(
+        config.rel_error_threshold,
+        0.5,
+    )
+
+    learning_rate_upper_bound: float | None = None
+    max_valid_learning_rate: float | None = None
+    learning_rate_interval_valid: bool | None = None
+    theory_descent_coefficient: float | None = None
+    skipped_batches = 0
+    if config.learning_rate_policy == "theory_interval":
+        learning_rate_upper_bound = theoretical_learning_rate_upper_bound(
+            relative_error,
+            config,
+        )
+        if learning_rate_upper_bound is None:
+            learning_rate_interval_valid = False
+            skipped_batches = 1
+        else:
+            safe_upper_bound = config.theory_lr_safety * learning_rate_upper_bound
+            interval_ok = safe_upper_bound > config.theory_lr_min + config.eps
+            if interval_ok:
+                max_valid_learning_rate = safe_upper_bound
+            if learning_rate is not None and learning_rate > config.eps:
+                if config.local_acceptance_conditions:
+                    # Strict interval: theory_lr_min < eta < eta_bar, with
+                    # eps as the only numerical tolerance.
+                    upper_bound_ok = (
+                        learning_rate < safe_upper_bound + config.eps
+                    )
+                else:
+                    upper_bound_ok = (
+                        learning_rate <= safe_upper_bound + config.eps
+                    )
+                interval_ok = (
+                    interval_ok
+                    and learning_rate > config.theory_lr_min
+                    and upper_bound_ok
+                )
+            learning_rate_interval_valid = interval_ok
+            if not interval_ok:
+                skipped_batches = 1
+            elif learning_rate is not None and learning_rate > config.eps:
+                theory_descent_coefficient = theoretical_descent_coefficient(
+                    relative_error,
+                    learning_rate,
+                    config,
+                )
+
+    return FGDValidationCertificate(
+        learning_rate_upper_bound=learning_rate_upper_bound,
+        max_valid_learning_rate=max_valid_learning_rate,
+        learning_rate_interval_valid=learning_rate_interval_valid,
+        skipped_batches=skipped_batches,
+        relative_error_condition_valid=relative_error_condition_valid,
+        gradient_sq_norm=output_error.target_norm**2,
+        theory_descent_coefficient=theory_descent_coefficient,
+        relative_error=relative_error,
+        output_relative_error=output_error,
+        sensor_valid=True,
+        sensor_invalid_batches=0,
+    )
+
+
+def measure_direction_projection(
+    model: GrowingMLP,
+    parameter_updates: tuple[torch.Tensor, ...],
+    x: torch.Tensor,
+    y: torch.Tensor,
+    config: FGDApproxConfig,
+) -> _FunctionalStepStats:
+    """Measure g = J u against r = grad L on a probe for one SHARED direction.
+
+    This is the certificate measurement for an outer step: ``u`` is the
+    direction that will actually move the model, evaluated at the CURRENT
+    parameters through a Jacobian-vector product (the Jacobian is never
+    materialized).
+    """
+    named_parameters = _trainable_named_parameters(model)
+    if not named_parameters:
+        raise RuntimeError(
+            "FGD direction measurement requires trainable parameters."
+        )
+    parameter_names = tuple(named_parameters.keys())
+    parameters = tuple(named_parameters.values())
+    buffers = OrderedDict(model.named_buffers())
+
+    with torch.no_grad():
+        output = model(x)
+    target = mse_functional_gradient(output, y).reshape(-1)
+
+    def call_with_parameters(
+        parameter_values: tuple[torch.Tensor, ...],
+    ) -> torch.Tensor:
+        state = OrderedDict(zip(parameter_names, parameter_values))
+        state.update(buffers)
+        return functional_call(model, state, (x,)).reshape(-1)
+
+    try:
+        _, approximation = jvp(
+            call_with_parameters,
+            (parameters,),
+            (tuple(parameter_updates),),
+        )
+    finally:
+        _clear_inaccessible_tensor_caches(model)
+    return _output_relative_error_from_tensors(
+        approximation=approximation.detach(),
+        target=target,
+        eps=config.eps,
+    )
+
+
 def evaluate_fgd_validation_certificate(
     model: GrowingMLP,
     data_loader: torch.utils.data.DataLoader,
     device: torch.device,
     config: FGDApproxConfig,
     learning_rate: float | None,
-    projection_group_size: int = 1,
+    probe: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> FGDValidationCertificate:
-    """Evaluate FGD certificate conditions on held-out validation data."""
+    """Evaluate FGD certificate conditions on a fixed held-out probe.
+
+    The certificate solves ONE joint tangent projection over the probe (the
+    concatenation of ``config.probe_batches`` mini-batches of
+    ``data_loader``, unless an explicit ``probe`` is given): a single shared
+    parameter direction u* = argmin_u |J_probe u - r_probe|^2, certified
+    through g_probe = J_probe u*. Independent per-batch projections combined
+    through their aggregated norms are no longer computed anywhere.
+    """
     if config.rel_error_mode != "tangent_projection":
         raise ValueError(
             f"Unsupported fgd_approx.rel_error_mode '{config.rel_error_mode}'. "
@@ -1628,163 +1872,27 @@ def evaluate_fgd_validation_certificate(
         )
 
     model.eval()
-    dot_product = 0.0
-    approximation_sq_norm = 0.0
-    target_sq_norm = 0.0
-    upper_bound_sum = 0.0
-    upper_bound_count = 0
-    max_valid_learning_rate: float | None = None
-    learning_rate_interval_possible = True
-    skipped_batches = 0
-    sensor_invalid_batches = 0
-    valid_projection_batches = 0
-    relative_error_condition_valid: bool | None = True
-    learning_rate_interval_valid: bool | None = (
-        True if config.learning_rate_policy == "theory_interval" else None
+    if probe is None:
+        probe = build_projection_probe(data_loader, config.probe_batches)
+    x, y = probe
+    x = x.to(device)
+    y = y.to(device)
+    projection_step = _compute_tangent_projection_step(
+        model=model,
+        x=x,
+        y=y,
+        config=config,
     )
-    min_theory_descent_coefficient: float | None = None
-
-    for x, y in _grouped_batches(data_loader, projection_group_size):
-        x = x.to(device)
-        y = y.to(device)
-        projection_step = _compute_tangent_projection_step(
-            model=model,
-            x=x,
-            y=y,
-            config=config,
-        )
-        if not _projection_step_sensor_valid(projection_step, config):
-            sensor_invalid_batches += 1
-            continue
-
-        valid_projection_batches += 1
-        batch_relative_error = projection_step.output_error.relative_error
-        if batch_relative_error >= min(config.rel_error_threshold, 0.5):
-            relative_error_condition_valid = False
-
-        if config.learning_rate_policy == "theory_interval":
-            upper_bound = theoretical_learning_rate_upper_bound(
-                batch_relative_error,
-                config,
-            )
-            upper_bound_sum += upper_bound if upper_bound is not None else 0.0
-            upper_bound_count += 1
-            if upper_bound is None:
-                learning_rate_interval_valid = False
-                learning_rate_interval_possible = False
-                skipped_batches += 1
-            else:
-                safe_upper_bound = config.theory_lr_safety * upper_bound
-                interval_ok = safe_upper_bound > config.theory_lr_min + config.eps
-                if interval_ok:
-                    max_valid_learning_rate = (
-                        safe_upper_bound
-                        if max_valid_learning_rate is None
-                        else min(max_valid_learning_rate, safe_upper_bound)
-                    )
-                else:
-                    learning_rate_interval_possible = False
-                if learning_rate is not None and learning_rate > config.eps:
-                    interval_ok = (
-                        interval_ok
-                        and learning_rate > config.theory_lr_min
-                        and learning_rate <= safe_upper_bound + config.eps
-                    )
-                if not interval_ok:
-                    learning_rate_interval_valid = False
-                    skipped_batches += 1
-                elif learning_rate is not None and learning_rate > config.eps:
-                    descent_coefficient = theoretical_descent_coefficient(
-                        batch_relative_error,
-                        learning_rate,
-                        config,
-                    )
-                    if descent_coefficient is not None:
-                        min_theory_descent_coefficient = (
-                            descent_coefficient
-                            if min_theory_descent_coefficient is None
-                            else min(
-                                min_theory_descent_coefficient,
-                                descent_coefficient,
-                            )
-                        )
-
-        dot_product += projection_step.dot_product
-        approximation_sq_norm += projection_step.approximation_sq_norm
-        target_sq_norm += projection_step.target_sq_norm
-
-    if valid_projection_batches == 0:
-        relative_error_condition_valid = None
-        learning_rate_interval_valid = None
-        return FGDValidationCertificate(
-            learning_rate_upper_bound=None,
-            max_valid_learning_rate=None,
-            learning_rate_interval_valid=learning_rate_interval_valid,
-            skipped_batches=skipped_batches,
-            relative_error_condition_valid=relative_error_condition_valid,
-            gradient_sq_norm=None,
-            theory_descent_coefficient=None,
-            relative_error=None,
-            output_relative_error=None,
-            sensor_valid=False,
-            sensor_invalid_batches=sensor_invalid_batches,
-        )
-
-    aggregate_sensor_valid = (
-        sensor_invalid_batches == 0
-        and _projection_sensor_valid(
-            dot_product=dot_product,
-            approximation_sq_norm=approximation_sq_norm,
-            target_sq_norm=target_sq_norm,
-            eps=config.eps,
-        )
+    stats = _FunctionalStepStats(
+        output_error=projection_step.output_error,
+        dot_product=projection_step.dot_product,
+        approximation_sq_norm=projection_step.approximation_sq_norm,
+        target_sq_norm=projection_step.target_sq_norm,
     )
-    if not aggregate_sensor_valid:
-        if sensor_invalid_batches == 0:
-            sensor_invalid_batches = 1
-        return FGDValidationCertificate(
-            learning_rate_upper_bound=None,
-            max_valid_learning_rate=None,
-            learning_rate_interval_valid=None,
-            skipped_batches=skipped_batches,
-            relative_error_condition_valid=None,
-            gradient_sq_norm=None,
-            theory_descent_coefficient=None,
-            relative_error=None,
-            output_relative_error=None,
-            sensor_valid=False,
-            sensor_invalid_batches=sensor_invalid_batches,
-        )
-
-    output_error = _output_relative_error_from_stats(
-        dot_product=dot_product,
-        approximation_sq_norm=approximation_sq_norm,
-        target_sq_norm=target_sq_norm,
-        eps=config.eps,
-    )
-    relative_error = output_error.relative_error
-    gradient_sq_norm = output_error.target_norm**2
-    if relative_error >= min(config.rel_error_threshold, 0.5):
-        relative_error_condition_valid = False
-
-    return FGDValidationCertificate(
-        learning_rate_upper_bound=(
-            upper_bound_sum / upper_bound_count if upper_bound_count > 0 else None
-        ),
-        max_valid_learning_rate=(
-            max_valid_learning_rate
-            if learning_rate_interval_possible
-            else None
-        ),
-        learning_rate_interval_valid=learning_rate_interval_valid,
-        skipped_batches=skipped_batches,
-        relative_error_condition_valid=relative_error_condition_valid,
-        gradient_sq_norm=gradient_sq_norm,
-        theory_descent_coefficient=min_theory_descent_coefficient,
-        relative_error=relative_error,
-        output_relative_error=output_error,
-        sensor_valid=sensor_invalid_batches == 0,
-        sensor_invalid_batches=sensor_invalid_batches,
+    return certificate_from_projection_stats(
+        stats=stats,
+        learning_rate=learning_rate,
+        config=config,
     )
 
 
@@ -1795,144 +1903,58 @@ def evaluate_secant_validation_certificate(
     device: torch.device,
     config: FGDApproxConfig,
     learning_rate: float,
-    projection_group_size: int = 1,
+    probe: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> FGDValidationCertificate:
-    """Certify a finite functional secant in the output Hilbert space."""
+    """Certify a finite functional secant in the output Hilbert space.
+
+    The realized displacement Delta = F(base) - F(candidate) is one shared
+    direction by construction, so the certificate measures it jointly on the
+    same fixed probe used by the tangent certificate. Secants are not
+    projections, so the exact-projector sensor invariants are not enforced
+    (only finiteness).
+    """
     if learning_rate <= config.eps:
         raise ValueError("A secant FGD learning rate must be positive.")
 
     base_model.eval()
     candidate_model.eval()
-    dot_product = 0.0
-    approximation_sq_norm = 0.0
-    target_sq_norm = 0.0
-    upper_bound_sum = 0.0
-    upper_bound_count = 0
-    max_valid_learning_rate: float | None = None
-    learning_rate_interval_possible = True
-    skipped_batches = 0
-    sensor_invalid_batches = 0
-    valid_batches = 0
-    relative_error_condition_valid: bool | None = True
-    learning_rate_interval_valid: bool | None = True
-    min_theory_descent_coefficient: float | None = None
-
+    if probe is None:
+        probe = build_projection_probe(data_loader, config.probe_batches)
+    x, y = probe
+    x = x.to(device)
+    y = y.to(device)
     with torch.no_grad():
-        for x, y in _grouped_batches(data_loader, projection_group_size):
-            x = x.to(device)
-            y = y.to(device)
-            base_output = base_model(x)
-            candidate_output = candidate_model(x)
-            target = mse_functional_gradient(base_output, y)
-            approximation = (base_output - candidate_output) / learning_rate
-            if not (
-                torch.isfinite(target).all()
-                and torch.isfinite(approximation).all()
-            ):
-                sensor_invalid_batches += 1
-                continue
-
-            stats = _output_relative_error_from_tensors(
-                approximation,
-                target,
-                config.eps,
-            )
-            batch_error = stats.output_error.relative_error
-            valid_batches += 1
-            if batch_error >= min(config.rel_error_threshold, 0.5):
-                relative_error_condition_valid = False
-
-            upper_bound = theoretical_learning_rate_upper_bound(
-                batch_error,
-                config,
-            )
-            upper_bound_sum += upper_bound if upper_bound is not None else 0.0
-            upper_bound_count += 1
-            if upper_bound is None:
-                learning_rate_interval_possible = False
-                learning_rate_interval_valid = False
-                skipped_batches += 1
-            else:
-                safe_upper_bound = config.theory_lr_safety * upper_bound
-                interval_ok = (
-                    safe_upper_bound > config.theory_lr_min + config.eps
-                    and learning_rate > config.theory_lr_min
-                    and learning_rate <= safe_upper_bound + config.eps
-                )
-                if safe_upper_bound > config.theory_lr_min + config.eps:
-                    max_valid_learning_rate = (
-                        safe_upper_bound
-                        if max_valid_learning_rate is None
-                        else min(max_valid_learning_rate, safe_upper_bound)
-                    )
-                else:
-                    learning_rate_interval_possible = False
-                if not interval_ok:
-                    learning_rate_interval_valid = False
-                    skipped_batches += 1
-                else:
-                    descent_coefficient = theoretical_descent_coefficient(
-                        batch_error,
-                        learning_rate,
-                        config,
-                    )
-                    if descent_coefficient is not None:
-                        min_theory_descent_coefficient = (
-                            descent_coefficient
-                            if min_theory_descent_coefficient is None
-                            else min(
-                                min_theory_descent_coefficient,
-                                descent_coefficient,
-                            )
-                        )
-
-            dot_product += stats.dot_product
-            approximation_sq_norm += stats.approximation_sq_norm
-            target_sq_norm += stats.target_sq_norm
-
-    if valid_batches == 0 or sensor_invalid_batches > 0:
+        base_output = base_model(x)
+        candidate_output = candidate_model(x)
+    target = mse_functional_gradient(base_output, y)
+    approximation = (base_output - candidate_output) / learning_rate
+    if not (
+        torch.isfinite(target).all() and torch.isfinite(approximation).all()
+    ):
         return FGDValidationCertificate(
             learning_rate_upper_bound=None,
             max_valid_learning_rate=None,
             learning_rate_interval_valid=None,
-            skipped_batches=skipped_batches,
+            skipped_batches=0,
             relative_error_condition_valid=None,
             gradient_sq_norm=None,
             theory_descent_coefficient=None,
             relative_error=None,
             output_relative_error=None,
             sensor_valid=False,
-            sensor_invalid_batches=max(1, sensor_invalid_batches),
+            sensor_invalid_batches=1,
         )
 
-    output_error = _output_relative_error_from_stats(
-        dot_product=dot_product,
-        approximation_sq_norm=approximation_sq_norm,
-        target_sq_norm=target_sq_norm,
-        eps=config.eps,
+    stats = _output_relative_error_from_tensors(
+        approximation,
+        target,
+        config.eps,
     )
-    relative_error = output_error.relative_error
-    if relative_error >= min(config.rel_error_threshold, 0.5):
-        relative_error_condition_valid = False
-
-    return FGDValidationCertificate(
-        learning_rate_upper_bound=(
-            upper_bound_sum / upper_bound_count if upper_bound_count > 0 else None
-        ),
-        max_valid_learning_rate=(
-            max_valid_learning_rate
-            if learning_rate_interval_possible
-            else None
-        ),
-        learning_rate_interval_valid=learning_rate_interval_valid,
-        skipped_batches=skipped_batches,
-        relative_error_condition_valid=relative_error_condition_valid,
-        gradient_sq_norm=output_error.target_norm**2,
-        theory_descent_coefficient=min_theory_descent_coefficient,
-        relative_error=relative_error,
-        output_relative_error=output_error,
-        sensor_valid=True,
-        sensor_invalid_batches=0,
+    return certificate_from_projection_stats(
+        stats=stats,
+        learning_rate=learning_rate,
+        config=config,
+        projection_sensor=False,
     )
 
 

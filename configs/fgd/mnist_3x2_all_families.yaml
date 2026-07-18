@@ -79,6 +79,23 @@ fgd_approx:
   projection_group_size: 1
   projection_group_auto: true
   projection_group_max:
+  # Joint certification probe: number of mini-batches concatenated into the
+  # FIXED probe on which every certificate solves ONE shared-direction
+  # projection (the projection_group_* keys above are deprecated: they used
+  # to aggregate independent per-batch projections).
+  probe_batches: 4
+  # A rejected fallback family is skipped until this many ACCEPTED outer
+  # steps have been committed since the rejection (weight updates change the
+  # tangent space, so rejection is never permanent at a fixed architecture).
+  # Growth clears all rejection state immediately; 0 retries every epoch.
+  family_rejection_cooldown: 5
+  # Acceptance mode. true: an outer step commits on its four LOCAL
+  # conditions only (valid sensor, strict RelErr < 0.5, strict LR interval
+  # theory_lr_min < eta < eta_bar, STRICT realized validation descent) and
+  # the stationary/global bounds are computed and logged as trajectory
+  # diagnostics. false (default): legacy behavior — non-strict descent and
+  # Cstat/Cglob as acceptance gates.
+  local_acceptance_conditions: false
   eps: 1.0e-12
   tiny_use_covariance: true
   tiny_alpha_zero: false
@@ -89,7 +106,8 @@ fgd_approx:
   tiny_maximum_added_neurons:
   tiny_numerical_threshold: 1.0e-6
   tiny_statistical_threshold: 1.0e-3
-  growth_function_preserving: true
+  #function preserving or no
+  growth_function_preserving: false
   growth_preservation_tolerance: 1.0e-6
   # Ordered ladder of approximation families, evaluated top to bottom.
   # "tangent" must come first (it is the epoch's main transactional

@@ -27,10 +27,17 @@ from fgdlib.tangent import (
     ParametricDescentConfig,
     ParametricGDConfig,
     SecantFGDConfig,
+    _FunctionalStepStats,
     _clear_inaccessible_tensor_caches,
+    _compute_tangent_projection_step,
+    _projection_step_sensor_valid,
+    _trainable_named_parameters,
     batch_functional_mse_loss,
+    build_projection_probe,
+    certificate_from_projection_stats,
     evaluate_fgd_validation_certificate,
     evaluate_secant_validation_certificate,
+    measure_direction_projection,
     mse_functional_gradient,
     select_tiny_growth_layer_index,
     should_trigger_fgd_growth,
@@ -191,6 +198,7 @@ class HistoryEntry:
     fgd_theory_learning_rate_adjusted: bool = False
     fgd_sensor_valid: bool | None = None
     fgd_sensor_invalid_batches: int = 0
+    fgd_update_norm: float | None = None
     fgd_candidate_accepted: bool | None = None
     fgd_lr_search_trials: int = 0
     fgd_approximation_kind: str | None = None
@@ -631,17 +639,39 @@ def _certify_fgd_candidate(
     initial_functional_gap: float,
     theory_loss_star: float,
 ) -> _FGDTrial:
-    """Evaluate accumulated FGD conditions for a realizable candidate."""
+    """Evaluate the FGD acceptance conditions for a realizable candidate.
+
+    With fgd_approx.local_acceptance_conditions enabled, acceptance is
+    decided by the four LOCAL conditions of the current outer step (sensor,
+    Crel, LR interval, strict realized descent) and the stationary/global
+    convergence bounds are computed and logged only as diagnostics of the
+    ACCUMULATED trajectory guarantees. With the flag off (default), the
+    legacy gates apply: non-strict descent and Cstat/Cglob as acceptance
+    conditions.
+    """
+    local_acceptance = config.fgd_approx.local_acceptance_conditions
     validation_functional_loss = evaluate_functional_loss(
         candidate_model,
         validation_loader,
         device,
     )
-    loss_descent_valid = (
-        validation_functional_loss
-        <= theory_state.previous_validation_functional_loss
-        + config.fgd_approx.eps
-    )
+    if local_acceptance:
+        # Local condition 4: STRICT realized descent of the validation
+        # functional loss, L(f_{t+1}) < L(f_t), up to the numerical eps
+        # only.
+        loss_descent_valid = (
+            math.isfinite(validation_functional_loss)
+            and theory_state.previous_validation_functional_loss
+            - validation_functional_loss
+            > config.fgd_approx.eps
+        )
+    else:
+        # Legacy gate: non-strict descent (a no-progress step passes).
+        loss_descent_valid = (
+            validation_functional_loss
+            <= theory_state.previous_validation_functional_loss
+            + config.fgd_approx.eps
+        )
 
     epoch_count = theory_state.epoch_count
     min_gradient_sq_norm = theory_state.min_gradient_sq_norm
@@ -671,6 +701,9 @@ def _certify_fgd_candidate(
             else min(min_descent_coefficient, descent_coefficient)
         )
 
+    # Trajectory diagnostics: the stationary and global bounds monitor the
+    # ACCUMULATED theoretical guarantees over the committed steps. They are
+    # computed and logged for every trial but are NOT acceptance gates.
     stationary_bound: float | None = None
     stationary_bound_valid: bool | None = None
     global_bound: float | None = None
@@ -723,6 +756,13 @@ def _certify_fgd_candidate(
         global_contraction_product=contraction_product,
         previous_validation_functional_loss=validation_functional_loss,
     )
+    # LOCAL acceptance conditions — these four decide whether THIS outer
+    # step commits:
+    #   1. the projection and numerical sensor are valid;
+    #   2. Crel: relative_error < min(rel_error_threshold, 0.5), strict;
+    #   3. LR interval: theory_lr_min < eta < safe upper bound eta_bar,
+    #      strict up to the configured eps;
+    #   4. strict realized descent of the validation functional loss.
     all_conditions_valid = (
         epoch_result.sensor_valid
         and epoch_result.skipped_batches == 0
@@ -730,9 +770,17 @@ def _certify_fgd_candidate(
         and certificate.relative_error_condition_valid is True
         and certificate.learning_rate_interval_valid is True
         and loss_descent_valid
-        and stationary_bound_valid is True
-        and global_bound_valid is True
     )
+    if not local_acceptance:
+        # Legacy mode: the accumulated stationary and global bounds also
+        # gate acceptance. Under local_acceptance_conditions they are
+        # intentionally ABSENT — they describe the trajectory, not this
+        # step.
+        all_conditions_valid = (
+            all_conditions_valid
+            and stationary_bound_valid is True
+            and global_bound_valid is True
+        )
     return _FGDTrial(
         model=candidate_model,
         epoch_result=epoch_result,
@@ -749,45 +797,94 @@ def _certify_fgd_candidate(
     )
 
 
-def _evaluate_fgd_trial(
+def _apply_shared_direction_step(
+    model: GrowingMLP,
+    direction: tuple[torch.Tensor, ...],
+    learning_rate: float,
+) -> None:
+    """Apply theta <- theta - eta * u for the shared probe direction u."""
+    parameters = tuple(_trainable_named_parameters(model).values())
+    if len(parameters) != len(direction):
+        raise RuntimeError(
+            "Shared-direction update does not match the trainable parameters."
+        )
+    with torch.no_grad():
+        for parameter, update in zip(parameters, direction):
+            parameter.add_(update.to(parameter.device), alpha=-learning_rate)
+
+
+def _evaluate_fgd_outer_trial(
     *,
     base_model: GrowingMLP,
+    direction: tuple[torch.Tensor, ...],
+    direction_stats: _FunctionalStepStats,
     train_batches: list[tuple[torch.Tensor, torch.Tensor]],
-    test_loader: torch.utils.data.DataLoader,
     validation_loader: torch.utils.data.DataLoader,
     loss_function: torch.nn.Module,
     device: torch.device,
     learning_rate: float,
     accuracy_tolerance: float,
     config: PipelineConfig,
-    projection_group_size: int,
     classification: bool,
     theory_state: _FGDTheoryState,
     initial_functional_gap: float,
     theory_loss_star: float,
 ) -> _FGDTrial:
-    """Train a disposable model and certify every condition on validation."""
-    trial_model = copy.deepcopy(base_model)
-    epoch_result = train_one_epoch_fgd_approx(
-        model=trial_model,
-        train_loader=train_batches,
-        test_loader=test_loader,
-        loss_function=loss_function,
-        device=device,
+    """One genuine FGD outer step: theta - eta * u with the shared direction.
+
+    The relative-error certificate comes from ``direction_stats``, measured
+    at the CURRENT model f_t for the exact direction u that moves it — never
+    at the endpoint of a training epoch, and never for a direction other
+    than the one applied. The stepped clone is then checked transactionally
+    (validation functional loss before vs after, Cstat, Cglob); rejection
+    rolls back by discarding the clone.
+
+    u is the projection on the TRAIN probe; on the validation probe it is a
+    general Hilbert direction, so only finiteness is sensor-checked here
+    (the exact-projector invariants do not apply) and Crel/the LR interval
+    are the binding admissibility gates, as in Lemma 3.5.
+    """
+    certificate = certificate_from_projection_stats(
+        stats=direction_stats,
         learning_rate=learning_rate,
-        accuracy_tolerance=accuracy_tolerance,
         config=config.fgd_approx,
-        projection_group_size=projection_group_size,
-        classification=classification,
-        evaluate_test=False,
+        projection_sensor=False,
     )
-    certificate = evaluate_fgd_validation_certificate(
-        model=trial_model,
-        data_loader=validation_loader,
+    trial_model = copy.deepcopy(base_model)
+    _apply_shared_direction_step(trial_model, direction, learning_rate)
+    train_metrics = evaluate_regression_metrics(
+        trial_model,
+        train_batches,
+        loss_function,
         device=device,
-        config=config.fgd_approx,
-        learning_rate=epoch_result.min_positive_learning_rate,
-        projection_group_size=projection_group_size,
+        accuracy_tolerance=accuracy_tolerance,
+        classification=classification,
+    )
+    epoch_result = FGDApproxEpochResult(
+        train_loss=train_metrics.loss,
+        train_accuracy=train_metrics.accuracy,
+        test_loss=float("nan"),
+        test_accuracy=float("nan"),
+        learning_rate=learning_rate,
+        next_learning_rate=None,
+        learning_rate_upper_bound=certificate.learning_rate_upper_bound,
+        learning_rate_interval_valid=certificate.learning_rate_interval_valid,
+        learning_rate_clipped_batches=0,
+        skipped_batches=0,
+        relative_error_condition_valid=(
+            certificate.relative_error_condition_valid
+        ),
+        loss_descent_valid=None,
+        loss_non_descent_batches=0,
+        gradient_sq_norm=certificate.gradient_sq_norm,
+        theory_descent_coefficient=certificate.theory_descent_coefficient,
+        min_positive_learning_rate=learning_rate,
+        relative_error=certificate.relative_error,
+        selected_layer_index=None,
+        layer_relative_errors=[],
+        output_relative_error=certificate.output_relative_error,
+        sensor_valid=certificate.sensor_valid,
+        sensor_invalid_batches=certificate.sensor_invalid_batches,
     )
     return _certify_fgd_candidate(
         candidate_model=trial_model,
@@ -812,7 +909,7 @@ def _evaluate_secant_fgd_trial(
     learning_rate: float,
     accuracy_tolerance: float,
     config: PipelineConfig,
-    projection_group_size: int,
+    probe: tuple[torch.Tensor, torch.Tensor] | None,
     classification: bool,
     theory_state: _FGDTheoryState,
     initial_functional_gap: float,
@@ -911,7 +1008,7 @@ def _evaluate_secant_fgd_trial(
         device=device,
         config=config.fgd_approx,
         learning_rate=learning_rate,
-        projection_group_size=projection_group_size,
+        probe=probe,
     )
     return _certify_fgd_candidate(
         candidate_model=trial_model,
@@ -1052,7 +1149,7 @@ def _probe_fgd_growth(
     growth_count: int,
     device: torch.device,
     config: PipelineConfig,
-    projection_group_size: int,
+    probe: tuple[torch.Tensor, torch.Tensor] | None,
 ) -> _GrowthProbe | None:
     """Trial growth on clones and retain the best FGD certificate change."""
     growable_layers = getattr(model, "_growable_layers", None)
@@ -1098,7 +1195,7 @@ def _probe_fgd_growth(
             device=device,
             config=config.fgd_approx,
             learning_rate=None,
-            projection_group_size=projection_group_size,
+            probe=probe,
         )
         probes.append(
             _GrowthProbe(
@@ -1113,17 +1210,47 @@ def _probe_fgd_growth(
             )
         )
 
+    return _select_growth_probe(probes)
+
+
+def _probe_relative_error(probe: _GrowthProbe) -> float:
+    relative_error = probe.certificate.relative_error
+    return relative_error if relative_error is not None else float("inf")
+
+
+def _probe_parameter_count(probe: _GrowthProbe) -> int:
+    return sum(parameter.numel() for parameter in probe.model.parameters())
+
+
+def _select_growth_probe(probes: list[_GrowthProbe]) -> _GrowthProbe | None:
+    """Deterministic growth-layer choice.
+
+    Among probes that improve the FGD certificate the policy stays
+    frugal-first: fewest total parameters, then lowest post-growth relative
+    error, then layer index. When NO probe reaches the improvement
+    threshold the priority inverts: lowest post-growth relative error
+    first, parameter count only as a tie-breaker — growth exists to restore
+    approximation capacity, so a smaller architecture must never outrank a
+    better certificate.
+    """
     if not probes:
         return None
     improving = [probe for probe in probes if probe.improves_fgd]
-    candidates = improving if improving else probes
+    if improving:
+        return min(
+            improving,
+            key=lambda probe: (
+                _probe_parameter_count(probe),
+                _probe_relative_error(probe),
+                probe.result.layer_index,
+            ),
+        )
     return min(
-        candidates,
+        probes,
         key=lambda probe: (
-            sum(parameter.numel() for parameter in probe.model.parameters()),
-            probe.certificate.relative_error
-            if probe.certificate.relative_error is not None
-            else float("inf"),
+            _probe_relative_error(probe),
+            _probe_parameter_count(probe),
+            probe.result.layer_index,
         ),
     )
 
@@ -1137,7 +1264,7 @@ def _search_secant_fgd_candidate(
     device: torch.device,
     accuracy_tolerance: float,
     config: PipelineConfig,
-    projection_group_size: int,
+    probe: tuple[torch.Tensor, torch.Tensor] | None = None,
     classification: bool,
     theory_state: _FGDTheoryState,
     initial_functional_gap: float,
@@ -1167,7 +1294,7 @@ def _search_secant_fgd_candidate(
             learning_rate=learning_rate,
             accuracy_tolerance=accuracy_tolerance,
             config=config,
-            projection_group_size=projection_group_size,
+            probe=probe,
             classification=classification,
             theory_state=theory_state,
             initial_functional_gap=initial_functional_gap,
@@ -1303,7 +1430,7 @@ def _evaluate_parametric_gd_trial(
     steps: int,
     accuracy_tolerance: float,
     config: PipelineConfig,
-    projection_group_size: int,
+    probe: tuple[torch.Tensor, torch.Tensor] | None = None,
     classification: bool,
     theory_state: _FGDTheoryState,
     initial_functional_gap: float,
@@ -1382,7 +1509,7 @@ def _evaluate_parametric_gd_trial(
         device=device,
         config=config.fgd_approx,
         learning_rate=eta_star,
-        projection_group_size=projection_group_size,
+        probe=probe,
     )
     return _certify_fgd_candidate(
         candidate_model=candidate,
@@ -1497,6 +1624,8 @@ def _certify_measured_descent_candidate(
             * min_positive_learning_rate
             * min_descent_coefficient
         )
+        # Trajectory diagnostics only (never acceptance gates), as in
+        # _certify_fgd_candidate.
         stationary_bound_valid = (
             min_gradient_sq_norm is not None
             and min_gradient_sq_norm <= stationary_bound + eps
@@ -1569,14 +1698,23 @@ def _certify_measured_descent_candidate(
         global_contraction_product=contraction_product,
         previous_validation_functional_loss=validation_loss_after,
     )
+    # LOCAL acceptance conditions for the measured-descent family: strict
+    # realized descent, the Cprog floor and a positive measured coefficient
+    # decide whether THIS step commits.
     all_conditions_valid = (
         loss_descent_valid
         and progress_valid
         and descent_coefficient is not None
         and descent_coefficient > 0.0
-        and stationary_bound_valid is True
-        and global_bound_valid is True
     )
+    if not config.fgd_approx.local_acceptance_conditions:
+        # Legacy mode: Cstat/Cglob also gate. Under
+        # local_acceptance_conditions they are trajectory diagnostics only.
+        all_conditions_valid = (
+            all_conditions_valid
+            and stationary_bound_valid is True
+            and global_bound_valid is True
+        )
     return _FGDTrial(
         model=candidate_model,
         epoch_result=epoch_result,
@@ -1719,6 +1857,24 @@ def _search_parametric_descent_candidate(
     )
 
 
+def _family_rejection_active(
+    rejected_at_step: int | None,
+    accepted_outer_steps: int,
+    cooldown: int,
+) -> bool:
+    """Whether a family rejection is still in effect.
+
+    The cooldown counts ACCEPTED outer steps committed since the rejection:
+    ordinary weight updates change the tangent space and the behavior of
+    every family, so a rejection at theta_t must never be permanent while
+    the architecture stays fixed. Growth clears rejection state entirely;
+    cooldown <= 0 disables the memory.
+    """
+    if rejected_at_step is None or cooldown <= 0:
+        return False
+    return accepted_outer_steps - rejected_at_step < cooldown
+
+
 def _certified_trial_progress(trial: _FGDTrial) -> float:
     """Certified progress eta r of a trial (the Cprog mass of the step)."""
     coefficient = trial.certificate.theory_descent_coefficient
@@ -1737,7 +1893,7 @@ def _search_parametric_gd_candidate(
     device: torch.device,
     accuracy_tolerance: float,
     config: PipelineConfig,
-    projection_group_size: int,
+    probe: tuple[torch.Tensor, torch.Tensor] | None = None,
     classification: bool,
     theory_state: _FGDTheoryState,
     initial_functional_gap: float,
@@ -1766,7 +1922,7 @@ def _search_parametric_gd_candidate(
                 steps=steps,
                 accuracy_tolerance=accuracy_tolerance,
                 config=config,
-                projection_group_size=projection_group_size,
+                probe=probe,
                 classification=classification,
                 theory_state=theory_state,
                 initial_functional_gap=initial_functional_gap,
@@ -2580,21 +2736,30 @@ def run_pipeline(
         fgd_global_contraction_product = 1.0
         fgd_previous_train_loss: float | None = None
         fgd_stalled_epochs = 0
-        # A family rejected at the current architecture stays skipped until a
-        # growth event changes the structure: the same structure re-offers
-        # the same (already refused) approximation capacity, so retrying
-        # every epoch only burns compute and hides structure exhaustion.
-        families_rejected_at_structure: set[str] = set()
-        projection_group_limit = max(
-            1,
-            config.fgd_approx.projection_group_max
-            if config.fgd_approx.projection_group_max is not None
-            else max(len(train_loader), len(validation_loader)),
-        )
-        current_projection_group_size = max(
-            1,
-            min(config.fgd_approx.projection_group_size, projection_group_limit),
-        )
+        # A rejected fallback family is skipped for a COOLDOWN of accepted
+        # outer steps (family_rejection_cooldown), not forever: weight
+        # updates change the tangent space, so the same architecture can
+        # re-admit a family once the parameters have moved. Growth clears
+        # all rejection state immediately.
+        fgd_accepted_outer_steps = 0
+        family_rejection_step: dict[str, int] = {}
+        family_rejection_cooldown = config.fgd_approx.family_rejection_cooldown
+        # FIXED certification probes, materialized once for the whole run:
+        # every certificate, family comparison and growth-layer trial solves
+        # one joint shared-direction projection over the same sample.
+        fgd_validation_probe: tuple[torch.Tensor, torch.Tensor] | None = None
+        fgd_train_probe: tuple[torch.Tensor, torch.Tensor] | None = None
+        if config.training.method == "fgd_approx":
+            fgd_validation_probe = build_projection_probe(
+                validation_loader,
+                config.fgd_approx.probe_batches,
+                device,
+            )
+            fgd_train_probe = build_projection_probe(
+                train_loader,
+                config.fgd_approx.probe_batches,
+                device,
+            )
         validation_certificate_for_next_epoch = None
         if (
             config.training.method == "fgd_approx"
@@ -2608,7 +2773,7 @@ def run_pipeline(
                     device=device,
                     config=config.fgd_approx,
                     learning_rate=current_fgd_learning_rate,
-                    projection_group_size=current_projection_group_size,
+                    probe=fgd_validation_probe,
                 )
             )
 
@@ -2680,7 +2845,7 @@ def run_pipeline(
                             device=device,
                             config=config.fgd_approx,
                             learning_rate=current_fgd_learning_rate,
-                            projection_group_size=current_projection_group_size,
+                            probe=fgd_validation_probe,
                         )
                     )
                 lr_certificate = validation_certificate_for_next_epoch
@@ -2745,6 +2910,7 @@ def run_pipeline(
             fgd_theory_learning_rate_adjusted = False
             fgd_sensor_valid: bool | None = None
             fgd_sensor_invalid_batches = 0
+            fgd_update_norm: float | None = None
             fgd_trial_sensor_failure = False
             diagnostic_trial: _FGDTrial | None = None
             fgd_growth_requested = False
@@ -2785,23 +2951,80 @@ def run_pipeline(
                     )
                     _clear_inaccessible_tensor_caches(model)
                     frozen_train_batches = list(train_loader)
-                    maximum_learning_rate = certified_validation_learning_rate(
-                        lr_certificate,
-                        config.fgd_approx,
+
+                    # One genuine outer step per epoch: solve the SHARED
+                    # direction u* on the fixed train probe at the current
+                    # model f_t, certify THAT direction on the fixed
+                    # validation probe BEFORE any update, then search the
+                    # step size eta for the single update theta - eta * u*.
+                    tangent_direction: tuple[torch.Tensor, ...] | None = None
+                    direction_stats: _FunctionalStepStats | None = None
+                    maximum_learning_rate: float | None = None
+                    direction_sensor_failure = False
+                    direction_step = _compute_tangent_projection_step(
+                        model=model,
+                        x=fgd_train_probe[0],
+                        y=fgd_train_probe[1],
+                        config=config.fgd_approx,
                     )
+                    if _projection_step_sensor_valid(
+                        direction_step,
+                        config.fgd_approx,
+                    ):
+                        tangent_direction = direction_step.parameter_updates
+                        fgd_update_norm = math.sqrt(
+                            sum(
+                                float(
+                                    torch.sum(update.detach() ** 2).item()
+                                )
+                                for update in tangent_direction
+                            )
+                        )
+                        direction_stats = measure_direction_projection(
+                            model,
+                            tangent_direction,
+                            fgd_validation_probe[0],
+                            fgd_validation_probe[1],
+                            config.fgd_approx,
+                        )
+                        # The direction is only a projection on the TRAIN
+                        # probe; on validation it is certified like a secant
+                        # (finiteness sensor, Crel/interval as gates).
+                        direction_certificate = (
+                            certificate_from_projection_stats(
+                                stats=direction_stats,
+                                learning_rate=None,
+                                config=config.fgd_approx,
+                                projection_sensor=False,
+                            )
+                        )
+                        if direction_certificate.sensor_valid:
+                            maximum_learning_rate = (
+                                certified_validation_learning_rate(
+                                    direction_certificate,
+                                    config.fgd_approx,
+                                )
+                            )
+                        else:
+                            direction_sensor_failure = True
+                            direction_stats = None
+                    else:
+                        direction_sensor_failure = True
 
                     def evaluate_trial(candidate_learning_rate: float) -> _FGDTrial:
-                        return _evaluate_fgd_trial(
+                        assert tangent_direction is not None
+                        assert direction_stats is not None
+                        return _evaluate_fgd_outer_trial(
                             base_model=model,
+                            direction=tangent_direction,
+                            direction_stats=direction_stats,
                             train_batches=frozen_train_batches,
-                            test_loader=test_loader,
                             validation_loader=validation_loader,
                             loss_function=loss_function,
                             device=device,
                             learning_rate=candidate_learning_rate,
                             accuracy_tolerance=config.training.accuracy_tolerance,
                             config=config,
-                            projection_group_size=current_projection_group_size,
                             classification=classification,
                             theory_state=theory_state,
                             initial_functional_gap=initial_functional_gap,
@@ -2815,12 +3038,65 @@ def run_pipeline(
                             config=config.fgd_approx,
                         )
                         if maximum_learning_rate is not None
-                        else _FGDSearchResult(None, None, 0, False)
+                        and direction_stats is not None
+                        else _FGDSearchResult(
+                            None,
+                            None,
+                            0,
+                            direction_sensor_failure,
+                        )
                     )
                     fgd_lr_search_trials = search_result.trial_count
                     fgd_trial_sensor_failure = search_result.sensor_failure
                     accepted_trial = search_result.accepted
                     diagnostic_trial = search_result.last_trial
+
+                    outer_step_trial = (
+                        accepted_trial
+                        if accepted_trial is not None
+                        else diagnostic_trial
+                    )
+                    if progress is not None and outer_step_trial is not None:
+                        step_error = (
+                            outer_step_trial.certificate.output_relative_error
+                        )
+                        step_rel_error = (
+                            outer_step_trial.certificate.relative_error
+                        )
+                        progress(
+                            f"[FGD-STEP] Epoch {epoch}: "
+                            "loss_before="
+                            f"{theory_state.previous_validation_functional_loss:.6e}, "
+                            "loss_after="
+                            f"{outer_step_trial.validation_functional_loss:.6e}, "
+                            "rel_err_before="
+                            + (
+                                f"{step_rel_error:.4f}"
+                                if step_rel_error is not None
+                                else "n/a"
+                            )
+                            + ", |r|="
+                            + (
+                                f"{step_error.target_norm:.4e}"
+                                if step_error is not None
+                                else "n/a"
+                            )
+                            + ", |g|="
+                            + (
+                                f"{step_error.approximation_norm:.4e}"
+                                if step_error is not None
+                                else "n/a"
+                            )
+                            + ", |u|="
+                            + (
+                                f"{fgd_update_norm:.4e}"
+                                if fgd_update_norm is not None
+                                else "n/a"
+                            )
+                            + ", eta="
+                            f"{outer_step_trial.epoch_result.learning_rate:.4g}, "
+                            f"accepted={accepted_trial is not None}"
+                        )
 
                     if accepted_trial is not None:
                         model = accepted_trial.model
@@ -2839,10 +3115,12 @@ def run_pipeline(
                             test_accuracy=test_metrics.accuracy,
                         )
                         epoch_result = fgd_epoch_result
+                        # The committed certificate describes the DIRECTION
+                        # that moved f_t; the next epoch's state certificate
+                        # must be measured at f_{t+1}, so it is recomputed
+                        # lazily at the top of the next epoch.
                         validation_certificate = accepted_trial.certificate
-                        validation_certificate_for_next_epoch = (
-                            validation_certificate
-                        )
+                        validation_certificate_for_next_epoch = None
                         current_fgd_learning_rate = (
                             fgd_epoch_result.min_positive_learning_rate
                             or learning_rate
@@ -2851,6 +3129,7 @@ def run_pipeline(
                         apply_learning_rate(optimizer, current_fgd_learning_rate)
                         entry_learning_rate = current_fgd_learning_rate
                         fgd_candidate_accepted = True
+                        fgd_accepted_outer_steps += 1
                         fgd_theory_learning_rate_adjusted = (
                             abs(current_fgd_learning_rate - learning_rate)
                             > config.fgd_approx.eps
@@ -2976,7 +3255,10 @@ def run_pipeline(
                         learning_rate=learning_rate,
                         accuracy_tolerance=config.training.accuracy_tolerance,
                         config=config.fgd_approx,
-                        projection_group_size=current_projection_group_size,
+                        projection_group_size=max(
+                            1,
+                            config.fgd_approx.projection_group_size,
+                        ),
                         classification=classification,
                     )
                     epoch_result = fgd_epoch_result
@@ -2986,7 +3268,7 @@ def run_pipeline(
                         device=device,
                         config=config.fgd_approx,
                         learning_rate=None,
-                        projection_group_size=current_projection_group_size,
+                        probe=fgd_validation_probe,
                     )
 
                 selected_layer_index = epoch_result.selected_layer_index
@@ -3086,6 +3368,7 @@ def run_pipeline(
                 ),
                 fgd_sensor_valid=fgd_sensor_valid,
                 fgd_sensor_invalid_batches=fgd_sensor_invalid_batches,
+                fgd_update_norm=fgd_update_norm,
                 fgd_candidate_accepted=fgd_candidate_accepted,
                 fgd_lr_search_trials=fgd_lr_search_trials,
                 fgd_approximation_kind=fgd_approximation_kind,
@@ -3144,10 +3427,21 @@ def run_pipeline(
                         f"sensor invalid on "
                         f"{fgd_sensor_invalid_batches} validation batch(es)"
                     )
+                diagnostic_bound_suffix = (
+                    " (trajectory diagnostic, not an acceptance gate)"
+                    if config.fgd_approx.local_acceptance_conditions
+                    else ""
+                )
                 if fgd_stationary_bound_valid is False:
-                    warnings.append("stationary-point bound failed")
+                    warnings.append(
+                        "stationary-point bound failed"
+                        + diagnostic_bound_suffix
+                    )
                 if fgd_global_bound_valid is False:
-                    warnings.append("global-convergence bound failed")
+                    warnings.append(
+                        "global-convergence bound failed"
+                        + diagnostic_bound_suffix
+                    )
                 if fgd_theory_learning_rate_adjusted:
                     warnings.append(
                         "maximum validation-certified learning rate accepted "
@@ -3210,6 +3504,7 @@ def run_pipeline(
                     nonlocal current_fgd_learning_rate
                     nonlocal previous_validation_functional_loss
                     nonlocal last_test_loss
+                    nonlocal fgd_accepted_outer_steps
                     fgd_rkhs_phase_attempted = (
                         True if in_ladder else config.secant_fgd.enabled
                     )
@@ -3285,9 +3580,7 @@ def run_pipeline(
                                 device=device,
                                 config=config.fgd_approx,
                                 learning_rate=None,
-                                projection_group_size=(
-                                    current_projection_group_size
-                                ),
+                                probe=fgd_validation_probe,
                             )
                         )
                         certified_learning_rate = (
@@ -3410,6 +3703,8 @@ def run_pipeline(
                                 f"converged={phase.converged})"
                             )
                         last_test_loss = phase_test_metrics.loss
+                        fgd_accepted_outer_steps += 1
+                        family_rejection_step.pop("rkhs_head", None)
                         return True
                     else:
                         phase_theory = (
@@ -3512,6 +3807,7 @@ def run_pipeline(
                     nonlocal fgd_min_descent_coefficient
                     nonlocal fgd_global_contraction_product
                     nonlocal last_test_loss
+                    nonlocal fgd_accepted_outer_steps
                     stage_theory_state = _FGDTheoryState(
                         epoch_count=fgd_epoch_count,
                         min_gradient_sq_norm=fgd_min_gradient_sq_norm,
@@ -3533,9 +3829,7 @@ def run_pipeline(
                                 config.training.accuracy_tolerance
                             ),
                             config=config,
-                            projection_group_size=(
-                                current_projection_group_size
-                            ),
+                            probe=fgd_validation_probe,
                             classification=classification,
                             theory_state=stage_theory_state,
                             initial_functional_gap=initial_functional_gap,
@@ -3595,7 +3889,7 @@ def run_pipeline(
                             device=device,
                             config=config.fgd_approx,
                             learning_rate=None,
-                            projection_group_size=current_projection_group_size,
+                            probe=fgd_validation_probe,
                         )
                     )
                     certified_learning_rate = certified_validation_learning_rate(
@@ -3679,6 +3973,8 @@ def run_pipeline(
                             f"rel_err={stage_rel_error:.4f})"
                         )
                     last_test_loss = stage_test_metrics.loss
+                    fgd_accepted_outer_steps += 1
+                    family_rejection_step.pop(family_name, None)
                     return True
 
                 # Fallback approximation families run in the configured order;
@@ -3688,27 +3984,38 @@ def run_pipeline(
                     for name in config.fgd_approx.family_order
                     if name != "tangent"
                 )
+                def _family_on_cooldown(name: str) -> bool:
+                    return _family_rejection_active(
+                        family_rejection_step.get(name),
+                        fgd_accepted_outer_steps,
+                        family_rejection_cooldown,
+                    )
+
                 skipped_families = [
                     name
                     for name in fallback_families
-                    if name in families_rejected_at_structure
+                    if _family_on_cooldown(name)
                 ]
                 if skipped_families and progress is not None:
                     progress(
                         f"[FGD] Epoch {epoch}: skipping "
                         + ", ".join(skipped_families)
-                        + " (rejected at this structure; retried after growth)"
+                        + " (rejected recently; retried after "
+                        f"{family_rejection_cooldown} accepted outer step(s) "
+                        "or growth)"
                     )
                 for family_name in fallback_families:
                     if not growth_triggered:
                         break
-                    if family_name in families_rejected_at_structure:
+                    if _family_on_cooldown(family_name):
                         continue
                     if family_name == "rkhs_head":
                         if _attempt_rkhs_head_stage(in_ladder=True):
                             growth_triggered = False
                         else:
-                            families_rejected_at_structure.add(family_name)
+                            family_rejection_step[family_name] = (
+                                fgd_accepted_outer_steps
+                            )
                     elif family_name in (
                         "parametric_gd",
                         "parametric_descent",
@@ -3716,7 +4023,9 @@ def run_pipeline(
                         if _attempt_parametric_stage(family_name):
                             growth_triggered = False
                         else:
-                            families_rejected_at_structure.add(family_name)
+                            family_rejection_step[family_name] = (
+                                fgd_accepted_outer_steps
+                            )
 
                 if growth_triggered:
                     growth_probe = _probe_fgd_growth(
@@ -3728,7 +4037,7 @@ def run_pipeline(
                         growth_count=growth_count,
                         device=device,
                         config=config,
-                        projection_group_size=current_projection_group_size,
+                        probe=fgd_validation_probe,
                     )
                     fgd_growth_probe_improved = bool(
                         growth_probe is not None and growth_probe.improves_fgd
@@ -3829,9 +4138,9 @@ def run_pipeline(
                     # Growth is a mode switch: the accumulated stationary and
                     # global bounds certify a fixed architecture, so restart
                     # them from the post-growth loss. The new structure also
-                    # re-offers approximation capacity, so families rejected
-                    # at the previous structure become eligible again.
-                    families_rejected_at_structure.clear()
+                    # re-offers approximation capacity, so all stale family
+                    # rejections are cleared immediately.
+                    family_rejection_step.clear()
                     reset_fgd_certificate()
                     if config.fgd_approx.learning_rate_policy == "theory_interval":
                         validation_certificate_for_next_epoch = (
@@ -3841,7 +4150,7 @@ def run_pipeline(
                                 device=device,
                                 config=config.fgd_approx,
                                 learning_rate=None,
-                                projection_group_size=current_projection_group_size,
+                                probe=fgd_validation_probe,
                             )
                         )
                         post_growth_certified_learning_rate = (

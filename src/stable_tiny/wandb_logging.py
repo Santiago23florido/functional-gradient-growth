@@ -207,6 +207,7 @@ class WandbRunLogger:
                 ("fgd_stationary_bound", "fgd/stationary_bound"),
                 ("fgd_global_bound", "fgd/global_bound"),
                 ("fgd_global_contraction", "fgd/global_contraction"),
+                ("fgd_update_norm", "fgd/update_norm"),
             ):
                 value = getattr(entry, attribute_name, None)
                 if value is not None:
