@@ -103,6 +103,17 @@ class FGDApproxConfig:
     # fails. Every family commits through the same full FGD certificate.
     # Supported: "tangent", "rkhs_head", "parametric_gd".
     family_order: tuple[str, ...] = ("tangent",)
+    # Certified outer steps attempted per epoch: each pass re-solves the
+    # shared direction at the CURRENT model and certifies it independently
+    # (k applications of the same per-step theorem). The epoch stops at the
+    # first rejected attempt. 1 = one outer step per epoch (legacy).
+    outer_steps_per_epoch: int = 1
+    # Structure-burst patience: the growth probe runs only after this many
+    # CONSECUTIVE epochs in which no family committed a step. With a value
+    # above 1, combine with family_rejection_cooldown: 0 so the stochastic
+    # parametric generators actually retry during the patience window.
+    # 1 = probe growth on the first fully-failed epoch (legacy).
+    growth_patience: int = 1
     # Acceptance mode. When true, an outer step commits on its four LOCAL
     # conditions only — valid sensor, strict Crel, strict LR interval
     # (theory_lr_min < eta < eta_bar), and STRICT realized descent of the
