@@ -1,0 +1,8 @@
+run: {name: fast_dense_adamw_3x10, results_dir: results, save_plot: false, show_plot: false}
+data: {kind: mnist, in_features: 784, out_features: 10, batch_size: 64, train_seed: 0, validation_seed: 2, test_seed: 1, mnist_train_samples: 2048, mnist_validation_samples: 1024, mnist_test_samples: 1024}
+model: {hidden_size: 10, number_hidden_layers: 3, model_seed: 0}
+training: {method: normal, epochs: 60, accuracy_tolerance: 0.1, gradient_clip_norm: 1.0, log_every: 20, device: auto}
+optimizer: {name: adamW, learning_rate: 0.001, weight_decay: 0.01, betas: [0.9, 0.999], eps: 1.0e-8}
+lr_scheduler: {name: cosineannealing, t_max: 60, eta_min: 0.0, restart_on_growth: false}
+growth_schedule: {enabled: false, every: 100, first_epoch: 50, layer_policy: round_robin}
+wandb: {enabled: false}
