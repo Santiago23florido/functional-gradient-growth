@@ -426,3 +426,50 @@ def test_outer_step_rejects_when_the_step_ascends() -> None:
     assert trial.validation_functional_loss > loss
     assert trial.loss_descent_valid is False
     assert trial.all_conditions_valid is False
+
+
+def test_tangent_measured_descent_search_takes_a_big_certified_step() -> None:
+    """Tangent direction + measured descent (Prop 3.8) beats the eps bound."""
+    from dataclasses import replace
+    from stable_tiny.pipeline import _search_tangent_measured_descent
+
+    problem = _outer_problem(local_acceptance=True)
+    model, batches, config, state, loss, direction, direction_stats = problem
+    config = replace(
+        config,
+        fgd_approx=replace(
+            config.fgd_approx,
+            tangent_measured_descent=True,
+            tangent_measured_max_lr=1.0,
+            theory_lr_search_steps=8,
+            theory_mu=1e-9,
+        ),
+    )
+    result = _search_tangent_measured_descent(
+        base_model=model,
+        direction=direction,
+        direction_stats=direction_stats,
+        train_batches=batches,
+        validation_loader=batches,
+        loss_function=torch.nn.MSELoss(),
+        device=torch.device("cpu"),
+        accuracy_tolerance=0.1,
+        config=config,
+        theory_state=state,
+        initial_functional_gap=loss,
+        theory_loss_star=0.0,
+    )
+    trial = result.accepted
+    assert trial is not None
+    # A genuine measured descent was certified via Prop. 3.8 (not the
+    # Lemma-3.5 epsilon interval, which is None-gated here).
+    assert trial.validation_functional_loss < loss
+    assert trial.loss_descent_valid is True
+    assert trial.all_conditions_valid is True
+    assert trial.certificate.relative_error_condition_valid is None
+    assert trial.certificate.learning_rate_interval_valid is None
+    # The committed step is the measured line-search optimum (positive).
+    assert trial.epoch_result.learning_rate > 0.0
+    # The measured descent coefficient is positive (Prop. 3.8 contraction).
+    assert trial.certificate.theory_descent_coefficient is not None
+    assert trial.certificate.theory_descent_coefficient > 0.0

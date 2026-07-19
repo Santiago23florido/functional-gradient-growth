@@ -103,6 +103,20 @@ class FGDApproxConfig:
     # fails. Every family commits through the same full FGD certificate.
     # Supported: "tangent", "rkhs_head", "parametric_gd".
     family_order: tuple[str, ...] = ("tangent",)
+    # Certify the tangent outer step by MEASURED validation descent
+    # (Prop. 3.8) instead of the Lemma-3.5 relative-error interval. The
+    # step direction is still the paper's functional-gradient projection
+    # g = P_T r; only the step SIZE is chosen by a measured nonlinear line
+    # search rather than the worst-case bound eta_max(eps), which is far
+    # too conservative (measured optimum ~0.5 vs eta_max ~0.06 at eps 0.45).
+    # Both certificates are in the paper; measured descent unlocks the
+    # nonlinear step the linear bound forbids. Default False (legacy
+    # eps-bounded step).
+    tangent_measured_descent: bool = False
+    # Largest eta tried by the measured tangent line search (the grid
+    # descends geometrically from here to theory_lr_min). Only used when
+    # tangent_measured_descent is True.
+    tangent_measured_max_lr: float = 1.0
     # Certified outer steps attempted per epoch: each pass re-solves the
     # shared direction at the CURRENT model and certifies it independently
     # (k applications of the same per-step theorem). The epoch stops at the

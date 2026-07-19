@@ -813,6 +813,81 @@ def _apply_shared_direction_step(
             parameter.add_(update.to(parameter.device), alpha=-learning_rate)
 
 
+def _search_tangent_measured_descent(
+    *,
+    base_model: GrowingMLP,
+    direction: tuple[torch.Tensor, ...],
+    direction_stats: _FunctionalStepStats,
+    train_batches: list[tuple[torch.Tensor, torch.Tensor]],
+    validation_loader: torch.utils.data.DataLoader,
+    loss_function: torch.nn.Module,
+    device: torch.device,
+    accuracy_tolerance: float,
+    config: PipelineConfig,
+    theory_state: _FGDTheoryState,
+    initial_functional_gap: float,
+    theory_loss_star: float,
+) -> _FGDSearchResult:
+    """Certify the tangent functional-gradient step by MEASURED descent.
+
+    The direction is the paper's g = P_T r (tangent projection); the step
+    SIZE is chosen by a nonlinear line search that maximizes the certified
+    measured validation descent (Prop. 3.8), instead of the worst-case
+    Lemma-3.5 bound eta_max(eps). The line search sweeps a descending
+    geometric grid of eta and commits the certified step with the largest
+    measured progress. Every accepted step still satisfies the paper's
+    per-step descent inequality — only the sufficient mechanism used to
+    certify it changes (measured coefficient, not the epsilon interval).
+    """
+    relative_error = direction_stats.output_error.relative_error
+    maximum_learning_rate = config.fgd_approx.tangent_measured_max_lr
+    floor = config.fgd_approx.theory_lr_min + config.fgd_approx.eps
+    steps = max(1, config.fgd_approx.theory_lr_search_steps)
+    trial_count = 0
+    best_trial: _FGDTrial | None = None
+    last_trial: _FGDTrial | None = None
+    best_progress = float("-inf")
+    for index in range(steps):
+        fraction = index / max(1, steps - 1)
+        eta = maximum_learning_rate * (
+            floor / maximum_learning_rate
+        ) ** fraction
+        if eta <= floor:
+            continue
+        candidate = copy.deepcopy(base_model)
+        _apply_shared_direction_step(candidate, direction, eta)
+        trial = _certify_measured_descent_candidate(
+            candidate_model=candidate,
+            base_model=base_model,
+            train_batches=train_batches,
+            validation_loader=validation_loader,
+            loss_function=loss_function,
+            device=device,
+            eta_star=eta,
+            relative_error=relative_error,
+            accuracy_tolerance=accuracy_tolerance,
+            config=config,
+            classification=False,
+            theory_state=theory_state,
+            initial_functional_gap=initial_functional_gap,
+            theory_loss_star=theory_loss_star,
+        )
+        trial_count += 1
+        last_trial = trial
+        if not trial.all_conditions_valid:
+            continue
+        progress = _certified_trial_progress(trial)
+        if progress > best_progress:
+            best_progress = progress
+            best_trial = trial
+    return _FGDSearchResult(
+        best_trial,
+        best_trial if best_trial is not None else last_trial,
+        trial_count,
+        False,
+    )
+
+
 def _evaluate_fgd_outer_trial(
     *,
     base_model: GrowingMLP,
@@ -3072,21 +3147,47 @@ def run_pipeline(
                                 theory_loss_star=theory_loss_star,
                             )
 
-                        search_result = (
-                            _search_fgd_certified_trial(
-                                maximum_learning_rate=maximum_learning_rate,
-                                evaluate_trial=evaluate_trial,
-                                config=config.fgd_approx,
-                            )
-                            if maximum_learning_rate is not None
+                        if (
+                            config.fgd_approx.tangent_measured_descent
+                            and tangent_direction is not None
                             and direction_stats is not None
-                            else _FGDSearchResult(
-                                None,
-                                None,
-                                0,
-                                direction_sensor_failure,
+                        ):
+                            # Paper-pure functional step: the tangent
+                            # direction g = P_T r certified by MEASURED
+                            # descent (Prop. 3.8), step size from a
+                            # nonlinear line search instead of eta_max(eps).
+                            search_result = _search_tangent_measured_descent(
+                                base_model=model,
+                                direction=tangent_direction,
+                                direction_stats=direction_stats,
+                                train_batches=frozen_train_batches,
+                                validation_loader=validation_loader,
+                                loss_function=loss_function,
+                                device=device,
+                                accuracy_tolerance=(
+                                    config.training.accuracy_tolerance
+                                ),
+                                config=config,
+                                theory_state=theory_state,
+                                initial_functional_gap=initial_functional_gap,
+                                theory_loss_star=theory_loss_star,
                             )
-                        )
+                        else:
+                            search_result = (
+                                _search_fgd_certified_trial(
+                                    maximum_learning_rate=maximum_learning_rate,
+                                    evaluate_trial=evaluate_trial,
+                                    config=config.fgd_approx,
+                                )
+                                if maximum_learning_rate is not None
+                                and direction_stats is not None
+                                else _FGDSearchResult(
+                                    None,
+                                    None,
+                                    0,
+                                    direction_sensor_failure,
+                                )
+                            )
                         fgd_lr_search_trials += search_result.trial_count
                         fgd_trial_sensor_failure = (
                             fgd_trial_sensor_failure
