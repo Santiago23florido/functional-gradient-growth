@@ -4324,7 +4324,49 @@ def run_pipeline(
 
             if growth_triggered:
                 if config.training.method == "fgd_approx":
-                    if growth_probe is not None:
+                    if config.fgd_approx.growth_uniform:
+                        # Uniform growth: widen EVERY hidden layer together,
+                        # tracing the balanced dense nets (3xk) from the tiny
+                        # start. Sidesteps the greedy input-layer credit
+                        # problem. The delta of the last grown layer stands
+                        # in as the reported growth_result.
+                        growable = list(
+                            range(len(getattr(model, "_growable_layers", [])))
+                        )
+                        uniform_kwargs = tiny_optimal_update_kwargs(
+                            config.fgd_approx,
+                            compute_delta=config.fgd_approx.growth_compute_delta,
+                        )
+                        growth_result = None
+                        for uniform_layer in growable:
+                            growth_result = grow_layer(
+                                model=model,
+                                train_loader=train_loader,
+                                layer_index=uniform_layer,
+                                device=device,
+                                line_search_config=config.scaling_line_search,
+                                optimal_update_kwargs=uniform_kwargs,
+                                progress=None,
+                                function_preserving=(
+                                    config.fgd_approx.growth_function_preserving
+                                ),
+                                preservation_tolerance=(
+                                    config.fgd_approx
+                                    .growth_preservation_tolerance
+                                ),
+                            )
+                        layer_index = (
+                            growth_result.layer_index
+                            if growth_result is not None
+                            else 0
+                        )
+                        selected_layer_index = layer_index
+                        if progress is not None:
+                            progress(
+                                f"[GRO] Uniform growth at epoch {epoch}: "
+                                f"widened all {len(growable)} hidden layers"
+                            )
+                    elif growth_probe is not None:
                         model = growth_probe.model
                         growth_result = growth_probe.result
                         layer_index = growth_result.layer_index

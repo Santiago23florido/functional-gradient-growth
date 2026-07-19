@@ -122,6 +122,15 @@ class FGDApproxConfig:
     # (k applications of the same per-step theorem). The epoch stops at the
     # first rejected attempt. 1 = one outer step per epoch (legacy).
     outer_steps_per_epoch: int = 1
+    # Grow EVERY hidden layer together (uniform widening) instead of
+    # selecting one layer. This sidesteps the input-layer credit-assignment
+    # problem of greedy per-layer growth: any greedy criterion (descent or
+    # relative error) undervalues the input layer, whose benefit is latent,
+    # so incremental growth from a tiny net keeps layer 0 narrow and caps
+    # accuracy. Uniform growth traces the balanced dense nets (3xk) from a
+    # tiny start, so the certified family training matches fixed AdamW.
+    # Default False.
+    growth_uniform: bool = False
     # Select the growth layer by the largest CERTIFIED functional descent
     # per added parameter (Prop. 3.8 measured descent), instead of the
     # relative-error certificate. Required with delta growth (function-
