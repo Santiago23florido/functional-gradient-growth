@@ -260,6 +260,12 @@ class _GrowthProbe:
     result: GrowthResult
     certificate: FGDValidationCertificate
     improves_fgd: bool
+    # Measured validation functional descent this growth realizes
+    # (loss_before - loss_after) and the parameters it adds. Used by the
+    # descent-per-parameter selection (Prop. 3.8-certified growth), which
+    # is coherent with delta growth where the rel-error jumps.
+    functional_descent: float = 0.0
+    added_parameters: int = 0
 
 
 def _section_dataclass(
@@ -813,6 +819,81 @@ def _apply_shared_direction_step(
             parameter.add_(update.to(parameter.device), alpha=-learning_rate)
 
 
+def _search_tangent_measured_descent(
+    *,
+    base_model: GrowingMLP,
+    direction: tuple[torch.Tensor, ...],
+    direction_stats: _FunctionalStepStats,
+    train_batches: list[tuple[torch.Tensor, torch.Tensor]],
+    validation_loader: torch.utils.data.DataLoader,
+    loss_function: torch.nn.Module,
+    device: torch.device,
+    accuracy_tolerance: float,
+    config: PipelineConfig,
+    theory_state: _FGDTheoryState,
+    initial_functional_gap: float,
+    theory_loss_star: float,
+) -> _FGDSearchResult:
+    """Certify the tangent functional-gradient step by MEASURED descent.
+
+    The direction is the paper's g = P_T r (tangent projection); the step
+    SIZE is chosen by a nonlinear line search that maximizes the certified
+    measured validation descent (Prop. 3.8), instead of the worst-case
+    Lemma-3.5 bound eta_max(eps). The line search sweeps a descending
+    geometric grid of eta and commits the certified step with the largest
+    measured progress. Every accepted step still satisfies the paper's
+    per-step descent inequality — only the sufficient mechanism used to
+    certify it changes (measured coefficient, not the epsilon interval).
+    """
+    relative_error = direction_stats.output_error.relative_error
+    maximum_learning_rate = config.fgd_approx.tangent_measured_max_lr
+    floor = config.fgd_approx.theory_lr_min + config.fgd_approx.eps
+    steps = max(1, config.fgd_approx.theory_lr_search_steps)
+    trial_count = 0
+    best_trial: _FGDTrial | None = None
+    last_trial: _FGDTrial | None = None
+    best_progress = float("-inf")
+    for index in range(steps):
+        fraction = index / max(1, steps - 1)
+        eta = maximum_learning_rate * (
+            floor / maximum_learning_rate
+        ) ** fraction
+        if eta <= floor:
+            continue
+        candidate = copy.deepcopy(base_model)
+        _apply_shared_direction_step(candidate, direction, eta)
+        trial = _certify_measured_descent_candidate(
+            candidate_model=candidate,
+            base_model=base_model,
+            train_batches=train_batches,
+            validation_loader=validation_loader,
+            loss_function=loss_function,
+            device=device,
+            eta_star=eta,
+            relative_error=relative_error,
+            accuracy_tolerance=accuracy_tolerance,
+            config=config,
+            classification=False,
+            theory_state=theory_state,
+            initial_functional_gap=initial_functional_gap,
+            theory_loss_star=theory_loss_star,
+        )
+        trial_count += 1
+        last_trial = trial
+        if not trial.all_conditions_valid:
+            continue
+        progress = _certified_trial_progress(trial)
+        if progress > best_progress:
+            best_progress = progress
+            best_trial = trial
+    return _FGDSearchResult(
+        best_trial,
+        best_trial if best_trial is not None else last_trial,
+        trial_count,
+        False,
+    )
+
+
 def _evaluate_fgd_outer_trial(
     *,
     base_model: GrowingMLP,
@@ -1174,6 +1255,18 @@ def _probe_fgd_growth(
         config.fgd_approx,
         compute_delta=config.fgd_approx.growth_compute_delta,
     )
+    base_parameter_count = count_parameters(model)
+    # Base functional loss for the measured-descent growth criterion. Only
+    # paid when that selection is active (delta growth reduces the loss, so
+    # ranking candidates by their certified descent-per-parameter is the
+    # coherent, Prop. 3.8-justified choice; the rel-error certificate is
+    # blind to it because the delta step jumps the linearization).
+    select_by_descent = config.fgd_approx.growth_select_by_descent
+    base_functional_loss = (
+        evaluate_functional_loss(model, validation_loader, device)
+        if select_by_descent
+        else 0.0
+    )
     for layer_index in layer_indices:
         trial_model = copy.deepcopy(model)
         growth_result = grow_layer(
@@ -1197,6 +1290,12 @@ def _probe_fgd_growth(
             learning_rate=None,
             probe=probe,
         )
+        functional_descent = 0.0
+        if select_by_descent:
+            candidate_loss = evaluate_functional_loss(
+                trial_model, validation_loader, device
+            )
+            functional_descent = base_functional_loss - candidate_loss
         probes.append(
             _GrowthProbe(
                 model=trial_model,
@@ -1207,10 +1306,56 @@ def _probe_fgd_growth(
                     certificate,
                     config,
                 ),
+                functional_descent=functional_descent,
+                added_parameters=(
+                    count_parameters(trial_model) - base_parameter_count
+                ),
             )
         )
 
-    return _select_growth_probe(probes)
+    if select_by_descent:
+        by_descent = _select_growth_probe_by_descent(
+            probes, config.fgd_approx.eps
+        )
+        if by_descent is not None:
+            return by_descent
+        # No growth realizes an immediate validation descent (every
+        # single-neuron delta overfits the tiny structure). Rather than
+        # stall, still add the capacity the certificate ranks best so the
+        # structure can escape the bottleneck and train into it — growth is
+        # the paper's structural response to an exhausted family.
+    return _select_growth_probe(
+        probes,
+        prefer_lower_error=config.fgd_approx.growth_prefer_lower_error,
+    )
+
+
+def _select_growth_probe_by_descent(
+    probes: list[_GrowthProbe],
+    eps: float,
+) -> _GrowthProbe | None:
+    """Grow the layer with the largest certified descent PER PARAMETER.
+
+    This is the paper's structural step made parameter-efficient: among
+    growths that realize a genuine validation functional descent (Prop. 3.8
+    measured descent > 0), pick the one that reduces the functional gap most
+    per added parameter. Ties fall to the larger absolute descent, then the
+    lower layer index. If no growth descends, fall back to None (the caller
+    then leaves the structure unchanged and keeps training).
+    """
+    descending = [p for p in probes if p.functional_descent > eps]
+    if not descending:
+        return None
+
+    def efficiency(probe: _GrowthProbe) -> tuple[float, float, int]:
+        added = max(probe.added_parameters, 1)
+        return (
+            -probe.functional_descent / added,
+            -probe.functional_descent,
+            probe.result.layer_index,
+        )
+
+    return min(descending, key=efficiency)
 
 
 def _probe_relative_error(probe: _GrowthProbe) -> float:
@@ -1222,29 +1367,39 @@ def _probe_parameter_count(probe: _GrowthProbe) -> int:
     return sum(parameter.numel() for parameter in probe.model.parameters())
 
 
-def _select_growth_probe(probes: list[_GrowthProbe]) -> _GrowthProbe | None:
+def _select_growth_probe(
+    probes: list[_GrowthProbe],
+    prefer_lower_error: bool = False,
+) -> _GrowthProbe | None:
     """Deterministic growth-layer choice.
 
-    Among probes that improve the FGD certificate the policy stays
+    Among probes that improve the FGD certificate the default policy is
     frugal-first: fewest total parameters, then lowest post-growth relative
-    error, then layer index. When NO probe reaches the improvement
-    threshold the priority inverts: lowest post-growth relative error
-    first, parameter count only as a tie-breaker — growth exists to restore
-    approximation capacity, so a smaller architecture must never outrank a
-    better certificate.
+    error, then layer index. With ``prefer_lower_error`` the improving case
+    instead ranks by lowest post-growth relative error first (parameter
+    count as a tie-break), so growth widens the most impactful layer even
+    when it is the expensive input layer. When NO probe reaches the
+    improvement threshold the priority is always lowest post-growth relative
+    error first — growth exists to restore approximation capacity, so a
+    smaller architecture must never outrank a better certificate.
     """
     if not probes:
         return None
     improving = [probe for probe in probes if probe.improves_fgd]
     if improving:
-        return min(
-            improving,
-            key=lambda probe: (
+        if prefer_lower_error:
+            improving_key = lambda probe: (
+                _probe_relative_error(probe),
+                _probe_parameter_count(probe),
+                probe.result.layer_index,
+            )
+        else:
+            improving_key = lambda probe: (
                 _probe_parameter_count(probe),
                 _probe_relative_error(probe),
                 probe.result.layer_index,
-            ),
-        )
+            )
+        return min(improving, key=improving_key)
     return min(
         probes,
         key=lambda probe: (
@@ -1379,8 +1534,21 @@ def _train_parametric_gd_candidate(
     ]
     if config.optimizer == "sgd":
         optimizer = torch.optim.SGD(trainable, lr=config.inner_learning_rate)
+    elif config.optimizer == "adamw":
+        # The certificate only sees the realized displacement, so the
+        # candidate generator may be as strong as the dense baseline's
+        # optimizer (decoupled weight decay for generalization).
+        optimizer = torch.optim.AdamW(
+            trainable,
+            lr=config.inner_learning_rate,
+            weight_decay=config.weight_decay,
+        )
     else:
-        optimizer = torch.optim.Adam(trainable, lr=config.inner_learning_rate)
+        optimizer = torch.optim.Adam(
+            trainable,
+            lr=config.inner_learning_rate,
+            weight_decay=config.weight_decay,
+        )
 
     for _ in range(max(1, steps)):
         for x, y in train_batches:
@@ -2744,6 +2912,9 @@ def run_pipeline(
         fgd_accepted_outer_steps = 0
         family_rejection_step: dict[str, int] = {}
         family_rejection_cooldown = config.fgd_approx.family_rejection_cooldown
+        # Consecutive epochs with no committed step from any family; the
+        # growth probe waits for fgd_approx.growth_patience of them.
+        fgd_epochs_without_commit = 0
         # FIXED certification probes, materialized once for the whole run:
         # every certificate, family comparison and growth-layer trial solves
         # one joint shared-direction projection over the same sample.
@@ -2939,166 +3110,209 @@ def run_pipeline(
                 step_type: StepType = "SGD"
             elif config.training.method == "fgd_approx":
                 if use_fgd_theory_learning_rate:
-                    theory_state = _FGDTheoryState(
-                        epoch_count=fgd_epoch_count,
-                        min_gradient_sq_norm=fgd_min_gradient_sq_norm,
-                        min_positive_learning_rate=fgd_min_positive_learning_rate,
-                        min_descent_coefficient=fgd_min_descent_coefficient,
-                        global_contraction_product=fgd_global_contraction_product,
-                        previous_validation_functional_loss=(
-                            previous_validation_functional_loss
-                        ),
+                    max_outer_steps = max(
+                        1,
+                        config.fgd_approx.outer_steps_per_epoch,
                     )
-                    _clear_inaccessible_tensor_caches(model)
-                    frozen_train_batches = list(train_loader)
+                    accepted_steps_this_epoch = 0
+                    # Multiple certified outer steps per epoch: each pass
+                    # re-solves the shared direction at the CURRENT model and
+                    # certifies it independently (k applications of the same
+                    # per-step theorem). The epoch stops at the first
+                    # rejected attempt; growth can only be requested when
+                    # the FIRST attempt of the epoch fails.
+                    for _outer_step_index in range(max_outer_steps):
+                        theory_state = _FGDTheoryState(
+                            epoch_count=fgd_epoch_count,
+                            min_gradient_sq_norm=fgd_min_gradient_sq_norm,
+                            min_positive_learning_rate=fgd_min_positive_learning_rate,
+                            min_descent_coefficient=fgd_min_descent_coefficient,
+                            global_contraction_product=fgd_global_contraction_product,
+                            previous_validation_functional_loss=(
+                                previous_validation_functional_loss
+                            ),
+                        )
+                        _clear_inaccessible_tensor_caches(model)
+                        frozen_train_batches = list(train_loader)
 
-                    # One genuine outer step per epoch: solve the SHARED
-                    # direction u* on the fixed train probe at the current
-                    # model f_t, certify THAT direction on the fixed
-                    # validation probe BEFORE any update, then search the
-                    # step size eta for the single update theta - eta * u*.
-                    tangent_direction: tuple[torch.Tensor, ...] | None = None
-                    direction_stats: _FunctionalStepStats | None = None
-                    maximum_learning_rate: float | None = None
-                    direction_sensor_failure = False
-                    direction_step = _compute_tangent_projection_step(
-                        model=model,
-                        x=fgd_train_probe[0],
-                        y=fgd_train_probe[1],
-                        config=config.fgd_approx,
-                    )
-                    if _projection_step_sensor_valid(
-                        direction_step,
-                        config.fgd_approx,
-                    ):
-                        tangent_direction = direction_step.parameter_updates
-                        fgd_update_norm = math.sqrt(
-                            sum(
-                                float(
-                                    torch.sum(update.detach() ** 2).item()
-                                )
-                                for update in tangent_direction
-                            )
-                        )
-                        direction_stats = measure_direction_projection(
-                            model,
-                            tangent_direction,
-                            fgd_validation_probe[0],
-                            fgd_validation_probe[1],
-                            config.fgd_approx,
-                        )
-                        # The direction is only a projection on the TRAIN
-                        # probe; on validation it is certified like a secant
-                        # (finiteness sensor, Crel/interval as gates).
-                        direction_certificate = (
-                            certificate_from_projection_stats(
-                                stats=direction_stats,
-                                learning_rate=None,
-                                config=config.fgd_approx,
-                                projection_sensor=False,
-                            )
-                        )
-                        if direction_certificate.sensor_valid:
-                            maximum_learning_rate = (
-                                certified_validation_learning_rate(
-                                    direction_certificate,
-                                    config.fgd_approx,
-                                )
-                            )
-                        else:
-                            direction_sensor_failure = True
-                            direction_stats = None
-                    else:
-                        direction_sensor_failure = True
-
-                    def evaluate_trial(candidate_learning_rate: float) -> _FGDTrial:
-                        assert tangent_direction is not None
-                        assert direction_stats is not None
-                        return _evaluate_fgd_outer_trial(
-                            base_model=model,
-                            direction=tangent_direction,
-                            direction_stats=direction_stats,
-                            train_batches=frozen_train_batches,
-                            validation_loader=validation_loader,
-                            loss_function=loss_function,
-                            device=device,
-                            learning_rate=candidate_learning_rate,
-                            accuracy_tolerance=config.training.accuracy_tolerance,
-                            config=config,
-                            classification=classification,
-                            theory_state=theory_state,
-                            initial_functional_gap=initial_functional_gap,
-                            theory_loss_star=theory_loss_star,
-                        )
-
-                    search_result = (
-                        _search_fgd_certified_trial(
-                            maximum_learning_rate=maximum_learning_rate,
-                            evaluate_trial=evaluate_trial,
+                        # One genuine outer step per epoch: solve the SHARED
+                        # direction u* on the fixed train probe at the current
+                        # model f_t, certify THAT direction on the fixed
+                        # validation probe BEFORE any update, then search the
+                        # step size eta for the single update theta - eta * u*.
+                        tangent_direction: tuple[torch.Tensor, ...] | None = None
+                        direction_stats: _FunctionalStepStats | None = None
+                        maximum_learning_rate: float | None = None
+                        direction_sensor_failure = False
+                        direction_step = _compute_tangent_projection_step(
+                            model=model,
+                            x=fgd_train_probe[0],
+                            y=fgd_train_probe[1],
                             config=config.fgd_approx,
                         )
-                        if maximum_learning_rate is not None
-                        and direction_stats is not None
-                        else _FGDSearchResult(
-                            None,
-                            None,
-                            0,
-                            direction_sensor_failure,
-                        )
-                    )
-                    fgd_lr_search_trials = search_result.trial_count
-                    fgd_trial_sensor_failure = search_result.sensor_failure
-                    accepted_trial = search_result.accepted
-                    diagnostic_trial = search_result.last_trial
+                        if _projection_step_sensor_valid(
+                            direction_step,
+                            config.fgd_approx,
+                        ):
+                            tangent_direction = direction_step.parameter_updates
+                            fgd_update_norm = math.sqrt(
+                                sum(
+                                    float(
+                                        torch.sum(update.detach() ** 2).item()
+                                    )
+                                    for update in tangent_direction
+                                )
+                            )
+                            direction_stats = measure_direction_projection(
+                                model,
+                                tangent_direction,
+                                fgd_validation_probe[0],
+                                fgd_validation_probe[1],
+                                config.fgd_approx,
+                            )
+                            # The direction is only a projection on the TRAIN
+                            # probe; on validation it is certified like a secant
+                            # (finiteness sensor, Crel/interval as gates).
+                            direction_certificate = (
+                                certificate_from_projection_stats(
+                                    stats=direction_stats,
+                                    learning_rate=None,
+                                    config=config.fgd_approx,
+                                    projection_sensor=False,
+                                )
+                            )
+                            if direction_certificate.sensor_valid:
+                                maximum_learning_rate = (
+                                    certified_validation_learning_rate(
+                                        direction_certificate,
+                                        config.fgd_approx,
+                                    )
+                                )
+                            else:
+                                direction_sensor_failure = True
+                                direction_stats = None
+                        else:
+                            direction_sensor_failure = True
 
-                    outer_step_trial = (
-                        accepted_trial
-                        if accepted_trial is not None
-                        else diagnostic_trial
-                    )
-                    if progress is not None and outer_step_trial is not None:
-                        step_error = (
-                            outer_step_trial.certificate.output_relative_error
-                        )
-                        step_rel_error = (
-                            outer_step_trial.certificate.relative_error
-                        )
-                        progress(
-                            f"[FGD-STEP] Epoch {epoch}: "
-                            "loss_before="
-                            f"{theory_state.previous_validation_functional_loss:.6e}, "
-                            "loss_after="
-                            f"{outer_step_trial.validation_functional_loss:.6e}, "
-                            "rel_err_before="
-                            + (
-                                f"{step_rel_error:.4f}"
-                                if step_rel_error is not None
-                                else "n/a"
+                        def evaluate_trial(candidate_learning_rate: float) -> _FGDTrial:
+                            assert tangent_direction is not None
+                            assert direction_stats is not None
+                            return _evaluate_fgd_outer_trial(
+                                base_model=model,
+                                direction=tangent_direction,
+                                direction_stats=direction_stats,
+                                train_batches=frozen_train_batches,
+                                validation_loader=validation_loader,
+                                loss_function=loss_function,
+                                device=device,
+                                learning_rate=candidate_learning_rate,
+                                accuracy_tolerance=config.training.accuracy_tolerance,
+                                config=config,
+                                classification=classification,
+                                theory_state=theory_state,
+                                initial_functional_gap=initial_functional_gap,
+                                theory_loss_star=theory_loss_star,
                             )
-                            + ", |r|="
-                            + (
-                                f"{step_error.target_norm:.4e}"
-                                if step_error is not None
-                                else "n/a"
-                            )
-                            + ", |g|="
-                            + (
-                                f"{step_error.approximation_norm:.4e}"
-                                if step_error is not None
-                                else "n/a"
-                            )
-                            + ", |u|="
-                            + (
-                                f"{fgd_update_norm:.4e}"
-                                if fgd_update_norm is not None
-                                else "n/a"
-                            )
-                            + ", eta="
-                            f"{outer_step_trial.epoch_result.learning_rate:.4g}, "
-                            f"accepted={accepted_trial is not None}"
-                        )
 
-                    if accepted_trial is not None:
+                        if (
+                            config.fgd_approx.tangent_measured_descent
+                            and tangent_direction is not None
+                            and direction_stats is not None
+                        ):
+                            # Paper-pure functional step: the tangent
+                            # direction g = P_T r certified by MEASURED
+                            # descent (Prop. 3.8), step size from a
+                            # nonlinear line search instead of eta_max(eps).
+                            search_result = _search_tangent_measured_descent(
+                                base_model=model,
+                                direction=tangent_direction,
+                                direction_stats=direction_stats,
+                                train_batches=frozen_train_batches,
+                                validation_loader=validation_loader,
+                                loss_function=loss_function,
+                                device=device,
+                                accuracy_tolerance=(
+                                    config.training.accuracy_tolerance
+                                ),
+                                config=config,
+                                theory_state=theory_state,
+                                initial_functional_gap=initial_functional_gap,
+                                theory_loss_star=theory_loss_star,
+                            )
+                        else:
+                            search_result = (
+                                _search_fgd_certified_trial(
+                                    maximum_learning_rate=maximum_learning_rate,
+                                    evaluate_trial=evaluate_trial,
+                                    config=config.fgd_approx,
+                                )
+                                if maximum_learning_rate is not None
+                                and direction_stats is not None
+                                else _FGDSearchResult(
+                                    None,
+                                    None,
+                                    0,
+                                    direction_sensor_failure,
+                                )
+                            )
+                        fgd_lr_search_trials += search_result.trial_count
+                        fgd_trial_sensor_failure = (
+                            fgd_trial_sensor_failure
+                            or search_result.sensor_failure
+                        )
+                        accepted_trial = search_result.accepted
+                        diagnostic_trial = search_result.last_trial
+
+                        outer_step_trial = (
+                            accepted_trial
+                            if accepted_trial is not None
+                            else diagnostic_trial
+                        )
+                        if progress is not None and outer_step_trial is not None:
+                            step_error = (
+                                outer_step_trial.certificate.output_relative_error
+                            )
+                            step_rel_error = (
+                                outer_step_trial.certificate.relative_error
+                            )
+                            progress(
+                                f"[FGD-STEP] Epoch {epoch}: "
+                                "loss_before="
+                                f"{theory_state.previous_validation_functional_loss:.6e}, "
+                                "loss_after="
+                                f"{outer_step_trial.validation_functional_loss:.6e}, "
+                                "rel_err_before="
+                                + (
+                                    f"{step_rel_error:.4f}"
+                                    if step_rel_error is not None
+                                    else "n/a"
+                                )
+                                + ", |r|="
+                                + (
+                                    f"{step_error.target_norm:.4e}"
+                                    if step_error is not None
+                                    else "n/a"
+                                )
+                                + ", |g|="
+                                + (
+                                    f"{step_error.approximation_norm:.4e}"
+                                    if step_error is not None
+                                    else "n/a"
+                                )
+                                + ", |u|="
+                                + (
+                                    f"{fgd_update_norm:.4e}"
+                                    if fgd_update_norm is not None
+                                    else "n/a"
+                                )
+                                + ", eta="
+                                f"{outer_step_trial.epoch_result.learning_rate:.4g}, "
+                                f"accepted={accepted_trial is not None}"
+                            )
+
+                        if accepted_trial is None:
+                            break
+                        accepted_steps_this_epoch += 1
                         model = accepted_trial.model
                         fgd_epoch_result = accepted_trial.epoch_result
                         test_metrics = evaluate_regression_metrics(
@@ -3167,7 +3381,7 @@ def run_pipeline(
                         fgd_global_contraction = (
                             accepted_trial.global_contraction
                         )
-                    else:
+                    if accepted_steps_this_epoch == 0:
                         base_train_metrics = evaluate_regression_metrics(
                             model,
                             frozen_train_batches,
@@ -3479,6 +3693,28 @@ def run_pipeline(
                         )
                     )
                 )
+                # Hard parameter budget: stop growing once the cap is
+                # reached; the flow keeps training the fixed structure.
+                max_parameters = config.fgd_approx.max_total_parameters
+                if (
+                    growth_triggered
+                    and max_parameters is not None
+                    and count_parameters(model) >= max_parameters
+                ):
+                    growth_triggered = False
+                    if progress is not None:
+                        progress(
+                            f"[FGD] Epoch {epoch}: growth suppressed "
+                            f"(parameter budget {max_parameters} reached: "
+                            f"{count_parameters(model)} params)"
+                        )
+
+            if (
+                config.training.method == "fgd_approx"
+                and fgd_candidate_accepted is True
+            ):
+                # A committed tangent outer step: the structure is alive.
+                fgd_epochs_without_commit = 0
 
             growth_probe: _GrowthProbe | None = None
             if (
@@ -3505,6 +3741,7 @@ def run_pipeline(
                     nonlocal previous_validation_functional_loss
                     nonlocal last_test_loss
                     nonlocal fgd_accepted_outer_steps
+                    nonlocal fgd_epochs_without_commit
                     fgd_rkhs_phase_attempted = (
                         True if in_ladder else config.secant_fgd.enabled
                     )
@@ -3704,6 +3941,7 @@ def run_pipeline(
                             )
                         last_test_loss = phase_test_metrics.loss
                         fgd_accepted_outer_steps += 1
+                        fgd_epochs_without_commit = 0
                         family_rejection_step.pop("rkhs_head", None)
                         return True
                     else:
@@ -3808,6 +4046,7 @@ def run_pipeline(
                     nonlocal fgd_global_contraction_product
                     nonlocal last_test_loss
                     nonlocal fgd_accepted_outer_steps
+                    nonlocal fgd_epochs_without_commit
                     stage_theory_state = _FGDTheoryState(
                         epoch_count=fgd_epoch_count,
                         min_gradient_sq_norm=fgd_min_gradient_sq_norm,
@@ -3974,6 +4213,7 @@ def run_pipeline(
                         )
                     last_test_loss = stage_test_metrics.loss
                     fgd_accepted_outer_steps += 1
+                    fgd_epochs_without_commit = 0
                     family_rejection_step.pop(family_name, None)
                     return True
 
@@ -4028,6 +4268,31 @@ def run_pipeline(
                             )
 
                 if growth_triggered:
+                    # Structure-burst patience: nothing committed this
+                    # epoch; only probe structural growth after
+                    # growth_patience consecutive exhausted epochs, so the
+                    # stochastic families get real retries at the current
+                    # structure first.
+                    fgd_epochs_without_commit += 1
+                    if (
+                        fgd_epochs_without_commit
+                        < config.fgd_approx.growth_patience
+                    ):
+                        growth_triggered = False
+                        if progress is not None:
+                            progress(
+                                f"[FGD] Epoch {epoch}: growth deferred "
+                                f"({fgd_epochs_without_commit}/"
+                                f"{config.fgd_approx.growth_patience} "
+                                "consecutive exhausted epochs at this "
+                                "structure)"
+                            )
+                else:
+                    # A family committed within the ladder: the structure is
+                    # not exhausted.
+                    fgd_epochs_without_commit = 0
+
+                if growth_triggered:
                     growth_probe = _probe_fgd_growth(
                         model=model,
                         train_batches=growth_train_batches,
@@ -4059,7 +4324,49 @@ def run_pipeline(
 
             if growth_triggered:
                 if config.training.method == "fgd_approx":
-                    if growth_probe is not None:
+                    if config.fgd_approx.growth_uniform:
+                        # Uniform growth: widen EVERY hidden layer together,
+                        # tracing the balanced dense nets (3xk) from the tiny
+                        # start. Sidesteps the greedy input-layer credit
+                        # problem. The delta of the last grown layer stands
+                        # in as the reported growth_result.
+                        growable = list(
+                            range(len(getattr(model, "_growable_layers", [])))
+                        )
+                        uniform_kwargs = tiny_optimal_update_kwargs(
+                            config.fgd_approx,
+                            compute_delta=config.fgd_approx.growth_compute_delta,
+                        )
+                        growth_result = None
+                        for uniform_layer in growable:
+                            growth_result = grow_layer(
+                                model=model,
+                                train_loader=train_loader,
+                                layer_index=uniform_layer,
+                                device=device,
+                                line_search_config=config.scaling_line_search,
+                                optimal_update_kwargs=uniform_kwargs,
+                                progress=None,
+                                function_preserving=(
+                                    config.fgd_approx.growth_function_preserving
+                                ),
+                                preservation_tolerance=(
+                                    config.fgd_approx
+                                    .growth_preservation_tolerance
+                                ),
+                            )
+                        layer_index = (
+                            growth_result.layer_index
+                            if growth_result is not None
+                            else 0
+                        )
+                        selected_layer_index = layer_index
+                        if progress is not None:
+                            progress(
+                                f"[GRO] Uniform growth at epoch {epoch}: "
+                                f"widened all {len(growable)} hidden layers"
+                            )
+                    elif growth_probe is not None:
                         model = growth_probe.model
                         growth_result = growth_probe.result
                         layer_index = growth_result.layer_index
@@ -4141,6 +4448,7 @@ def run_pipeline(
                     # re-offers approximation capacity, so all stale family
                     # rejections are cleared immediately.
                     family_rejection_step.clear()
+                    fgd_epochs_without_commit = 0
                     reset_fgd_certificate()
                     if config.fgd_approx.learning_rate_policy == "theory_interval":
                         validation_certificate_for_next_epoch = (

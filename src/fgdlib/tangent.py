@@ -103,6 +103,60 @@ class FGDApproxConfig:
     # fails. Every family commits through the same full FGD certificate.
     # Supported: "tangent", "rkhs_head", "parametric_gd".
     family_order: tuple[str, ...] = ("tangent",)
+    # Certify the tangent outer step by MEASURED validation descent
+    # (Prop. 3.8) instead of the Lemma-3.5 relative-error interval. The
+    # step direction is still the paper's functional-gradient projection
+    # g = P_T r; only the step SIZE is chosen by a measured nonlinear line
+    # search rather than the worst-case bound eta_max(eps), which is far
+    # too conservative (measured optimum ~0.5 vs eta_max ~0.06 at eps 0.45).
+    # Both certificates are in the paper; measured descent unlocks the
+    # nonlinear step the linear bound forbids. Default False (legacy
+    # eps-bounded step).
+    tangent_measured_descent: bool = False
+    # Largest eta tried by the measured tangent line search (the grid
+    # descends geometrically from here to theory_lr_min). Only used when
+    # tangent_measured_descent is True.
+    tangent_measured_max_lr: float = 1.0
+    # Certified outer steps attempted per epoch: each pass re-solves the
+    # shared direction at the CURRENT model and certifies it independently
+    # (k applications of the same per-step theorem). The epoch stops at the
+    # first rejected attempt. 1 = one outer step per epoch (legacy).
+    outer_steps_per_epoch: int = 1
+    # Grow EVERY hidden layer together (uniform widening) instead of
+    # selecting one layer. This sidesteps the input-layer credit-assignment
+    # problem of greedy per-layer growth: any greedy criterion (descent or
+    # relative error) undervalues the input layer, whose benefit is latent,
+    # so incremental growth from a tiny net keeps layer 0 narrow and caps
+    # accuracy. Uniform growth traces the balanced dense nets (3xk) from a
+    # tiny start, so the certified family training matches fixed AdamW.
+    # Default False.
+    growth_uniform: bool = False
+    # Select the growth layer by the largest CERTIFIED functional descent
+    # per added parameter (Prop. 3.8 measured descent), instead of the
+    # relative-error certificate. Required with delta growth (function-
+    # preserving False, compute_delta True): there the GroMo optimal update
+    # reduces the loss but jumps the tangent linearization, so the
+    # rel-error certificate is blind to which layer actually helps. This is
+    # the paper's structural step made parameter-efficient. Default False.
+    growth_select_by_descent: bool = False
+    # Growth layer selection among probes that improve the certificate.
+    # False (default): frugal-first (fewest added parameters, then lowest
+    # post-growth relative error). True: lowest post-growth relative error
+    # first, so growth widens the most impactful layer even when it is the
+    # expensive input layer — required on MNIST, where layer-0 width drives
+    # accuracy and the frugal tie-break otherwise starves it.
+    growth_prefer_lower_error: bool = False
+    # Hard parameter budget: once the model has at least this many total
+    # parameters, structural growth is suppressed and the flow keeps
+    # training the fixed structure through the certified families. None
+    # means no cap. Keeps a grow-and-train run inside a target budget.
+    max_total_parameters: int | None = None
+    # Structure-burst patience: the growth probe runs only after this many
+    # CONSECUTIVE epochs in which no family committed a step. With a value
+    # above 1, combine with family_rejection_cooldown: 0 so the stochastic
+    # parametric generators actually retry during the patience window.
+    # 1 = probe growth on the first fully-failed epoch (legacy).
+    growth_patience: int = 1
     # Acceptance mode. When true, an outer step commits on its four LOCAL
     # conditions only — valid sensor, strict Crel, strict LR interval
     # (theory_lr_min < eta < eta_bar), and STRICT realized descent of the
@@ -177,10 +231,21 @@ class ParametricGDConfig:
     min_cosine: float = 0.9
     parameter_penalty: float = 1e-6
     gradient_clip_norm: float | None = 1.0
+    # Decoupled weight decay for the adam/adamw inner optimizer. Higher
+    # values regularize the generated candidate so its realized
+    # displacement generalizes to validation (closing the train/val gap
+    # that caps the certified acceptance).
+    weight_decay: float = 0.0
 
     def validate(self) -> None:
-        if self.optimizer not in ("sgd", "adam"):
-            raise ValueError("parametric_gd.optimizer must be 'sgd' or 'adam'.")
+        if self.optimizer not in ("sgd", "adam", "adamw"):
+            raise ValueError(
+                "parametric_gd.optimizer must be 'sgd', 'adam' or 'adamw'."
+            )
+        if self.weight_decay < 0.0:
+            raise ValueError(
+                "parametric_gd.weight_decay must be non-negative."
+            )
         if self.inner_learning_rate <= 0.0:
             raise ValueError(
                 "parametric_gd.inner_learning_rate must be positive."
@@ -230,6 +295,11 @@ class ParametricDescentConfig:
     min_cosine: float = 0.0
     parameter_penalty: float = 1e-6
     gradient_clip_norm: float | None = 1.0
+    # Decoupled weight decay for the adam/adamw inner optimizer. Higher
+    # values regularize the generated candidate so its realized
+    # displacement generalizes to validation (closing the train/val gap
+    # that caps the certified acceptance).
+    weight_decay: float = 0.0
     # Cprog floor on the measured progress eta* r_t = D_t / |grad L_t|^2
     # (= D/4L). Every accepted step must remove at least 4*min_progress of
     # the remaining loss; below that the structure is treated as exhausted
@@ -238,13 +308,18 @@ class ParametricDescentConfig:
     min_progress: float = 1e-3
 
     def validate(self) -> None:
-        if self.optimizer not in ("sgd", "adam"):
+        if self.optimizer not in ("sgd", "adam", "adamw"):
             raise ValueError(
-                "parametric_descent.optimizer must be 'sgd' or 'adam'."
+                "parametric_descent.optimizer must be 'sgd', 'adam' or "
+                "'adamw'."
             )
         if self.inner_learning_rate <= 0.0:
             raise ValueError(
                 "parametric_descent.inner_learning_rate must be positive."
+            )
+        if self.weight_decay < 0.0:
+            raise ValueError(
+                "parametric_descent.weight_decay must be non-negative."
             )
         if not self.inner_steps or any(v < 1 for v in self.inner_steps):
             raise ValueError(
