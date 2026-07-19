@@ -1314,7 +1314,16 @@ def _probe_fgd_growth(
         )
 
     if select_by_descent:
-        return _select_growth_probe_by_descent(probes, config.fgd_approx.eps)
+        by_descent = _select_growth_probe_by_descent(
+            probes, config.fgd_approx.eps
+        )
+        if by_descent is not None:
+            return by_descent
+        # No growth realizes an immediate validation descent (every
+        # single-neuron delta overfits the tiny structure). Rather than
+        # stall, still add the capacity the certificate ranks best so the
+        # structure can escape the bottleneck and train into it — growth is
+        # the paper's structural response to an exhausted family.
     return _select_growth_probe(
         probes,
         prefer_lower_error=config.fgd_approx.growth_prefer_lower_error,
