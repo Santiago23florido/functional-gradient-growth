@@ -6,7 +6,7 @@ import torch
 
 from fgdlib.growth import GrowthResult
 from fgdlib.tangent import FGDOutputRelError, FGDValidationCertificate
-from stable_tiny.pipeline import _GrowthProbe, _select_growth_probe
+from stable_tiny.pipeline import _GrowthProbe, _select_growth_probe, _select_growth_probe_by_descent
 
 
 def _certificate(relative_error: float | None) -> FGDValidationCertificate:
@@ -160,4 +160,58 @@ def test_prefer_lower_error_grows_the_impactful_expensive_layer() -> None:
             prefer_lower_error=True,
         )
         is expensive_strong
+    )
+
+
+def _probe_with_descent(
+    *, layer_index, added_params, descent
+) -> _GrowthProbe:
+    return _GrowthProbe(
+        model=torch.nn.Linear(max(added_params, 1), 1, bias=False),
+        result=GrowthResult(
+            layer_index=layer_index,
+            best_scaling_factor=1.0,
+            best_train_loss=1.0,
+            line_search=[],
+        ),
+        certificate=_certificate(1.5),  # rel_err jumped (blind); irrelevant
+        improves_fgd=False,
+        functional_descent=descent,
+        added_parameters=added_params,
+    )
+
+
+def test_descent_per_parameter_selection_prefers_efficient_layer() -> None:
+    from stable_tiny.pipeline import _select_growth_probe_by_descent
+
+    # Input layer: big absolute descent but many params (low per-param).
+    input_layer = _probe_with_descent(
+        layer_index=0, added_params=1574, descent=1297.0
+    )
+    # Late layer: smaller absolute descent but tiny params (huge per-param).
+    late_layer = _probe_with_descent(
+        layer_index=2, added_params=26, descent=7516.0
+    )
+    chosen = _select_growth_probe_by_descent(
+        [input_layer, late_layer], eps=1e-12
+    )
+    assert chosen is late_layer  # 289/param vs 0.8/param
+
+
+def test_descent_selection_ignores_non_descending_growths() -> None:
+    from stable_tiny.pipeline import _select_growth_probe_by_descent
+
+    ascends = _probe_with_descent(
+        layer_index=0, added_params=10, descent=-5.0
+    )
+    descends = _probe_with_descent(
+        layer_index=1, added_params=100, descent=3.0
+    )
+    assert (
+        _select_growth_probe_by_descent([ascends, descends], eps=1e-12)
+        is descends
+    )
+    # No genuine descent anywhere -> no growth committed.
+    assert (
+        _select_growth_probe_by_descent([ascends], eps=1e-12) is None
     )

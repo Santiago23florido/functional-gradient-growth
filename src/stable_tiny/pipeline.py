@@ -260,6 +260,12 @@ class _GrowthProbe:
     result: GrowthResult
     certificate: FGDValidationCertificate
     improves_fgd: bool
+    # Measured validation functional descent this growth realizes
+    # (loss_before - loss_after) and the parameters it adds. Used by the
+    # descent-per-parameter selection (Prop. 3.8-certified growth), which
+    # is coherent with delta growth where the rel-error jumps.
+    functional_descent: float = 0.0
+    added_parameters: int = 0
 
 
 def _section_dataclass(
@@ -1249,6 +1255,18 @@ def _probe_fgd_growth(
         config.fgd_approx,
         compute_delta=config.fgd_approx.growth_compute_delta,
     )
+    base_parameter_count = count_parameters(model)
+    # Base functional loss for the measured-descent growth criterion. Only
+    # paid when that selection is active (delta growth reduces the loss, so
+    # ranking candidates by their certified descent-per-parameter is the
+    # coherent, Prop. 3.8-justified choice; the rel-error certificate is
+    # blind to it because the delta step jumps the linearization).
+    select_by_descent = config.fgd_approx.growth_select_by_descent
+    base_functional_loss = (
+        evaluate_functional_loss(model, validation_loader, device)
+        if select_by_descent
+        else 0.0
+    )
     for layer_index in layer_indices:
         trial_model = copy.deepcopy(model)
         growth_result = grow_layer(
@@ -1272,6 +1290,12 @@ def _probe_fgd_growth(
             learning_rate=None,
             probe=probe,
         )
+        functional_descent = 0.0
+        if select_by_descent:
+            candidate_loss = evaluate_functional_loss(
+                trial_model, validation_loader, device
+            )
+            functional_descent = base_functional_loss - candidate_loss
         probes.append(
             _GrowthProbe(
                 model=trial_model,
@@ -1282,13 +1306,47 @@ def _probe_fgd_growth(
                     certificate,
                     config,
                 ),
+                functional_descent=functional_descent,
+                added_parameters=(
+                    count_parameters(trial_model) - base_parameter_count
+                ),
             )
         )
 
+    if select_by_descent:
+        return _select_growth_probe_by_descent(probes, config.fgd_approx.eps)
     return _select_growth_probe(
         probes,
         prefer_lower_error=config.fgd_approx.growth_prefer_lower_error,
     )
+
+
+def _select_growth_probe_by_descent(
+    probes: list[_GrowthProbe],
+    eps: float,
+) -> _GrowthProbe | None:
+    """Grow the layer with the largest certified descent PER PARAMETER.
+
+    This is the paper's structural step made parameter-efficient: among
+    growths that realize a genuine validation functional descent (Prop. 3.8
+    measured descent > 0), pick the one that reduces the functional gap most
+    per added parameter. Ties fall to the larger absolute descent, then the
+    lower layer index. If no growth descends, fall back to None (the caller
+    then leaves the structure unchanged and keeps training).
+    """
+    descending = [p for p in probes if p.functional_descent > eps]
+    if not descending:
+        return None
+
+    def efficiency(probe: _GrowthProbe) -> tuple[float, float, int]:
+        added = max(probe.added_parameters, 1)
+        return (
+            -probe.functional_descent / added,
+            -probe.functional_descent,
+            probe.result.layer_index,
+        )
+
+    return min(descending, key=efficiency)
 
 
 def _probe_relative_error(probe: _GrowthProbe) -> float:

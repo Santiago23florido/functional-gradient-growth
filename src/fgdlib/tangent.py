@@ -122,6 +122,14 @@ class FGDApproxConfig:
     # (k applications of the same per-step theorem). The epoch stops at the
     # first rejected attempt. 1 = one outer step per epoch (legacy).
     outer_steps_per_epoch: int = 1
+    # Select the growth layer by the largest CERTIFIED functional descent
+    # per added parameter (Prop. 3.8 measured descent), instead of the
+    # relative-error certificate. Required with delta growth (function-
+    # preserving False, compute_delta True): there the GroMo optimal update
+    # reduces the loss but jumps the tangent linearization, so the
+    # rel-error certificate is blind to which layer actually helps. This is
+    # the paper's structural step made parameter-efficient. Default False.
+    growth_select_by_descent: bool = False
     # Growth layer selection among probes that improve the certificate.
     # False (default): frugal-first (fewest added parameters, then lowest
     # post-growth relative error). True: lowest post-growth relative error
