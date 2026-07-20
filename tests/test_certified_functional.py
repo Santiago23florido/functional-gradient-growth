@@ -102,3 +102,30 @@ def test_cross_entropy_never_penalises_confidence() -> None:
     assert float(mse_r[0, 0]) > 0.0
     # Cross-entropy: negative gradient -> descent INCREASES it further.
     assert float(ce_r[0, 0]) < 0.0
+
+
+def test_configured_functional_governs_the_reported_loss() -> None:
+    """evaluate_functional_loss must report the CERTIFIED loss, not MSE."""
+    import torch.nn as nn
+    from stable_tiny.pipeline import evaluate_functional_loss
+
+    torch.manual_seed(3)
+    model = nn.Linear(4, 3)
+    x = torch.randn(5, 4)
+    y = torch.zeros(5, 3)
+    y[range(5), torch.randint(0, 3, (5,))] = 1.0
+    batches = [(x, y)]
+    device = torch.device("cpu")
+
+    mse_total = evaluate_functional_loss(model, batches, device, "mse")
+    ce_total = evaluate_functional_loss(model, batches, device, "cross_entropy")
+
+    with torch.no_grad():
+        f = model(x)
+    assert mse_total == pytest.approx(
+        float(batch_functional_loss(f, y, "mse")), rel=1e-6
+    )
+    assert ce_total == pytest.approx(
+        float(batch_functional_loss(f, y, "cross_entropy")), rel=1e-6
+    )
+    assert mse_total != pytest.approx(ce_total)

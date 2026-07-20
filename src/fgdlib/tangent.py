@@ -1047,7 +1047,7 @@ def _compute_exact_tangent_projection_step(
     buffers = OrderedDict(model.named_buffers())
 
     output = model(x)
-    loss = batch_functional_mse_loss(output, y)
+    loss = batch_functional_loss(output, y, config.functional_loss)
     if not torch.isfinite(loss).all():
         raise RuntimeError(f"Non-finite FGD loss detected before projection: {loss}.")
 
@@ -1132,7 +1132,7 @@ def _compute_cg_tangent_projection_step(
     buffers = OrderedDict(model.named_buffers())
 
     output = model(x)
-    loss = batch_functional_mse_loss(output, y)
+    loss = batch_functional_loss(output, y, config.functional_loss)
     if not torch.isfinite(loss).all():
         raise RuntimeError(f"Non-finite FGD loss detected before projection: {loss}.")
 
@@ -1374,7 +1374,11 @@ def _apply_tangent_projection_step(
 
     @torch.no_grad()
     def trial_loss() -> float:
-        return float(batch_functional_mse_loss(model(x), y).detach().item())
+        return float(
+            batch_functional_loss(model(x), y, config.functional_loss)
+            .detach()
+            .item()
+        )
 
     if learning_rate <= config.eps or directional_derivative <= config.eps:
         apply(0.0)
@@ -1496,7 +1500,7 @@ def _layer_functional_error(
         y_candidate = _forward_with_tiny_update(model, x)
 
         approximation = y_before - y_candidate
-        target = mse_functional_gradient(y_before, y)
+        target = functional_gradient(y_before, y, config.functional_loss)
 
         dot_product += float(torch.sum(approximation * target).detach().item())
         approximation_sq_norm += float(torch.sum(approximation**2).detach().item())
@@ -2006,7 +2010,7 @@ def measure_direction_projection(
 
     with torch.no_grad():
         output = model(x)
-    target = mse_functional_gradient(output, y).reshape(-1)
+    target = functional_gradient(output, y, config.functional_loss).reshape(-1)
 
     def call_with_parameters(
         parameter_values: tuple[torch.Tensor, ...],
@@ -2113,7 +2117,7 @@ def evaluate_secant_validation_certificate(
     with torch.no_grad():
         base_output = base_model(x)
         candidate_output = candidate_model(x)
-    target = mse_functional_gradient(base_output, y)
+    target = functional_gradient(base_output, y, config.functional_loss)
     approximation = (base_output - candidate_output) / learning_rate
     if not (
         torch.isfinite(target).all() and torch.isfinite(approximation).all()

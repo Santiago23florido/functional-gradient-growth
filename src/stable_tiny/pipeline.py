@@ -32,13 +32,13 @@ from fgdlib.tangent import (
     _compute_tangent_projection_step,
     _projection_step_sensor_valid,
     _trainable_named_parameters,
-    batch_functional_mse_loss,
+    batch_functional_loss,
     build_projection_probe,
     certificate_from_projection_stats,
     evaluate_fgd_validation_certificate,
     evaluate_secant_validation_certificate,
     measure_direction_projection,
-    mse_functional_gradient,
+    functional_gradient,
     select_tiny_growth_layer_index,
     should_trigger_fgd_growth,
     tiny_optimal_update_kwargs,
@@ -608,13 +608,22 @@ def evaluate_functional_loss(
     model: torch.nn.Module,
     data_loader: torch.utils.data.DataLoader,
     device: torch.device,
+    functional_loss: str = "mse",
 ) -> float:
+    """Total certified functional loss L(f) over ``data_loader``.
+
+    This is the quantity every certificate in the flow is a statement
+    about, so it must be the SAME functional the families and the growth
+    trigger use (fgd_approx.functional_loss).
+    """
     model.eval()
     total_loss = 0.0
     for x, y in data_loader:
         x = x.to(device)
         y = y.to(device)
-        total_loss += float(batch_functional_mse_loss(model(x), y).detach().item())
+        total_loss += float(
+            batch_functional_loss(model(x), y, functional_loss).detach().item()
+        )
     return total_loss
 
 
@@ -660,6 +669,7 @@ def _certify_fgd_candidate(
         candidate_model,
         validation_loader,
         device,
+        config.fgd_approx.functional_loss,
     )
     if local_acceptance:
         # Local condition 4: STRICT realized descent of the validation
@@ -1016,10 +1026,10 @@ def _evaluate_secant_fgd_trial(
             y = y.to(device)
             with torch.no_grad():
                 base_output = base_model(x)
-                functional_gradient = mse_functional_gradient(base_output, y)
-                functional_target = (
-                    base_output - learning_rate * functional_gradient
+                residual = functional_gradient(
+                    base_output, y, config.fgd_approx.functional_loss
                 )
+                functional_target = base_output - learning_rate * residual
 
             optimizer.zero_grad(set_to_none=True)
             candidate_output = trial_model(x)
@@ -1263,7 +1273,9 @@ def _probe_fgd_growth(
     # blind to it because the delta step jumps the linearization).
     select_by_descent = config.fgd_approx.growth_select_by_descent
     base_functional_loss = (
-        evaluate_functional_loss(model, validation_loader, device)
+        evaluate_functional_loss(
+            model, validation_loader, device, config.fgd_approx.functional_loss
+        )
         if select_by_descent
         else 0.0
     )
@@ -1298,7 +1310,10 @@ def _probe_fgd_growth(
         functional_descent = 0.0
         if select_by_descent:
             candidate_loss = evaluate_functional_loss(
-                trial_model, validation_loader, device
+                trial_model,
+                validation_loader,
+                device,
+                config.fgd_approx.functional_loss,
             )
             functional_descent = base_functional_loss - candidate_loss
         probes.append(
@@ -1492,6 +1507,7 @@ def _measure_secant_projection(
     validation_loader: torch.utils.data.DataLoader,
     device: torch.device,
     eps: float,
+    functional_loss: str = "mse",
 ) -> tuple[float, float] | None:
     """Aggregate (cosine, eta*) of the realized output displacement.
 
@@ -1512,7 +1528,9 @@ def _measure_secant_projection(
             y = y.to(device)
             base_output = base_model(x).to(torch.float64)
             candidate_output = candidate_model(x).to(torch.float64)
-            target = mse_functional_gradient(base_output, y.to(torch.float64))
+            target = functional_gradient(
+                base_output, y.to(torch.float64), functional_loss
+            )
             delta = base_output - candidate_output
             if not (
                 torch.isfinite(delta).all() and torch.isfinite(target).all()
@@ -1536,6 +1554,7 @@ def _train_parametric_gd_candidate(
     functional_learning_rate: float,
     steps: int,
     config: ParametricGDConfig | ParametricDescentConfig,
+    functional_loss: str = "mse",
 ) -> GrowingMLP | None:
     """Train a disposable clone toward the functional target f - eta * r.
 
@@ -1581,7 +1600,7 @@ def _train_parametric_gd_candidate(
                 functional_target = (
                     base_output
                     - functional_learning_rate
-                    * mse_functional_gradient(base_output, y)
+                    * functional_gradient(base_output, y, functional_loss)
                 )
             optimizer.zero_grad(set_to_none=True)
             candidate_output = trial_model(x)
@@ -1642,6 +1661,7 @@ def _evaluate_parametric_gd_trial(
         functional_learning_rate=functional_learning_rate,
         steps=steps,
         config=config.parametric_gd,
+        functional_loss=config.fgd_approx.functional_loss,
     )
     if candidate is None:
         return None
@@ -1651,6 +1671,7 @@ def _evaluate_parametric_gd_trial(
         validation_loader=validation_loader,
         device=device,
         eps=config.fgd_approx.eps,
+        functional_loss=config.fgd_approx.functional_loss,
     )
     if projection is None:
         return None
@@ -1748,11 +1769,13 @@ def _certify_measured_descent_candidate(
         base_model,
         validation_loader,
         device,
+        config.fgd_approx.functional_loss,
     )
     validation_loss_after = evaluate_functional_loss(
         candidate_model,
         validation_loader,
         device,
+        config.fgd_approx.functional_loss,
     )
     descent = validation_loss_before - validation_loss_after
     # Exact for sum-MSE with L* = 0: |grad L|^2 = |2 (F - Y)|^2 = 4 L.
@@ -1946,6 +1969,7 @@ def _evaluate_parametric_descent_trial(
         functional_learning_rate=functional_learning_rate,
         steps=steps,
         config=descent_config,
+        functional_loss=config.fgd_approx.functional_loss,
     )
     if candidate is None:
         return None
@@ -1955,6 +1979,7 @@ def _evaluate_parametric_descent_trial(
         validation_loader=validation_loader,
         device=device,
         eps=config.fgd_approx.eps,
+        functional_loss=config.fgd_approx.functional_loss,
     )
     if projection is None:
         return None
@@ -2915,6 +2940,7 @@ def run_pipeline(
             model,
             validation_loader,
             device,
+            config.fgd_approx.functional_loss,
         )
         previous_validation_functional_loss = initial_functional_loss
         theory_loss_star = config.fgd_approx.theory_loss_star
@@ -2984,6 +3010,7 @@ def run_pipeline(
                 model,
                 validation_loader,
                 device,
+                config.fgd_approx.functional_loss,
             )
             initial_functional_gap = max(
                 previous_validation_functional_loss - theory_loss_star,
@@ -3811,6 +3838,7 @@ def run_pipeline(
                             model,
                             validation_loader,
                             device,
+                            config.fgd_approx.functional_loss,
                         )
                         gate_candidate = copy.deepcopy(model)
                         _apply_certified_head(
@@ -3821,6 +3849,7 @@ def run_pipeline(
                             gate_candidate,
                             validation_loader,
                             device,
+                            config.fgd_approx.functional_loss,
                         )
                         required_improvement = (
                             config.fgd_approx
@@ -3877,6 +3906,7 @@ def run_pipeline(
                                 model,
                                 validation_loader,
                                 device,
+                                config.fgd_approx.functional_loss,
                             )
                         )
                         phase_theory = phase.trainer.theory
