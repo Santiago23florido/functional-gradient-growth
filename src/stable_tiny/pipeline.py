@@ -45,6 +45,7 @@ from fgdlib.tangent import (
     tiny_optimal_update_kwargs,
     train_one_epoch_fgd_approx,
     validate_family_order,
+    validate_functional_loss,
 )
 from fgdlib.rkhs import (
     FGDRKHSConfig,
@@ -379,6 +380,7 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
         run=_section_dataclass("run", RunConfig, raw),
     )
     validate_family_order(config.fgd_approx.family_order)
+    validate_functional_loss(config.fgd_approx.functional_loss)
     config.parametric_gd.validate()
     config.parametric_descent.validate()
     return config

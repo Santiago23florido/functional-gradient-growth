@@ -216,6 +216,15 @@ SUPPORTED_FGD_FAMILIES = (
 )
 
 
+def validate_functional_loss(functional_loss: str) -> None:
+    """Reject an unknown certified functional at config-load time."""
+    if functional_loss not in _FUNCTIONAL_LOSSES:
+        raise ValueError(
+            f"Unsupported fgd_approx.functional_loss '{functional_loss}'. "
+            f"Use one of: {', '.join(sorted(_FUNCTIONAL_LOSSES))}."
+        )
+
+
 def validate_family_order(family_order: tuple[str, ...]) -> None:
     """Reject malformed fgd_approx.family_order values early."""
     if not family_order:
