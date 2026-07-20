@@ -34,6 +34,7 @@ from fgdlib.tangent import (
     _trainable_named_parameters,
     batch_functional_loss,
     build_projection_probe,
+    FUNCTIONAL_HAS_PL_CONSTANT,
     certificate_from_projection_stats,
     evaluate_fgd_validation_certificate,
     evaluate_secant_validation_certificate,
@@ -642,6 +643,24 @@ def certified_validation_learning_rate(
     return learning_rate
 
 
+def _certified_pl_constant(config: PipelineConfig) -> float:
+    """Return the PL constant mu that may legitimately be asserted.
+
+    Proposition 3.8's LINEAR contraction rests on a global
+    Polyak-Lojasiewicz constant, ||grad_f L||^2 >= 2 mu (L - L*). Only
+    sum-MSE admits one: the identity ||r||^2 = 4L holds exactly, giving
+    mu = 2 with L* = 0. Cross-entropy admits none -- ||r||^2 = Theta(L^2)
+    as p_c -> 1 and ||r||^2 stays bounded while L diverges as p_c -> 0 --
+    so the C_glob envelope is simply not available for it and returning 0
+    leaves the bound undefined rather than asserting an invented rate.
+    Convexity is untouched, so global optimality still holds; only the RATE
+    drops to the convex O(1/T) bound. See report/CROSS_ENTROPY_FGD.md.
+    """
+    if not FUNCTIONAL_HAS_PL_CONSTANT.get(config.fgd_approx.functional_loss, False):
+        return 0.0
+    return config.fgd_approx.theory_mu
+
+
 def _certify_fgd_candidate(
     *,
     candidate_model: GrowingMLP,
@@ -744,7 +763,7 @@ def _certify_fgd_candidate(
         )
 
         beta = config.fgd_approx.theory_beta
-        mu = config.fgd_approx.theory_mu
+        mu = _certified_pl_constant(config)
         if (
             eta is not None
             and descent_coefficient is not None
@@ -1735,6 +1754,29 @@ def _evaluate_parametric_gd_trial(
     )
 
 
+@torch.no_grad()
+def _functional_gradient_sq_norm(
+    model: torch.nn.Module,
+    data_loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    functional_loss: str,
+) -> float:
+    """Measure ||r||^2 = ||grad_f L||^2 directly on held-out data.
+
+    Only sum-MSE admits the closed identity ||r||^2 = 4L. For every other
+    certified functional the quantity Prop. 3.8 needs is measured rather
+    than assumed.
+    """
+    model.eval()
+    total = 0.0
+    for x, y in data_loader:
+        x = x.to(device)
+        y = y.to(device)
+        residual = functional_gradient(model(x), y, functional_loss)
+        total += float(torch.sum(residual * residual).item())
+    return total
+
+
 def _certify_measured_descent_candidate(
     *,
     candidate_model: GrowingMLP,
@@ -1778,8 +1820,17 @@ def _certify_measured_descent_candidate(
         config.fgd_approx.functional_loss,
     )
     descent = validation_loss_before - validation_loss_after
-    # Exact for sum-MSE with L* = 0: |grad L|^2 = |2 (F - Y)|^2 = 4 L.
-    gradient_sq_norm = 4.0 * validation_loss_before
+    # ||r||^2 at the base model. For sum-MSE this is the exact identity
+    # |grad L|^2 = |2(F-Y)|^2 = 4L; for any other functional (cross-entropy)
+    # no such identity exists, so it is measured directly on the same
+    # held-out data.
+    functional_name = config.fgd_approx.functional_loss
+    if functional_name == "mse":
+        gradient_sq_norm = 4.0 * validation_loss_before
+    else:
+        gradient_sq_norm = _functional_gradient_sq_norm(
+            base_model, validation_loader, device, functional_name
+        )
 
     eps = config.fgd_approx.eps
     loss_descent_valid = (
@@ -1845,7 +1896,7 @@ def _certify_measured_descent_candidate(
         )
 
         beta = config.fgd_approx.theory_beta
-        mu = config.fgd_approx.theory_mu
+        mu = _certified_pl_constant(config)
         if descent_coefficient is not None and beta > 0 and mu > 0:
             # With the measured coefficient and the exact MSE constants this
             # contraction equals the realized loss ratio L_{t+1} / L_t.

@@ -749,6 +749,24 @@ def _projection_step_sensor_valid(
     )
 
 
+def certified_smoothness_constant(config: FGDApproxConfig) -> float:
+    """Return the smoothness L_s of the CERTIFIED functional.
+
+    Lemma 3.5's admissible interval is eta_bar = 2(1-2eps)/(L_s(1+2eps)),
+    so L_s must describe the loss actually being certified: 2 for sum-MSE
+    (Hessian 2*Id) and 1/2 for softmax cross-entropy (Hessian
+    diag(p)-p p^T, lambda_max <= 1/2), which makes the cross-entropy
+    interval four times wider. When theory_smoothness_constant is left at
+    its MSE default the constant of the configured functional is used;
+    an explicitly non-default value always wins, so the knob stays usable.
+    """
+    configured = float(config.theory_smoothness_constant)
+    default_mse = FUNCTIONAL_SMOOTHNESS["mse"]
+    if configured == default_mse:
+        return FUNCTIONAL_SMOOTHNESS.get(config.functional_loss, configured)
+    return configured
+
+
 def theoretical_learning_rate_upper_bound(
     relative_error: float,
     config: FGDApproxConfig,
@@ -757,7 +775,7 @@ def theoretical_learning_rate_upper_bound(
     if relative_error < 0.0 or relative_error >= 0.5:
         return None
 
-    smoothness = float(config.theory_smoothness_constant)
+    smoothness = float(certified_smoothness_constant(config))
     if smoothness <= 0.0:
         raise ValueError("fgd_approx.theory_smoothness_constant must be positive.")
 
@@ -777,7 +795,7 @@ def theoretical_descent_coefficient(
     if learning_rate <= 0.0:
         return None
 
-    smoothness = float(config.theory_smoothness_constant)
+    smoothness = float(certified_smoothness_constant(config))
     alpha = float(config.theory_alpha)
     beta = float(config.theory_beta)
     if smoothness <= 0.0:

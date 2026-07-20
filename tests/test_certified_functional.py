@@ -129,3 +129,49 @@ def test_configured_functional_governs_the_reported_loss() -> None:
         float(batch_functional_loss(f, y, "cross_entropy")), rel=1e-6
     )
     assert mse_total != pytest.approx(ce_total)
+
+
+def test_cross_entropy_widens_the_admissible_interval_fourfold() -> None:
+    """L_s = 1/2 vs 2 makes Lemma 3.5's eta_bar four times wider."""
+    from dataclasses import replace
+
+    from fgdlib.tangent import theoretical_learning_rate_upper_bound
+
+    mse_config = FGDApproxConfig()
+    ce_config = replace(mse_config, functional_loss="cross_entropy")
+    for epsilon in (0.05, 0.1, 0.3, 0.45):
+        mse_bound = theoretical_learning_rate_upper_bound(epsilon, mse_config)
+        ce_bound = theoretical_learning_rate_upper_bound(epsilon, ce_config)
+        assert ce_bound == pytest.approx(4.0 * mse_bound, rel=1e-9)
+
+
+def test_explicit_smoothness_override_still_wins() -> None:
+    from dataclasses import replace
+
+    from fgdlib.tangent import certified_smoothness_constant
+
+    ce_config = replace(
+        FGDApproxConfig(),
+        functional_loss="cross_entropy",
+        theory_smoothness_constant=1.0,
+    )
+    assert certified_smoothness_constant(ce_config) == 1.0
+
+
+def test_no_global_bound_is_asserted_without_a_pl_constant() -> None:
+    """Without mu the C_glob envelope must be left undefined, not invented."""
+    from dataclasses import replace
+
+    from stable_tiny.pipeline import PipelineConfig, _certified_pl_constant
+
+    mse_config = PipelineConfig()
+    assert _certified_pl_constant(mse_config) == mse_config.fgd_approx.theory_mu
+
+    ce_config = replace(
+        mse_config,
+        fgd_approx=replace(
+            mse_config.fgd_approx, functional_loss="cross_entropy"
+        ),
+    )
+    # mu = 0 disables the linear contraction: global_bound stays None.
+    assert _certified_pl_constant(ce_config) == 0.0
