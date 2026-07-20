@@ -6,7 +6,7 @@
 # schedule: the descent-per-added-parameter criterion is a ratio, so it
 # transfers to datasets that have never been trained.
 run:
-  name: fgd_search_mse
+  name: fgd_search_ce_uniform
   results_dir: results
   save_plot: false
   show_plot: false
@@ -103,7 +103,7 @@ fgd_approx:
   # and is 4x smoother than MSE (wider admissible interval), but has NO
   # global PL constant, so the C_glob linear envelope is left undefined.
   # See report/CROSS_ENTROPY_FGD.md.
-  functional_loss: mse
+  functional_loss: cross_entropy
   # Cross-entropy's infimum is not attained (f_c -> inf), so SOME family
   # step always certifies. Without this the structural step would be
   # postponed for ever while the network stays inadequate. Self-limiting
@@ -132,11 +132,6 @@ fgd_approx:
   growth_prefer_lower_error: true
   growth_select_by_descent: true
   growth_requires_admissibility_failure: true
-  # Per-parameter selection (descent, immediate eps and look-ahead eps alike)
-  # starves the input layer: after a 784->2 projection every later layer has
-  # a tiny fan-in, so it is always the cheaper buy. Measured end-to-end it
-  # grew layer 2 ten times (784->2->2->14, 64.4%). Uniform widening decides
-  # WHERE; R1 (eps stationarity) decides WHEN.
   growth_uniform: true
   max_total_parameters:
   growth_preservation_tolerance: 1.0e-6
@@ -265,7 +260,7 @@ wandb:
   run_name:
   group: fgd-growth
   job_type: train
-  tags: [fgd_approx, certified_growth, mnist, from_3x2, mse, r1_uniform]
+  tags: [fgd_approx, certified_growth, mnist, from_3x2, cross_entropy]
   notes: Algorithm 5 - certified growth-and-train from a 3x2 network, no parameter budget
   mode: online
   dir: results
