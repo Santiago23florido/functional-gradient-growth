@@ -1313,6 +1313,23 @@ def _probe_fgd_growth(
             )
         )
 
+    # Budget-aware growth: a candidate that would push the model past the
+    # parameter budget is not affordable and is dropped BEFORE selection.
+    # Checking the budget only before growing lets one expensive
+    # input-layer widening (784 params/neuron) blow through it; filtering
+    # post-growth counts steers growth to the parameter-efficient
+    # narrow-in / wide-late shape automatically, because the input layer
+    # becomes unaffordable early while the late layers stay cheap.
+    max_parameters = config.fgd_approx.max_total_parameters
+    if max_parameters is not None:
+        affordable = [
+            probe
+            for probe in probes
+            if base_parameter_count + probe.added_parameters <= max_parameters
+        ]
+        if affordable:
+            probes = affordable
+
     if select_by_descent:
         by_descent = _select_growth_probe_by_descent(
             probes, config.fgd_approx.eps
