@@ -234,14 +234,14 @@ growth_schedule:
   layer_policy: round_robin
 
 wandb:
-  enabled: false
+  enabled: true
   project: stable-tiny
   entity:
   run_name:
-  group: fgd-mnist
+  group: fgd-growth
   job_type: train
-  tags: [fgd_approx, gromo, mnist, exact_kernel_eigh, width_2, function_preserving_growth]
-  notes:
+  tags: [fgd_approx, certified_growth, mnist, from_3x2, no_budget]
+  notes: Algorithm 5 - certified growth-and-train from a 3x2 network, no parameter budget
   mode: online
   dir: results
   log_code: false
