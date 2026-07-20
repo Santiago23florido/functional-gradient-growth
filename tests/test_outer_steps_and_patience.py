@@ -183,3 +183,54 @@ def test_committed_family_does_not_veto_growth_when_lemma35_fails(tmp_path) -> N
     assert committed, "expected a committed family step under Lemma-3.5 failure"
     # ... and the structural step happened anyway in the same run.
     assert result.growth_events
+
+
+def test_families_still_run_when_growth_is_not_due(tmp_path) -> None:
+    """The ladder must not be gated behind the growth trigger.
+
+    Once the structure is adequate (eps < 1/2) growth is correctly NOT
+    requested; if the ladder lived inside that trigger the flow would be
+    left with the tangent family alone and freeze.
+    """
+    config = load_pipeline_config("configs/fgd/default.yaml")
+    config = replace(
+        config,
+        model=replace(config.model, hidden_size=2, number_hidden_layers=2),
+        training=replace(config.training, epochs=2, device="cpu", log_every=1),
+        fgd_approx=replace(
+            config.fgd_approx,
+            # Unreachable LR floor: the tangent can never commit, while the
+            # relative error stays LOW so growth is not requested.
+            theory_lr_min=1e9,
+            theory_lr_search_steps=1,
+            theory_lr_search_refinements=0,
+            family_order=("tangent", "parametric_descent"),
+            family_rejection_cooldown=0,
+            growth_requires_admissibility_failure=True,
+            rel_error_threshold=0.5,
+            families_available_without_growth=True,
+        ),
+        parametric_descent=replace(
+            config.parametric_descent,
+            inner_steps=(1,),
+            functional_learning_rates=(0.5,),
+            min_progress=1e-12,
+        ),
+        secant_fgd=replace(config.secant_fgd, enabled=False),
+        scaling_line_search=replace(config.scaling_line_search, iterations=0),
+        wandb=replace(config.wandb, enabled=False),
+        run=replace(
+            config.run,
+            results_dir=tmp_path,
+            save_plot=False,
+            show_plot=False,
+        ),
+    )
+
+    lines: list[str] = []
+    result = run_pipeline(config=config, progress=lines.append)
+
+    # The fallback family was consulted even though growth was never due ...
+    assert any("parametric_descent" in line for line in lines)
+    # ... and no capacity was added, because Lemma 3.5 did not fail.
+    assert not result.growth_events

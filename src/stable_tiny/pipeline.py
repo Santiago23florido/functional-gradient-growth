@@ -3837,8 +3837,20 @@ def run_pipeline(
                 fgd_epochs_without_commit = 0
 
             growth_probe: _GrowthProbe | None = None
+            # The fallback families exist to act when the tangent outer step
+            # cannot certify. Nesting them inside the GROWTH trigger means
+            # that as soon as the structure becomes adequate (eps < 1/2, so
+            # growth is correctly not requested) the ladder is skipped and
+            # only the tangent family remains -- which is exactly when the
+            # flow freezes. The two decisions are independent: families
+            # handle "the tangent could not move", growth handles "the
+            # reachable set cannot represent r".
+            tangent_needs_fallback = (
+                config.fgd_approx.families_available_without_growth
+                and fgd_candidate_accepted is False
+            )
             if (
-                growth_triggered
+                (growth_triggered or tangent_needs_fallback)
                 and config.training.method == "fgd_approx"
                 and config.fgd_approx.projection_solver != "gromo_layer"
                 and config.fgd_approx.learning_rate_policy == "theory_interval"
@@ -4391,8 +4403,9 @@ def run_pipeline(
                     and rel_error >= config.fgd_approx.rel_error_threshold
                 )
 
+                family_committed = False
                 for family_name in fallback_families:
-                    if not growth_triggered:
+                    if family_committed:
                         break
                     if _family_on_cooldown(family_name):
                         continue
@@ -4414,6 +4427,7 @@ def run_pipeline(
                     # The family step IS kept either way -- it certified, so
                     # it commits. The only question is whether it also
                     # postpones the structural step.
+                    family_committed = True
                     if not admissibility_failed:
                         growth_triggered = False
                         break
@@ -4427,7 +4441,7 @@ def run_pipeline(
                         )
                     break
 
-                if growth_triggered:
+                if growth_triggered and not family_committed:
                     # Structure-burst patience: nothing committed this
                     # epoch; only probe structural growth after
                     # growth_patience consecutive exhausted epochs, so the
@@ -4447,7 +4461,7 @@ def run_pipeline(
                                 "consecutive exhausted epochs at this "
                                 "structure)"
                             )
-                else:
+                elif family_committed:
                     # A family committed within the ladder: the structure is
                     # not exhausted.
                     fgd_epochs_without_commit = 0

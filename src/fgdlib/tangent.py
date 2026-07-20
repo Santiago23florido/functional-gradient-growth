@@ -131,6 +131,12 @@ class FGDApproxConfig:
     # so the linear C_glob envelope is unavailable for it -- see
     # report/CROSS_ENTROPY_FGD.md.
     functional_loss: FunctionalLoss = "mse"
+    # Let the fallback families run whenever the tangent outer step fails,
+    # independently of whether growth is due. They are nested inside the
+    # growth trigger otherwise, so once the structure becomes adequate
+    # (eps < 1/2 -> growth correctly not requested) the ladder is skipped
+    # and only the tangent remains, freezing the flow. Default False.
+    families_available_without_growth: bool = False
     # When Lemma 3.5 fails on the committed state (eps >=
     # rel_error_threshold) a successful family step does NOT cancel the
     # growth probe. Needed for any functional whose infimum is not attained

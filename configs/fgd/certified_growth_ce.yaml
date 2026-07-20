@@ -109,6 +109,10 @@ fgd_approx:
   # postponed for ever while the network stays inadequate. Self-limiting
   # through eps -- no parameter budget involved.
   admissibility_failure_forces_growth: true
+  # The fallback families must stay available once the structure becomes
+  # adequate (eps < 1/2): otherwise growth correctly stops and the flow is
+  # left with the tangent alone, which freezes it.
+  families_available_without_growth: true
   local_acceptance_conditions: true
   eps: 1.0e-12
   tiny_use_covariance: true
