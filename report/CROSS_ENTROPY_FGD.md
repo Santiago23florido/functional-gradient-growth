@@ -240,8 +240,10 @@ cause.
    **MSE-only**. Under CE the $C_{\mathrm{glob}}$ product must be either
    disabled or replaced by the $O(1/T)$ bound of §3.4; keeping the linear
    envelope with an invented $\mu$ would be an unsupported claim.
-5. The per-step measured-descent certificate, the family ladder, the growth
-   trigger and the descent-per-parameter growth criterion need **no change**.
+5. The per-step measured-descent certificate and the family ladder need
+   **no change**. The *growth trigger* does: the $C_{\mathrm{prog}}$ floor is
+   not a valid limit criterion here, because an infimum that is not attained
+   admits descent for ever. §6 replaces it.
 6. The accuracy metric is already argmax-based and needs no change; targets
    stay one-hot.
 
@@ -249,3 +251,138 @@ The honest summary: **(P1) and (P2) transfer, so the method and every
 per-step certificate transfer; (P3) does not, so the global guarantee drops
 from linear to $O(1/T)$.** In exchange, the certified objective stops
 fighting the metric the model is judged on.
+
+---
+
+## 6. The structural criterion: what "the limit of a structure" means
+
+The substitution of §5 exposes a hole. The growth trigger used the certified
+progress floor $C_{\mathrm{prog}}$: *grow when the current structure can no
+longer produce certified progress*. Under sum-MSE that is well posed, because
+$\inf L$ is attained at the finite point $f=Y$ and progress genuinely runs
+out. Under cross-entropy it is not: $L\to 0$ only as $f_c\to\infty$, so
+raising the confidence of already-correct samples always yields more descent.
+Measured on MNIST from a $3\times2$: certified progress stayed pinned at
+$2.3\times10^{-2}$ against a $10^{-4}$ floor for eighty epochs — **one growth,
+50.25 % test**. The criterion never fires, so the structure never grows.
+
+A criterion is needed that is defined for *either* certified functional.
+
+### 6.1 R1 — the structural limit is stationarity of $\varepsilon$
+
+The reinterpretation is of Lemma 3.5's own quantity,
+
+$$\varepsilon_t \;=\; \frac{\lVert g_t - r_t\rVert}{\lVert g_t\rVert},$$
+
+the relative error with which the reachable set of the current architecture
+expresses the functional gradient. Lemma 3.5 uses $\varepsilon<\tfrac12$ as
+the *admissibility* condition on a step. The reinterpretation uses its
+*evolution* as the limit condition on a structure:
+
+> **R1.** If a **certified** family step does not reduce the held-out
+> $\varepsilon$, the descent being taken is going into directions the
+> structure cannot follow. The structure — not the training — is the binding
+> constraint, and growth is the correct response.
+
+The step is still committed (it certified; nothing is discarded), it simply
+no longer postpones the structural step. This is a monotonicity comparison
+between two measured values: **no threshold, no window, no schedule, no
+parameter budget**, so it transfers unchanged to a dataset never seen before.
+This is the property that made it necessary — the tuned floor could not.
+
+Why $\varepsilon$ and not the loss: $\varepsilon$ is scale-free and is a
+property of the *reachable set*, not of how far training has progressed
+inside it. Measured on MNIST under CE, that distinction is visible: with the
+structure **fixed**, $\varepsilon$ rises $1.93\to3.14$ as training proceeds
+(training is exhausting what the structure can express); with the structure
+**growing**, it falls $1.93\to0.28$.
+
+### 6.2 R2 — proposed, and refuted by measurement
+
+R1 answers *when* to grow. The natural companion was to answer *where* by the
+same currency: spend the next parameter where it most reduces $\varepsilon$,
+
+$$\ell^\star=\arg\max_\ell \frac{\Delta\varepsilon_\ell}{\Delta p_\ell}.$$
+
+Isolated, the criterion looks right. On a trained $3\times2$ under CE
+(base $\varepsilon=1.7732$) the look-ahead ranking is the only one that
+discriminates at all, and it agrees with the ground truth:
+
+| grown layer | immediate $\varepsilon$ | look-ahead $\varepsilon$ | test after 10 steps |
+|---|---|---|---|
+| 0 (input) | 1.876 | 2.025 | 17.6 % |
+| 1 | 1.833 | 1.952 | 19.2 % |
+| 2 | 1.810 | **1.458** | **48.4 %** |
+
+End-to-end it fails. The run grew layer 2 ten consecutive times and finished
+at $784\to2\to2\to14$, **64.4 %**, with $\varepsilon$ saturating near $0.75$.
+The cause is structural and applies to *every* per-parameter criterion —
+certified descent, immediate $\varepsilon$ and look-ahead $\varepsilon$ alike:
+after a $784\to2$ projection, every later layer has a tiny fan-in and is
+therefore always the cheaper buy, while the information destroyed by the
+input projection is not recoverable downstream. Measured effective rank
+confirms it is not a tuning artifact: width $4\to$ rank 4, $14\to11$,
+$64\to19$, $256\to47$ — sublinear, so a wide late layer cannot restore what
+a narrow early layer discarded.
+
+**R2 is therefore not adopted.** Greedy per-layer ranking is myopic in
+exactly the direction that matters, and no reweighting inside the greedy
+frame repairs it. Growth direction falls back to **uniform widening**, which
+spends parameters where the ranking provably cannot look. R1 decides *when*;
+uniform widening decides *where*.
+
+### 6.3 R3 — termination is Lemma 3.5 itself
+
+Growth stops when $\varepsilon<\tfrac12$: the reachable set represents $r$,
+Lemma 3.5 is satisfied, and the admissible-step machinery of the paper
+applies without any structural change. This is what gives "optimal structure"
+a precise meaning here — **the smallest structure reached whose reachable set
+expresses the functional gradient** — and it is a criterion of the theory, not
+an added stopping rule.
+
+### 6.4 Measured result
+
+From a $3\times2$ (2 hidden neurons per layer) on MNIST, batch 64, no budget
+and no schedule, against the fixed-structure AdamW baseline it is compared
+against:
+
+| method | test | params | note |
+|---|---|---|---|
+| **certified grow, CE, R1 + uniform** | **90.25 %** | **6552** | $784\to8\to8\to10$, 2 growths |
+| dense AdamW, fixed | 90.15 % | 8180 | $784\to10\to10\to10$ |
+| dense AdamW, fixed | 90.50 % | 9862 | $784\to12\to12\to12$ |
+| certified grow, CE, per-parameter (R2) | 64.4 % | — | $784\to2\to2\to14$ |
+| certified grow, MSE | 86.1 % | 5269 | previous best under §4's conflict |
+
+Both growth events fired for the R1 reason and are logged as such
+("committed but eps did not decrease … the structure is at its
+representation limit"), at epochs 2 and 4; the remaining 76 epochs added no
+parameters, because $\varepsilon$ kept decreasing.
+
+**Higher accuracy than the fixed-structure baseline with 20 % fewer
+parameters**, discovered from a two-neuron start without being told anything
+about the dataset.
+
+### 6.5 What is and is not guaranteed
+
+Claimed, and certified per step:
+
+* every committed step realises held-out functional descent (Prop. 3.8);
+* every accepted tangent step satisfies $\varepsilon<\tfrac12$ and a strict
+  admissible learning-rate interval (Lemma 3.5, with $L_s=\tfrac12$ under CE
+  giving a $4\times$ wider interval than MSE);
+* growth fires only at a measured representation limit, and stops exactly
+  when Lemma 3.5 is satisfied;
+* convexity in $f$ (§3.1) means a functional-space stationary point is a
+  global minimum of the *functional* problem.
+
+**Not** claimed:
+
+* global optimality of the **architecture**. The search is greedy in a
+  one-dimensional family (uniform width) and there is no proof it reaches the
+  parameter-optimal structure. A hand-picked $784\to6\to24\to24$ reaches
+  89.95 % with 5728 parameters: better parameter efficiency than what the
+  search found, at slightly lower accuracy. The search is *competitive with
+  and cheaper than the baseline*, not provably optimal.
+* the linear global contraction $C_{\mathrm{glob}}$ under CE — §3.3: no PL
+  constant exists, and the $O(1/T)$ convex rate of §3.4 replaces it.
