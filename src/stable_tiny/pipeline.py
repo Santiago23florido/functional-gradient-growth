@@ -4331,8 +4331,15 @@ def run_pipeline(
                             f"(eta*={stage_trial.epoch_result.learning_rate:.4g}, "
                             f"cos={stage_cosine:.4f}, "
                             f"progress={_certified_trial_progress(stage_trial):.3e}, "
-                            f"contraction={stage_trial.global_contraction:.6f}, "
-                            f"rel_err={stage_rel_error:.4f})"
+                            + (
+                                "contraction="
+                                f"{stage_trial.global_contraction:.6f}, "
+                                if stage_trial.global_contraction is not None
+                                # No PL constant for this functional, so no
+                                # linear contraction is asserted.
+                                else "contraction=n/a, "
+                            )
+                            + f"rel_err={stage_rel_error:.4f})"
                         )
                     last_test_loss = stage_test_metrics.loss
                     fgd_accepted_outer_steps += 1
