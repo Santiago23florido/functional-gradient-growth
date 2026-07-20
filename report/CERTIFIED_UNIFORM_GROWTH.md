@@ -167,3 +167,36 @@ earlier, so the gap is specific to the grown trajectory — most plausibly the
 families unable to fully re-converge afterwards. Closing that gap (e.g.
 re-training to convergence after the final growth, or function-preserving
 delta growth that keeps the certificate meaningful) is the next step.
+
+## Attempts to close the training gap *through growth* (no retraining)
+
+Two theory-motivated attempts, both **refuted by measurement**:
+
+| variant | idea | test | params | shape |
+|---|---|---|---|---|
+| E24 (baseline) | delta growth, descent-selected, budget-aware | **86.1%** | 5269 | `784→6→19→14` |
+| E25 | fully function-preserving growth (zero-output neurons, no delta at all) — the cleanest theory: growth only expands the reachable set, every function change comes from a certified family step | 57.6% | — | `784→2→4→8` |
+| E26 | delta growth with the scaling line search moved from TRAIN loss to held-out loss (certifying the growth's *magnitude*) | 66.8% | — | `784→2→4→22` |
+
+- **E25** shows the zero-init capacity is never exploited: the certified
+  families exhaust before they can train the new neurons, so the network
+  stalls far below the delta variant. The delta is doing real work.
+- **E26** shows the GroMo train-loss line search is not the leak: choosing
+  the growth magnitude on held-out data picks systematically smaller
+  scalings, each growth contributes less, and the trajectory degrades.
+
+**Correction to the earlier framing:** the delta growth is *not* an
+uncertified step. Under `growth_select_by_descent` only a candidate that
+realizes a **measured validation functional descent** is committed — that is
+Proposition 3.8 applied to the structural step. What remains uncertified is
+only the scaling's inner objective, and E26 shows certifying it does not
+help.
+
+**Where the residual gap actually comes from (current best understanding):**
+the certificate governs the *functional loss* (sum-MSE) and halts the flow
+when held-out MSE stops descending. Dense AdamW keeps minimizing train MSE
+for a fixed epoch budget and its best *accuracy* appears after the point
+where the certified flow would have stopped. The gap is therefore a
+**criterion mismatch (MSE descent vs. argmax accuracy)**, not missing
+capacity and not a missing retraining phase. Closing it inside the theory
+would require a certificate on a loss whose descent tracks accuracy.
