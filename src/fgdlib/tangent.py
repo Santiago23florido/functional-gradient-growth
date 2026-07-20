@@ -32,6 +32,7 @@ ProjectionSolver = Literal[
     "exact_kernel_eigh",
 ]
 LearningRatePolicy = Literal["scheduler", "theory_interval"]
+GrowthLimitCriterion = Literal["progress_floor", "epsilon_stationary"]
 FunctionalLoss = Literal["mse", "cross_entropy"]
 GlobalBoundAction = Literal["lr_then_growth", "grow", "ignore"]
 
@@ -131,6 +132,27 @@ class FGDApproxConfig:
     # so the linear C_glob envelope is unavailable for it -- see
     # report/CROSS_ENTROPY_FGD.md.
     functional_loss: FunctionalLoss = "mse"
+    # How the structure's LIMIT is recognised, i.e. when more training can
+    # no longer substitute for more capacity.
+    #
+    #   "progress_floor"      the legacy reading: the structure is exhausted
+    #                         when no family certifies progress above the
+    #                         C_prog floor. Sound for sum-MSE, whose infimum
+    #                         is attained at f = Y.
+    #   "epsilon_stationary"  the reinterpretation: the structure is at its
+    #                         REPRESENTATION limit when a certified step no
+    #                         longer reduces the held-out relative error
+    #                         eps = ||g - r|| / ||g||. Required for any
+    #                         functional whose infimum is NOT attained
+    #                         (cross-entropy: more confidence always lowers
+    #                         the loss, so the progress floor never fires and
+    #                         the structure never grows). It is a monotonicity
+    #                         comparison of the Lemma-3.5 quantity between two
+    #                         measured states -- no threshold, no window, no
+    #                         budget -- and it is defined for EVERY certified
+    #                         functional, which is what makes the method
+    #                         loss-agnostic.
+    growth_limit_criterion: GrowthLimitCriterion = "progress_floor"
     # Let the fallback families run whenever the tangent outer step fails,
     # independently of whether growth is due. They are nested inside the
     # growth trigger otherwise, so once the structure becomes adequate

@@ -4402,6 +4402,8 @@ def run_pipeline(
                     and rel_error is not None
                     and rel_error >= config.fgd_approx.rel_error_threshold
                 )
+                # eps BEFORE the family step, for the stationarity test.
+                epsilon_before_family = rel_error
 
                 family_committed = False
                 for family_name in fallback_families:
@@ -4428,7 +4430,38 @@ def run_pipeline(
                     # it commits. The only question is whether it also
                     # postpones the structural step.
                     family_committed = True
-                    if not admissibility_failed:
+                    # R1 -- the structure's limit as stationarity of eps.
+                    # A committed step that does not REDUCE the held-out
+                    # relative error means training is no longer improving
+                    # the reachable set's ability to express r: the descent
+                    # is going into directions the structure cannot follow.
+                    # That is the representation limit, so the step is kept
+                    # but it must not postpone the structural step.
+                    epsilon_stationary = False
+                    if (
+                        config.fgd_approx.growth_limit_criterion
+                        == "epsilon_stationary"
+                    ):
+                        after = validation_certificate_for_next_epoch
+                        epsilon_after_family = (
+                            after.relative_error if after is not None else None
+                        )
+                        epsilon_stationary = (
+                            epsilon_before_family is not None
+                            and epsilon_after_family is not None
+                            and epsilon_after_family
+                            >= epsilon_before_family - config.fgd_approx.eps
+                        )
+                        if epsilon_stationary and progress is not None:
+                            progress(
+                                f"[FGD] Epoch {epoch}: {family_name} "
+                                "committed but eps did not decrease "
+                                f"({epsilon_before_family:.3f} -> "
+                                f"{epsilon_after_family:.3f}): the structure "
+                                "is at its representation limit, so the step "
+                                "does not postpone growth"
+                            )
+                    if not admissibility_failed and not epsilon_stationary:
                         growth_triggered = False
                         break
                     if progress is not None:

@@ -175,3 +175,40 @@ def test_no_global_bound_is_asserted_without_a_pl_constant() -> None:
     )
     # mu = 0 disables the linear contraction: global_bound stays None.
     assert _certified_pl_constant(ce_config) == 0.0
+
+
+def test_epsilon_stationarity_is_the_loss_agnostic_limit_criterion() -> None:
+    """R1: eps is defined for BOTH functionals, C_prog is not comparable.
+
+    The progress floor cannot recognise the limit of a functional whose
+    infimum is not attained: cross-entropy always admits more descent by
+    raising confidence, so certified progress never falls to the floor.
+    eps is a property of the reachable set, so the same test works for
+    either certified loss.
+    """
+    from fgdlib.tangent import GrowthLimitCriterion  # noqa: F401
+
+    assert FGDApproxConfig().growth_limit_criterion == "progress_floor"
+
+    # Raising confidence on an already-correct sample: cross-entropy keeps
+    # descending without bound, so no progress floor can ever fire.
+    target = torch.tensor([[1.0, 0.0, 0.0]])
+    losses = [
+        float(
+            batch_functional_loss(
+                torch.tensor([[scale, 0.0, 0.0]]), target, "cross_entropy"
+            )
+        )
+        for scale in (2.0, 6.0, 10.0, 14.0)
+    ]
+    assert losses[0] > losses[1] > losses[2] > losses[3] > 0.0
+    # ... while sum-MSE has a finite minimiser and turns back up.
+    mse_losses = [
+        float(
+            batch_functional_loss(
+                torch.tensor([[scale, 0.0, 0.0]]), target, "mse"
+            )
+        )
+        for scale in (1.0, 2.0, 6.0)
+    ]
+    assert mse_losses[0] < mse_losses[1] < mse_losses[2]
