@@ -290,6 +290,26 @@ between two measured values: **no threshold, no window, no schedule, no
 parameter budget**, so it transfers unchanged to a dataset never seen before.
 This is the property that made it necessary — the tuned floor could not.
 
+**The precise division of labour** (worth stating exactly, because R1 is
+easily overread as a new trigger — it is not):
+
+| stage | what decides it |
+|---|---|
+| growth is **proposed** | Lemma 3.5 admissibility failure, $\varepsilon\ge\tfrac12$, or an explicit request from the tangent certificate |
+| the proposal is **withdrawn** | a family step certifies **and** reduces $\varepsilon$ — training is still enlarging what the structure expresses, so capacity is not the constraint |
+| the proposal **stands** | R1: the family step certified but $\varepsilon$ did not fall |
+
+So the *trigger* is the paper's own structural criterion, unmodified. R1
+governs only whether training may render that trigger unnecessary. Nothing
+in the chain reads the epoch number: the trigger discards it explicitly
+(`should_trigger_fgd_growth` begins `del epoch, last_growth_epoch`), and no
+parameter cap participates (`max_total_parameters` is empty). The
+`growth_schedule.every` / `first_epoch` fields are read **only** by
+`method: normal`; under `fgd_approx` the sole field consulted is `.enabled`,
+a master on/off switch. The measured run is the proof: growth fired at
+epochs 2 and 4 while `first_epoch: 50` — a schedule could not have produced
+that.
+
 Why $\varepsilon$ and not the loss: $\varepsilon$ is scale-free and is a
 property of the *reachable set*, not of how far training has progressed
 inside it. Measured on MNIST under CE, that distinction is visible: with the

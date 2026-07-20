@@ -4542,7 +4542,11 @@ def run_pipeline(
                     if not admissibility_failed and not epsilon_stationary:
                         growth_triggered = False
                         break
-                    if progress is not None:
+                    # Two different criteria reach this point; only the
+                    # Lemma-3.5 one may claim eps >= threshold. R1 fires
+                    # precisely when eps is BELOW the threshold but no longer
+                    # decreasing, and has already logged its own reason.
+                    if admissibility_failed and progress is not None:
                         progress(
                             f"[FGD] Epoch {epoch}: {family_name} committed, "
                             f"but eps={rel_error:.3f} >= "

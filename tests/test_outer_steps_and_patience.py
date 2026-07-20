@@ -234,3 +234,67 @@ def test_families_still_run_when_growth_is_not_due(tmp_path) -> None:
     assert any("parametric_descent" in line for line in lines)
     # ... and no capacity was added, because Lemma 3.5 did not fail.
     assert not result.growth_events
+
+
+def test_r1_does_not_claim_a_lemma35_failure_that_did_not_happen(tmp_path) -> None:
+    """The accept log is the audit trail: it may only cite the criterion that fired.
+
+    Two different criteria let a committed family step through to growth --
+    Lemma 3.5 admissibility failure (eps >= threshold) and R1 (eps below the
+    threshold but no longer decreasing). Reporting the Lemma-3.5 reason for
+    an R1 event printed statements like "eps=0.438 >= 0.5", which is
+    arithmetically false and corrupts the certificate record.
+    """
+    config = load_pipeline_config("configs/fgd/default.yaml")
+    config = replace(
+        config,
+        model=replace(config.model, hidden_size=2, number_hidden_layers=2),
+        training=replace(config.training, epochs=1, device="cpu", log_every=1),
+        fgd_approx=replace(
+            config.fgd_approx,
+            # Tangent can never commit, so the ladder is consulted while the
+            # state relative error stays well BELOW the threshold.
+            theory_lr_min=1e9,
+            theory_lr_search_steps=1,
+            theory_lr_search_refinements=0,
+            family_order=("tangent", "parametric_descent"),
+            family_rejection_cooldown=0,
+            growth_limit_criterion="epsilon_stationary",
+            families_available_without_growth=True,
+            # ... and this keeps admissibility_failed False by construction.
+            admissibility_failure_forces_growth=False,
+            rel_error_threshold=0.5,
+            growth_patience=1,
+        ),
+        parametric_descent=replace(
+            config.parametric_descent,
+            inner_steps=(1,),
+            functional_learning_rates=(0.5,),
+            min_progress=1e-12,
+        ),
+        secant_fgd=replace(config.secant_fgd, enabled=False),
+        scaling_line_search=replace(config.scaling_line_search, iterations=0),
+        wandb=replace(config.wandb, enabled=False),
+        run=replace(
+            config.run,
+            results_dir=tmp_path,
+            save_plot=False,
+            show_plot=False,
+        ),
+    )
+
+    lines: list[str] = []
+    run_pipeline(config=config, progress=lines.append)
+
+    # R1 fires on this setup (eps 0.305 -> 0.524 at epoch 1) ...
+    r1_lines = [line for line in lines if "representation limit" in line]
+    assert r1_lines, "expected the R1 stationarity event on this setup"
+    # ... and it must NOT be reported as a Lemma 3.5 failure.
+    assert not [line for line in lines if "Lemma 3.5 fails" in line]
+
+    # Whenever the Lemma-3.5 message IS emitted, its own arithmetic must hold.
+    for line in lines:
+        if "Lemma 3.5 fails" in line:
+            measured = float(line.split("eps=")[1].split(" ")[0])
+            threshold = float(line.split(">= ")[1].split(" ")[0])
+            assert measured >= threshold, line

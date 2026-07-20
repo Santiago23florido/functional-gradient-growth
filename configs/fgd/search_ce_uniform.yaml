@@ -1,10 +1,13 @@
 # Default certified growth-and-train configuration (Algorithm 5).
 #
 # Starts from a minimal 3x2 network and grows only when the paper's
-# structural criterion fires (Lemma 3.5 admissibility failure,
-# eps >= rel_error_threshold). No parameter budget and no growth
-# schedule: the descent-per-added-parameter criterion is a ratio, so it
-# transfers to datasets that have never been trained.
+# structural criterion fires: Lemma 3.5 admissibility failure
+# (eps >= rel_error_threshold) proposes growth, and R1 -- a certified
+# family step that no longer REDUCES eps -- decides whether training may
+# render the proposal unnecessary. Both are comparisons between measured
+# certificate quantities, with no parameter budget, no growth schedule and
+# no per-dataset threshold, so the method transfers unchanged to data that
+# has never been trained on.
 run:
   name: fgd_search_ce_uniform
   results_dir: results
@@ -247,6 +250,13 @@ scaling_line_search:
   iterations: 12
   tolerance: 0.001
 
+# NOT a schedule under method: fgd_approx. Only `enabled` is read here, as
+# a master on/off switch for architecture changes; `every`, `first_epoch`
+# and `layer_policy` are consulted exclusively by method: normal. Growth
+# timing comes from the certificate alone -- Lemma 3.5 (eps >= 0.5) proposes
+# it and R1 (eps no longer decreasing) decides whether training may render
+# the proposal unnecessary. should_trigger_fgd_growth() opens with
+# `del epoch, last_growth_epoch`: no epoch, dwell or cap participates.
 growth_schedule:
   enabled: true
   every: 100
