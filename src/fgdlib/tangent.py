@@ -32,6 +32,7 @@ ProjectionSolver = Literal[
     "exact_kernel_eigh",
 ]
 LearningRatePolicy = Literal["scheduler", "theory_interval"]
+FunctionalLoss = Literal["mse", "cross_entropy"]
 GlobalBoundAction = Literal["lr_then_growth", "grow", "ignore"]
 
 
@@ -122,6 +123,14 @@ class FGDApproxConfig:
     # (k applications of the same per-step theorem). The epoch stops at the
     # first rejected attempt. 1 = one outer step per epoch (legacy).
     outer_steps_per_epoch: int = 1
+    # The certified functional. Every certificate in this file is a
+    # statement about THIS loss. "mse" is the legacy default with the exact
+    # identity ||r||^2 = 4L (mu = 2, L* = 0). "cross_entropy" keeps
+    # convexity and smoothness (so the method and every per-step
+    # certificate transfer) but has NO global Polyak-Lojasiewicz constant,
+    # so the linear C_glob envelope is unavailable for it -- see
+    # report/CROSS_ENTROPY_FGD.md.
+    functional_loss: FunctionalLoss = "mse"
     # Require the paper's structural criterion before growing: capacity is
     # increased only when Lemma 3.5 fails on the committed state, i.e. when
     # the relative error reaches rel_error_threshold and the reachable set
@@ -472,6 +481,91 @@ def batch_functional_mse_loss(
 ) -> torch.Tensor:
     """Return the sum-MSE loss used by GroMo/TINY statistics."""
     return torch.sum((y_pred - y) ** 2)
+
+
+def cross_entropy_functional_gradient(
+    y_pred: torch.Tensor,
+    y: torch.Tensor,
+) -> torch.Tensor:
+    """Return the functional gradient of summed softmax cross-entropy.
+
+    With logits ``f`` and one-hot targets ``Y``,
+    ``L(f) = sum_i [logsumexp(f_i) - f_{i,c_i}]`` and
+
+        r = grad_f L = softmax(f) - Y.
+
+    Unlike the sum-MSE gradient ``2(f-Y)``, this vanishes only as the
+    correct-class logit diverges, so it never opposes additional confidence
+    on an already-correct sample. See report/CROSS_ENTROPY_FGD.md §4.
+    """
+    return torch.softmax(y_pred.detach(), dim=-1) - y.detach()
+
+
+def batch_functional_cross_entropy_loss(
+    y_pred: torch.Tensor,
+    y: torch.Tensor,
+) -> torch.Tensor:
+    """Return summed softmax cross-entropy against one-hot targets."""
+    log_probabilities = torch.log_softmax(y_pred, dim=-1)
+    return -torch.sum(y * log_probabilities)
+
+
+# The certified functional. Every certificate in this module is a statement
+# about THIS loss; see report/CROSS_ENTROPY_FGD.md for which parts of the
+# theory transfer between the two (convexity and smoothness do, the
+# Polyak-Lojasiewicz constant does not).
+
+_FUNCTIONAL_GRADIENTS = {
+    "mse": mse_functional_gradient,
+    "cross_entropy": cross_entropy_functional_gradient,
+}
+_FUNCTIONAL_LOSSES = {
+    "mse": batch_functional_mse_loss,
+    "cross_entropy": batch_functional_cross_entropy_loss,
+}
+# Smoothness constant L_s of the functional in output space:
+#   MSE:           Hessian = 2 Id                      -> L_s = 2
+#   cross-entropy: Hessian = diag(p) - p p^T, PSD,     -> L_s = 1/2
+#                  lambda_max <= 1/2 (verified numerically)
+# Lemma 3.5's admissible interval is eta_bar = 2(1-2eps)/(L_s(1+2eps)), so
+# the cross-entropy interval is four times wider.
+FUNCTIONAL_SMOOTHNESS = {"mse": 2.0, "cross_entropy": 0.5}
+# Whether the functional admits a global Polyak-Lojasiewicz constant. Only
+# sum-MSE does (||r||^2 = 4L exactly, mu = 2, L* = 0). Cross-entropy has
+# ||r||^2 = Theta(L^2) as p_c -> 1 and bounded ||r||^2 with unbounded L as
+# p_c -> 0, so no mu > 0 exists and the LINEAR contraction of Prop. 3.8
+# (the C_glob envelope) is not available for it.
+FUNCTIONAL_HAS_PL_CONSTANT = {"mse": True, "cross_entropy": False}
+
+
+def functional_gradient(
+    y_pred: torch.Tensor,
+    y: torch.Tensor,
+    functional_loss: FunctionalLoss = "mse",
+) -> torch.Tensor:
+    """Return r = grad_f L for the configured certified functional."""
+    try:
+        return _FUNCTIONAL_GRADIENTS[functional_loss](y_pred, y)
+    except KeyError:
+        raise ValueError(
+            f"Unsupported fgd_approx.functional_loss '{functional_loss}'. "
+            f"Use one of: {', '.join(_FUNCTIONAL_GRADIENTS)}."
+        ) from None
+
+
+def batch_functional_loss(
+    y_pred: torch.Tensor,
+    y: torch.Tensor,
+    functional_loss: FunctionalLoss = "mse",
+) -> torch.Tensor:
+    """Return L(f) on a batch for the configured certified functional."""
+    try:
+        return _FUNCTIONAL_LOSSES[functional_loss](y_pred, y)
+    except KeyError:
+        raise ValueError(
+            f"Unsupported fgd_approx.functional_loss '{functional_loss}'. "
+            f"Use one of: {', '.join(_FUNCTIONAL_LOSSES)}."
+        ) from None
 
 
 def relative_l2_error(
