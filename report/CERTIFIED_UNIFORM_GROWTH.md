@@ -128,3 +128,42 @@ later layers wide (≈24) — which would deliver ~90% at ~5.7k parameters,
 30% below the fixed-AdamW frontier. `configs/exp/E22_efficient_growth_10k.yaml`
 is the first attempt (per-parameter greedy growth); it does build the right
 shape (`784→12→16→23`) but over-grows the expensive input layer.
+
+## Steering growth to the efficient shape — two fixes, and what remains
+
+Two certification defects blocked the efficient shape; both are fixed:
+
+1. **Budget-aware growth.** `max_total_parameters` was only checked *before*
+   growing, so a single input-layer widening (784 params/neuron) overshot it
+   (E22 hit 10259 on an 8000 budget, layer 0 at width 12 = 92% of the model).
+   Candidates whose *post-growth* parameter count exceeds the budget are now
+   dropped before selection.
+2. **Descent-realizing probes count as improvements.** `_growth_certificate_
+   improves` is rel-error based, and delta growth always worsens rel_err, so
+   no probe ever "improved" and growth was cancelled every epoch with the
+   families already exhausted (E23 froze at 85.8%). Under
+   `growth_select_by_descent`, a probe realizing a certified validation
+   descent now counts.
+
+With both, the method builds the target shape from `3×2` unaided:
+
+| run | architecture grown from `3×2` | test | params |
+|---|---|---|---|
+| E22 (no budget filter) | `784→12→16→23` | 86.4% | 10259 |
+| E23 (budget, gate blocked) | `784→6→9→10` | 85.8% | 4983 |
+| **E24 (both fixes)** | **`784→6→19→14`** | **86.1%** | **5269** |
+| *dense AdamW, efficient shape* | `784→6→24→24` | *89.95%* | *5728* |
+| *dense AdamW, uniform reference* | `784→10→10→10` | *89.95%* | *8180* |
+
+**The architecture problem is solved**: certified growth now reaches the
+narrow-in / wide-late shape inside a parameter budget, using **35% fewer
+parameters than the uniform dense baseline** (5269 vs 8180).
+
+**What remains is a training gap, not an architecture gap.** On the shape it
+builds, the certified flow reaches 86.1% where dense AdamW reaches ~90% at
+the same size. The certified flow matched dense AdamW at a *fixed* `3×10`
+earlier, so the gap is specific to the grown trajectory — most plausibly the
+12 delta growths repeatedly perturbing the function, with the certified
+families unable to fully re-converge afterwards. Closing that gap (e.g.
+re-training to convergence after the final growth, or function-preserving
+delta growth that keeps the certificate meaningful) is the next step.
