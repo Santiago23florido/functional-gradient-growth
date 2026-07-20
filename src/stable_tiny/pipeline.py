@@ -4321,8 +4321,24 @@ def run_pipeline(
                         config=config,
                         probe=fgd_validation_probe,
                     )
+                    # The rel-error improvement gate is blind to delta
+                    # growth (the GroMo optimal update reduces the loss but
+                    # jumps the tangent linearization, so rel_err worsens and
+                    # no candidate ever "improves"). When growth is selected
+                    # by certified descent, a probe that realizes a genuine
+                    # validation functional descent counts as an improvement
+                    # — otherwise the flow cancels growth and stalls with the
+                    # families already exhausted.
                     fgd_growth_probe_improved = bool(
-                        growth_probe is not None and growth_probe.improves_fgd
+                        growth_probe is not None
+                        and (
+                            growth_probe.improves_fgd
+                            or (
+                                config.fgd_approx.growth_select_by_descent
+                                and growth_probe.functional_descent
+                                > config.fgd_approx.eps
+                            )
+                        )
                     )
                     if not fgd_growth_probe_improved:
                         growth_triggered = False
