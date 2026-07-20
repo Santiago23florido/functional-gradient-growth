@@ -273,6 +273,7 @@ def grow_layer(
     progress: ProgressFn | None = None,
     function_preserving: bool = False,
     preservation_tolerance: float = 1e-6,
+    line_search_loader: torch.utils.data.DataLoader | None = None,
 ) -> GrowthResult:
     """Grow one GroMo layer and apply the best line-search update.
 
@@ -280,6 +281,13 @@ def grow_layer(
     ``model._growable_layers``. With ``function_preserving=True`` the
     scaling line search is skipped and the extension is applied with zero
     outgoing weights, leaving the represented function exactly unchanged.
+
+    ``line_search_loader`` selects the data the scaling factor is chosen on.
+    The GroMo default minimizes the TRAIN loss, which makes the magnitude of
+    the structural step an uncertified, train-fitting choice; passing the
+    held-out loader instead makes the growth's magnitude follow the same
+    held-out functional descent that Proposition 3.8 certifies for every
+    other step.
     """
     if function_preserving:
         return _function_preserving_growth(
@@ -314,7 +322,9 @@ def grow_layer(
 
     best_value, best_loss, line_search = _golden_section_line_search(
         model=model,
-        train_loader=train_loader,
+        train_loader=(
+            line_search_loader if line_search_loader is not None else train_loader
+        ),
         criterion=criterion_mean,
         device=device,
         config=line_search_config,

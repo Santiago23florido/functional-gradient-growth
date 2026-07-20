@@ -1281,6 +1281,11 @@ def _probe_fgd_growth(
             preservation_tolerance=(
                 config.fgd_approx.growth_preservation_tolerance
             ),
+            line_search_loader=(
+                validation_loader
+                if config.fgd_approx.growth_scaling_on_validation
+                else None
+            ),
         )
         certificate = evaluate_fgd_validation_certificate(
             model=trial_model,
@@ -1312,6 +1317,23 @@ def _probe_fgd_growth(
                 ),
             )
         )
+
+    # Budget-aware growth: a candidate that would push the model past the
+    # parameter budget is not affordable and is dropped BEFORE selection.
+    # Checking the budget only before growing lets one expensive
+    # input-layer widening (784 params/neuron) blow through it; filtering
+    # post-growth counts steers growth to the parameter-efficient
+    # narrow-in / wide-late shape automatically, because the input layer
+    # becomes unaffordable early while the late layers stay cheap.
+    max_parameters = config.fgd_approx.max_total_parameters
+    if max_parameters is not None:
+        affordable = [
+            probe
+            for probe in probes
+            if base_parameter_count + probe.added_parameters <= max_parameters
+        ]
+        if affordable:
+            probes = affordable
 
     if select_by_descent:
         by_descent = _select_growth_probe_by_descent(
@@ -3431,6 +3453,24 @@ def run_pipeline(
                             and lr_certificate.sensor_valid
                             and not search_result.sensor_failure
                         )
+                        if (
+                            fgd_growth_requested
+                            and config.fgd_approx.growth_requires_admissibility_failure
+                        ):
+                            # Lemma 3.5 is the paper's structural criterion:
+                            # capacity must increase only when the reachable
+                            # set can no longer represent r_t, i.e. when
+                            # eps >= rel_error_threshold. A failed transaction
+                            # is NOT that signal on its own -- a step can fail
+                            # for step-size or loss-plateau reasons while
+                            # eps stays far below 1/2, and growing then throws
+                            # parameters at a problem that is not capacity.
+                            state_relative_error = lr_certificate.relative_error
+                            fgd_growth_requested = (
+                                state_relative_error is not None
+                                and state_relative_error
+                                >= config.fgd_approx.rel_error_threshold
+                            )
                         if fgd_growth_requested:
                             selected_layer_index = select_tiny_growth_layer_index(
                                 model=model,
@@ -4304,8 +4344,24 @@ def run_pipeline(
                         config=config,
                         probe=fgd_validation_probe,
                     )
+                    # The rel-error improvement gate is blind to delta
+                    # growth (the GroMo optimal update reduces the loss but
+                    # jumps the tangent linearization, so rel_err worsens and
+                    # no candidate ever "improves"). When growth is selected
+                    # by certified descent, a probe that realizes a genuine
+                    # validation functional descent counts as an improvement
+                    # — otherwise the flow cancels growth and stalls with the
+                    # families already exhausted.
                     fgd_growth_probe_improved = bool(
-                        growth_probe is not None and growth_probe.improves_fgd
+                        growth_probe is not None
+                        and (
+                            growth_probe.improves_fgd
+                            or (
+                                config.fgd_approx.growth_select_by_descent
+                                and growth_probe.functional_descent
+                                > config.fgd_approx.eps
+                            )
+                        )
                     )
                     if not fgd_growth_probe_improved:
                         growth_triggered = False
@@ -4353,6 +4409,12 @@ def run_pipeline(
                                 preservation_tolerance=(
                                     config.fgd_approx
                                     .growth_preservation_tolerance
+                                ),
+                                line_search_loader=(
+                                    validation_loader
+                                    if config.fgd_approx
+                                    .growth_scaling_on_validation
+                                    else None
                                 ),
                             )
                         layer_index = (
@@ -4411,6 +4473,11 @@ def run_pipeline(
                             ),
                             preservation_tolerance=(
                                 config.fgd_approx.growth_preservation_tolerance
+                            ),
+                            line_search_loader=(
+                                validation_loader
+                                if config.fgd_approx.growth_scaling_on_validation
+                                else None
                             ),
                         )
                 else:
