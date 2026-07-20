@@ -33,6 +33,7 @@ ProjectionSolver = Literal[
 ]
 LearningRatePolicy = Literal["scheduler", "theory_interval"]
 GrowthLimitCriterion = Literal["progress_floor", "epsilon_stationary"]
+GrowthSelection = Literal["descent_per_parameter", "epsilon_lookahead"]
 FunctionalLoss = Literal["mse", "cross_entropy"]
 GlobalBoundAction = Literal["lr_then_growth", "grow", "ignore"]
 
@@ -132,6 +133,29 @@ class FGDApproxConfig:
     # so the linear C_glob envelope is unavailable for it -- see
     # report/CROSS_ENTROPY_FGD.md.
     functional_loss: FunctionalLoss = "mse"
+    # How the growth LAYER is chosen.
+    #
+    #   "descent_per_parameter"  legacy: largest certified functional
+    #                            descent per added parameter.
+    #   "epsilon_lookahead"      R2: largest reduction of the Lemma-3.5
+    #                            relative error per added parameter,
+    #                            measured AFTER one certified family step on
+    #                            the grown clone. Spending a parameter is
+    #                            worthwhile exactly when it enlarges what the
+    #                            reachable set can express, and that only
+    #                            shows once the new capacity has been used:
+    #                            measured on a trained 3x2 the IMMEDIATE eps
+    #                            gets worse for every candidate (the delta
+    #                            perturbs the function first), while after one
+    #                            family step exactly one layer improves it --
+    #                            the same layer that yields the best accuracy.
+    #                            "no candidate reduces eps" is then the
+    #                            termination condition: the structure is
+    #                            already minimal-adequate.
+    growth_selection: GrowthSelection = "descent_per_parameter"
+    # Certified family steps taken on each grown clone before its eps is
+    # judged, for growth_selection = "epsilon_lookahead".
+    growth_lookahead_steps: int = 10
     # How the structure's LIMIT is recognised, i.e. when more training can
     # no longer substitute for more capacity.
     #

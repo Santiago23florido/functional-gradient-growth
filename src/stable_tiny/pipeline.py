@@ -268,6 +268,11 @@ class _GrowthProbe:
     # is coherent with delta growth where the rel-error jumps.
     functional_descent: float = 0.0
     added_parameters: int = 0
+    # Reduction of the Lemma-3.5 relative error this growth achieves once
+    # the new capacity has been USED (one certified family step on the
+    # grown clone). Positive means the reachable set genuinely expanded
+    # toward r. See fgd_approx.growth_selection = "epsilon_lookahead".
+    epsilon_reduction: float | None = None
 
 
 def _section_dataclass(
@@ -1293,6 +1298,9 @@ def _probe_fgd_growth(
     # coherent, Prop. 3.8-justified choice; the rel-error certificate is
     # blind to it because the delta step jumps the linearization).
     select_by_descent = config.fgd_approx.growth_select_by_descent
+    select_by_epsilon = (
+        config.fgd_approx.growth_selection == "epsilon_lookahead"
+    )
     base_functional_loss = (
         evaluate_functional_loss(
             model, validation_loader, device, config.fgd_approx.functional_loss
@@ -1328,6 +1336,37 @@ def _probe_fgd_growth(
             learning_rate=None,
             probe=probe,
         )
+        epsilon_reduction = None
+        if select_by_epsilon:
+            # Use the new capacity before judging it: the delta perturbs the
+            # function, so the IMMEDIATE eps is worse for every candidate.
+            trained_clone = _train_parametric_gd_candidate(
+                base_model=trial_model,
+                train_batches=train_batches,
+                device=device,
+                functional_learning_rate=(
+                    config.parametric_descent.functional_learning_rates[0]
+                ),
+                steps=config.fgd_approx.growth_lookahead_steps,
+                config=config.parametric_descent,
+                functional_loss=config.fgd_approx.functional_loss,
+            )
+            if trained_clone is not None:
+                after = evaluate_fgd_validation_certificate(
+                    model=trained_clone,
+                    data_loader=validation_loader,
+                    device=device,
+                    config=config.fgd_approx,
+                    learning_rate=None,
+                    probe=probe,
+                )
+                if (
+                    base_certificate.relative_error is not None
+                    and after.relative_error is not None
+                ):
+                    epsilon_reduction = (
+                        base_certificate.relative_error - after.relative_error
+                    )
         functional_descent = 0.0
         if select_by_descent:
             candidate_loss = evaluate_functional_loss(
@@ -1351,6 +1390,7 @@ def _probe_fgd_growth(
                 added_parameters=(
                     count_parameters(trial_model) - base_parameter_count
                 ),
+                epsilon_reduction=epsilon_reduction,
             )
         )
 
@@ -1371,6 +1411,13 @@ def _probe_fgd_growth(
         if affordable:
             probes = affordable
 
+    if select_by_epsilon:
+        # R3 -- termination: None here means no candidate enlarges what the
+        # structure can express, i.e. it is already minimal-adequate. The
+        # caller leaves the structure unchanged; there is NO fallback, because
+        # growing anyway would spend parameters that buy no representability.
+        return _select_growth_probe_by_epsilon(probes, config.fgd_approx.eps)
+
     if select_by_descent:
         by_descent = _select_growth_probe_by_descent(
             probes, config.fgd_approx.eps
@@ -1386,6 +1433,37 @@ def _probe_fgd_growth(
         probes,
         prefer_lower_error=config.fgd_approx.growth_prefer_lower_error,
     )
+
+
+def _select_growth_probe_by_epsilon(
+    probes: list[_GrowthProbe],
+    eps: float,
+) -> _GrowthProbe | None:
+    """Grow where a parameter most enlarges what the structure can express.
+
+    Ranks by the look-ahead reduction of the Lemma-3.5 relative error per
+    added parameter. A candidate that does not reduce eps did not enlarge
+    the reachable set toward r, so it is not a growth worth paying for; if
+    NO candidate reduces eps the structure is already minimal-adequate and
+    None is returned, which is the termination condition of the search.
+    """
+    improving = [
+        probe
+        for probe in probes
+        if probe.epsilon_reduction is not None and probe.epsilon_reduction > eps
+    ]
+    if not improving:
+        return None
+
+    def efficiency(probe: _GrowthProbe) -> tuple[float, float, int]:
+        added = max(probe.added_parameters, 1)
+        return (
+            -(probe.epsilon_reduction or 0.0) / added,
+            -(probe.epsilon_reduction or 0.0),
+            probe.result.layer_index,
+        )
+
+    return min(improving, key=efficiency)
 
 
 def _select_growth_probe_by_descent(

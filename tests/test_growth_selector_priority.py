@@ -215,3 +215,54 @@ def test_descent_selection_ignores_non_descending_growths() -> None:
     assert (
         _select_growth_probe_by_descent([ascends], eps=1e-12) is None
     )
+
+
+def _probe_with_epsilon(*, layer_index, added_params, epsilon_reduction):
+    return _GrowthProbe(
+        model=torch.nn.Linear(max(added_params, 1), 1, bias=False),
+        result=GrowthResult(
+            layer_index=layer_index,
+            best_scaling_factor=1.0,
+            best_train_loss=1.0,
+            line_search=[],
+        ),
+        certificate=_certificate(1.5),
+        improves_fgd=False,
+        added_parameters=added_params,
+        epsilon_reduction=epsilon_reduction,
+    )
+
+
+def test_epsilon_selection_buys_representability_per_parameter() -> None:
+    """R2: rank by look-ahead eps reduction per added parameter."""
+    from stable_tiny.pipeline import _select_growth_probe_by_epsilon
+
+    # Mirrors the measured A/B: the expensive input layer barely moves eps,
+    # the cheap late layer moves it a lot.
+    expensive = _probe_with_epsilon(
+        layer_index=0, added_params=1574, epsilon_reduction=0.10
+    )
+    cheap = _probe_with_epsilon(
+        layer_index=2, added_params=26, epsilon_reduction=0.316
+    )
+    chosen = _select_growth_probe_by_epsilon([expensive, cheap], eps=1e-12)
+    assert chosen is cheap
+
+
+def test_no_growth_when_nothing_enlarges_the_reachable_set() -> None:
+    """R3: 'no candidate reduces eps' is the termination condition."""
+    from stable_tiny.pipeline import _select_growth_probe_by_epsilon
+
+    # Every candidate makes eps WORSE -- the measured immediate-eps case.
+    worse = [
+        _probe_with_epsilon(
+            layer_index=i, added_params=10 * (i + 1), epsilon_reduction=-0.05
+        )
+        for i in range(3)
+    ]
+    assert _select_growth_probe_by_epsilon(worse, eps=1e-12) is None
+    # A single improving candidate is enough to keep searching.
+    worse.append(
+        _probe_with_epsilon(layer_index=3, added_params=20, epsilon_reduction=0.2)
+    )
+    assert _select_growth_probe_by_epsilon(worse, eps=1e-12) is worse[-1]
