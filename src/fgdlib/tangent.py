@@ -122,6 +122,15 @@ class FGDApproxConfig:
     # (k applications of the same per-step theorem). The epoch stops at the
     # first rejected attempt. 1 = one outer step per epoch (legacy).
     outer_steps_per_epoch: int = 1
+    # Choose the growth's scaling factor by held-out (validation) loss
+    # instead of the GroMo default train loss. The magnitude of the
+    # structural step is otherwise the one part of growth that escapes the
+    # certificate: minimizing TRAIN loss over the scaling makes each growth
+    # a train-fitting move, and the overfit accumulates over many growths.
+    # On validation the growth's magnitude follows the same held-out
+    # functional descent Prop. 3.8 certifies for every other step.
+    # Default False (legacy GroMo behavior).
+    growth_scaling_on_validation: bool = False
     # Grow EVERY hidden layer together (uniform widening) instead of
     # selecting one layer. This sidesteps the input-layer credit-assignment
     # problem of greedy per-layer growth: any greedy criterion (descent or

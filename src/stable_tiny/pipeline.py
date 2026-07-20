@@ -1281,6 +1281,11 @@ def _probe_fgd_growth(
             preservation_tolerance=(
                 config.fgd_approx.growth_preservation_tolerance
             ),
+            line_search_loader=(
+                validation_loader
+                if config.fgd_approx.growth_scaling_on_validation
+                else None
+            ),
         )
         certificate = evaluate_fgd_validation_certificate(
             model=trial_model,
@@ -4387,6 +4392,12 @@ def run_pipeline(
                                     config.fgd_approx
                                     .growth_preservation_tolerance
                                 ),
+                                line_search_loader=(
+                                    validation_loader
+                                    if config.fgd_approx
+                                    .growth_scaling_on_validation
+                                    else None
+                                ),
                             )
                         layer_index = (
                             growth_result.layer_index
@@ -4444,6 +4455,11 @@ def run_pipeline(
                             ),
                             preservation_tolerance=(
                                 config.fgd_approx.growth_preservation_tolerance
+                            ),
+                            line_search_loader=(
+                                validation_loader
+                                if config.fgd_approx.growth_scaling_on_validation
+                                else None
                             ),
                         )
                 else:
