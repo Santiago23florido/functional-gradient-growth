@@ -88,3 +88,40 @@ def test_growth_patience_defers_the_probe(tmp_path) -> None:
     # With cooldown 0 the declining family is retried every epoch.
     declines = [line for line in lines if "no parametric_gd candidate" in line]
     assert len(declines) == 3
+
+
+def test_growth_requires_lemma35_admissibility_failure(tmp_path) -> None:
+    """Growth must not fire while the reachable set still represents r."""
+    config = load_pipeline_config("configs/fgd/default.yaml")
+    config = replace(
+        config,
+        model=replace(config.model, hidden_size=2, number_hidden_layers=2),
+        training=replace(config.training, epochs=3, device="cpu", log_every=1),
+        fgd_approx=replace(
+            config.fgd_approx,
+            # An unreachable LR floor makes every transaction fail, but the
+            # relative error stays low: Lemma 3.5 does NOT fail, so the
+            # paper's structural criterion forbids growing.
+            theory_lr_min=1e9,
+            theory_lr_search_steps=1,
+            theory_lr_search_refinements=0,
+            family_order=("tangent",),
+            growth_requires_admissibility_failure=True,
+            rel_error_threshold=0.5,
+        ),
+        secant_fgd=replace(config.secant_fgd, enabled=False),
+        scaling_line_search=replace(config.scaling_line_search, iterations=0),
+        wandb=replace(config.wandb, enabled=False),
+        run=replace(
+            config.run,
+            results_dir=tmp_path,
+            save_plot=False,
+            show_plot=False,
+        ),
+    )
+
+    result = run_pipeline(config=config, progress=None)
+
+    # Transactions fail every epoch, yet no capacity is added.
+    assert not result.growth_events
+    assert all(entry.step_type != "GRO" for entry in result.history)

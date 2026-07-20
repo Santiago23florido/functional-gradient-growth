@@ -3453,6 +3453,24 @@ def run_pipeline(
                             and lr_certificate.sensor_valid
                             and not search_result.sensor_failure
                         )
+                        if (
+                            fgd_growth_requested
+                            and config.fgd_approx.growth_requires_admissibility_failure
+                        ):
+                            # Lemma 3.5 is the paper's structural criterion:
+                            # capacity must increase only when the reachable
+                            # set can no longer represent r_t, i.e. when
+                            # eps >= rel_error_threshold. A failed transaction
+                            # is NOT that signal on its own -- a step can fail
+                            # for step-size or loss-plateau reasons while
+                            # eps stays far below 1/2, and growing then throws
+                            # parameters at a problem that is not capacity.
+                            state_relative_error = lr_certificate.relative_error
+                            fgd_growth_requested = (
+                                state_relative_error is not None
+                                and state_relative_error
+                                >= config.fgd_approx.rel_error_threshold
+                            )
                         if fgd_growth_requested:
                             selected_layer_index = select_tiny_growth_layer_index(
                                 model=model,

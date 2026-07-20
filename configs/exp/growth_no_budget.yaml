@@ -112,6 +112,7 @@ fgd_approx:
   growth_function_preserving: false
   growth_prefer_lower_error: true
   growth_select_by_descent: true
+  growth_requires_admissibility_failure: true
   growth_uniform: false
   max_total_parameters:
   growth_preservation_tolerance: 1.0e-6
