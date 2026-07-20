@@ -92,3 +92,39 @@ certified criteria do not solve — the open problem is a non-greedy /
 look-ahead growth criterion that can value the input layer's latent
 contribution. CUG is the method that reliably reaches the AdamW frontier
 from scratch; beating it is future work.
+
+---
+
+## Addendum: the parameter-efficiency prize is real, and where it lives
+
+Measured directly (dense AdamW, MNIST 10k, batch 64, 60 epochs):
+
+| architecture | test | params |
+|---|---|---|
+| `784→10→10→10→10` (uniform reference) | 89.95% | 8180 |
+| `784→8→16→16→10` | 89.95% | 6866 |
+| **`784→6→24→24→10`** | **89.95%** | **5728** |
+| `784→8→20→20→10` | 89.70% | 7090 |
+| `784→12→12→12→10` | 90.85% | 9862 |
+
+**A narrow input layer with wide later layers reaches the same accuracy as
+the uniform net with 30% fewer parameters** (5728 vs 8180). The input layer
+costs 784 parameters per neuron; the later layers cost 10–25. So the
+parameter-efficient shape is *narrow-in / wide-late*, and it is exactly the
+shape a per-parameter greedy growth criterion prefers.
+
+This **corrects the earlier "input-layer credit-assignment wall" reading**:
+the failures of the early grown runs were not caused by a narrow layer 0 per
+se (width 6 suffices) but by the *later* layers staying narrow too
+(`784→4→5→2`). Look-ahead does not rescue greedy selection either — measured
+at a trained `3×2`, growing the last hidden layer still wins after 12 AdamW
+passes (+210 vs +156 for the input layer, at 26 vs 1574 parameters), because
+the input layer's value only materializes once the later layers are wide.
+It is a *joint-allocation* problem, not a myopia problem.
+
+**Open problem, restated precisely:** steer certified growth to the
+narrow-in / wide-late shape — keep layer 0 small (≈6) while driving the
+later layers wide (≈24) — which would deliver ~90% at ~5.7k parameters,
+30% below the fixed-AdamW frontier. `configs/exp/E22_efficient_growth_10k.yaml`
+is the first attempt (per-parameter greedy growth); it does build the right
+shape (`784→12→16→23`) but over-grows the expensive input layer.
