@@ -125,3 +125,61 @@ def test_growth_requires_lemma35_admissibility_failure(tmp_path) -> None:
     # Transactions fail every epoch, yet no capacity is added.
     assert not result.growth_events
     assert all(entry.step_type != "GRO" for entry in result.history)
+
+
+def test_committed_family_does_not_veto_growth_when_lemma35_fails(tmp_path) -> None:
+    """The family step is KEPT and growth still happens when eps >= 1/2.
+
+    Under a functional whose infimum is not attained, some family step
+    always certifies, so without this the structural step is postponed for
+    ever while the network stays inadequate.
+    """
+    config = load_pipeline_config("configs/fgd/default.yaml")
+    config = replace(
+        config,
+        model=replace(config.model, hidden_size=2, number_hidden_layers=2),
+        training=replace(config.training, epochs=2, device="cpu", log_every=1),
+        fgd_approx=replace(
+            config.fgd_approx,
+            # Tangent cannot certify, so the ladder is consulted; the huge
+            # damping also keeps the state relative error above 1/2.
+            projection_damping=1e6,
+            theory_lr_search_steps=1,
+            theory_lr_search_refinements=0,
+            family_order=("tangent", "parametric_descent"),
+            family_rejection_cooldown=0,
+            growth_patience=1,
+            admissibility_failure_forces_growth=True,
+            rel_error_threshold=0.5,
+            # Judge the growth probe by certified descent, as the real
+            # configuration does; the rel-error improvement gate is blind
+            # to delta growth.
+            growth_select_by_descent=True,
+            growth_compute_delta=True,
+            growth_function_preserving=False,
+        ),
+        parametric_descent=replace(
+            config.parametric_descent,
+            inner_steps=(1,),
+            functional_learning_rates=(0.5,),
+            min_progress=1e-12,     # accept almost anything: it must commit
+        ),
+        secant_fgd=replace(config.secant_fgd, enabled=False),
+        scaling_line_search=replace(config.scaling_line_search, iterations=0),
+        wandb=replace(config.wandb, enabled=False),
+        run=replace(
+            config.run,
+            results_dir=tmp_path,
+            save_plot=False,
+            show_plot=False,
+        ),
+    )
+
+    lines: list[str] = []
+    result = run_pipeline(config=config, progress=lines.append)
+
+    committed = [line for line in lines if "does not postpone" in line]
+    # The family committed (its step was kept) ...
+    assert committed, "expected a committed family step under Lemma-3.5 failure"
+    # ... and the structural step happened anyway in the same run.
+    assert result.growth_events

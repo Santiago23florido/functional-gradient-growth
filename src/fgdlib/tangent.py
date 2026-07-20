@@ -131,6 +131,16 @@ class FGDApproxConfig:
     # so the linear C_glob envelope is unavailable for it -- see
     # report/CROSS_ENTROPY_FGD.md.
     functional_loss: FunctionalLoss = "mse"
+    # When Lemma 3.5 fails on the committed state (eps >=
+    # rel_error_threshold) a successful family step does NOT cancel the
+    # growth probe. Needed for any functional whose infimum is not attained
+    # -- under cross-entropy some family step always certifies (more
+    # confidence always lowers the loss), so growth would be postponed for
+    # ever while the structure stays inadequate. Self-limiting through eps,
+    # so it needs no parameter budget: once the reachable set can represent
+    # the functional gradient again, eps drops below the threshold and the
+    # override switches itself off. Default False.
+    admissibility_failure_forces_growth: bool = False
     # Require the paper's structural criterion before growing: capacity is
     # increased only when Lemma 3.5 fails on the committed state, i.e. when
     # the relative error reaches rel_error_threshold and the reachable set

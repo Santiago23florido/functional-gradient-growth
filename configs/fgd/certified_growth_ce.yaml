@@ -104,6 +104,11 @@ fgd_approx:
   # global PL constant, so the C_glob linear envelope is left undefined.
   # See report/CROSS_ENTROPY_FGD.md.
   functional_loss: cross_entropy
+  # Cross-entropy's infimum is not attained (f_c -> inf), so SOME family
+  # step always certifies. Without this the structural step would be
+  # postponed for ever while the network stays inadequate. Self-limiting
+  # through eps -- no parameter budget involved.
+  admissibility_failure_forces_growth: true
   local_acceptance_conditions: true
   eps: 1.0e-12
   tiny_use_covariance: true

@@ -4374,28 +4374,58 @@ def run_pipeline(
                         f"{family_rejection_cooldown} accepted outer step(s) "
                         "or growth)"
                     )
+                # A committed family step normally cancels growth: the
+                # structure was not exhausted after all. That reasoning
+                # breaks for a functional whose infimum is not attained
+                # (cross-entropy: more confidence always lowers the loss),
+                # because then SOME family step always certifies and growth
+                # is postponed for ever, however inadequate the structure.
+                # When Lemma 3.5 declares the reachable set unable to
+                # represent r (eps >= rel_error_threshold), a family step
+                # improves WITHIN an inadequate set and must not veto the
+                # structural step.
+                admissibility_failed = (
+                    config.fgd_approx.admissibility_failure_forces_growth
+                    and fgd_sensor_valid is True
+                    and rel_error is not None
+                    and rel_error >= config.fgd_approx.rel_error_threshold
+                )
+
                 for family_name in fallback_families:
                     if not growth_triggered:
                         break
                     if _family_on_cooldown(family_name):
                         continue
+                    committed = False
                     if family_name == "rkhs_head":
-                        if _attempt_rkhs_head_stage(in_ladder=True):
-                            growth_triggered = False
-                        else:
-                            family_rejection_step[family_name] = (
-                                fgd_accepted_outer_steps
-                            )
+                        committed = _attempt_rkhs_head_stage(in_ladder=True)
                     elif family_name in (
                         "parametric_gd",
                         "parametric_descent",
                     ):
-                        if _attempt_parametric_stage(family_name):
-                            growth_triggered = False
-                        else:
-                            family_rejection_step[family_name] = (
-                                fgd_accepted_outer_steps
-                            )
+                        committed = _attempt_parametric_stage(family_name)
+                    if not committed:
+                        # The family declined: remember it and let the next
+                        # family in the ladder try.
+                        family_rejection_step[family_name] = (
+                            fgd_accepted_outer_steps
+                        )
+                        continue
+                    # The family step IS kept either way -- it certified, so
+                    # it commits. The only question is whether it also
+                    # postpones the structural step.
+                    if not admissibility_failed:
+                        growth_triggered = False
+                        break
+                    if progress is not None:
+                        progress(
+                            f"[FGD] Epoch {epoch}: {family_name} committed, "
+                            f"but eps={rel_error:.3f} >= "
+                            f"{config.fgd_approx.rel_error_threshold} "
+                            "(Lemma 3.5 fails), so it does not postpone "
+                            "growth"
+                        )
+                    break
 
                 if growth_triggered:
                     # Structure-burst patience: nothing committed this
