@@ -190,3 +190,38 @@ def test_blind_immediate_eps_falls_back_to_relieving_the_bottleneck() -> None:
         )
         == []
     )
+
+
+def test_relief_target_is_the_second_smallest_width() -> None:
+    """How far to buy is DERIVED, not chosen.
+
+    While one location is the unique minimum it alone pins rank J, so
+    purchases there are mandated. The moment the minimum becomes shared,
+    relieving that location no longer lifts the cap. Levelling to the
+    second-smallest width is exactly where the mandate ends.
+    """
+    from fgdlib.unified_growth import bottleneck_relief_target
+
+    assert bottleneck_relief_target([2, 9, 9]) == (0, 9)
+    assert bottleneck_relief_target([7, 3, 5]) == (1, 5)
+
+
+def test_no_mandate_when_the_minimum_is_shared() -> None:
+    """Two locations at the minimum: relieving one alone lifts nothing."""
+    from fgdlib.unified_growth import bottleneck_relief_target
+
+    assert bottleneck_relief_target([2, 2, 9]) is None
+    assert bottleneck_relief_target([5, 5, 5]) is None
+    assert bottleneck_relief_target([4]) is None
+    assert bottleneck_relief_target([]) is None
+
+
+def test_relief_amount_never_depends_on_a_constant() -> None:
+    """The amount is read off the structure, so nothing is presumed about
+    a dataset that has never been trained on."""
+    from fgdlib.unified_growth import bottleneck_relief_target
+
+    for second in (3, 17, 260):
+        index, target = bottleneck_relief_target([2, second, second + 5])
+        assert index == 0
+        assert target == second

@@ -81,6 +81,41 @@ def rank_limiting_locations(widths: list[int]) -> list[int]:
     return [index for index, width in enumerate(widths) if width == narrowest]
 
 
+def bottleneck_relief_target(widths: list[int]) -> tuple[int, int] | None:
+    """The location the rank cap mandates buying, and how far.
+
+    Returns ``(index, target_width)`` when exactly one location attains the
+    minimum width, else ``None``.
+
+    The *how far* is derived, not chosen. While ``l*`` is the **unique**
+    minimum, ``rank J <= w_l*`` and that location alone caps the reachable
+    set's dimension, so purchases there are mandated. The moment the minimum
+    becomes **shared**, relieving ``l*`` on its own no longer lifts the cap,
+    because the other location at the minimum still pins it. "Unique
+    minimum" is therefore exactly the condition under which single-location
+    buying is mandated, and levelling to the second-smallest width is where
+    that mandate ends.
+
+    Nothing here is a budget: the amount is read off the current widths, so
+    nothing is presumed about a dataset that has never been trained on. It
+    is the same rank inequality already used to decide *where*, read once
+    more to decide *how much*.
+
+    This is what fixes the pace. Buying one neuron per growth event made
+    each purchase wait for R1 to fire again: measured on MNIST from 3x2, 20
+    events across 44 epochs, with accuracy at 72.5 % by epoch 30 where the
+    incumbent reached 88.7 % by epoch 14. Relieving to the level the mandate
+    covers collapses that into a single event without loosening any
+    criterion.
+    """
+    if len(widths) < 2:
+        return None
+    ordered = sorted(widths)
+    if ordered[0] == ordered[1]:
+        return None                      # the minimum is shared: no mandate
+    return widths.index(ordered[0]), ordered[1]
+
+
 @dataclass(frozen=True)
 class Candidate:
     """A structural proposal, priced and scored.

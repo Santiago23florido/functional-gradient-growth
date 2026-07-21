@@ -59,6 +59,7 @@ from fgdlib.gromo_setup import ensure_gromo_importable
 from fgdlib.depth import insert_identity_layer
 from fgdlib.unified_growth import (
     Candidate,
+    bottleneck_relief_target,
     rank_candidates,
     rank_limiting_locations,
 )
@@ -4680,6 +4681,84 @@ def run_pipeline(
                             for layer in model._growable_layers
                         ]
                         bottlenecks = set(rank_limiting_locations(widths))
+                        ceiling_binds_precheck = (
+                            validation_certificate.relative_error is not None
+                            and validation_certificate.relative_error
+                            >= config.fgd_approx.rel_error_threshold
+                        )
+                        # The rank cap mandates not only WHERE to buy but
+                        # how far: while one location is the unique minimum
+                        # it alone pins rank J, and the mandate ends exactly
+                        # when the minimum becomes shared. Levelling there
+                        # in one event is what the inequality already says;
+                        # buying one neuron per event merely made each
+                        # purchase wait for R1 again.
+                        relief = bottleneck_relief_target(widths)
+                        if (
+                            relief is not None
+                            and ceiling_binds_precheck
+                        ):
+                            relief_index, target_width = relief
+                            added = 0
+                            while (
+                                int(
+                                    model._growable_layers[
+                                        relief_index
+                                    ].in_features
+                                )
+                                < target_width
+                            ):
+                                try:
+                                    grow_layer(
+                                        model=model,
+                                        train_loader=train_loader,
+                                        layer_index=relief_index,
+                                        device=device,
+                                        line_search_config=(
+                                            config.scaling_line_search
+                                        ),
+                                        optimal_update_kwargs=unified_kwargs,
+                                        progress=None,
+                                        function_preserving=True,
+                                        preservation_tolerance=(
+                                            config.fgd_approx
+                                            .growth_preservation_tolerance
+                                        ),
+                                    )
+                                except RuntimeError as error:
+                                    if progress is not None:
+                                        progress(
+                                            f"[GRO-WARN] Epoch {epoch}: "
+                                            f"bottleneck relief at "
+                                            f"{relief_index} stopped: {error}"
+                                        )
+                                    break
+                                added += 1
+                            if added:
+                                growth_result = GrowthResult(
+                                    layer_index=relief_index,
+                                    best_scaling_factor=1.0,
+                                    best_train_loss=float("nan"),
+                                    line_search=[],
+                                )
+                                layer_index = relief_index
+                                selected_layer_index = relief_index
+                                if progress is not None:
+                                    progress(
+                                        f"[GRO] Epoch {epoch}: rank cap "
+                                        f"relieved at location "
+                                        f"{relief_index}, widened to "
+                                        f"{target_width} (+{added} neurons); "
+                                        "the minimum is now shared, so the "
+                                        "mandate ends"
+                                    )
+                                widths = [
+                                    int(layer.in_features)
+                                    for layer in model._growable_layers
+                                ]
+                                bottlenecks = set(
+                                    rank_limiting_locations(widths)
+                                )
                         ceiling_binds = (
                             validation_certificate.relative_error is not None
                             and validation_certificate.relative_error
