@@ -50,6 +50,37 @@ from dataclasses import dataclass
 __all__ = ["Candidate", "expansion_value", "rank_candidates"]
 
 
+def rank_limiting_locations(widths: list[int]) -> list[int]:
+    """Growable locations whose width caps the reachable set's dimension.
+
+    For a composition ``W_L sigma ... sigma W_1`` the tangent image obeys
+
+        rank J <= min_l w_l ,
+
+    so while some layer sits at that minimum, **no purchase anywhere else
+    can raise the dimension of what the structure can express**. Buying
+    width in an already-wide layer refines within a subspace whose dimension
+    is pinned by the narrow one.
+
+    This is why a pure value-per-parameter ranking starves the input
+    projection, and it is not a heuristic to be traded off: it is what
+    Lemma 3.5's quantity is *about*. eps measures how well the reachable set
+    expresses r; if the set's dimension is capped, eps is capped with it.
+    Measured, the failure is stark -- ranking by value per parameter bought
+    the three cheapest locations for eps reductions of 0.001 to 0.004 each
+    and then stalled with eps at 1.87, structure 784->2->3->4, because every
+    cheap purchase was refining inside a rank-2 image.
+
+    Returns every index attaining the minimum, so the caller may still rank
+    among them by value per parameter -- the constraint says *where the
+    dimension can be lifted*, not which of those to buy.
+    """
+    if not widths:
+        return []
+    narrowest = min(widths)
+    return [index for index, width in enumerate(widths) if width == narrowest]
+
+
 @dataclass(frozen=True)
 class Candidate:
     """A structural proposal, priced and scored.
@@ -64,6 +95,10 @@ class Candidate:
     index: int
     cost: int
     relative_error_after: float | None
+    # True when this purchase raises min_l w_l, i.e. lifts the cap on
+    # rank J and therefore on what eps can ever reach. See
+    # rank_limiting_locations.
+    relieves_rank_ceiling: bool = False
 
 
 def expansion_value(
@@ -96,6 +131,7 @@ def rank_candidates(
     relative_error_before: float | None,
     gradient_sq_norm: float | None,
     statistical_threshold: float = 1e-3,
+    rank_ceiling_binds: bool = False,
 ) -> list[Candidate]:
     """Return the candidates worth buying, best value-per-parameter first.
 
@@ -107,6 +143,13 @@ def rank_candidates(
     zero and is never admitted; if none does, the returned list is empty and
     the structure is already minimal-adequate for this step (R3).
     """
+    # While Lemma 3.5 is unsatisfied and some location caps the rank, only
+    # purchases that lift the cap can change what eps is able to reach.
+    # Ranking among the rest is refining inside a pinned subspace.
+    binding = [c for c in candidates if c.relieves_rank_ceiling]
+    if rank_ceiling_binds and binding:
+        candidates = binding
+
     scored: list[tuple[float, Candidate]] = []
     for candidate in candidates:
         value = expansion_value(
@@ -119,6 +162,26 @@ def rank_candidates(
         scored.append((value / max(candidate.cost, 1), candidate))
 
     if not scored:
+        # Nothing measurably enlarged the reachable set *immediately*. That
+        # is not the same as nothing being worth buying: a
+        # function-preserving extension adds directions whose value only
+        # materialises once they are trained, so the immediate eps is blind
+        # to them -- measured earlier for width, where immediate eps ranked
+        # every candidate as worse while look-ahead eps discriminated
+        # cleanly. Falling straight through to "terminate" on that evidence
+        # is what left the structure at 784->2->3->4 with eps at 1.87.
+        #
+        # When the rank ceiling is the binding constraint the theory still
+        # dictates the move regardless of the immediate reading, so the
+        # caller is handed the cheapest bottleneck relief instead of a
+        # termination.
+        fallback = [
+            candidate
+            for candidate in candidates
+            if candidate.kind == "width" and candidate.relieves_rank_ceiling
+        ]
+        if fallback:
+            return [min(fallback, key=lambda item: (item.cost, item.index))]
         return []
 
     best = max(value for value, _ in scored)

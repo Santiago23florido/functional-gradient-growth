@@ -57,7 +57,11 @@ from fgdlib.rkhs import (
 )
 from fgdlib.gromo_setup import ensure_gromo_importable
 from fgdlib.depth import insert_identity_layer
-from fgdlib.unified_growth import Candidate, rank_candidates
+from fgdlib.unified_growth import (
+    Candidate,
+    rank_candidates,
+    rank_limiting_locations,
+)
 from fgdlib.growth import (
     GrowthResult,
     ScalingLineSearchConfig,
@@ -4668,6 +4672,19 @@ def run_pipeline(
                             model, config.data.in_features
                         )
                         base_parameters = count_parameters(model)
+                        # rank J <= min_l w_l: while a location sits at the
+                        # minimum, no purchase elsewhere can raise what the
+                        # structure is able to express.
+                        widths = [
+                            int(layer.in_features)
+                            for layer in model._growable_layers
+                        ]
+                        bottlenecks = set(rank_limiting_locations(widths))
+                        ceiling_binds = (
+                            validation_certificate.relative_error is not None
+                            and validation_certificate.relative_error
+                            >= config.fgd_approx.rel_error_threshold
+                        )
                         candidates: list[Candidate] = []
                         trials: dict[tuple[str, int], GrowingMLP] = {}
 
@@ -4720,6 +4737,9 @@ def run_pipeline(
                                         1,
                                     ),
                                     relative_error_after=_certificate_for(trial),
+                                    relieves_rank_ceiling=(
+                                        candidate_layer in bottlenecks
+                                    ),
                                 )
                             )
 
@@ -4756,6 +4776,7 @@ def run_pipeline(
                             statistical_threshold=(
                                 config.fgd_approx.tiny_statistical_threshold
                             ),
+                            rank_ceiling_binds=ceiling_binds,
                         )
                         if ranked:
                             # R3: buy the best proposal. Re-measuring after
