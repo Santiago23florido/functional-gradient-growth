@@ -462,10 +462,43 @@ $\varepsilon<\tfrac12$ the reachable set represents $r$, the ordinary
 admissible-step machinery of the paper applies, and adding parameters would
 be unjustified.
 
-**(d) What it gets wrong: the cost of a parameter is wildly anisotropic,
-and uniform widening ignores it.** For $784\to w_1\to w_2\to w_3\to 10$ the
-parameter count is dominated by the input layer, $784w_1$ against $w_1w_2$
-and $w_2w_3$:
+**(d) What it gets wrong: the neuron-selection rule is blind to what a
+neuron costs.**
+
+First, precisely who decides what. `growth_uniform` does **not** mean "add
+the same number of neurons everywhere". It means every hidden layer is
+*offered* a growth; **TINY decides, per layer, both which neurons to add and
+how many**. The count is the rank of $P=S^{-1/2}N$ retained by GroMo's
+truncation (`gromo/utils/tools.py`):
+
+```python
+selected_singular_values = s >= min(statistical_threshold, s.max())
+if maximum_added_neurons is not None:
+    selected_singular_values[maximum_added_neurons:] = False
+```
+
+so a layer receives one neuron per singular value of $P$ above
+`statistical_threshold`, capped at `maximum_added_neurons`. The measured
+trajectories show this is genuinely adaptive, not uniform:
+
+| | widths after each growth | added per layer |
+|---|---|---|
+| CE | $[2,2,2]\to[4,4,6]\to[8,8,10]$ | $+2,+2,+4$ then $+4,+4,+4$ |
+| MSE | $[2,2,2]\to[4,4,5]\to[8,8,9]$ | $+2,+2,+3$ then $+4,+4,+4$ |
+
+In the first growth layers 0 and 1 were *threshold*-limited (2 significant
+directions) while layer 2 took the cap. In the second growth **every layer
+hit the cap of 4**, so `tiny_maximum_added_neurons: 4` was the binding
+constraint on the final architecture — an arbitrary constant shaping the
+result.
+
+Now the defect. The truncation compares $s_i$ against an **absolute**
+threshold, and $s_i$ is the certified first-order loss decrease contributed
+by that neuron. But the *cost* of a neuron is not uniform: one in $w_1$
+carries $784+\text{fan}_{\text{out}}+1$ parameters, one in $w_3$ about 19.
+The rule therefore buys decrease without asking its price. For
+$784\to w_1\to w_2\to w_3\to 10$ the parameter count is dominated by the
+input layer, $784w_1$ against $w_1w_2$ and $w_2w_3$:
 
 | architecture | params | spent on the input layer |
 |---|---|---|
@@ -476,41 +509,55 @@ and $w_2w_3$:
 
 The found network spends **96 % of its budget on one layer and 272
 parameters on everything after it** — it is very nearly a linear map
-followed by a token head. A neuron in $w_1$ costs 784 parameters; a neuron
-in $w_3$ costs about 10. Uniform widening buys them at the same rate,
-which is why the search stopped at a shape that is *good* but not
+followed by a token head. Because the truncation is cost-blind, a direction
+in $w_1$ worth $s_i$ is bought at 784 parameters while a direction in $w_3$
+worth the same $s_i$ costs 19 — and both are accepted on the same test. The
+search therefore stopped at a shape that is *good* but not
 parameter-optimal: the hand-picked $784\to6\to24\to24$ reaches 89.95 % with
 13 % fewer parameters, and $784\to6\to32\to32$ has room for more at
 comparable cost.
 
-Note this is the **opposite** failure to R2's (§6.2). R2 ranked by
-$\Delta\varepsilon$ per parameter and therefore *always* chose the cheap
-late layer, starving $w_1$ until the input bottleneck destroyed the run
-(64.4 %). Uniform widening never starves $w_1$, but overpays for it. The
-truth is between them, and the reason neither greedy rule finds it is
-structural: the harm of a narrow $w_1$ is a **rank constraint**,
-$\operatorname{rank} J \le \min_\ell w_\ell$, which is a global property of
-the composition, while $\Delta\varepsilon$ at the current point is a local
-derivative that cannot see it. Measured effective rank confirms the
-constraint binds: width $4\to$ rank 4, $14\to11$, $64\to19$, $256\to47$.
+Note this is the **opposite** failure to R2's (§6.2). R2 ranked whole
+*layers* by $\Delta\varepsilon$ per parameter and therefore always chose the
+cheap late layer, starving $w_1$ until the input bottleneck destroyed the
+run (64.4 %). Offering every layer never starves $w_1$, but overpays for it.
+The reason the layer-ranking rule fails is structural: the harm of a narrow
+$w_1$ is a **rank constraint**, $\operatorname{rank} J \le \min_\ell w_\ell$,
+a global property of the composition, while $\Delta\varepsilon$ at the
+current point is a local derivative that cannot see it. Measured effective
+rank confirms the constraint binds: width $4\to$ rank 4, $14\to11$,
+$64\to19$, $256\to47$.
+
+Crucially, the cost correction does **not** have to be applied at layer
+granularity, which is what made R2 myopic. It belongs on the individual
+neuron, inside the truncation that already exists — see §6.8.1.
 
 ### 6.8 What to consider for the next implementation
 
 In priority order, each with the measurement that motivates it.
 
-1. **Decouple the input layer from the hidden ones.** This is the single
-   highest-value change and §6.7(d) is its justification. Uniform widening
-   over $\{w_2,\dots,w_{L-1}\}$ with $w_1$ governed separately keeps R2's
-   virtue (spend where parameters are cheap) without its vice (starving the
-   rank). $w_1$ should still grow, but on the criterion that actually
-   detects its failure — a **rank/spectral** test on the input Jacobian,
-   not a marginal $\Delta\varepsilon$ per parameter.
-2. **Make the growth *amount* certified, not fixed.** `tiny_maximum_added_neurons: 4`
-   is currently a constant, and it is the last unjustified number in the
-   loop. The natural certified replacement is to add the number of
-   directions needed to bring $\varepsilon$ below $\tfrac12$, read off the
-   spectrum of the projection residual — the same eigendecomposition the
-   `exact_kernel_eigh` solver already computes.
+1. **Make TINY's truncation cost-aware.** This is the single
+   highest-value change and §6.7(d) is its justification. GroMo currently
+   keeps a direction when $s_i \ge \tau$. Since $s_i$ *is* the certified
+   first-order loss decrease of that neuron, the scale-correct test is
+   decrease **per parameter**,
+
+   $$\frac{s_i}{c_i}\;\ge\;\tau', \qquad c_i=\text{fan}_{\text{in}}(\ell)+\text{fan}_{\text{out}}(\ell)+1,$$
+
+   which is the same $\Delta$-per-parameter currency R2 used, but applied to
+   an **individual neuron inside every layer at once** rather than to whole
+   layers in competition. That is precisely why it escapes R2's failure
+   mode: no layer can be starved by another winning a ranking, because
+   there is no ranking — each layer keeps exactly the directions that pay
+   for themselves. It also needs no new machinery: $s_i$ and $c_i$ are both
+   already available at the truncation site.
+2. **Make the growth *amount* certified, not capped.** With (1) in place,
+   `tiny_maximum_added_neurons` should be removable, which matters because
+   the measurements in §6.7(d) show the cap was the **binding constraint on
+   every layer** in the second growth — an arbitrary constant currently
+   shapes the final architecture. The principled stopping point is the
+   number of directions needed to bring $\varepsilon$ below $\tfrac12$
+   (Lemma 3.5), read off the same spectrum.
 3. **Validate dataset-agnosticism on a second dataset.** Everything above is
    one dataset and one seed. The repo already ships
    `make_cifar10_dataloaders` and the `cifar_*` config fields, so the claim
