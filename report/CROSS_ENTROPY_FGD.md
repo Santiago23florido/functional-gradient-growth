@@ -406,3 +406,124 @@ Claimed, and certified per step:
   and cheaper than the baseline*, not provably optimal.
 * the linear global contraction $C_{\mathrm{glob}}$ under CE — §3.3: no PL
   constant exists, and the $O(1/T)$ convex rate of §3.4 replaces it.
+
+### 6.6 The controlled experiment: R1 is loss-agnostic
+
+The two configurations `search_ce_uniform.yaml` and `search_mse.yaml` are
+byte-identical except for one key, `functional_loss`. Both start from
+$3\times2$ on MNIST, both run 80 epochs with no budget and no schedule:
+
+| certified loss | best test | params | architecture | growths |
+|---|---|---|---|---|
+| **cross-entropy** | **90.25 %** | 6552 | $784\to8\to8\to10\to10$ | 2 (epochs 2, 4) |
+| sum-MSE | 88.45 % | 6533 | $784\to8\to8\to9\to10$ | 2 (epochs 2, 3) |
+
+This is the experiment that separates the two claims that were previously
+entangled:
+
+* **The search is loss-agnostic.** Same number of growths, same growth
+  epochs to within one, final parameter counts differing by 0.3 %. R1 is a
+  monotonicity test on $\varepsilon$, and $\varepsilon$ is a property of the
+  reachable set rather than of the loss scale, so it transports across
+  functionals exactly as §6.1 argued. It is not a threshold that happened to
+  be tuned for cross-entropy.
+* **The accuracy gap is the loss, and only the loss.** With the structure
+  held equal by construction, cross-entropy is worth **+1.8 points**. This
+  is §4's mechanism measured in isolation: $r^{\mathrm{MSE}}=2(f-Y)$
+  vanishes at the *finite* point $f=Y$, so certified descent actively pushes
+  confident logits back down and fights the argmax metric; $r^{\mathrm{CE}}
+  =p-Y$ vanishes only as $f_c\to\infty$, so certified descent never opposes
+  margin.
+
+The best configuration is therefore **cross-entropy + R1 + uniform
+widening**, and the reason it is best is now attributable rather than
+assumed.
+
+### 6.7 Why it works — and the one thing it gets wrong
+
+Three mechanisms explain the result, and honesty requires naming the fourth
+that it does *not* get right.
+
+**(a) The certified functional no longer fights the metric.** §6.6, +1.8
+points at equal parameters.
+
+**(b) The limit criterion is measurable under either functional.** The
+progress floor $C_{\mathrm{prog}}$ is a statement about the loss, and the
+loss is not comparable across functionals whose infima differ in
+attainability — under CE it never fired at all (1 growth in 80 epochs,
+50.25 %). $\varepsilon$ is a normalised angle between $r$ and the reachable
+set, so its *evolution* is meaningful for any $L$.
+
+**(c) Growth is early and then stops.** Both runs added all their capacity
+in the first 3–4 epochs and then trained a fixed structure for 76 more.
+This is the correct shape for a certified method: growth is a *structural*
+step taken when Lemma 3.5 fails, not a continuous process. Once
+$\varepsilon<\tfrac12$ the reachable set represents $r$, the ordinary
+admissible-step machinery of the paper applies, and adding parameters would
+be unjustified.
+
+**(d) What it gets wrong: the cost of a parameter is wildly anisotropic,
+and uniform widening ignores it.** For $784\to w_1\to w_2\to w_3\to 10$ the
+parameter count is dominated by the input layer, $784w_1$ against $w_1w_2$
+and $w_2w_3$:
+
+| architecture | params | spent on the input layer |
+|---|---|---|
+| $784\to8\to8\to10$ (found) | 6552 | 6280 — **96 %** |
+| $784\to10\to10\to10$ (dense baseline) | 8180 | 7850 — 96 % |
+| $784\to6\to24\to24$ (hand-picked) | 5728 | 4710 — 82 % |
+| $784\to6\to32\to32$ | 6320 | 4710 — 75 % |
+
+The found network spends **96 % of its budget on one layer and 272
+parameters on everything after it** — it is very nearly a linear map
+followed by a token head. A neuron in $w_1$ costs 784 parameters; a neuron
+in $w_3$ costs about 10. Uniform widening buys them at the same rate,
+which is why the search stopped at a shape that is *good* but not
+parameter-optimal: the hand-picked $784\to6\to24\to24$ reaches 89.95 % with
+13 % fewer parameters, and $784\to6\to32\to32$ has room for more at
+comparable cost.
+
+Note this is the **opposite** failure to R2's (§6.2). R2 ranked by
+$\Delta\varepsilon$ per parameter and therefore *always* chose the cheap
+late layer, starving $w_1$ until the input bottleneck destroyed the run
+(64.4 %). Uniform widening never starves $w_1$, but overpays for it. The
+truth is between them, and the reason neither greedy rule finds it is
+structural: the harm of a narrow $w_1$ is a **rank constraint**,
+$\operatorname{rank} J \le \min_\ell w_\ell$, which is a global property of
+the composition, while $\Delta\varepsilon$ at the current point is a local
+derivative that cannot see it. Measured effective rank confirms the
+constraint binds: width $4\to$ rank 4, $14\to11$, $64\to19$, $256\to47$.
+
+### 6.8 What to consider for the next implementation
+
+In priority order, each with the measurement that motivates it.
+
+1. **Decouple the input layer from the hidden ones.** This is the single
+   highest-value change and §6.7(d) is its justification. Uniform widening
+   over $\{w_2,\dots,w_{L-1}\}$ with $w_1$ governed separately keeps R2's
+   virtue (spend where parameters are cheap) without its vice (starving the
+   rank). $w_1$ should still grow, but on the criterion that actually
+   detects its failure — a **rank/spectral** test on the input Jacobian,
+   not a marginal $\Delta\varepsilon$ per parameter.
+2. **Make the growth *amount* certified, not fixed.** `tiny_maximum_added_neurons: 4`
+   is currently a constant, and it is the last unjustified number in the
+   loop. The natural certified replacement is to add the number of
+   directions needed to bring $\varepsilon$ below $\tfrac12$, read off the
+   spectrum of the projection residual — the same eigendecomposition the
+   `exact_kernel_eigh` solver already computes.
+3. **Validate dataset-agnosticism on a second dataset.** Everything above is
+   one dataset and one seed. The repo already ships
+   `make_cifar10_dataloaders` and the `cifar_*` config fields, so the claim
+   "transfers to data never trained on" is testable by changing only the
+   data block. Until that is run, the claim is *designed for*, not
+   *demonstrated*.
+4. **Repeat with several seeds.** The 1.8-point CE/MSE gap and the 0.1-point
+   margin over the dense baseline come from single runs. The first is large
+   enough to trust; **the second is not** — 90.25 % vs 90.15 % is well
+   inside seed noise, and the honest headline is *"matches the dense
+   baseline with 20 % fewer parameters"*, not *"beats it"*.
+5. **Do not reintroduce a budget or a schedule to fix any of this.** Every
+   number that governs the loop must be a comparison between measured
+   certificate quantities. That constraint is what makes the method
+   transferable, and it is also what forced R1 into existence — the tuned
+   floor could not survive a change of functional.
