@@ -4661,23 +4661,26 @@ def run_pipeline(
                         costs = growable_neuron_costs(
                             model, config.data.in_features
                         )
-                        spectra = [
+                        measured = [
                             expansion_spectrum(
                                 model, train_loader, index, device, alloc_kwargs
                             )
                             for index in growable
                         ]
-                        # The budget is the TOTAL neurons this event may
-                        # buy, pooled across locations -- not a per-layer
-                        # cap. With a per-layer cap the pool never exceeds
-                        # the budget early on (a width-w layer offers only w
-                        # directions), every candidate is accepted and the
-                        # allocation silently degenerates to uniform, which
-                        # is exactly what was measured: [4, 4, 4].
+                        spectra = [item[0] for item in measured]
+                        incumbents = [item[1] for item in measured]
+                        # No budget: a neuron is admitted iff it buys at
+                        # least as much certified first-order decrease per
+                        # parameter as the layer's existing weights do by
+                        # being re-optimised. Nothing has to be guessed
+                        # about an unseen dataset, and the rule
+                        # self-terminates as the structure becomes
+                        # efficient.
                         allocation = allocate_by_expansion_per_parameter(
                             spectra,
                             costs,
-                            config.fgd_approx.tiny_maximum_added_neurons,
+                            incumbents,
+                            config.fgd_approx.tiny_statistical_threshold,
                         )
                         growth_result = None
                         for index, neurons in enumerate(allocation):
@@ -4718,7 +4721,10 @@ def run_pipeline(
                             progress(
                                 f"[GRO] Expansion-per-parameter growth at "
                                 f"epoch {epoch}: allocation {allocation} "
-                                f"over neuron costs {costs}"
+                                f"over neuron costs {costs}; growing beat "
+                                f"tuning at "
+                                f"{sum(1 for a in allocation if a)} of "
+                                f"{len(allocation)} locations"
                             )
                     elif (
                         config.fgd_approx.growth_selection

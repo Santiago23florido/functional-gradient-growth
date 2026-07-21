@@ -294,8 +294,14 @@ def expansion_spectrum(
     layer_index: int,
     device: torch.device,
     optimal_update_kwargs: dict[str, Any] | None = None,
-) -> list[float]:
-    """Per-neuron expansion scores at ``layer_index``: the ``s_i^2``.
+) -> tuple[list[float], float]:
+    """Per-neuron expansion scores at ``layer_index``, and the incumbent rate.
+
+    Returns ``(spectrum, incumbent_efficiency)`` where ``spectrum`` holds the
+    ``s_i^2`` of each candidate neuron and ``incumbent_efficiency`` is the
+    first-order decrease per parameter that the layer's EXISTING weights buy
+    by being re-optimised. The two are in the same units, which is what lets
+    :func:`allocate_by_expansion_per_parameter` decide without a budget.
 
     :func:`rank_layer_expansion_score` returns their sum, which is the
     location's total first-order loss decrease. This returns the individual
@@ -316,10 +322,19 @@ def expansion_spectrum(
     model.compute_optimal_updates(**(optimal_update_kwargs or {}))
 
     spectrum: list[float] = []
+    incumbent = 0.0
     for layer in getattr(model, "_growing_layers", []):
         eigenvalues = getattr(layer, "eigenvalues_extension", None)
         if eigenvalues is not None:
             spectrum.extend(float(value) ** 2 for value in eigenvalues)
+        # The decrease the layer's EXISTING parameters buy by being
+        # re-optimised, per parameter. Same units as s_i^2, so the two are
+        # directly comparable -- this is what removes the need for a budget.
+        decrease = getattr(layer, "parameter_update_decrease", None)
+        if decrease is not None:
+            count = sum(p.numel() for p in layer.parameters())
+            if count:
+                incumbent += float(decrease) / count
 
     model.reset_computation()
     for layer in getattr(model, "_growing_layers", []):
@@ -327,46 +342,86 @@ def expansion_spectrum(
             layer.delete_update(include_previous=True)
     model.currently_updated_layer_index = None
     model.zero_grad(set_to_none=True)
-    return spectrum
+    return spectrum, incumbent
 
 
 def allocate_by_expansion_per_parameter(
     spectra: list[list[float]],
     costs: list[int],
-    total_neurons: int,
+    incumbent_efficiencies: list[float],
+    statistical_threshold: float = 1e-3,
 ) -> list[int]:
-    """Spend ``total_neurons`` on the neurons that pay for themselves best.
+    """Grow exactly where growing beats *tuning*. No budget, no threshold.
 
-    Every candidate neuron from every location is pooled and ranked by
+    GroMo reports two first-order decreases in the same units
+    (``growing_module.py``)::
 
-        s_i^2 / cost(location)
+        L(A + dA) = L(A) - t * parameter_update_decrease + o(t)     # tuning
+        L(A + dA) = L(A) - t * sigma'(0) * sum(s_i^2) + o(t)        # growing
 
-    the certified first-order loss decrease per parameter it costs, and the
-    budget is spent down that list. Returns how many neurons each location
-    won.
+    so a candidate neuron and the parameters already present can be compared
+    directly, per parameter. A neuron is admitted iff
 
-    This is a *neuron*-level criterion evaluated with all locations pooled,
-    which is what distinguishes it from R2. R2 ranked whole layers by
-    decrease per parameter and therefore always bought the cheap late layer,
-    starving the input projection until the run collapsed (784->2->2->14,
-    64.4%). Here a location that holds one genuinely valuable direction
-    still wins its slot even when its neurons are expensive, because the
-    comparison is per candidate rather than per layer.
+        s_i^2 / cost_i  >=  parameter_update_decrease_l / P_l
 
-    The budget replaces a threshold: no tuned constant decides what "pays
-    for itself" means, only how much is spent per growth event.
+    i.e. iff it buys at least as much certified first-order decrease per
+    parameter as the layer's existing parameters do by being re-optimised.
+
+    Two properties this has and a budget does not:
+
+    * **No free constant.** The right-hand side is measured on the network
+      itself, so nothing has to be guessed about a dataset that has never
+      been trained on. A parameter budget presumes the answer -- how large
+      the final structure should be -- which is precisely what the search is
+      supposed to discover.
+    * **It self-terminates.** As the structure becomes efficient the
+      incumbent efficiency rises, so fewer candidates clear it, and growth
+      stops on its own rather than on exhausting an allowance.
+
+    Pooling at *neuron* granularity is what separates this from the refuted
+    R2, which ranked whole layers by decrease per parameter and therefore
+    always bought the cheap late layer, starving the input projection
+    (784->2->2->14, 64.4 %). Here each candidate is judged against its own
+    layer's incumbent, so no location can be starved by another winning a
+    ranking.
+
+    ``incumbent_efficiencies`` is accepted for signature stability and is
+    logged as a diagnostic; see the note below on why it is not used as the
+    admission test.
+
+    **Measured and rejected: the incumbent-efficiency test.** Comparing a
+    candidate against ``parameter_update_decrease_l / P_l`` looks like the
+    natural budget-free rule -- "grow only where growing beats tuning" -- and
+    the two quantities really are in the same units. They are not comparable
+    in *character*, though, and the run says so immediately: at a 3x2 start
+    the incumbents measure 0.734, 1.58 and 0.135 against candidate
+    efficiencies of 1.2e-3, 5.8e-4 and 3.5e-5, so nothing ever clears and the
+    allocation is ``[0, 0, 0]`` for ever. The reason is temporal, not
+    numerical: the decrease from re-optimising existing weights is
+    *transient* -- it is consumed by taking the step, and the certified
+    families already take it every epoch -- whereas a new neuron is
+    *permanent capacity*. Tuning six parameters for 4.4 of decrease will
+    always look more efficient than 787 parameters for 0.93, right up until
+    tuning saturates. The comparison is left in the code as a logged
+    diagnostic and not as a gate.
+
+    What is used instead introduces **no new constant**: GroMo's own
+    truncation rule, ``s >= min(statistical_threshold, s.max())`` -- keep
+    everything above the threshold, but always keep at least the best
+    candidate -- applied to the cost-normalised quantity rather than to the
+    raw singular values. The knob is the one already in the config; only the
+    quantity it judges is corrected.
     """
-    pooled: list[tuple[float, int]] = []
+    allocation = [0] * len(spectra)
     for location, spectrum in enumerate(spectra):
         cost = max(costs[location], 1)
-        pooled.extend((value / cost, location) for value in spectrum)
-    pooled.sort(key=lambda item: -item[0])
-
-    allocation = [0] * len(spectra)
-    for value, location in pooled[:total_neurons]:
-        if value <= 0.0:
-            break
-        allocation[location] += 1
+        efficiencies = [value / cost for value in spectrum if value > 0.0]
+        if not efficiencies:
+            continue
+        reference = min(statistical_threshold, max(efficiencies))
+        allocation[location] = sum(
+            1 for value in efficiencies if value >= reference
+        )
     return allocation
 
 
