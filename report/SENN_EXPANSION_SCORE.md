@@ -189,12 +189,49 @@ recomputation, grew layer 2 ten times in a row and never touched layer 0.
 
 ---
 
-## 5. Status
+## 5. The measured A/B — and what it actually showed
 
-The theory is validated and the criterion is implemented, tested and
-config-selectable (`growth_selection: natural_expansion`, with
-`tiny_use_fisher: true`). Whether it **beats** uniform widening end-to-end is
-an empirical question that the A/B run against the incumbent
-(90.25 % @ 6552, `784→8→8→10`) settles — and R2 is the standing reminder that
-a criterion which looks correct in isolation can still fail in the loop. The
-result is recorded here either way.
+Three *where* criteria, identical in every other respect (same seeds, same
+batch size, no budget, no schedule), from a $3\times2$ start on MNIST under
+cross-entropy:
+
+| *where* criterion | best test | params | growths | architecture |
+|---|---|---|---|---|
+| uniform widening | **90.25 %** | 6552 | 2 | $784\to8\to8\to10$ |
+| SENN natural expansion | 88.70 % | 6552 | 2 | $784\to8\to8\to10$ |
+| expansion per parameter | 88.85 % | 5774 | 5 | $784\to7\to10\to9$ |
+
+**SENN and uniform widening found the identical architecture and still
+differ by 1.55 points.** That single fact governs the reading of the whole
+table: the spread between criteria is *training-trajectory variance at fixed
+architecture*, not architecture quality. No single-run comparison here can
+separate one criterion from another — and by the same token, the incumbent's
+0.1-point margin over the dense AdamW baseline (90.15 % @ 8180) was never a
+margin at all.
+
+So the honest conclusion is not "SENN loses". It is:
+
+> **The *where* is not the bottleneck.** The search converges to
+> 5 800–6 600 parameters from a two-neuron start regardless of how capacity
+> is allocated among layers. What determines the outcome is *when the search
+> stops* — Lemma 3.5's $\varepsilon<\tfrac12$ — which is the part of the
+> method that carries the theory.
+
+That is a positive result about the method's stability and it sharpens where
+further work belongs. It also means the comparison must be re-run across
+seeds before any of these numbers is quoted as a result; that sweep is what
+`scripts/seed_sweep.py` exists for.
+
+### What each criterion is still worth
+
+- **Expansion per parameter** reached comparable accuracy at **12 % fewer
+  parameters** (5774 against 6552) and produced the narrow-in/wide-late shape
+  the dense frontier rewards, without that shape being imposed. Whether the
+  parameter saving survives seeding is exactly the open question.
+- **SENN's score** is the cheapest of the three to evaluate (§3) and remains
+  the one with an exact bridge to the certified quantity (§1). Its value here
+  is that ranking locations costs $L$ statistics passes instead of $L$ model
+  clones plus $13L$ passes.
+- **Uniform widening** remains the default: nothing measured yet displaces it,
+  and a criterion that is not measurably better should not become the default
+  merely because it is better motivated.
