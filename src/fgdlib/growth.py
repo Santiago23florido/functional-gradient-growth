@@ -263,6 +263,63 @@ def _function_preserving_growth(
     )
 
 
+def rank_layer_expansion_score(
+    model: GrowingMLP,
+    train_loader: torch.utils.data.DataLoader,
+    layer_index: int,
+    device: torch.device,
+    optimal_update_kwargs: dict[str, Any] | None = None,
+) -> float:
+    """SENN's natural expansion score for growing ``layer_index``.
+
+    Returns ``sum(s_i^2)`` over the retained TINY singular values, which
+    GroMo documents (``growing_module.py``) as the extension's first-order
+    effect on the loss::
+
+        L(A + dA) = L(A) - t * sigma'(0) * (eigenvalues_extension ** 2).sum()
+
+    That first-order decrease is exactly SENN's expansion-score increase for
+    this location (arXiv:2307.04526, Theorem 3.2), computed from the layer's
+    Kronecker factors: ``tensor_s_growth()`` is the input activation second
+    moment (KFAC's ``A``) and, with ``use_fisher=True`` in
+    ``optimal_update_kwargs``, ``covariance_loss_gradient()`` supplies the
+    output-side factor ``S``. Without that flag the score is TINY's, in the
+    plain Euclidean output metric rather than SENN's Fisher one.
+
+    The point of this helper is cost. It stops after the statistics pass and
+    the SVD, so ranking L candidate layers costs L statistics passes instead
+    of L * (1 + line_search.iterations) passes plus L model clones -- the
+    golden-section search is then paid once, on the winner, inside
+    :func:`grow_layer`. This is why SENN can afford to answer *where* from
+    curvature instead of from trial growths.
+
+    The model is left with its update tensors cleared, so a subsequent
+    :func:`grow_layer` on the chosen layer starts from a clean state.
+    """
+    model.set_growing_layers(index=layer_index)
+    compute_statistics(
+        model,
+        train_loader,
+        loss_function=torch.nn.MSELoss(reduction="sum"),
+        device=device,
+    )
+    model.compute_optimal_updates(**(optimal_update_kwargs or {}))
+
+    score = 0.0
+    for layer in getattr(model, "_growing_layers", []):
+        eigenvalues = getattr(layer, "eigenvalues_extension", None)
+        if eigenvalues is not None:
+            score += float(eigenvalues.pow(2).sum())
+
+    model.reset_computation()
+    for layer in getattr(model, "_growing_layers", []):
+        if hasattr(layer, "delete_update"):
+            layer.delete_update(include_previous=True)
+    model.currently_updated_layer_index = None
+    model.zero_grad(set_to_none=True)
+    return score
+
+
 def grow_layer(
     model: GrowingMLP,
     train_loader: torch.utils.data.DataLoader,

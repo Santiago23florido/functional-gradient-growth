@@ -33,7 +33,14 @@ ProjectionSolver = Literal[
 ]
 LearningRatePolicy = Literal["scheduler", "theory_interval"]
 GrowthLimitCriterion = Literal["progress_floor", "epsilon_stationary"]
-GrowthSelection = Literal["descent_per_parameter", "epsilon_lookahead"]
+GrowthSelection = Literal[
+    "descent_per_parameter",
+    "epsilon_lookahead",
+    # SENN (arXiv:2307.04526): rank by the RAW increase in the natural
+    # expansion score. Identical to "epsilon_lookahead" except that it does
+    # not divide by the added parameter count. See fgdlib/senn.py.
+    "natural_expansion",
+]
 FunctionalLoss = Literal["mse", "cross_entropy"]
 GlobalBoundAction = Literal["lr_then_growth", "grow", "ignore"]
 

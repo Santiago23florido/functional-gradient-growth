@@ -56,7 +56,12 @@ from fgdlib.rkhs import (
     KernelDictionaryModel,
 )
 from fgdlib.gromo_setup import ensure_gromo_importable
-from fgdlib.growth import GrowthResult, ScalingLineSearchConfig, grow_layer
+from fgdlib.growth import (
+    GrowthResult,
+    ScalingLineSearchConfig,
+    grow_layer,
+    rank_layer_expansion_score,
+)
 from fgdlib.growth_schedule import (
     GrowthScheduleConfig,
     layer_index_for_growth,
@@ -273,6 +278,10 @@ class _GrowthProbe:
     # grown clone). Positive means the reachable set genuinely expanded
     # toward r. See fgd_approx.growth_selection = "epsilon_lookahead".
     epsilon_reduction: float | None = None
+    # The pre-growth relative error the reduction above is measured from.
+    # SENN's expansion score is a nonlinear function of eps, so ranking by
+    # score needs the base point, not only the delta.
+    epsilon_before: float | None = None
 
 
 def _section_dataclass(
@@ -1391,6 +1400,7 @@ def _probe_fgd_growth(
                     count_parameters(trial_model) - base_parameter_count
                 ),
                 epsilon_reduction=epsilon_reduction,
+                epsilon_before=base_certificate.relative_error,
             )
         )
 
@@ -4629,7 +4639,82 @@ def run_pipeline(
 
             if growth_triggered:
                 if config.training.method == "fgd_approx":
-                    if config.fgd_approx.growth_uniform:
+                    if (
+                        config.fgd_approx.growth_selection
+                        == "natural_expansion"
+                    ):
+                        # SENN's where (arXiv:2307.04526). Its Ingredient 4
+                        # adds at the best location and REPEATS -- picking a
+                        # single layer per event is what starved the input
+                        # layer under R2, so the loop is part of the method,
+                        # not an embellishment.
+                        #
+                        # The addition budget is the number of growable
+                        # layers: exactly what uniform growth spends per
+                        # event, so the comparison isolates the ALLOCATION
+                        # and not the amount. SENN's own stopping rule uses
+                        # tuned tau/alpha thresholds, which this flow does
+                        # not adopt; the threshold-free part -- stop when no
+                        # location buys a first-order decrease -- is kept.
+                        senn_kwargs = tiny_optimal_update_kwargs(
+                            config.fgd_approx,
+                            compute_delta=config.fgd_approx.growth_compute_delta,
+                        )
+                        growable = list(
+                            range(len(getattr(model, "_growable_layers", [])))
+                        )
+                        growth_result = None
+                        allocation: list[int] = []
+                        for _ in growable:
+                            scores = [
+                                rank_layer_expansion_score(
+                                    model,
+                                    train_loader,
+                                    candidate,
+                                    device,
+                                    senn_kwargs,
+                                )
+                                for candidate in growable
+                            ]
+                            best = max(range(len(growable)), key=scores.__getitem__)
+                            if scores[best] <= config.fgd_approx.eps:
+                                break
+                            growth_result = grow_layer(
+                                model=model,
+                                train_loader=train_loader,
+                                layer_index=growable[best],
+                                device=device,
+                                line_search_config=config.scaling_line_search,
+                                optimal_update_kwargs=senn_kwargs,
+                                progress=None,
+                                function_preserving=(
+                                    config.fgd_approx.growth_function_preserving
+                                ),
+                                preservation_tolerance=(
+                                    config.fgd_approx
+                                    .growth_preservation_tolerance
+                                ),
+                                line_search_loader=(
+                                    validation_loader
+                                    if config.fgd_approx
+                                    .growth_scaling_on_validation
+                                    else None
+                                ),
+                            )
+                            allocation.append(growable[best])
+                        layer_index = (
+                            growth_result.layer_index
+                            if growth_result is not None
+                            else 0
+                        )
+                        selected_layer_index = layer_index
+                        if progress is not None:
+                            progress(
+                                f"[GRO] SENN expansion-score growth at epoch "
+                                f"{epoch}: added at layers {allocation} "
+                                f"(scores recomputed after each addition)"
+                            )
+                    elif config.fgd_approx.growth_uniform:
                         # Uniform growth: widen EVERY hidden layer together,
                         # tracing the balanced dense nets (3xk) from the tiny
                         # start. Sidesteps the greedy input-layer credit
