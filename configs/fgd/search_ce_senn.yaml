@@ -133,14 +133,21 @@ fgd_approx:
   tiny_omega_zero: false
   tiny_use_projection: true
   tiny_ignore_singular_values: false
-  # SENN needs BOTH Kronecker factors. Without this the SVD is preconditioned
-  # only by the input activation second moment (KFAC's A) and the score is
-  # TINY's, in the plain Euclidean output metric; with it the gradient
-  # covariance supplies the output-side factor S and the quantity becomes
-  # SENN's natural expansion score. The same SVD yields alpha/omega, so this
-  # also makes the new neurons' INITIAL weights SENN-optimal (Ingredient 2):
-  # score and initialization come from one decomposition and cannot disagree.
-  tiny_use_fisher: true
+  # MEASURED: leave this false. Enabling the output-side Kronecker factor
+  # makes the score rank layer 2 top (37.7 vs 11.0 for layer 0) while the
+  # scaling line search then rejects that very extension outright
+  # (best_scaling = 0.000, train_loss 0.187 -- the WORST of the three). In
+  # the end-to-end run 7 of 8 growth events took scaling 0, adding dead
+  # parameters, so eps never improved, R1 re-fired every epoch and the run
+  # stalled at 65.6%. The Fisher-preconditioned score was anti-correlated
+  # with the realized outcome here.
+  #
+  # This is also the metric SENN's own theory states (their 3.4: "for the
+  # purposes of simplicity we choose the euclidean metric, corresponding to
+  # F := (1/N) J^T J"), and the one the bridge identity in
+  # report/SENN_EXPANSION_SCORE.md is derived under. KFAC S (x) A is their
+  # practical approximation to it, not the definition.
+  tiny_use_fisher: false
   tiny_maximum_added_neurons: 4
   tiny_numerical_threshold: 1.0e-6
   tiny_statistical_threshold: 1.0e-3

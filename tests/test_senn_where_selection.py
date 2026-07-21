@@ -135,14 +135,25 @@ def test_ranking_never_runs_the_line_search(monkeypatch) -> None:
 
 
 def test_fisher_preconditioning_changes_the_score() -> None:
-    """`tiny_use_fisher` supplies SENN's output-side Kronecker factor.
+    """`tiny_use_fisher` selects the output metric the score is measured in.
 
-    Without it the score is TINY's, in the plain Euclidean output metric;
-    with it the SVD is preconditioned by the gradient covariance, which is
-    what makes the quantity SENN's natural expansion score -- and, because
-    the same SVD supplies alpha/omega, what makes the new neurons' INITIAL
-    weights SENN-optimal too (their Ingredient 2). Score and initialization
-    cannot disagree, because they come from one decomposition.
+    It is one decision, not two: the same SVD yields the singular values (the
+    score) and the singular vectors alpha/omega (the new neurons' initial
+    weights), so preconditioning moves both together. SENN's Ingredient 2 --
+    "choose the initialization that maximises Delta eta" -- is automatic here
+    for that reason, but so is the failure mode.
+
+    MEASURED, and why the shipped config leaves this off: with the Fisher
+    factor the score ranks layer 2 first (37.7 vs 11.0) while the scaling
+    line search then rejects that extension outright (scaling 0.000, worst
+    realised loss). End-to-end, 7 of 8 growth events took scaling 0 and the
+    run stalled at 65.6 % accumulating dead capacity. SENN's own theory is
+    stated in the Euclidean metric (their 3.4), which is also the metric the
+    bridge identity is derived under; KFAC is their approximation to it, and
+    at these widths it is not needed.
+
+    This test only pins that the flag is genuinely wired through to the
+    score, so the choice above stays a measured one rather than a no-op.
     """
     config, model, loader, device = _fixture()
     plain = tiny_optimal_update_kwargs(

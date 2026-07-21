@@ -92,17 +92,56 @@ quantity is already there:
   `covariance_loss_gradient()`, applied as
   `matrix_p = matrix_p @ matrix_e_inverse_sqrt`, gated by `tiny_use_fisher`.
 
-So **`tiny_use_fisher: true` turns TINY's computation into SENN's
-KFAC-preconditioned score**, and `sum(eigenvalues_extension**2)` reads it off.
+so `sum(eigenvalues_extension**2)` reads the score off directly, and
+`tiny_use_fisher` selects which output metric it is measured in.
 
-### Score and initialization cannot disagree
+### Score and initialization are one decision, which is why the metric matters
 
 The same SVD supplies both the singular values (the score) and the singular
-vectors $\alpha,\omega$ (the new neurons' initial weights). Ranking with the
-Fisher-preconditioned metric while initialising from the unpreconditioned
-decomposition would be incoherent; because both come from one factorisation,
-enabling `tiny_use_fisher` makes the *initialization* SENN-optimal too —
-their Ingredient 2, "choose the initialization that maximises $\Delta\eta$".
+vectors $\alpha,\omega$ (the new neurons' initial weights). They cannot be
+chosen independently: preconditioning the decomposition changes the ranking
+*and* the initialization together. SENN's Ingredient 2 — "choose the
+initialization that maximises $\Delta\eta$" — is therefore automatic here,
+but it also means a bad metric choice corrupts both at once.
+
+**Measured: enabling the Fisher factor does exactly that, and it must stay
+off.** On MNIST from $3\times2$ under cross-entropy:
+
+| `tiny_use_fisher` | layer | score | scaling chosen | train loss |
+|---|---|---|---|---|
+| false | 0 | 0.974 | 0.510 | 0.122 |
+| false | 1 | 0.0030 | 0.376 | 0.121 |
+| false | 2 | 0.0005 | 0.706 | **0.086** |
+| **true** | 0 | 11.02 | 0.749 | 0.137 |
+| **true** | 1 | 1.23 | 0.728 | 0.147 |
+| **true** | 2 | **37.69** | **0.000** | **0.187** |
+
+With the Fisher factor the score ranks layer 2 first by a wide margin, and
+the scaling line search then rejects that very extension outright — zero
+magnitude, worst realised loss of the three. The score is *anti-correlated*
+with the outcome. End-to-end the consequence was unambiguous: **7 of 8 growth
+events took scaling 0**, adding parameters that contribute nothing, so
+$\varepsilon$ never improved, R1 re-fired every epoch, and the run stalled at
+65.6 % while accumulating dead capacity.
+
+This is not a departure from SENN. Their §3.4 states the theory in the
+Euclidean output metric — "for the purposes of simplicity we choose the
+euclidean metric, corresponding to $F:=\tfrac1N J^{\!\top}\!J$" — which is
+also the metric the bridge identity $(\ast)$ is derived under. KFAC
+$S\otimes A$ is their *practical approximation* to that matrix, adopted
+because the full Fisher is intractable at their scale; at the widths here the
+approximation is not needed and, measured, it hurts.
+
+### A pre-existing mismatch this exposed
+
+`grow_layer` and `rank_layer_expansion_score` both accumulate GroMo's
+statistics with `torch.nn.MSELoss(reduction="sum")` **hard-coded**
+(`src/fgdlib/growth.py`), regardless of `functional_loss`. So under
+cross-entropy the growth machinery — the delta, the score and the line search
+— is computed against a *different* objective from the one the certificates
+govern. This predates SENN and affects uniform widening identically, so it
+does not confound the A/B; but it is a real inconsistency and belongs on the
+list in `CROSS_ENTROPY_FGD.md` §6.8.
 
 ### Cost
 
