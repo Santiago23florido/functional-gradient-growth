@@ -45,6 +45,10 @@ GrowthSelection = Literal[
     # and pooled, which is what separates it from the refuted per-LAYER
     # ranking. See fgdlib/growth.py:allocate_by_expansion_per_parameter.
     "expansion_per_parameter",
+    # Width AND depth in one certified ranking, both applied
+    # function-preservingly so growth never touches f. See
+    # fgdlib/unified_growth.py.
+    "unified_expansion",
 ]
 FunctionalLoss = Literal["mse", "cross_entropy"]
 GlobalBoundAction = Literal["lr_then_growth", "grow", "ignore"]

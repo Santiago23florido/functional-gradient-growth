@@ -122,6 +122,20 @@ def insert_identity_layer(
         if hasattr(layer, "previous_module"):
             layer.previous_module = rebuilt[index - 1] if index else None
     model.layers = nn.ModuleList(rebuilt)
+
+    # Refresh GroMo's own bookkeeping. ``GrowingMLP.__init__`` sets
+    # ``_growable_layers = list(self.layers[1:])`` ONCE
+    # (``containers/growing_mlp.py``), so without this the container keeps a
+    # stale list: the inserted layer would never be selectable for widening
+    # and the growable indices would no longer correspond to positions in
+    # ``layers``. Rebuilding it the same way the constructor does, and then
+    # re-running ``set_growing_layers``, keeps every downstream GroMo call
+    # -- ``compute_statistics``, ``compute_optimal_updates``,
+    # ``reset_computation`` -- operating on the real graph.
+    if hasattr(model, "_growable_layers"):
+        model._growable_layers = list(model.layers[1:])
+    if hasattr(model, "set_growing_layers"):
+        model.set_growing_layers(scheduling_method="all")
     return inserted
 
 

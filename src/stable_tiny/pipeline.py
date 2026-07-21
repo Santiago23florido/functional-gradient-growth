@@ -56,6 +56,8 @@ from fgdlib.rkhs import (
     KernelDictionaryModel,
 )
 from fgdlib.gromo_setup import ensure_gromo_importable
+from fgdlib.depth import insert_identity_layer
+from fgdlib.unified_growth import Candidate, rank_candidates
 from fgdlib.growth import (
     GrowthResult,
     ScalingLineSearchConfig,
@@ -4643,6 +4645,145 @@ def run_pipeline(
             if growth_triggered:
                 if config.training.method == "fgd_approx":
                     if (
+                        config.fgd_approx.growth_selection
+                        == "unified_expansion"
+                    ):
+                        # Width AND depth in one certified ranking.
+                        #
+                        # Both kinds are applied FUNCTION-PRESERVINGLY, so
+                        # the structural step leaves f untouched: the loss
+                        # cannot move, Prop. 3.8's descent certificate can
+                        # never be violated by growing, and every change in
+                        # eps is attributable to range(J) alone. Training
+                        # descends; growth enlarges what can be descended
+                        # along.
+                        unified_kwargs = tiny_optimal_update_kwargs(
+                            config.fgd_approx,
+                            compute_delta=config.fgd_approx.growth_compute_delta,
+                        )
+                        growable = list(
+                            range(len(getattr(model, "_growable_layers", [])))
+                        )
+                        neuron_costs = growable_neuron_costs(
+                            model, config.data.in_features
+                        )
+                        base_parameters = count_parameters(model)
+                        candidates: list[Candidate] = []
+                        trials: dict[tuple[str, int], GrowingMLP] = {}
+
+                        def _certificate_for(trial: GrowingMLP) -> float | None:
+                            measured = evaluate_fgd_validation_certificate(
+                                model=trial,
+                                data_loader=validation_loader,
+                                device=device,
+                                config=config.fgd_approx,
+                                learning_rate=None,
+                                probe=fgd_validation_probe,
+                            )
+                            return measured.relative_error
+
+                        for candidate_layer in growable:
+                            trial = copy.deepcopy(model)
+                            try:
+                                grow_layer(
+                                    model=trial,
+                                    train_loader=train_loader,
+                                    layer_index=candidate_layer,
+                                    device=device,
+                                    line_search_config=config.scaling_line_search,
+                                    optimal_update_kwargs=unified_kwargs,
+                                    progress=None,
+                                    function_preserving=True,
+                                    preservation_tolerance=(
+                                        config.fgd_approx
+                                        .growth_preservation_tolerance
+                                    ),
+                                )
+                            except RuntimeError:
+                                continue
+                            trials[("width", candidate_layer)] = trial
+                            candidates.append(
+                                Candidate(
+                                    kind="width",
+                                    index=candidate_layer,
+                                    cost=max(
+                                        count_parameters(trial)
+                                        - base_parameters,
+                                        1,
+                                    ),
+                                    relative_error_after=_certificate_for(trial),
+                                )
+                            )
+
+                        for position in range(1, len(model.layers)):
+                            trial = copy.deepcopy(model)
+                            try:
+                                insert_identity_layer(
+                                    trial, position=position, device=device
+                                )
+                            except (ValueError, TypeError):
+                                continue
+                            trials[("depth", position)] = trial
+                            candidates.append(
+                                Candidate(
+                                    kind="depth",
+                                    index=position,
+                                    cost=max(
+                                        count_parameters(trial)
+                                        - base_parameters,
+                                        1,
+                                    ),
+                                    relative_error_after=_certificate_for(trial),
+                                )
+                            )
+
+                        ranked = rank_candidates(
+                            candidates,
+                            relative_error_before=(
+                                validation_certificate.relative_error
+                            ),
+                            gradient_sq_norm=(
+                                validation_certificate.gradient_sq_norm
+                            ),
+                            statistical_threshold=(
+                                config.fgd_approx.tiny_statistical_threshold
+                            ),
+                        )
+                        if ranked:
+                            # R3: buy the best proposal. Re-measuring after
+                            # each purchase would be ideal but doubles the
+                            # cost; one purchase per event keeps every step
+                            # attributable to a single measured certificate.
+                            chosen = ranked[0]
+                            model = trials[(chosen.kind, chosen.index)]
+                            growth_result = GrowthResult(
+                                layer_index=chosen.index,
+                                best_scaling_factor=1.0,
+                                best_train_loss=float("nan"),
+                                line_search=[],
+                            )
+                            layer_index = chosen.index
+                            selected_layer_index = (
+                                chosen.index if chosen.kind == "width" else None
+                            )
+                            if progress is not None:
+                                progress(
+                                    f"[GRO] Unified growth at epoch {epoch}: "
+                                    f"{chosen.kind} at index {chosen.index} "
+                                    f"(+{chosen.cost} params, eps "
+                                    f"{validation_certificate.relative_error:.3f}"
+                                    f" -> {chosen.relative_error_after:.3f}); "
+                                    f"{len(candidates)} candidates considered"
+                                )
+                        else:
+                            growth_triggered = False
+                            if progress is not None:
+                                progress(
+                                    f"[GRO] Epoch {epoch}: no width or depth "
+                                    "candidate enlarged the reachable set; "
+                                    "structure left unchanged"
+                                )
+                    elif (
                         config.fgd_approx.growth_selection
                         == "expansion_per_parameter"
                     ):

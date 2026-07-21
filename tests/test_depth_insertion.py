@@ -120,3 +120,53 @@ def test_depth_cost_is_comparable_to_neuron_cost() -> None:
     # be decided by a separate policy from width.
     assert depth_cost < neuron_costs[0]
     assert depth_cost > min(neuron_costs[1:])
+
+
+def test_insertion_refreshes_gromo_bookkeeping() -> None:
+    """The inserted layer must become a first-class GroMo growable layer.
+
+    ``GrowingMLP.__init__`` builds ``_growable_layers`` once, so an insertion
+    that does not refresh it leaves the container describing the OLD graph:
+    the new layer could never be widened and the growable indices would stop
+    matching positions in ``layers``. Everything downstream --
+    compute_statistics, compute_optimal_updates, the TINY spectrum -- reads
+    that list.
+    """
+    model, _, device = _model(hidden_size=6)
+    growable_before = len(model._growable_layers)
+
+    inserted = insert_identity_layer(model, position=2, device=device)
+
+    assert len(model._growable_layers) == growable_before + 1
+    assert inserted in model._growable_layers
+    # The list must mirror the real graph, in order.
+    assert list(model._growable_layers) == list(model.layers[1:])
+    # And GroMo's selection machinery still works on the new chain.
+    assert model._growing_layers
+
+
+def test_a_grown_model_still_widens_after_an_insertion() -> None:
+    """End-to-end: insert a layer, then grow one -- GroMo must cope."""
+    import torch as _torch
+
+    from fgdlib.growth import rank_layer_expansion_score
+    from fgdlib.tangent import tiny_optimal_update_kwargs
+
+    model, config, device = _model(hidden_size=6)
+    insert_identity_layer(model, position=2, device=device)
+
+    _torch.manual_seed(0)
+    inputs = _torch.randn(64, config.data.in_features)
+    targets = _torch.randn(64, config.data.out_features)
+    loader = _torch.utils.data.DataLoader(
+        _torch.utils.data.TensorDataset(inputs, targets), batch_size=32
+    )
+    kwargs = tiny_optimal_update_kwargs(config.fgd_approx, compute_delta=True)
+
+    # Every location, including the freshly inserted one, must be scorable.
+    scores = [
+        rank_layer_expansion_score(model, loader, index, device, kwargs)
+        for index in range(len(model._growable_layers))
+    ]
+    assert len(scores) == len(model._growable_layers)
+    assert all(score >= 0.0 for score in scores)
