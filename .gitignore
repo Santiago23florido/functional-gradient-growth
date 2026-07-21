@@ -15,3 +15,7 @@ wandb/
 
 # Local report notes.
 report/README_FGD_GROWTH_MODEL.md
+
+# Third-party reference papers (cite by arXiv id, do not vendor).
+report/*.pdf
+*:Zone.Identifier
