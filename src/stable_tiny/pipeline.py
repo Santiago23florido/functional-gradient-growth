@@ -4699,7 +4699,15 @@ def run_pipeline(
                                         .growth_preservation_tolerance
                                     ),
                                 )
-                            except RuntimeError:
+                            except RuntimeError as error:
+                                # A skipped candidate is a candidate removed
+                                # from the search; it must never be silent.
+                                if progress is not None:
+                                    progress(
+                                        f"[GRO-WARN] Epoch {epoch}: width "
+                                        f"candidate at {candidate_layer} "
+                                        f"could not be built: {error}"
+                                    )
                                 continue
                             trials[("width", candidate_layer)] = trial
                             candidates.append(

@@ -9,7 +9,7 @@
 # no per-dataset threshold, so the method transfers unchanged to data that
 # has never been trained on.
 run:
-  name: fgd_search_ce_unified
+  name: fgd_search_ce_unified_3x2
   results_dir: results
   save_plot: false
   show_plot: false
@@ -27,11 +27,17 @@ data:
   mnist_validation_samples: 2000
   mnist_test_samples: 2000
 
-# The minimal start the theory allows: ONE hidden layer of ONE neuron.
-# Width and depth are both discovered, neither is given.
+# Start at 3x2, the incumbent's start. MEASURED reason: the value-per-
+# parameter hierarchy only exists when cheap late locations are available.
+# At two hidden layers of width 8 the ranking spans 39,000x -- a neuron on a
+# cheap late layer scores 0.101 per parameter, one on the 784-wide input
+# projection 2.6e-6, with depth in between at 4.3e-4. Starting from a single
+# hidden layer removes every cheap location, so each purchase costs 795 and
+# the search burns parameters at the worst available rate until Lemma 3.5
+# stops it (measured: 784->9->10, 7165 params, 89.0%).
 model:
-  hidden_size: 1
-  number_hidden_layers: 1
+  hidden_size: 2
+  number_hidden_layers: 3
   model_seed: 0
 
 training:
@@ -302,7 +308,7 @@ wandb:
   run_name:
   group: fgd-growth
   job_type: train
-  tags: [fgd_approx, certified_growth, mnist, from_3x2, cross_entropy, unified, from_1x1]
+  tags: [fgd_approx, certified_growth, mnist, from_3x2, cross_entropy, unified, from_3x2]
   notes: Algorithm 5 - certified growth-and-train from a 3x2 network, no parameter budget
   mode: online
   dir: results

@@ -230,16 +230,30 @@ def _function_preserving_growth(
 
     model.eval()
     drift = 0.0
+    scale = 1.0
     with torch.no_grad():
         for batch_x, output_before in reference:
             batch_drift = float(
                 torch.max(torch.abs(model(batch_x) - output_before)).item()
             )
             drift = max(drift, batch_drift)
-    if not math.isfinite(drift) or drift > preservation_tolerance:
+            scale = max(scale, float(torch.max(torch.abs(output_before)).item()))
+    # RELATIVE tolerance. The check must certify that the represented
+    # function is unchanged, and "unchanged" for a float32 network is a
+    # statement about significant digits, not about an absolute magnitude:
+    # a 784-term dot product accumulates ~1e-6 of rounding on logits of
+    # order 10 while being exactly correct. An absolute 1e-6 therefore
+    # rejects arithmetically perfect growths -- measured, 1.371e-6 -- and,
+    # where the caller skips failed candidates, silently removes them from
+    # the search. Scaling by the output magnitude (floored at 1, so small
+    # outputs keep an absolute guarantee) tests the thing actually meant.
+    allowed = preservation_tolerance * scale
+    if not math.isfinite(drift) or drift > allowed:
         raise RuntimeError(
             "Function-preserving growth exceeded its output tolerance: "
-            f"{drift:.3e} > {preservation_tolerance:.3e}."
+            f"{drift:.3e} > {allowed:.3e} "
+            f"(relative tolerance {preservation_tolerance:.3e} "
+            f"x output scale {scale:.3e})."
         )
 
     train_loss, _ = evaluate_model(
