@@ -59,7 +59,10 @@ from fgdlib.gromo_setup import ensure_gromo_importable
 from fgdlib.growth import (
     GrowthResult,
     ScalingLineSearchConfig,
+    allocate_by_expansion_per_parameter,
+    expansion_spectrum,
     grow_layer,
+    growable_neuron_costs,
     rank_layer_expansion_score,
 )
 from fgdlib.growth_schedule import (
@@ -4640,6 +4643,84 @@ def run_pipeline(
             if growth_triggered:
                 if config.training.method == "fgd_approx":
                     if (
+                        config.fgd_approx.growth_selection
+                        == "expansion_per_parameter"
+                    ):
+                        # Every candidate NEURON from every location, pooled
+                        # and ranked by certified first-order decrease per
+                        # parameter it costs. The budget -- what uniform
+                        # widening spends per event -- replaces a threshold,
+                        # so no tuned constant decides what "worth it" means.
+                        alloc_kwargs = tiny_optimal_update_kwargs(
+                            config.fgd_approx,
+                            compute_delta=config.fgd_approx.growth_compute_delta,
+                        )
+                        growable = list(
+                            range(len(getattr(model, "_growable_layers", [])))
+                        )
+                        costs = growable_neuron_costs(
+                            model, config.data.in_features
+                        )
+                        spectra = [
+                            expansion_spectrum(
+                                model, train_loader, index, device, alloc_kwargs
+                            )
+                            for index in growable
+                        ]
+                        # The budget is the TOTAL neurons this event may
+                        # buy, pooled across locations -- not a per-layer
+                        # cap. With a per-layer cap the pool never exceeds
+                        # the budget early on (a width-w layer offers only w
+                        # directions), every candidate is accepted and the
+                        # allocation silently degenerates to uniform, which
+                        # is exactly what was measured: [4, 4, 4].
+                        allocation = allocate_by_expansion_per_parameter(
+                            spectra,
+                            costs,
+                            config.fgd_approx.tiny_maximum_added_neurons,
+                        )
+                        growth_result = None
+                        for index, neurons in enumerate(allocation):
+                            if neurons <= 0:
+                                continue
+                            growth_result = grow_layer(
+                                model=model,
+                                train_loader=train_loader,
+                                layer_index=growable[index],
+                                device=device,
+                                line_search_config=config.scaling_line_search,
+                                optimal_update_kwargs={
+                                    **alloc_kwargs,
+                                    "maximum_added_neurons": neurons,
+                                },
+                                progress=None,
+                                function_preserving=(
+                                    config.fgd_approx.growth_function_preserving
+                                ),
+                                preservation_tolerance=(
+                                    config.fgd_approx
+                                    .growth_preservation_tolerance
+                                ),
+                                line_search_loader=(
+                                    validation_loader
+                                    if config.fgd_approx
+                                    .growth_scaling_on_validation
+                                    else None
+                                ),
+                            )
+                        layer_index = (
+                            growth_result.layer_index
+                            if growth_result is not None
+                            else 0
+                        )
+                        selected_layer_index = layer_index
+                        if progress is not None:
+                            progress(
+                                f"[GRO] Expansion-per-parameter growth at "
+                                f"epoch {epoch}: allocation {allocation} "
+                                f"over neuron costs {costs}"
+                            )
+                    elif (
                         config.fgd_approx.growth_selection
                         == "natural_expansion"
                     ):

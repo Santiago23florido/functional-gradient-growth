@@ -263,6 +263,113 @@ def _function_preserving_growth(
     )
 
 
+def growable_neuron_costs(
+    model: GrowingMLP, input_features: int
+) -> list[int]:
+    """Parameter cost of ONE neuron added at each growable location.
+
+    Growing ``_growable_layers[i]`` widens its *input* dimension, so each new
+    neuron costs its incoming weights and bias in the preceding layer, plus
+    its outgoing weights in this one::
+
+        cost_i = fan_in_i + 1 + growable[i].out_features
+
+    The spread is the whole point: on MNIST from 3x2 this is 787 parameters
+    at the input projection against 5 and 13 later -- a factor of ~150 that
+    an absolute singular-value threshold cannot see.
+    """
+    growable = list(getattr(model, "_growable_layers", []))
+    costs: list[int] = []
+    for index, layer in enumerate(growable):
+        fan_in = (
+            input_features if index == 0 else growable[index - 1].in_features
+        )
+        costs.append(int(fan_in) + 1 + int(layer.out_features))
+    return costs
+
+
+def expansion_spectrum(
+    model: GrowingMLP,
+    train_loader: torch.utils.data.DataLoader,
+    layer_index: int,
+    device: torch.device,
+    optimal_update_kwargs: dict[str, Any] | None = None,
+) -> list[float]:
+    """Per-neuron expansion scores at ``layer_index``: the ``s_i^2``.
+
+    :func:`rank_layer_expansion_score` returns their sum, which is the
+    location's total first-order loss decrease. This returns the individual
+    terms, so candidate *neurons* can be compared across locations rather
+    than whole layers -- the granularity at which a cost correction escapes
+    the starvation that per-layer ranking produced (R2).
+
+    Same cost as the ranking: one statistics pass and one SVD, no line
+    search and no model clone. The model is left untouched.
+    """
+    model.set_growing_layers(index=layer_index)
+    compute_statistics(
+        model,
+        train_loader,
+        loss_function=torch.nn.MSELoss(reduction="sum"),
+        device=device,
+    )
+    model.compute_optimal_updates(**(optimal_update_kwargs or {}))
+
+    spectrum: list[float] = []
+    for layer in getattr(model, "_growing_layers", []):
+        eigenvalues = getattr(layer, "eigenvalues_extension", None)
+        if eigenvalues is not None:
+            spectrum.extend(float(value) ** 2 for value in eigenvalues)
+
+    model.reset_computation()
+    for layer in getattr(model, "_growing_layers", []):
+        if hasattr(layer, "delete_update"):
+            layer.delete_update(include_previous=True)
+    model.currently_updated_layer_index = None
+    model.zero_grad(set_to_none=True)
+    return spectrum
+
+
+def allocate_by_expansion_per_parameter(
+    spectra: list[list[float]],
+    costs: list[int],
+    total_neurons: int,
+) -> list[int]:
+    """Spend ``total_neurons`` on the neurons that pay for themselves best.
+
+    Every candidate neuron from every location is pooled and ranked by
+
+        s_i^2 / cost(location)
+
+    the certified first-order loss decrease per parameter it costs, and the
+    budget is spent down that list. Returns how many neurons each location
+    won.
+
+    This is a *neuron*-level criterion evaluated with all locations pooled,
+    which is what distinguishes it from R2. R2 ranked whole layers by
+    decrease per parameter and therefore always bought the cheap late layer,
+    starving the input projection until the run collapsed (784->2->2->14,
+    64.4%). Here a location that holds one genuinely valuable direction
+    still wins its slot even when its neurons are expensive, because the
+    comparison is per candidate rather than per layer.
+
+    The budget replaces a threshold: no tuned constant decides what "pays
+    for itself" means, only how much is spent per growth event.
+    """
+    pooled: list[tuple[float, int]] = []
+    for location, spectrum in enumerate(spectra):
+        cost = max(costs[location], 1)
+        pooled.extend((value / cost, location) for value in spectrum)
+    pooled.sort(key=lambda item: -item[0])
+
+    allocation = [0] * len(spectra)
+    for value, location in pooled[:total_neurons]:
+        if value <= 0.0:
+            break
+        allocation[location] += 1
+    return allocation
+
+
 def rank_layer_expansion_score(
     model: GrowingMLP,
     train_loader: torch.utils.data.DataLoader,

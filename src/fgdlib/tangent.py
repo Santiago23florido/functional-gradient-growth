@@ -40,6 +40,11 @@ GrowthSelection = Literal[
     # expansion score. Identical to "epsilon_lookahead" except that it does
     # not divide by the added parameter count. See fgdlib/senn.py.
     "natural_expansion",
+    # Pool every candidate NEURON from every location and rank by certified
+    # first-order decrease per parameter it costs, s_i^2 / cost. Neuron-level
+    # and pooled, which is what separates it from the refuted per-LAYER
+    # ranking. See fgdlib/growth.py:allocate_by_expansion_per_parameter.
+    "expansion_per_parameter",
 ]
 FunctionalLoss = Literal["mse", "cross_entropy"]
 GlobalBoundAction = Literal["lr_then_growth", "grow", "ignore"]
