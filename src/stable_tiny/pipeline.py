@@ -1282,44 +1282,78 @@ def _growth_reduces_lookahead_epsilon(
     train_loader: torch.utils.data.DataLoader,
     validation_loader: torch.utils.data.DataLoader,
     probe: tuple[torch.Tensor, torch.Tensor] | None,
-    current_relative_error: float,
     device: torch.device,
     config: PipelineConfig,
 ) -> bool:
     """Generalised R1: is the structure inadequate despite eps < 1/2?
 
     Asks the only question that separates "this small net is enough" (MNIST)
-    from "this net is rank-limited and grinding" (CIFAR): does adding
-    capacity at the bottleneck reach a strictly lower relative error than the
-    current structure holds?
+    from "this net is rank-limited and grinding" (CIFAR): after the SAME
+    amount of further training, does a structure that grew the bottleneck
+    reach a strictly lower relative error than one that did not?
+
+    The comparison must be apples-to-apples. More capacity almost always
+    lowers eps a little, so comparing a grown-and-trained clone against the
+    untrained current point trivially favours growth -- and does so even on
+    MNIST, where the structure is already adequate. The fair test trains
+    BOTH a grown clone and a stay clone for the same
+    ``growth_lookahead_steps`` and compares them: growth is warranted only
+    when growing reaches a lower eps than simply training longer would. That
+    is exactly "the structure, not the training, is the binding constraint".
 
     The bottleneck is the width-minimum growable location -- ``rank J <=
-    min_l w_l``, so that is where added capacity can raise what the reachable
-    set expresses. The candidate is grown function-preservingly (so the
-    comparison isolates capacity, not a lucky re-initialisation) and trained
-    for ``growth_lookahead_steps`` certified steps; its held-out eps is then
-    compared to ``current_relative_error``. Growth is warranted only when the
-    grown structure beats the current one by more than ``tiny_statistical_
-    threshold`` in relative terms -- the same margin the truncation uses, so
-    no new constant enters and numerical jitter cannot force endless growth.
+    min_l w_l`` -- grown function-preservingly so the comparison isolates
+    capacity, not a lucky re-initialisation. The margin reuses
+    ``tiny_statistical_threshold``: no new constant, and numerical jitter
+    cannot force endless growth.
 
-    Returns True when growth is warranted. False reproduces today's stop, so
-    with the flag off (the default) this is never called and behaviour is
-    unchanged.
+    Returns True only when growth beats training. With the flag off (the
+    default) this is never called and behaviour is unchanged.
     """
     widths = [int(layer.in_features) for layer in model._growable_layers]
     limiting = rank_limiting_locations(widths)
     if not limiting:
         return False
     bottleneck = limiting[0]
+    steps = config.fgd_approx.growth_lookahead_steps
 
-    trial = copy.deepcopy(model)
+    def _epsilon_after_training(candidate: GrowingMLP) -> float | None:
+        trained = _train_parametric_gd_candidate(
+            base_model=candidate,
+            train_batches=train_batches,
+            device=device,
+            functional_learning_rate=(
+                config.parametric_descent.functional_learning_rates[0]
+            ),
+            steps=steps,
+            config=config.parametric_descent,
+            functional_loss=config.fgd_approx.functional_loss,
+        )
+        if trained is None:
+            return None
+        certificate = evaluate_fgd_validation_certificate(
+            model=trained,
+            data_loader=validation_loader,
+            device=device,
+            config=config.fgd_approx,
+            learning_rate=None,
+            probe=probe,
+        )
+        return certificate.relative_error
+
+    # Stay: the current structure, trained the same number of steps.
+    epsilon_stay = _epsilon_after_training(copy.deepcopy(model))
+    if epsilon_stay is None:
+        return False
+
+    # Grow: the same, after relieving the bottleneck.
+    grown = copy.deepcopy(model)
     optimal_update_kwargs = tiny_optimal_update_kwargs(
         config.fgd_approx, compute_delta=config.fgd_approx.growth_compute_delta
     )
     try:
         grow_layer(
-            model=trial,
+            model=grown,
             train_loader=train_loader,
             layer_index=bottleneck,
             device=device,
@@ -1331,33 +1365,12 @@ def _growth_reduces_lookahead_epsilon(
         )
     except RuntimeError:
         return False
-
-    trained = _train_parametric_gd_candidate(
-        base_model=trial,
-        train_batches=train_batches,
-        device=device,
-        functional_learning_rate=(
-            config.parametric_descent.functional_learning_rates[0]
-        ),
-        steps=config.fgd_approx.growth_lookahead_steps,
-        config=config.parametric_descent,
-        functional_loss=config.fgd_approx.functional_loss,
-    )
-    if trained is None:
+    epsilon_grow = _epsilon_after_training(grown)
+    if epsilon_grow is None:
         return False
 
-    grown = evaluate_fgd_validation_certificate(
-        model=trained,
-        data_loader=validation_loader,
-        device=device,
-        config=config.fgd_approx,
-        learning_rate=None,
-        probe=probe,
-    )
-    if grown.relative_error is None:
-        return False
     margin = config.fgd_approx.tiny_statistical_threshold
-    return grown.relative_error < current_relative_error * (1.0 - margin)
+    return epsilon_grow < epsilon_stay * (1.0 - margin)
 
 
 def _probe_fgd_growth(
@@ -4659,7 +4672,6 @@ def run_pipeline(
                                 train_loader=train_loader,
                                 validation_loader=validation_loader,
                                 probe=fgd_validation_probe,
-                                current_relative_error=epsilon_after_family,
                                 device=device,
                                 config=config,
                             )

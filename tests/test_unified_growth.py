@@ -245,15 +245,21 @@ def test_lookahead_margin_reuses_the_truncation_constant() -> None:
     from fgdlib.tangent import FGDApproxConfig
 
     margin = FGDApproxConfig().tiny_statistical_threshold
-    current = 0.42
 
-    def warranted(grown: float) -> bool:
-        return grown < current * (1.0 - margin)
+    def warranted(eps_grow: float, eps_stay: float) -> bool:
+        # The APPLES-TO-APPLES rule: both clones trained the same steps.
+        return eps_grow < eps_stay * (1.0 - margin)
 
-    # A meaningful reduction warrants growth ...
-    assert warranted(0.30)
-    # ... a reduction smaller than the margin does not (this is the MNIST
-    # case: the structure already expresses r, so growing barely moves eps).
-    assert not warranted(current * (1.0 - margin / 2))
-    # ... and eps going UP certainly does not.
-    assert not warranted(0.50)
+    # Growing beats training longer -> the structure is the binding
+    # constraint (the CIFAR case): warrant growth.
+    assert warranted(eps_grow=0.30, eps_stay=0.42)
+    # Growing and training reach essentially the SAME eps -> training was
+    # the constraint, not the structure (the MNIST case): do not grow. This
+    # is the bug the fair comparison fixes -- growing always beats the
+    # UNtrained current point, but not a stay clone given the same steps.
+    assert not warranted(eps_grow=0.40, eps_stay=0.40)
+    # A reduction SMALLER than the margin does not warrant growth either.
+    sub_margin = 0.405 * (1.0 - margin / 2)
+    assert not warranted(eps_grow=sub_margin, eps_stay=0.405)
+    # Growing does worse -> certainly not.
+    assert not warranted(eps_grow=0.45, eps_stay=0.40)
