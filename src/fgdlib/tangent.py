@@ -193,6 +193,19 @@ class FGDApproxConfig:
     #                         functional, which is what makes the method
     #                         loss-agnostic.
     growth_limit_criterion: GrowthLimitCriterion = "progress_floor"
+    # Generalised R1. The eps < 1/2 stop is Lemma 3.5's admissibility of a
+    # STEP, not adequacy of the STRUCTURE; on an easy task the two coincide
+    # (MNIST stops at a good small net) but on a hard one they diverge --
+    # measured on grayscale CIFAR-10, growth stopped at 1024->15->15->16
+    # (eps 0.42, 46% train) while a 1024->32->32 reaches 34.6%, because eps
+    # kept decreasing slowly inside a rank-15 image and R1 never fired. When
+    # this flag is on, before stopping the search asks a look-ahead
+    # question: does growing the bottleneck reach a strictly lower eps than
+    # staying? If so the structure is inadequate and growth continues; if
+    # not it stops exactly where it does today. A strict generalisation, so
+    # the MNIST result is preserved. The margin reuses tiny_statistical_
+    # threshold -- no new constant, nothing dataset-specific.
+    growth_lookahead_adequacy: bool = False
     # Let the fallback families run whenever the tangent outer step fails,
     # independently of whether growth is due. They are nested inside the
     # growth trigger otherwise, so once the structure becomes adequate

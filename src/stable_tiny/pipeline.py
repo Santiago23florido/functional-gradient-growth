@@ -1275,6 +1275,91 @@ def _growth_certificate_improves(
     return after_learning_rate >= required_learning_rate
 
 
+def _growth_reduces_lookahead_epsilon(
+    *,
+    model: GrowingMLP,
+    train_batches: list[tuple[torch.Tensor, torch.Tensor]],
+    train_loader: torch.utils.data.DataLoader,
+    validation_loader: torch.utils.data.DataLoader,
+    probe: tuple[torch.Tensor, torch.Tensor] | None,
+    current_relative_error: float,
+    device: torch.device,
+    config: PipelineConfig,
+) -> bool:
+    """Generalised R1: is the structure inadequate despite eps < 1/2?
+
+    Asks the only question that separates "this small net is enough" (MNIST)
+    from "this net is rank-limited and grinding" (CIFAR): does adding
+    capacity at the bottleneck reach a strictly lower relative error than the
+    current structure holds?
+
+    The bottleneck is the width-minimum growable location -- ``rank J <=
+    min_l w_l``, so that is where added capacity can raise what the reachable
+    set expresses. The candidate is grown function-preservingly (so the
+    comparison isolates capacity, not a lucky re-initialisation) and trained
+    for ``growth_lookahead_steps`` certified steps; its held-out eps is then
+    compared to ``current_relative_error``. Growth is warranted only when the
+    grown structure beats the current one by more than ``tiny_statistical_
+    threshold`` in relative terms -- the same margin the truncation uses, so
+    no new constant enters and numerical jitter cannot force endless growth.
+
+    Returns True when growth is warranted. False reproduces today's stop, so
+    with the flag off (the default) this is never called and behaviour is
+    unchanged.
+    """
+    widths = [int(layer.in_features) for layer in model._growable_layers]
+    limiting = rank_limiting_locations(widths)
+    if not limiting:
+        return False
+    bottleneck = limiting[0]
+
+    trial = copy.deepcopy(model)
+    optimal_update_kwargs = tiny_optimal_update_kwargs(
+        config.fgd_approx, compute_delta=config.fgd_approx.growth_compute_delta
+    )
+    try:
+        grow_layer(
+            model=trial,
+            train_loader=train_loader,
+            layer_index=bottleneck,
+            device=device,
+            line_search_config=config.scaling_line_search,
+            optimal_update_kwargs=optimal_update_kwargs,
+            progress=None,
+            function_preserving=True,
+            preservation_tolerance=config.fgd_approx.growth_preservation_tolerance,
+        )
+    except RuntimeError:
+        return False
+
+    trained = _train_parametric_gd_candidate(
+        base_model=trial,
+        train_batches=train_batches,
+        device=device,
+        functional_learning_rate=(
+            config.parametric_descent.functional_learning_rates[0]
+        ),
+        steps=config.fgd_approx.growth_lookahead_steps,
+        config=config.parametric_descent,
+        functional_loss=config.fgd_approx.functional_loss,
+    )
+    if trained is None:
+        return False
+
+    grown = evaluate_fgd_validation_certificate(
+        model=trained,
+        data_loader=validation_loader,
+        device=device,
+        config=config.fgd_approx,
+        learning_rate=None,
+        probe=probe,
+    )
+    if grown.relative_error is None:
+        return False
+    margin = config.fgd_approx.tiny_statistical_threshold
+    return grown.relative_error < current_relative_error * (1.0 - margin)
+
+
 def _probe_fgd_growth(
     *,
     model: GrowingMLP,
@@ -4559,6 +4644,35 @@ def run_pipeline(
                                 "is at its representation limit, so the step "
                                 "does not postpone growth"
                             )
+                        # Generalised R1: eps is still (slowly) decreasing, so
+                        # the stationarity test says "adequate" -- but on a
+                        # rank-limited structure that verdict can be wrong.
+                        # Only pay the look-ahead when about to stop, and only
+                        # to CONFIRM the stop is real.
+                        if (
+                            not epsilon_stationary
+                            and config.fgd_approx.growth_lookahead_adequacy
+                            and epsilon_after_family is not None
+                            and _growth_reduces_lookahead_epsilon(
+                                model=model,
+                                train_batches=growth_train_batches,
+                                train_loader=train_loader,
+                                validation_loader=validation_loader,
+                                probe=fgd_validation_probe,
+                                current_relative_error=epsilon_after_family,
+                                device=device,
+                                config=config,
+                            )
+                        ):
+                            epsilon_stationary = True
+                            if progress is not None:
+                                progress(
+                                    f"[FGD] Epoch {epoch}: eps still falls in "
+                                    "place but growing the bottleneck reaches "
+                                    "a strictly lower eps -- the structure is "
+                                    "rank-limited, not adequate, so growth "
+                                    "proceeds"
+                                )
                     if not admissibility_failed and not epsilon_stationary:
                         growth_triggered = False
                         break
