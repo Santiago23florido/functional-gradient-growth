@@ -637,10 +637,10 @@ def build_model(config: PipelineConfig, device: torch.device) -> GrowingMLP:
         # so replace each hidden layer's post-function individually. The
         # output layer (last) is never regularized. Growth keeps each norm in
         # sync via sync_normalization in grow_layer.
-        from fgdlib.models.regularized_mlp import HiddenPostFunction
+        from fgdlib.models.regularized_mlp import make_hidden_post_function
 
         for layer in list(model.layers)[:-1]:
-            layer.post_layer_function = HiddenPostFunction(
+            layer.post_layer_function = make_hidden_post_function(
                 num_features=int(layer.out_features),
                 activation=nn.SELU(),
                 dropout_rate=model_config.dropout_rate,
