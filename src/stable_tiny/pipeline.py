@@ -147,6 +147,18 @@ class ModelConfig:
     # per-feature; LayerNorm is intentionally unavailable (it couples features
     # and breaks preservation). See fgdlib/models/regularized_mlp.py.
     use_batchnorm: bool = False
+    # Declarative architecture. When set, the model is built component by
+    # component from this list instead of the uniform hidden_size /
+    # number_hidden_layers + use_batchnorm / dropout_rate shorthand, so batch-
+    # norm and dropout can be placed exactly where wanted. Each `mlp` is a
+    # block (width, num_layers); `batchnorm` / `dropout` attach to the mlp
+    # above. Every mlp layer is growable. See fgdlib/models/stack.py. Example:
+    #   stack:
+    #     - {mlp: [2, 1]}
+    #     - batchnorm
+    #     - {mlp: [2, 1]}
+    #     - {dropout: 0.2}
+    stack: tuple[Any, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -610,6 +622,18 @@ def build_model(config: PipelineConfig, device: torch.device) -> GrowingMLP:
     model_config = config.model
     torch.manual_seed(model_config.model_seed)
     import torch.nn as nn
+
+    if model_config.stack is not None:
+        # Declarative stack: place mlp / dropout / batchnorm exactly where the
+        # config asks. Supersedes the uniform shorthand below.
+        from fgdlib.models.stack import build_stack_model
+
+        return build_stack_model(
+            stack=list(model_config.stack),
+            in_features=data_config.in_features,
+            out_features=data_config.out_features,
+            device=device,
+        )
 
     kwargs: dict[str, Any] = {}
     if model_config.dropout_rate > 0.0 and not model_config.use_batchnorm:
