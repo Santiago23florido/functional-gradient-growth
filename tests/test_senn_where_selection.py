@@ -12,7 +12,7 @@ from dataclasses import replace
 
 import torch
 
-from fgdlib.growth import grow_layer, rank_layer_expansion_score
+from fgdlib.search.growth import grow_layer, rank_layer_expansion_score
 from fgdlib.tangent import tiny_optimal_update_kwargs
 from stable_tiny.pipeline import build_model, load_pipeline_config
 
@@ -122,7 +122,7 @@ def test_ranking_leaves_the_model_untouched() -> None:
 
 def test_ranking_never_runs_the_line_search(monkeypatch) -> None:
     """Pin the cost claim rather than trusting it."""
-    import fgdlib.growth as growth_module
+    import fgdlib.search.growth as growth_module
 
     config, model, loader, device = _fixture()
     kwargs = tiny_optimal_update_kwargs(config.fgd_approx, compute_delta=True)

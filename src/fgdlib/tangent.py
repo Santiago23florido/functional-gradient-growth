@@ -9,8 +9,8 @@ from dataclasses import dataclass
 from typing import Callable, Literal
 
 from fgdlib.gromo_setup import ensure_gromo_importable
-from fgdlib.growth import ScalingLineSearchConfig, grow_layer
-from fgdlib.training import RegressionMetrics, evaluate_regression_metrics
+from fgdlib.search.growth import ScalingLineSearchConfig, grow_layer
+from fgdlib.training_utils.loop import RegressionMetrics, evaluate_regression_metrics
 
 
 ensure_gromo_importable()

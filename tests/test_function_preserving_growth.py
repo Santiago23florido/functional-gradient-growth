@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from fgdlib.gromo_setup import ensure_gromo_importable
-from fgdlib.growth import ScalingLineSearchConfig, grow_layer
+from fgdlib.search.growth import ScalingLineSearchConfig, grow_layer
 from fgdlib.tangent import FGDApproxConfig, tiny_optimal_update_kwargs
 from stable_tiny.pipeline import load_pipeline_config
 

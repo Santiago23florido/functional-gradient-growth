@@ -6,10 +6,10 @@ The library owns everything that trains the network:
   certificates (relative error, learning-rate interval, sensor checks).
 - ``fgdlib.rkhs``     -- certified RKHS FGD (arXiv:2606.16926) with exact
   constants and the global-optimality certificate for a fixed structure.
-- ``fgdlib.growth``   -- GroMo growth machinery (optimal extensions and
+- ``fgdlib.search.growth``   -- GroMo growth machinery (optimal extensions and
   the scaling line search).
-- ``fgdlib.growth_schedule``, ``fgdlib.lr_scheduler``, ``fgdlib.optim``,
-  ``fgdlib.training`` -- schedules, optimizers and training utilities.
+- ``fgdlib.search.schedule``, ``fgdlib.training_utils.lr_scheduler``, ``fgdlib.training_utils.optim``,
+  ``fgdlib.training_utils.loop`` -- schedules, optimizers and training utilities.
 
 Datasets, experiment pipelines, logging and plotting are intentionally
 NOT part of the library; they consume it (see ``stable_tiny.pipeline``).
@@ -18,22 +18,22 @@ NOT part of the library; they consume it (see ``stable_tiny.pipeline``).
 from __future__ import annotations
 
 from fgdlib.gromo_setup import ensure_gromo_importable
-from fgdlib.growth import (
+from fgdlib.search.growth import (
     GrowthResult,
     ScalingLineSearchConfig,
     grow_layer,
 )
-from fgdlib.growth_schedule import (
+from fgdlib.search.schedule import (
     GrowthScheduleConfig,
     layer_index_for_growth,
     should_grow,
 )
-from fgdlib.lr_scheduler import (
+from fgdlib.training_utils.lr_scheduler import (
     LRSchedulerConfig,
     apply_learning_rate,
     learning_rate_for_epoch,
 )
-from fgdlib.optim import OptimizerConfig, build_optimizer, current_learning_rate
+from fgdlib.training_utils.optim import OptimizerConfig, build_optimizer, current_learning_rate
 from fgdlib.rkhs import (
     FGDRKHSConfig,
     FGDRKHSEpochResult,
@@ -59,7 +59,7 @@ from fgdlib.tangent import (
     measure_direction_projection,
     train_one_epoch_fgd_approx,
 )
-from fgdlib.training import (
+from fgdlib.training_utils.loop import (
     RegressionMetrics,
     count_parameters,
     evaluate_regression_metrics,

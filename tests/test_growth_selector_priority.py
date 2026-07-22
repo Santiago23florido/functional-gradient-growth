@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from fgdlib.growth import GrowthResult
+from fgdlib.search.growth import GrowthResult
 from fgdlib.tangent import FGDOutputRelError, FGDValidationCertificate
 from stable_tiny.pipeline import _GrowthProbe, _select_growth_probe, _select_growth_probe_by_descent
 
