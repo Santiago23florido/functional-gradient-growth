@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import torch
 
-from fgdlib.averaging import FunctionSpaceAverage
+from fgdlib.training_utils.averaging import FunctionSpaceAverage
 from fgdlib.tangent import batch_functional_loss
 
 

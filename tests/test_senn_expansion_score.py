@@ -10,7 +10,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from fgdlib.senn import (
+from fgdlib.search.senn import (
     admissible_expansion_score,
     expansion_score_from_relative_error,
     expansion_score_increase_lower_bound,

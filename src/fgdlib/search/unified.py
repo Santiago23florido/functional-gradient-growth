@@ -8,7 +8,7 @@ Two properties make that possible.
 
 **1. Growth is a pure representation refinement.** Both candidate kinds are
 applied *function-preservingly*: widening uses GroMo's zero-outgoing-weight
-extension, depth uses the identity-homotopy insertion in `fgdlib.depth`.
+extension, depth uses the identity-homotopy insertion in `fgdlib.search.depth`.
 The represented ``f`` is therefore unchanged by the structural step, so
 
 * the loss is unchanged at the step, hence Proposition 3.8's held-out
@@ -21,7 +21,7 @@ This is the clean division the theory wants: **training descends, growth
 enlarges what can be descended along.**
 
 **2. Both kinds are scored in the same certified quantity.** By the bridge
-identity in `fgdlib.senn`,
+identity in `fgdlib.search.senn`,
 
     N * eta = ||P(r)||^2 = ||r||^2 / (1 + eps^2),
 

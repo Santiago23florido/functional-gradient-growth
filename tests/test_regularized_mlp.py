@@ -13,8 +13,8 @@ from dataclasses import replace
 import torch
 from torch import nn
 
-from fgdlib.growth import grow_layer, rank_layer_expansion_score
-from fgdlib.regularized_mlp import ActivationThenDropout, make_post_layer_function
+from fgdlib.search.growth import grow_layer, rank_layer_expansion_score
+from fgdlib.models.regularized_mlp import ActivationThenDropout, make_post_layer_function
 from fgdlib.tangent import tiny_optimal_update_kwargs
 from stable_tiny.pipeline import (
     build_dataloaders,

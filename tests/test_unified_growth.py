@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from fgdlib.unified_growth import Candidate, expansion_value, rank_candidates
+from fgdlib.search.unified import Candidate, expansion_value, rank_candidates
 
 
 def _candidate(kind: str, index: int, cost: int, after: float | None) -> Candidate:
@@ -114,7 +114,7 @@ def test_the_best_candidate_is_always_admitted() -> None:
 
 
 def test_rank_ceiling_identifies_the_bottleneck() -> None:
-    from fgdlib.unified_growth import rank_limiting_locations
+    from fgdlib.search.unified import rank_limiting_locations
 
     assert rank_limiting_locations([2, 3, 4]) == [0]
     assert rank_limiting_locations([8, 8, 10]) == [0, 1]
@@ -200,7 +200,7 @@ def test_relief_target_is_the_second_smallest_width() -> None:
     relieving that location no longer lifts the cap. Levelling to the
     second-smallest width is exactly where the mandate ends.
     """
-    from fgdlib.unified_growth import bottleneck_relief_target
+    from fgdlib.search.unified import bottleneck_relief_target
 
     assert bottleneck_relief_target([2, 9, 9]) == (0, 9)
     assert bottleneck_relief_target([7, 3, 5]) == (1, 5)
@@ -208,7 +208,7 @@ def test_relief_target_is_the_second_smallest_width() -> None:
 
 def test_no_mandate_when_the_minimum_is_shared() -> None:
     """Two locations at the minimum: relieving one alone lifts nothing."""
-    from fgdlib.unified_growth import bottleneck_relief_target
+    from fgdlib.search.unified import bottleneck_relief_target
 
     assert bottleneck_relief_target([2, 2, 9]) is None
     assert bottleneck_relief_target([5, 5, 5]) is None
@@ -219,7 +219,7 @@ def test_no_mandate_when_the_minimum_is_shared() -> None:
 def test_relief_amount_never_depends_on_a_constant() -> None:
     """The amount is read off the structure, so nothing is presumed about
     a dataset that has never been trained on."""
-    from fgdlib.unified_growth import bottleneck_relief_target
+    from fgdlib.search.unified import bottleneck_relief_target
 
     for second in (3, 17, 260):
         index, target = bottleneck_relief_target([2, second, second + 5])

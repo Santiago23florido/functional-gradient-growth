@@ -11,7 +11,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from fgdlib.depth import (
+from fgdlib.search.depth import (
     IdentityHomotopyActivation,
     insert_identity_layer,
     inserted_layer_cost,
@@ -101,7 +101,7 @@ def test_depth_cost_is_comparable_to_neuron_cost() -> None:
     """
     from dataclasses import replace
 
-    from fgdlib.growth import growable_neuron_costs
+    from fgdlib.search.growth import growable_neuron_costs
 
     # Use the real MNIST search config: the interesting price spread only
     # exists when the input projection is genuinely wide.
@@ -149,7 +149,7 @@ def test_a_grown_model_still_widens_after_an_insertion() -> None:
     """End-to-end: insert a layer, then grow one -- GroMo must cope."""
     import torch as _torch
 
-    from fgdlib.growth import rank_layer_expansion_score
+    from fgdlib.search.growth import rank_layer_expansion_score
     from fgdlib.tangent import tiny_optimal_update_kwargs
 
     model, config, device = _model(hidden_size=6)

@@ -56,14 +56,14 @@ from fgdlib.rkhs import (
     KernelDictionaryModel,
 )
 from fgdlib.gromo_setup import ensure_gromo_importable
-from fgdlib.depth import insert_identity_layer
-from fgdlib.unified_growth import (
+from fgdlib.search.depth import insert_identity_layer
+from fgdlib.search.unified import (
     Candidate,
     bottleneck_relief_target,
     rank_candidates,
     rank_limiting_locations,
 )
-from fgdlib.growth import (
+from fgdlib.search.growth import (
     GrowthResult,
     ScalingLineSearchConfig,
     allocate_by_expansion_per_parameter,
@@ -72,18 +72,18 @@ from fgdlib.growth import (
     growable_neuron_costs,
     rank_layer_expansion_score,
 )
-from fgdlib.growth_schedule import (
+from fgdlib.search.schedule import (
     GrowthScheduleConfig,
     layer_index_for_growth,
     should_grow,
 )
-from fgdlib.lr_scheduler import (
+from fgdlib.training_utils.lr_scheduler import (
     LRSchedulerConfig,
     apply_learning_rate,
     learning_rate_for_epoch,
 )
-from fgdlib.optim import OptimizerConfig, build_optimizer, current_learning_rate
-from fgdlib.training import (
+from fgdlib.training_utils.optim import OptimizerConfig, build_optimizer, current_learning_rate
+from fgdlib.training_utils.loop import (
     count_parameters,
     evaluate_regression_metrics,
     train_one_epoch,
@@ -614,7 +614,7 @@ def build_model(config: PipelineConfig, device: torch.device) -> GrowingMLP:
         # model is byte-identical to the plain MLP.
         import torch.nn as nn
 
-        from fgdlib.regularized_mlp import make_post_layer_function
+        from fgdlib.models.regularized_mlp import make_post_layer_function
 
         kwargs["activation"] = make_post_layer_function(
             nn.SELU(), model_config.dropout_rate
