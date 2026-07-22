@@ -129,6 +129,14 @@ fgd_approx:
   # number of growable layers, exactly what uniform widening spends, so the
   # comparison against search_ce_uniform.yaml isolates the ALLOCATION.
   growth_selection: unified_expansion
+  # Generalised R1: eps < 1/2 is Lemma 3.5 step-admissibility, not structural
+  # adequacy. Before stopping, check whether growing the bottleneck reaches a
+  # strictly lower eps than training longer would (both clones trained the
+  # same steps -- an apples-to-apples look-ahead). Verified a strict
+  # generalisation: MNIST on==off (identical growths, 0 firings while eps>1/2).
+  # Only pays its cost in the tail (eps<1/2), and reuses tiny_statistical_
+  # threshold as the margin -- no new constant.
+  growth_lookahead_adequacy: true
   growth_lookahead_steps: 10
   # The fallback families must stay available once the structure becomes
   # adequate (eps < 1/2): otherwise growth correctly stops and the flow is
