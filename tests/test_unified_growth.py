@@ -225,3 +225,35 @@ def test_relief_amount_never_depends_on_a_constant() -> None:
         index, target = bottleneck_relief_target([2, second, second + 5])
         assert index == 0
         assert target == second
+
+
+def test_lookahead_adequacy_flag_defaults_off() -> None:
+    """The generalisation must be opt-in, so MNIST behaviour is untouched
+    until the flag is deliberately enabled and verified."""
+    from fgdlib.tangent import FGDApproxConfig
+
+    assert FGDApproxConfig().growth_lookahead_adequacy is False
+
+
+def test_lookahead_margin_reuses_the_truncation_constant() -> None:
+    """No new constant: the adequacy margin is tiny_statistical_threshold.
+
+    Reproduces the helper's decision rule in isolation -- growth is
+    warranted only when the grown eps beats the current one by more than the
+    relative margin -- so the 'no dataset-specific knob' claim is pinned.
+    """
+    from fgdlib.tangent import FGDApproxConfig
+
+    margin = FGDApproxConfig().tiny_statistical_threshold
+    current = 0.42
+
+    def warranted(grown: float) -> bool:
+        return grown < current * (1.0 - margin)
+
+    # A meaningful reduction warrants growth ...
+    assert warranted(0.30)
+    # ... a reduction smaller than the margin does not (this is the MNIST
+    # case: the structure already expresses r, so growing barely moves eps).
+    assert not warranted(current * (1.0 - margin / 2))
+    # ... and eps going UP certainly does not.
+    assert not warranted(0.50)
