@@ -1,0 +1,58 @@
+# Dense AdamW frontier point: fixed 3x10, same data budget as the target
+# runs. Reference for the params->accuracy frontier the grown model must
+# beat (accuracy comparable with fewer parameters).
+run:
+  name: cifar_dense_256
+  results_dir: results
+  save_plot: false
+  show_plot: false
+
+data:
+  kind: cifar10
+  in_features: 1024
+  out_features: 10
+  data_dir:
+  batch_size: 64
+  train_seed: 0
+  validation_seed: 2
+  test_seed: 1
+  cifar_train_samples: 10000
+  cifar_validation_samples: 2000
+  cifar_test_samples: 2000
+
+model:
+  hidden_size: 256
+  number_hidden_layers: 2
+  model_seed: 0
+
+training:
+  method: normal
+  epochs: 80
+  accuracy_tolerance: 0.1
+  gradient_clip_norm: 1.0
+  log_every: 10
+  device: auto
+
+optimizer:
+  name: adamW
+  learning_rate: 0.001
+  momentum: 0.0
+  weight_decay: 0.01
+  nesterov: false
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+lr_scheduler:
+  name: cosineannealing
+  t_max: 60
+  eta_min: 0.0
+  restart_on_growth: false
+
+growth_schedule:
+  enabled: false
+  every: 100
+  first_epoch: 50
+  layer_policy: round_robin
+
+wandb:
+  enabled: false

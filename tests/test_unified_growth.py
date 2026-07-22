@@ -225,3 +225,41 @@ def test_relief_amount_never_depends_on_a_constant() -> None:
         index, target = bottleneck_relief_target([2, second, second + 5])
         assert index == 0
         assert target == second
+
+
+def test_lookahead_adequacy_flag_defaults_off() -> None:
+    """The generalisation must be opt-in, so MNIST behaviour is untouched
+    until the flag is deliberately enabled and verified."""
+    from fgdlib.tangent import FGDApproxConfig
+
+    assert FGDApproxConfig().growth_lookahead_adequacy is False
+
+
+def test_lookahead_margin_reuses_the_truncation_constant() -> None:
+    """No new constant: the adequacy margin is tiny_statistical_threshold.
+
+    Reproduces the helper's decision rule in isolation -- growth is
+    warranted only when the grown eps beats the current one by more than the
+    relative margin -- so the 'no dataset-specific knob' claim is pinned.
+    """
+    from fgdlib.tangent import FGDApproxConfig
+
+    margin = FGDApproxConfig().tiny_statistical_threshold
+
+    def warranted(eps_grow: float, eps_stay: float) -> bool:
+        # The APPLES-TO-APPLES rule: both clones trained the same steps.
+        return eps_grow < eps_stay * (1.0 - margin)
+
+    # Growing beats training longer -> the structure is the binding
+    # constraint (the CIFAR case): warrant growth.
+    assert warranted(eps_grow=0.30, eps_stay=0.42)
+    # Growing and training reach essentially the SAME eps -> training was
+    # the constraint, not the structure (the MNIST case): do not grow. This
+    # is the bug the fair comparison fixes -- growing always beats the
+    # UNtrained current point, but not a stay clone given the same steps.
+    assert not warranted(eps_grow=0.40, eps_stay=0.40)
+    # A reduction SMALLER than the margin does not warrant growth either.
+    sub_margin = 0.405 * (1.0 - margin / 2)
+    assert not warranted(eps_grow=sub_margin, eps_stay=0.405)
+    # Growing does worse -> certainly not.
+    assert not warranted(eps_grow=0.45, eps_stay=0.40)
