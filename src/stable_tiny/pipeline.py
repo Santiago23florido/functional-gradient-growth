@@ -136,6 +136,11 @@ class ModelConfig:
     hidden_size: int = 2
     number_hidden_layers: int = 2
     model_seed: int = 0
+    # Dropout on the hidden layers' post-activation. 0.0 (default) builds the
+    # plain MLP byte-identical, so MNIST is untouched. Certification-safe: the
+    # certificate runs in eval where dropout is the identity; it only
+    # regularizes the family training steps. See fgdlib/regularized_mlp.py.
+    dropout_rate: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -598,12 +603,29 @@ def build_model(config: PipelineConfig, device: torch.device) -> GrowingMLP:
     data_config = config.data
     model_config = config.model
     torch.manual_seed(model_config.model_seed)
+    kwargs: dict[str, Any] = {}
+    if model_config.dropout_rate > 0.0:
+        # Compose dropout into the hidden-layer post-function. GroMo's
+        # GrowingMLP applies `activation` as each hidden layer's
+        # post_layer_function (never on the output), so this regularizes
+        # exactly the hidden representations and nothing else. The composition
+        # honours GroMo's extended-forward protocol; see
+        # fgdlib/regularized_mlp.py. With rate 0 this branch is skipped and the
+        # model is byte-identical to the plain MLP.
+        import torch.nn as nn
+
+        from fgdlib.regularized_mlp import make_post_layer_function
+
+        kwargs["activation"] = make_post_layer_function(
+            nn.SELU(), model_config.dropout_rate
+        )
     return GrowingMLP(
         in_features=data_config.in_features,
         out_features=data_config.out_features,
         hidden_size=model_config.hidden_size,
         number_hidden_layers=model_config.number_hidden_layers,
         device=device,
+        **kwargs,
     )
 
 
