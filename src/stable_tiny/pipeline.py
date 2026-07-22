@@ -4660,10 +4660,20 @@ def run_pipeline(
                         # Generalised R1: eps is still (slowly) decreasing, so
                         # the stationarity test says "adequate" -- but on a
                         # rank-limited structure that verdict can be wrong.
-                        # Only pay the look-ahead when about to stop, and only
-                        # to CONFIRM the stop is real.
+                        # Only pay the look-ahead when it could actually change
+                        # the decision: when eps is BELOW the threshold, so the
+                        # normal criterion would not already trigger growth.
+                        # Above it, growth is mandated anyway and the two
+                        # trained clones would be pure waste -- this gate is
+                        # what keeps the cost in the tail, not every epoch.
+                        below_threshold = (
+                            epsilon_before_family is not None
+                            and epsilon_before_family
+                            < config.fgd_approx.rel_error_threshold
+                        )
                         if (
                             not epsilon_stationary
+                            and below_threshold
                             and config.fgd_approx.growth_lookahead_adequacy
                             and epsilon_after_family is not None
                             and _growth_reduces_lookahead_epsilon(
