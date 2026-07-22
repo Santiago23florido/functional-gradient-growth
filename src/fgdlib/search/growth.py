@@ -17,6 +17,8 @@ import torch
 from gromo.containers.growing_mlp import GrowingMLP
 from gromo.utils.training_utils import compute_statistics, evaluate_model
 
+from fgdlib.models.regularized_mlp import sync_normalization
+
 
 ProgressFn = Callable[[str], None]
 LineSearchMethod = Literal["golden_section"]
@@ -227,6 +229,10 @@ def _function_preserving_growth(
     )
     growing_layer.delete_update()
     model.currently_updated_layer_index = None
+
+    # The layer just widened; grow any paired batch-norm to match before the
+    # drift check forwards the model. A no-op on the plain MLP.
+    sync_normalization(model)
 
     model.eval()
     drift = 0.0
@@ -566,6 +572,9 @@ def grow_layer(
 
     model.set_scaling_factor(best_value)
     model.apply_change()
+    # The extension is now permanent; grow any paired batch-norm to match.
+    # A no-op on the plain MLP.
+    sync_normalization(model)
 
     return GrowthResult(
         layer_index=layer_index,

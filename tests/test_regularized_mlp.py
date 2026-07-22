@@ -125,3 +125,71 @@ def test_extended_forward_protocol_passes_extension_undropped() -> None:
     assert torch.count_nonzero(main) == 0
     # ... but the extension passes through the activation only, undropped.
     assert torch.allclose(extension, nn.SELU()(x_ext))
+
+
+def test_batchnorm_is_per_layer_and_off_the_output() -> None:
+    from fgdlib.models.regularized_mlp import HiddenPostFunction
+
+    config = replace(_config(0.0), model=replace(_config(0.0).model, use_batchnorm=True))
+    model = build_model(config, torch.device("cpu"))
+    for hidden in list(model.layers)[:-1]:
+        post = hidden.post_layer_function
+        assert isinstance(post, HiddenPostFunction)
+        # Each hidden batch-norm has its OWN running statistics.
+        assert post.norm.num_features == int(hidden.out_features)
+    assert isinstance(model.layers[-1].post_layer_function, nn.Identity)
+    # Distinct instances, not a shared one.
+    assert (
+        model.layers[0].post_layer_function.norm
+        is not model.layers[1].post_layer_function.norm
+    )
+
+
+def test_batchnorm_growth_preserves_function_and_syncs() -> None:
+    """The load-bearing test: per-feature BN grown in sync stays exact.
+
+    LayerNorm cannot pass this -- it couples features, so a new neuron shifts
+    the statistics of the existing ones. That is why only batch-norm is
+    offered.
+    """
+    device = torch.device("cpu")
+    config = replace(
+        _config(0.0), model=replace(_config(0.0).model, use_batchnorm=True)
+    )
+    train, _, _ = build_dataloaders(config, device)
+    model = build_model(config, device)
+    kwargs = tiny_optimal_update_kwargs(config.fgd_approx, compute_delta=True)
+
+    norm_before = model.layers[0].post_layer_function.norm.num_features
+    grow_layer(
+        model=model,
+        train_loader=train,
+        layer_index=0,
+        device=device,
+        line_search_config=config.scaling_line_search,
+        optimal_update_kwargs=kwargs,
+        function_preserving=True,          # drift check is the guard
+        preservation_tolerance=config.fgd_approx.growth_preservation_tolerance,
+    )
+    # The paired norm grew with the layer, so a forward still runs ...
+    norm_after = model.layers[0].post_layer_function.norm.num_features
+    assert norm_after == int(model.layers[0].out_features)
+    assert norm_after > norm_before
+    model(torch.randn(4, config.data.in_features))     # no dimension error
+
+
+def test_batchnorm_default_off_builds_plain_mlp() -> None:
+    """MNIST-preservation bar for the batch-norm feature."""
+    model = build_model(_config(0.0), torch.device("cpu"))
+    assert isinstance(model.layers[0].post_layer_function, nn.SELU)
+
+
+def test_sync_normalization_is_a_noop_without_norm() -> None:
+    """Safe to call from grow_layer on the plain MLP."""
+    from fgdlib.models.regularized_mlp import sync_normalization
+
+    model = build_model(_config(0.0), torch.device("cpu"))
+    before = [p.detach().clone() for p in model.parameters()]
+    sync_normalization(model)
+    for original, current in zip(before, model.parameters()):
+        assert torch.equal(original, current)
