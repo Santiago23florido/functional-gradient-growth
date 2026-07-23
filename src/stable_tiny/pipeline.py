@@ -1254,7 +1254,11 @@ def lemma35_learning_rate(
     upper_bound = theoretical_learning_rate_upper_bound(relative_error, config)
     if upper_bound is None:
         return None
-    learning_rate = config.theory_lr_safety * upper_bound
+    # eta_bar is where Lemma 3.5's bracket VANISHES, so the guaranteed
+    # decrease eta * bracket(eta) -- a parabola -- peaks at eta_bar/2. Taking
+    # a fraction close to 1 maximises the step and minimises what it buys.
+    fraction = 0.5 if config.certify_optimal_rate else config.theory_lr_safety
+    learning_rate = fraction * upper_bound
     if learning_rate <= config.theory_lr_min + config.eps:
         return None
     return learning_rate
@@ -3653,6 +3657,33 @@ def run_pipeline(
                         # model f_t, certify THAT direction on the fixed
                         # validation probe BEFORE any update, then search the
                         # step size eta for the single update theta - eta * u*.
+                        if config.fgd_approx.probe_resample:
+                            # A FIXED probe turns the method into Newton's
+                            # method on one subsample: the certified step is
+                            # now delivered in full, so the residual on those
+                            # samples is driven to zero and the network
+                            # interpolates them. MEASURED: train accuracy
+                            # 0.320 against validation 0.150, with the logged
+                            # tangent relative error exploding to 1077 --
+                            # RelErr is normalised by ||g||, so it diverges
+                            # precisely when there is no residual left on the
+                            # probe to approximate.
+                            #
+                            # Drawing a fresh probe each outer step makes the
+                            # functional gradient an unbiased estimate of the
+                            # one over the dataset, which is the object the
+                            # theory is about; the flow becomes stochastic FGD
+                            # instead of exact descent on 256 fixed points.
+                            fgd_train_probe = build_projection_probe(
+                                train_loader,
+                                config.fgd_approx.probe_batches,
+                                device,
+                            )
+                            fgd_validation_probe = build_projection_probe(
+                                validation_loader,
+                                config.fgd_approx.probe_batches,
+                                device,
+                            )
                         tangent_direction: tuple[torch.Tensor, ...] | None = None
                         direction_stats: _FunctionalStepStats | None = None
                         maximum_learning_rate: float | None = None

@@ -152,3 +152,60 @@ def test_a_skipped_batch_blocks_the_step(config) -> None:
     )
     assert result.accepted is None
     assert result.sensor_failure is True
+
+
+# --- the rate that maximises what the lemma guarantees ----------------------
+
+
+def test_the_optimal_rate_is_the_interval_midpoint(config) -> None:
+    """eta_bar is where the bracket VANISHES, so the parabola peaks at half.
+
+    Lemma 3.5 bounds L(f_t+1) <= L(f_t) - eta*bracket(eta)*||grad L||^2, and
+    the guaranteed decrease eta*bracket(eta) is a parabola whose upper root
+    is eta_bar. Its vertex is therefore always eta_bar/2 -- the midpoint --
+    independently of eps, L_s, alpha or beta.
+    """
+    optimal = replace(config, certify_optimal_rate=True)
+    for epsilon in (0.0, 0.1, 0.25, 0.4, 0.49):
+        bound = theoretical_learning_rate_upper_bound(epsilon, config)
+        assert lemma35_learning_rate(epsilon, optimal) == pytest.approx(
+            0.5 * bound
+        )
+
+
+def test_the_optimal_rate_is_smaller_than_the_edge_rate(config) -> None:
+    """0.95 of the interval maximises the STEP and minimises what it buys."""
+    optimal = replace(config, certify_optimal_rate=True)
+    for epsilon in (0.05, 0.2, 0.45):
+        assert lemma35_learning_rate(
+            epsilon, optimal
+        ) < lemma35_learning_rate(epsilon, config)
+
+
+def test_the_optimal_rate_still_honours_the_certificate(config) -> None:
+    """Choosing a better rate never licenses an uncertified step."""
+    optimal = replace(config, certify_optimal_rate=True)
+    for epsilon in (0.5, 0.7, float("inf"), None):
+        assert lemma35_learning_rate(epsilon, optimal) is None
+
+
+def test_sum_mse_lands_on_the_target_at_the_optimal_rate(config) -> None:
+    """Why the midpoint matters, in the one case where it is exact.
+
+    For sum-MSE the functional gradient is r = 2(f - y), so a step
+    f <- f - eta r gives f_new - y = (1 - 2 eta)(f - y). At eps = 0 with
+    L_s = 2 the interval is (0, 1): the midpoint 0.5 lands exactly on the
+    target, while 0.95 gives -0.9(f - y) -- the error flips sign and shrinks
+    by only 10 %, which is oscillation at the edge of stability.
+    """
+    mse = replace(
+        config,
+        functional_loss="mse",
+        theory_smoothness_constant=2.0,
+        certify_optimal_rate=True,
+    )
+    rate = lemma35_learning_rate(0.0, mse)
+    assert rate == pytest.approx(0.5)
+    assert abs(1.0 - 2.0 * rate) < 1e-12          # lands on the target
+    edge = lemma35_learning_rate(0.0, replace(mse, certify_optimal_rate=False))
+    assert 1.0 - 2.0 * edge == pytest.approx(-0.9)  # flips sign

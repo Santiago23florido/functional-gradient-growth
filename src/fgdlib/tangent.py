@@ -314,6 +314,45 @@ class FGDApproxConfig:
     # only the tangent family (every inner iteration IS the tangent projection)
     # and only steps certified by 1/2 (the certificate is computed once, on g;
     # what iterates is the realisation, never the certification).
+    # TAKE THE RATE THAT MAXIMISES THE GUARANTEED DECREASE, not the largest
+    # admissible one. Lemma 3.5 bounds
+    #
+    #   L(f_t+1) <= L(f_t) - eta[alpha - K eta/2 - (beta + K eta) c] ||grad L||^2
+    #
+    # with c = (3/2) e/(1-e). The guaranteed decrease is eta * bracket(eta), a
+    # PARABOLA in eta, so it is maximised at the vertex and eta_bar is where
+    # the bracket vanishes -- hence eta* = eta_bar / 2, the interval's
+    # MIDPOINT, always.
+    #
+    # theory_lr_safety = 0.95 therefore picks the worst admissible rate: it
+    # maximises the step and minimises what the step is guaranteed to buy. At
+    # eps ~ 0 with L_s = 2 the bracket is (1 - eta), so 0.95 leaves a
+    # coefficient of 0.05 against 0.5 at the midpoint -- twenty times worse.
+    # For sum-MSE, where r = 2(f - y), the arithmetic is stark:
+    # f_new - y = (1 - 2 eta)(f - y), so eta = 0.5 lands exactly on the target
+    # while eta = 0.95 gives -0.9(f - y) -- the error FLIPS SIGN and shrinks
+    # only 10 %, oscillating at the edge of stability.
+    #
+    # MEASURED: with the full certified step finally being delivered, 0.95
+    # sent train_loss 0.0917 -> 0.3991 in one epoch and validation accuracy
+    # 0.248 -> 0.123. It was harmless before only because the linearisation
+    # control was cutting eta by ~500x and landing in a good regime by
+    # accident.
+    certify_optimal_rate: bool = False
+    # RESAMPLE THE CERTIFICATION PROBE EVERY OUTER STEP. A fixed probe was
+    # harmless while steps were tiny; once the certified step is delivered in
+    # full it makes the method Newton's method on one subsample, driving the
+    # residual on those points to zero and interpolating them. MEASURED:
+    # train accuracy 0.320 against validation 0.150, and the logged tangent
+    # relative error diverging to 1077 -- RelErr is normalised by ||g||, so it
+    # blows up exactly when no residual is left on the probe.
+    #
+    # The theory's L is the loss over the DATASET; the probe exists only
+    # because the exact Jacobian over all of it is intractable. Redrawing it
+    # each step makes the functional gradient an unbiased estimate of that
+    # object, turning the flow into stochastic FGD rather than exact descent
+    # on a fixed 256 points.
+    probe_resample: bool = False
     certify_realize_path: bool = False
     certify_realize_max_iterations: int = 40
     certify_realize_tolerance: float = 0.05

@@ -104,7 +104,19 @@ fgd_approx:
   # gradient energy, and the exact solver materialises a (N*K) x P Jacobian
   # per candidate per growth. At 4 x 512 = 6144 rows the run died of CUDA
   # OOM after 23 growths, with eps still at 0.545.
-  probe_batches: 2
+  # THE WHOLE TRAINING SET, not a subsample. The probe exists only because
+  # materialising the exact Jacobian over all the data is usually intractable
+  # -- here it is not: 10 batches x 128 = 1280 samples x 3 outputs = 3840
+  # rows, so J is 3840 x P, about 61 MB in float64 at P ~ 2000.
+  #
+  # Using a SUBSAMPLE was the bug. Once the certified step is delivered in
+  # full it becomes Newton's method on those points and interpolates them:
+  # MEASURED train accuracy 0.320 against validation 0.150, with the tangent
+  # relative error diverging to 1077 because RelErr = ||g - r||/||g|| blows up
+  # exactly when no residual is left on the probe to approximate. With the
+  # full set there is no sampling at all and the certificate is a statement
+  # about the training loss itself, which is what the theory is about.
+  probe_batches: 10
   # A rejected fallback family is skipped until this many ACCEPTED outer
   # steps have been committed since the rejection (weight updates change the
   # tangent space, so rejection is never permanent at a fixed architecture).
@@ -212,6 +224,17 @@ fgd_approx:
   # the FULL eta g the certificate licensed. MEASURED, same direction and
   # certificate: loss 9.580e1 -> 8.567e1 against 9.576e1 for one jump -- 236x,
   # realising 96.2 % of the intended displacement.
+  # eta at the ARGMAX of Lemma 3.5's guaranteed decrease, not at the edge of
+  # the interval. The bound's bracket vanishes at eta_bar, so the guaranteed
+  # decrease eta*bracket(eta) is a parabola peaking at eta_bar/2. Taking 0.95
+  # of the interval maximises the step and minimises what it buys; for
+  # sum-MSE it gives f_new - y = -0.9(f - y), an error that flips sign and
+  # shrinks only 10 % per step. MEASURED with the full step delivered: 0.95
+  # sent train_loss 0.0917 -> 0.3991 and validation accuracy 0.248 -> 0.123.
+  certify_optimal_rate: true
+  # Nothing to resample: probe_batches covers the entire training set, so the
+  # certificate is exact over all of it rather than over a draw from it.
+  probe_resample: false
   certify_realize_path: true
   certify_realize_max_iterations: 40
   certify_realize_tolerance: 0.05
