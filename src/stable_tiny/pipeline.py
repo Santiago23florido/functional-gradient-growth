@@ -42,6 +42,7 @@ from fgdlib.tangent import (
     functional_gradient,
     select_tiny_growth_layer_index,
     should_trigger_fgd_growth,
+    theoretical_learning_rate_upper_bound,
     tiny_optimal_update_kwargs,
     train_one_epoch_fgd_approx,
     validate_family_order,
@@ -1226,50 +1227,77 @@ def _evaluate_secant_fgd_trial(
     )
 
 
+def lemma35_learning_rate(
+    relative_error: float | None,
+    config: FGDApproxConfig,
+) -> float | None:
+    """``theory_lr_safety * eta_bar(eps)`` -- 0.95 of the admissible interval.
+
+    ``relative_error`` must be the eps that is actually CERTIFIED, i.e. the
+    one measured on the probe the direction was solved on and driven below
+    ``rel_error_threshold`` by the grow loop. That is the eps Lemma 3.5
+    speaks about, and ``eta_bar(eps) = 2(1 - 2 eps) / (L_s (1 + 2 eps))`` is
+    its interval.
+
+    Returns ``None`` exactly when the certificate does not hold -- eps at or
+    above the threshold, unmeasured, or an interval so degenerate that no
+    rate sits strictly inside ``(theory_lr_min, eta_bar)``. That is the
+    signal to grow, not to step.
+    """
+    if relative_error is None:
+        return None
+    if not relative_error < min(config.rel_error_threshold, 0.5):
+        return None
+    upper_bound = theoretical_learning_rate_upper_bound(relative_error, config)
+    if upper_bound is None:
+        return None
+    learning_rate = config.theory_lr_safety * upper_bound
+    if learning_rate <= config.theory_lr_min + config.eps:
+        return None
+    return learning_rate
+
+
 def _apply_lemma35_step(
     *,
-    maximum_learning_rate: float | None,
+    relative_error: float | None,
     evaluate_trial: Callable[[float], _FGDTrial],
     config: FGDApproxConfig,
 ) -> _FGDSearchResult:
-    """Take the certified rate and commit it -- no descent gate.
+    """Take the certified step and commit it -- assume the lemma, don't check it.
 
-    ``maximum_learning_rate`` is the SAME quantity the ordinary path uses:
-    ``certified_validation_learning_rate``, i.e. ``theory_lr_safety`` times
-    the admissible bound of the certificate that was just measured. The only
-    difference here is what happens next. The ordinary path
-    (:func:`_search_fgd_certified_trial`) sweeps downward from it and keeps
-    the largest rate whose step is *observed* to descend on held-out data;
-    this one evaluates that single rate and accepts it, because Lemma 3.5
-    does not offer descent as something to check -- it derives it.
+    The cycle this serves: grow until eps < 1/2, then train with the tangent
+    approximation at ``eta = 0.95 * eta_bar(eps)``, and keep training until
+    eps stops satisfying the criterion -- at which point the caller grows
+    again. Nothing else is verified. The additional condition is ASSUMED to
+    hold, on the grounds that both of its premises do: the rate lies inside
+    the admissible interval and the relative error satisfies the criterion.
 
-    Deriving the rate from anywhere else is a mistake that was measured
-    here. Taking ``eta = 0.95 * eta_bar(eps_train)`` instead -- the eps the
-    grow loop certifies -- looks like the same formula but is not the same
-    number: a small ``eps`` makes ``eta_bar`` large, and at ``eps ~ 0.42``
-    it produced ``eta = 0.86`` against ``|u| = 15``, a parameter
-    displacement of ~13 that left the linear regime entirely and diverged
-    (validation loss 4.1e3 -> 2.7e4 over five accepted steps). Lemma 3.5 is
-    a FUNCTION-space statement, ``f - eta g``; the step taken is a
-    PARAMETER-space one, ``theta - eta u``, and the two agree only while
-    ``eta |u|`` is small enough for ``f(theta - eta u) ~ f(theta) - eta J u``
-    to hold. The certificate's own bound keeps the step inside that regime;
-    a bound recomputed from a different sample does not.
+    The ordinary path (:func:`_search_fgd_certified_trial`) instead sweeps
+    rates downward from the bound and keeps the largest whose step is
+    *observed* to descend on held-out data. That gate is what deadlocked
+    this flow -- eps = 0.475 certified the structure so no growth fired,
+    while no rate produced held-out descent so no step committed, and
+    epochs 2, 3 and 4 came out bit-identical.
 
-    What still gates is the finiteness sensor. That is not a theory
-    condition but a numerical one: a non-finite loss or a skipped batch means
-    the measurement itself is meaningless, and no lemma covers arithmetic
-    that overflowed.
+    Deriving the rate from the HELD-OUT certificate instead deadlocks it a
+    second way, which is worth recording because it looks like a fix: that
+    eps measures ~1.0 (on validation the direction is a secant, not a
+    projection), so ``eta_bar`` is undefined there, no rate is produced and
+    the flow sits still again. Only the certified eps has an interval at
+    all.
+
+    What still gates is the finiteness sensor. That is not a condition of
+    the theory but of the arithmetic: a non-finite loss or a skipped batch
+    means the measurement itself is meaningless.
     """
-    if (
-        maximum_learning_rate is None
-        or maximum_learning_rate <= config.theory_lr_min + config.eps
-    ):
-        # No admissible rate: the certificate did not license a step at all.
-        # Growth is the answer, and the caller has already run it.
+    learning_rate = lemma35_learning_rate(relative_error, config)
+    if learning_rate is None:
+        # The relative-error criterion is not satisfied, so this is where
+        # the cycle turns: no step, grow instead. The caller's grow loop
+        # runs before every outer step, so that happens on the next pass.
         return _FGDSearchResult(None, None, 0, False)
 
-    trial = evaluate_trial(maximum_learning_rate)
+    trial = evaluate_trial(learning_rate)
     sensor_valid = (
         trial.epoch_result.sensor_valid
         and trial.epoch_result.skipped_batches == 0
@@ -3566,6 +3594,11 @@ def run_pipeline(
                         tangent_direction: tuple[torch.Tensor, ...] | None = None
                         direction_stats: _FunctionalStepStats | None = None
                         maximum_learning_rate: float | None = None
+                        # The eps that is CERTIFIED: measured on the probe
+                        # the direction is solved on, and the quantity the
+                        # grow loop drives below the threshold. Lemma 3.5's
+                        # interval is defined from this one.
+                        certified_relative_error: float | None = None
                         direction_sensor_failure = False
                         if config.fgd_approx.grow_to_certify:
                             # GROW-TO-CERTIFY. Make the structure satisfy
@@ -3627,6 +3660,9 @@ def run_pipeline(
                             config.fgd_approx,
                         ):
                             tangent_direction = direction_step.parameter_updates
+                            certified_relative_error = (
+                                direction_step.output_error.relative_error
+                            )
                             fgd_update_norm = math.sqrt(
                                 sum(
                                     float(
@@ -3700,7 +3736,7 @@ def run_pipeline(
                             # held-out data asks the lemma for a guarantee
                             # outside its domain.
                             search_result = _apply_lemma35_step(
-                                maximum_learning_rate=maximum_learning_rate,
+                                relative_error=certified_relative_error,
                                 evaluate_trial=evaluate_trial,
                                 config=config.fgd_approx,
                             )

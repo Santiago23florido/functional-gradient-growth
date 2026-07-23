@@ -1,19 +1,23 @@
-"""The paper-pure step: take a rate inside the certified interval and apply.
+"""The certified cycle: grow until eps < 1/2, then step at 0.95 of the interval.
 
-Lemma 3.5 does not offer descent as a condition to check -- it derives it.
-So the flow keeps the rate the certificate licenses and drops only the
-empirical verification. These tests pin exactly that, and pin the boundary
-the divergence lesson established: the rate must come from the certificate
-that was measured, never recomputed from a different sample.
+The rule these pin, in full: once the relative-error criterion is satisfied,
+train with the tangent approximation at ``eta = 0.95 * eta_bar(eps)`` and
+ASSUME the remaining condition rather than verifying it -- its two premises
+(the rate lies in the admissible interval, the relative error satisfies the
+criterion) are exactly what has just been established. Keep stepping until
+the relative error stops being satisfied; that is the signal to grow again.
 """
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
+from fgdlib.tangent import theoretical_learning_rate_upper_bound
 from stable_tiny.pipeline import (
     _apply_lemma35_step,
-    certified_validation_learning_rate,
+    lemma35_learning_rate,
     load_pipeline_config,
 )
 
@@ -36,96 +40,101 @@ class _Trial:
         self.loss_descent_valid = descends
 
 
-class _Certificate:
-    def __init__(self, *, max_valid_learning_rate, sensor_valid=True):
-        self.max_valid_learning_rate = max_valid_learning_rate
-        self.sensor_valid = sensor_valid
+# --- the rate ------------------------------------------------------------
 
 
-def test_a_certified_step_commits_even_without_observed_descent(config) -> None:
-    """The whole point: descent is a CONCLUSION of the lemma, not a gate."""
-    seen: list[float] = []
+def test_rate_is_the_configured_fraction_of_the_bound(config) -> None:
+    """eta = theory_lr_safety * eta_bar(eps) -- 0.95 of the interval."""
+    assert config.theory_lr_safety == pytest.approx(0.95)
+    epsilon = 0.3
+    expected = config.theory_lr_safety * theoretical_learning_rate_upper_bound(
+        epsilon, config
+    )
+    assert lemma35_learning_rate(epsilon, config) == pytest.approx(expected)
 
-    def evaluate(rate: float) -> _Trial:
-        seen.append(rate)
-        return _Trial(descends=False)
 
+def test_rate_lies_strictly_inside_the_admissible_interval(config) -> None:
+    """The guarantee is for the OPEN interval, so stay off both ends."""
+    for epsilon in (0.0, 0.1, 0.25, 0.4, 0.49):
+        rate = lemma35_learning_rate(epsilon, config)
+        bound = theoretical_learning_rate_upper_bound(epsilon, config)
+        assert rate is not None
+        assert config.theory_lr_min < rate < bound
+
+
+def test_the_rate_widens_as_the_certificate_tightens(config) -> None:
+    """eta_bar(eps) = 2(1 - 2 eps)/(L_s (1 + 2 eps)) is decreasing in eps."""
+    rates = [lemma35_learning_rate(e, config) for e in (0.05, 0.2, 0.35, 0.45)]
+    assert all(rate is not None for rate in rates)
+    assert rates == sorted(rates, reverse=True)
+
+
+# --- where the cycle turns ----------------------------------------------
+
+
+def test_no_rate_once_the_relative_error_criterion_fails(config) -> None:
+    """eps >= 1/2 ends the training phase; the caller grows instead."""
+    for epsilon in (0.5, 0.501, 0.9, 1.7, float("inf")):
+        assert lemma35_learning_rate(epsilon, config) is None
+
+
+def test_a_stricter_configured_threshold_is_honoured(config) -> None:
+    """rel_error_threshold below 1/2 tightens the criterion, never loosens it."""
+    strict = replace(config, rel_error_threshold=0.2)
+    assert lemma35_learning_rate(0.3, strict) is None
+    assert lemma35_learning_rate(0.1, strict) is not None
+    # And a threshold ABOVE 1/2 cannot buy back what the lemma forbids.
+    assert lemma35_learning_rate(0.7, replace(config, rel_error_threshold=0.9)) is None
+
+
+def test_an_unmeasured_relative_error_is_not_a_pass(config) -> None:
+    """Absence of a measurement blocks the step rather than licensing it."""
+    assert lemma35_learning_rate(None, config) is None
+
+
+# --- the step ------------------------------------------------------------
+
+
+def test_a_certified_step_commits_without_verifying_descent(config) -> None:
+    """The whole point: the remaining condition is assumed, not checked."""
     result = _apply_lemma35_step(
-        maximum_learning_rate=0.0925, evaluate_trial=evaluate, config=config
+        relative_error=0.3,
+        evaluate_trial=lambda rate: _Trial(descends=False),
+        config=config,
     )
     assert result.accepted is not None
     assert result.accepted.all_conditions_valid is False   # explicitly ignored
 
 
-def test_exactly_one_rate_is_tried(config) -> None:
-    """There is nothing to search over: any interior point is certified."""
+def test_exactly_one_rate_is_tried_and_it_is_the_certified_one(config) -> None:
+    """No sweep: any interior point is admissible, so 0.95 of the bound it is."""
     seen: list[float] = []
     _apply_lemma35_step(
-        maximum_learning_rate=0.0925,
+        relative_error=0.3,
         evaluate_trial=lambda rate: (seen.append(rate), _Trial())[1],
         config=config,
     )
-    assert seen == [0.0925]
+    assert seen == [lemma35_learning_rate(0.3, config)]
 
 
-def test_the_rate_is_the_certificate_s_own_bound(config) -> None:
-    """It must be the SAME number the ordinary sweep would have started from.
-
-    Recomputing it from a different sample is the mistake that diverged the
-    run: eta = 0.95 * eta_bar(eps_train) at eps ~ 0.42 gave eta = 0.86
-    against |u| = 15, far outside the linear regime in which the
-    function-space lemma governs a parameter-space step.
-    """
-    certificate = _Certificate(max_valid_learning_rate=0.0925)
-    expected = certified_validation_learning_rate(certificate, config)
-    seen: list[float] = []
-    _apply_lemma35_step(
-        maximum_learning_rate=expected,
-        evaluate_trial=lambda rate: (seen.append(rate), _Trial())[1],
-        config=config,
-    )
-    assert seen == [expected]
-
-
-def test_an_unlicensed_certificate_takes_no_step_at_all(config) -> None:
-    """No admissible rate: no evaluation happens at all."""
+def test_an_uncertified_structure_takes_no_step_at_all(config) -> None:
+    """eps >= 1/2: nothing is evaluated, because no rate is admissible."""
 
     def evaluate(rate: float) -> _Trial:  # pragma: no cover - must not run
-        raise AssertionError("a step was taken without a certified rate")
+        raise AssertionError("a step was taken without a certificate")
 
     result = _apply_lemma35_step(
-        maximum_learning_rate=None, evaluate_trial=evaluate, config=config
+        relative_error=0.6, evaluate_trial=evaluate, config=config
     )
     assert result.accepted is None
     assert result.trial_count == 0
     assert result.sensor_failure is False   # not a numerical failure
 
 
-def test_a_degenerate_interval_takes_no_step(config) -> None:
-    """A rate at or below theory_lr_min is not strictly inside the interval."""
-
-    def evaluate(rate: float) -> _Trial:  # pragma: no cover - must not run
-        raise AssertionError("a step was taken outside the interval")
-
-    for rate in (0.0, config.theory_lr_min, config.theory_lr_min / 2):
-        result = _apply_lemma35_step(
-            maximum_learning_rate=rate, evaluate_trial=evaluate, config=config
-        )
-        assert result.accepted is None
-
-
-def test_the_certificate_withholds_a_rate_once_the_sensor_fails(config) -> None:
-    """Upstream, an invalid sensor yields no rate -- so no step follows."""
-    certificate = _Certificate(
-        max_valid_learning_rate=0.0925, sensor_valid=False
-    )
-    assert certified_validation_learning_rate(certificate, config) is None
-
-
 def test_numerical_failure_still_blocks_the_step(config) -> None:
     """Sensors are arithmetic, not theory: a non-finite measurement rejects."""
     result = _apply_lemma35_step(
-        maximum_learning_rate=0.0925,
+        relative_error=0.3,
         evaluate_trial=lambda rate: _Trial(sensor_valid=False),
         config=config,
     )
@@ -137,7 +146,7 @@ def test_numerical_failure_still_blocks_the_step(config) -> None:
 def test_a_skipped_batch_blocks_the_step(config) -> None:
     """A skipped batch means the measurement is incomplete, not that it passed."""
     result = _apply_lemma35_step(
-        maximum_learning_rate=0.0925,
+        relative_error=0.3,
         evaluate_trial=lambda rate: _Trial(skipped=1),
         config=config,
     )
