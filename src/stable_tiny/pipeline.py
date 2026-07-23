@@ -56,6 +56,7 @@ from fgdlib.rkhs import (
     KernelDictionaryModel,
 )
 from fgdlib.gromo_setup import ensure_gromo_importable
+from fgdlib.search.certify import grow_until_certified
 from fgdlib.search.depth import insert_identity_layer
 from fgdlib.search.unified import (
     Candidate,
@@ -3508,6 +3509,38 @@ def run_pipeline(
                         direction_stats: _FunctionalStepStats | None = None
                         maximum_learning_rate: float | None = None
                         direction_sensor_failure = False
+                        if config.fgd_approx.grow_to_certify:
+                            # GROW-TO-CERTIFY. Make the structure satisfy
+                            # Lemma 3.5 BEFORE stepping, instead of stepping
+                            # and growing when it fails. Every growth is
+                            # function-preserving, so f does not move here --
+                            # only the certified step below moves it -- and
+                            # eps decreases monotonically, so this terminates.
+                            model, certify_result = grow_until_certified(
+                                model=model,
+                                x=fgd_train_probe[0],
+                                y=fgd_train_probe[1],
+                                train_loader=train_loader,
+                                device=device,
+                                config=config,
+                                max_growths=(
+                                    config.fgd_approx.certify_max_growths
+                                ),
+                                progress=progress,
+                            )
+                            if certify_result.growths:
+                                growth_count += certify_result.growths
+                                optimizer = build_optimizer(
+                                    model, config.optimizer
+                                )
+                                _clear_inaccessible_tensor_caches(model)
+                            if progress is not None and not certify_result.certified:
+                                progress(
+                                    f"[CERTIFY] Epoch {epoch}: could NOT reach "
+                                    f"eps < {config.fgd_approx.rel_error_threshold} "
+                                    f"(stopped at {certify_result.relative_error:.4f} "
+                                    f"after {certify_result.growths} growths)"
+                                )
                         direction_step = _compute_tangent_projection_step(
                             model=model,
                             x=fgd_train_probe[0],

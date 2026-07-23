@@ -193,6 +193,26 @@ class FGDApproxConfig:
     #                         functional, which is what makes the method
     #                         loss-agnostic.
     growth_limit_criterion: GrowthLimitCriterion = "progress_floor"
+    # GROW-TO-CERTIFY. Inverts the flow: instead of growing where it is
+    # cheapest and stepping when it can, the structure is grown until it
+    # PROVABLY satisfies Lemma 3.5 (eps < rel_error_threshold), and only then
+    # is a step taken. Every growth is function-preserving, so f never moves,
+    # r is fixed and eps decreases monotonically -- termination is a theorem
+    # (tests/test_grow_to_certify_theorem.py), not a hope.
+    #
+    # This exists to answer one question: does enforcing the conditions
+    # EXACTLY -- never approximated, never bypassed -- reach the best loss and
+    # accuracy, whatever structure that costs? Parameter count is explicitly
+    # not a concern here. Use with family_order = ("tangent",),
+    # projection_solver = "exact" and tangent_measured_descent = False, so the
+    # only thing that can commit a step is the 1/2 condition itself.
+    # Default False: every existing config is untouched.
+    grow_to_certify: bool = False
+    # Iteration guard for that loop. NOT a budget: the theorem says the loop
+    # terminates on its own, so this only catches a numerical pathology (or a
+    # probe so large that certification is out of reach, which is itself a
+    # result worth seeing rather than hanging on).
+    certify_max_growths: int = 256
     # Generalised R1. The eps < 1/2 stop is Lemma 3.5's admissibility of a
     # STEP, not adequacy of the STRUCTURE; on an easy task the two coincide
     # (MNIST stops at a good small net) but on a hard one they diverge --
