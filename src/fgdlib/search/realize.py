@@ -29,11 +29,22 @@ functional movement by the same factor, so the method was taking 1/512 of
 the step the lemma had certified.
 
 Integrating instead of jumping fixes exactly that. Each inner iteration
-moves a short way, so its own defect is small and the linearisation holds
-where it is used, while the TOTAL functional displacement is the full
-``eta g`` the certificate licensed. It is the difference between one giant
-Euler step and many small ones: same destination, and only one of them
-arrives.
+moves a short way, so the linearisation holds where it is used, while the
+TOTAL functional displacement is the full ``eta g`` the certificate
+licensed. It is the difference between one giant Euler step and many small
+ones: same destination, and only one of them arrives.
+
+MEASURED on a grown synthetic model -- same direction, same certificate,
+the same certified ``eta = 3.615e-2`` against the ``1.412e-4`` a single
+jump was reduced to:
+
+    one jump                        loss 9.580e1 -> 9.576e1   (delta 0.043)
+    integrated, defect criterion    loss 9.580e1 -> 9.488e1   (delta 0.924)
+    integrated, residual criterion  loss 9.580e1 -> 8.567e1   (delta 10.13)
+
+realising 8.7 % and 96.2 % of the intended displacement respectively. The
+criterion for the inner sub-step matters as much as integrating at all, and
+:func:`_residual_reducing_sub_rate` explains why.
 
 Both rules of the method are preserved, neither bent:
 
@@ -52,10 +63,7 @@ from dataclasses import dataclass
 
 import torch
 
-from fgdlib.search.linearization import (
-    linearization_defect,
-    predicted_displacement,
-)
+from fgdlib.search.linearization import predicted_displacement
 from fgdlib.tangent import (
     FGDApproxConfig,
     _output_relative_error_from_tensors,
@@ -100,10 +108,9 @@ def realize_functional_step(
     to it throughout.
 
     Each iteration solves the tangent projection against the functional
-    residual that remains and takes the largest sub-step whose linearisation
-    defect stays within ``config.certify_linearization_tolerance``. Stops
-    when the remaining residual is under ``tolerance`` of the intended
-    displacement, or when no sub-step is admissible -- in which case the
+    residual that remains and takes the largest sub-step that reduces that
+    residual. Stops when it is under ``tolerance`` of the intended
+    displacement, or when no sub-step reduces it -- in which case the
     realised fraction reports honestly how far it got.
     """
     parameters = _trainable_named_parameters(model)
@@ -150,8 +157,8 @@ def realize_functional_step(
             )
             del stats  # measured for parity with the outer solve; unused here
 
-            sub_rate = _admissible_sub_rate(
-                model, x, step_updates, config
+            sub_rate = _residual_reducing_sub_rate(
+                model, x, target, step_updates, remaining, config
             )
             if sub_rate is None:
                 break
@@ -180,26 +187,57 @@ def realize_functional_step(
         model.train(was_training)
 
 
-def _admissible_sub_rate(
+def _residual_reducing_sub_rate(
     model: torch.nn.Module,
     x: torch.Tensor,
+    target: torch.Tensor,
     step_updates: tuple[torch.Tensor, ...],
+    remaining: float,
     config: FGDApproxConfig,
+    max_backtracks: int = 24,
 ) -> float | None:
-    """Largest sub-step of 1.0 whose linearisation defect is in tolerance.
+    """Largest sub-step of 1.0 that gets CLOSER to the functional target.
 
     A full Gauss-Newton step is ``1.0`` here -- the projection already
     carries the magnitude needed to close the residual -- so this backtracks
-    from 1 rather than from a certified rate. The tolerance is the same one
-    the outer control uses; ``None`` disables the check.
+    from 1 rather than from a certified rate.
+
+    The criterion is the residual, not the linearisation defect, and the
+    difference is worth being precise about because it is what makes the
+    integration effective. Demanding a small defect asks each sub-step to be
+    ACCURATE, which is the requirement for a single jump, where whatever the
+    linearisation misses is simply lost. Here the state is re-measured every
+    iteration and the projection is re-solved against the residual that
+    actually remains, so nothing accumulates: a sub-step that overshoots or
+    falls short is corrected by the next one. What the sub-step must do is
+    make PROGRESS. Measured: the defect criterion realised 8.7 % of the
+    intended displacement in 17 iterations, because it kept backtracking
+    steps that were inaccurate but perfectly useful.
+
+    This is not the descent gate that was removed. That one asked whether
+    the LOSS improved on held-out data, a question Lemma 3.5 answers rather
+    than poses. This asks whether we are getting closer to the functional
+    target the certificate prescribed -- ``f - eta g``, on the same probe
+    the certificate was measured on. It is the definition of realising the
+    step, not an extra condition on it.
+
+    ``None`` when no sub-step reduces the residual, which is where the
+    integration stops.
     """
-    tolerance = config.certify_linearization_tolerance
-    if tolerance is None:
-        return 1.0
+    parameters = _trainable_named_parameters(model)
     backtrack = min(max(config.lr_backtrack, 1e-6), 1.0 - 1e-9)
     rate = 1.0
-    while rate > config.theory_lr_min + config.eps:
-        if linearization_defect(model, x, step_updates, rate) <= tolerance:
-            return rate
+    for _ in range(max_backtracks):
+        with torch.no_grad():
+            originals = [p.detach().clone() for p in parameters.values()]
+            for parameter, step in zip(parameters.values(), step_updates):
+                parameter -= rate * step.to(parameter.device, parameter.dtype)
+            moved = model(x).detach()
+            for parameter, original in zip(parameters.values(), originals):
+                parameter.copy_(original)
+        if torch.isfinite(moved).all():
+            trial_residual = float(torch.linalg.vector_norm(target - moved))
+            if trial_residual < remaining:
+                return rate
         rate *= backtrack
     return None

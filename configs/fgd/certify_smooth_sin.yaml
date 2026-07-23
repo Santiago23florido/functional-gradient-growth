@@ -203,6 +203,18 @@ fgd_approx:
   # land within 9 % of the hand-tuned constant on the task it was tuned for,
   # with nothing dataset-specific in the rule.
   projection_damping_auto: true
+  # Realise the certified functional step by INTEGRATING toward it instead of
+  # jumping at it. theta - eta u is only the first Gauss-Newton iteration of
+  # "find theta' with f(theta') = f - eta g"; shrinking eta until that single
+  # iteration is accurate shrinks the functional movement by the same factor
+  # (MEASURED at 512x and 2047x), which is what stalled this run. Integrating
+  # keeps each sub-step short where the linearisation is used while delivering
+  # the FULL eta g the certificate licensed. MEASURED, same direction and
+  # certificate: loss 9.580e1 -> 8.567e1 against 9.576e1 for one jump -- 236x,
+  # realising 96.2 % of the intended displacement.
+  certify_realize_path: true
+  certify_realize_max_iterations: 40
+  certify_realize_tolerance: 0.05
   tangent_measured_descent: false
   growth_selection: unified_expansion
   # Generalised R1: eps < 1/2 is Lemma 3.5 step-admissibility, not structural

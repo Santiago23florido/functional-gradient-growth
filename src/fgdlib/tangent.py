@@ -293,6 +293,30 @@ class FGDApproxConfig:
     # the theorem's. Measured to land within 9 % of the hand-tuned constant on
     # the task the constant was tuned for.
     projection_damping_auto: bool = False
+    # REALISE THE CERTIFIED STEP AS A PATH instead of a single jump. Lemma 3.5
+    # licenses a move in FUNCTION space, f -> f - eta g; theta - eta u is only
+    # the first Gauss-Newton iteration of "find theta' with f(theta') = f_target".
+    # Shrinking eta until that one iteration is accurate also shrinks the
+    # FUNCTIONAL movement by the same factor -- MEASURED at 512x and 2047x --
+    # so the method delivered a fraction of the step it had certified. That is
+    # the stall, and growth cannot fix it: growth lowers eps, which widens
+    # eta_bar, which widens the gap.
+    #
+    # With this on, the step is integrated: each inner iteration re-solves the
+    # tangent projection against the functional residual that remains and takes
+    # the largest sub-step that reduces it. MEASURED on one grown model, same
+    # direction and certificate:
+    #
+    #   one jump                        loss 9.580e1 -> 9.576e1   delta  0.043
+    #   integrated, residual criterion  loss 9.580e1 -> 8.567e1   delta 10.13
+    #
+    # 236x, realising 96.2 % of the intended displacement. Both rules hold:
+    # only the tangent family (every inner iteration IS the tangent projection)
+    # and only steps certified by 1/2 (the certificate is computed once, on g;
+    # what iterates is the realisation, never the certification).
+    certify_realize_path: bool = False
+    certify_realize_max_iterations: int = 40
+    certify_realize_tolerance: float = 0.05
     # Generalised R1. The eps < 1/2 stop is Lemma 3.5's admissibility of a
     # STEP, not adequacy of the STRUCTURE; on an easy task the two coincide
     # (MNIST stops at a good small net) but on a hard one they diverge --

@@ -66,6 +66,7 @@ from fgdlib.search.unified import (
     rank_limiting_locations,
 )
 from fgdlib.search.damping import select_projection_damping
+from fgdlib.search.realize import realize_functional_step
 from fgdlib.search.linearization import certified_linear_learning_rate
 from fgdlib.search.growth import (
     GrowthResult,
@@ -3742,6 +3743,60 @@ def run_pipeline(
                             selected_learning_rate = (
                                 damping_choice.candidate.learning_rate
                             )
+                            if (
+                                config.fgd_approx.certify_realize_path
+                                and damping_choice.candidate.certified_learning_rate
+                            ):
+                                # Realise the FULL certified functional step
+                                # by integrating toward it, then express the
+                                # path travelled as the equivalent single
+                                # update so everything downstream -- the
+                                # validation certificate, the trial, the
+                                # accounting -- sees an ordinary outer step
+                                # and reproduces this exact point.
+                                nominal = (
+                                    damping_choice.candidate
+                                    .certified_learning_rate
+                                )
+                                walker = copy.deepcopy(model)
+                                realization = realize_functional_step(
+                                    walker,
+                                    fgd_train_probe[0],
+                                    fgd_train_probe[1],
+                                    tangent_direction,
+                                    nominal,
+                                    config.fgd_approx,
+                                    max_iterations=(
+                                        config.fgd_approx
+                                        .certify_realize_max_iterations
+                                    ),
+                                    tolerance=(
+                                        config.fgd_approx
+                                        .certify_realize_tolerance
+                                    ),
+                                )
+                                if realization.iterations > 0:
+                                    with torch.no_grad():
+                                        tangent_direction = tuple(
+                                            (before.detach() - after.detach())
+                                            / nominal
+                                            for before, after in zip(
+                                                model.parameters(),
+                                                walker.parameters(),
+                                            )
+                                        )
+                                    selected_learning_rate = nominal
+                                    if progress is not None:
+                                        progress(
+                                            "[REALIZE] "
+                                            f"eta={nominal:.4e} "
+                                            "realised="
+                                            f"{realization.realised_fraction:.1%} "
+                                            "residual="
+                                            f"{realization.residual_fraction:.1%} "
+                                            f"iters={realization.iterations}"
+                                        )
+                                del walker
                             if progress is not None:
                                 chosen = damping_choice.candidate
                                 progress(
