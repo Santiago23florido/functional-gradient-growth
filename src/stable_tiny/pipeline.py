@@ -3282,6 +3282,10 @@ def run_pipeline(
         # FIXED certification probes, materialized once for the whole run:
         # every certificate, family comparison and growth-layer trial solves
         # one joint shared-direction projection over the same sample.
+        # Grow-to-certify: remembers whether the previous epoch managed to
+        # commit a step. A certified structure that still cannot step is the
+        # deadlock this closes (see grow_until_certified's `force`).
+        certify_previous_step_committed = True
         fgd_validation_probe: tuple[torch.Tensor, torch.Tensor] | None = None
         fgd_train_probe: tuple[torch.Tensor, torch.Tensor] | None = None
         if config.training.method == "fgd_approx":
@@ -3529,6 +3533,13 @@ def run_pipeline(
                                 function_preserving=(
                                     config.fgd_approx.certify_function_preserving
                                 ),
+                                # eps < 1/2 certifies that an admissible RATE
+                                # exists; the realised descent is a separate
+                                # condition. When the last epoch satisfied the
+                                # former and still failed the latter, the
+                                # structure -- not the step size -- is what did
+                                # not deliver, so grow anyway.
+                                force=not certify_previous_step_committed,
                                 progress=progress,
                             )
                             if certify_result.growths:
@@ -3962,6 +3973,9 @@ def run_pipeline(
                 accuracy_tolerance=config.training.accuracy_tolerance,
                 classification=classification,
             )
+            # Drives the grow-to-certify `force`: a certified structure that
+            # still could not commit a step is the deadlock to break.
+            certify_previous_step_committed = bool(fgd_candidate_accepted)
             epoch_entry = HistoryEntry(
                 step=epoch,
                 step_type=step_type,

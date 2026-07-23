@@ -117,3 +117,33 @@ def test_certification_cost_grows_with_the_probe() -> None:
         assert result.certified
         growths[samples] = result.growths
     assert growths[100] > growths[25], growths
+
+
+def test_force_grows_even_when_already_certified() -> None:
+    """Closes the measured deadlock.
+
+    On MNIST the flow sat at eps = 0.475 for epoch after epoch with the loss
+    frozen at 0.0619: eps < 1/2 said the structure was adequate so nothing
+    grew, while no admissible learning rate produced held-out descent so
+    nothing stepped. Neither mechanism could act.
+
+    eps < 1/2 is Lemma 3.5's admissibility of a STEP -- it certifies that an
+    admissible RATE exists -- while the realised descent is a separate
+    certificate condition. Failing the latter while satisfying the former
+    means the STRUCTURE did not deliver, so `force` grows anyway.
+    """
+    config, model, x, y, loader, device = _fixture(samples=10)
+    # This fixture is already certified, so without force nothing happens.
+    _, unforced = grow_until_certified(
+        model=model, x=x, y=y, train_loader=loader, device=device,
+        config=config, max_growths=5,
+    )
+    assert unforced.growths == 0
+
+    _, forced = grow_until_certified(
+        model=model, x=x, y=y, train_loader=loader, device=device,
+        config=config, max_growths=5, function_preserving=False, force=True,
+    )
+    assert forced.growths >= 1
+    # And forcing must not break the certificate it already had.
+    assert forced.relative_error < config.fgd_approx.rel_error_threshold

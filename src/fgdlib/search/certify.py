@@ -152,25 +152,45 @@ def grow_until_certified(
     config,
     max_growths: int = 64,
     function_preserving: bool = True,
+    force: bool = False,
     progress=None,
 ):
     """Grow until ``eps < rel_error_threshold``; return the grown model.
 
-    At each iteration every growable location is tried on a clone, grown
-    function-preservingly, and scored by its EXACT resulting ``eps``; the
-    location with the lowest ``eps`` is committed. Because ``f`` never moves,
-    ``r`` is fixed and ``eps`` decreases monotonically, so the loop
-    terminates -- ``max_growths`` only guards against numerical pathology.
+    At each iteration every growable location is tried on a clone and scored
+    by its EXACT resulting ``eps``; the location with the lowest ``eps`` is
+    committed.
 
-    Returns ``(model, CertifyResult)``. The model is the grown one (a new
-    object when any growth was applied).
+    ``force`` grows at least once even when ``eps`` is already below the
+    threshold. It exists to close a real deadlock, measured on MNIST: after
+    certification the flow sat at ``eps = 0.475`` for epoch after epoch with
+    the loss frozen at 0.0619, because
+
+    * ``eps < 1/2`` said the structure was adequate, so no growth fired, and
+    * no admissible learning rate produced held-out descent, so no step
+      committed.
+
+    Neither mechanism could act and nothing changed, ever. The resolution is
+    the distinction the method already rests on: ``eps < 1/2`` is Lemma 3.5's
+    admissibility of a STEP -- it certifies that an admissible rate *exists*
+    in the worst-case bound -- while the realised descent is a **separate**
+    certificate condition. A step that fails the descent condition despite
+    ``eps < 1/2`` has shown that the structure did not deliver, and growth,
+    not more of the same step, is the answer. That is exactly R1's reasoning,
+    applied here.
+
+    Returns ``(model, CertifyResult)``.
     """
     threshold = config.fgd_approx.rel_error_threshold
     epsilon = exact_relative_error(model, x, y, config.fgd_approx)
     trajectory = [epsilon]
     growths = 0
+    forced_remaining = 1 if force else 0
 
-    while epsilon >= threshold and growths < max_growths:
+    while (
+        epsilon >= threshold or forced_remaining > 0
+    ) and growths < max_growths:
+        forced_remaining = max(0, forced_remaining - 1)
         locations = range(len(getattr(model, "_growable_layers", [])))
         best_model = None
         # Preserving growth cannot make eps worse, so requiring an improvement
