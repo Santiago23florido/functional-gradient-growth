@@ -722,6 +722,10 @@ class FGDValidationCertificate:
     output_relative_error: FGDOutputRelError | None
     sensor_valid: bool
     sensor_invalid_batches: int
+    #: Names of the quantities that came out non-finite, when that is why the
+    #: sensor rejected. Empty otherwise. Reported so a rejection says what
+    #: actually overflowed instead of only that something did.
+    non_finite_quantities: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2271,7 +2275,22 @@ def certificate_from_projection_stats(
         stats.approximation_sq_norm,
         stats.target_sq_norm,
     )
-    finite = all(math.isfinite(value) for value in values)
+    # Name the quantity that failed. "sensor invalid" on its own reads as a
+    # numerical defect in the certificate machinery, which sent this
+    # investigation the wrong way for a while: with projection_sensor off the
+    # ONLY test here is finiteness, so a failure means one of these three
+    # overflowed. For sum-MSE target_sq_norm = 4*sum (f - y)^2, so what
+    # overflows is the MODEL's output on unseen data, not our arithmetic --
+    # the Jacobian is exact either way. It is a symptom of the fit, and the
+    # right response is emphatically not to add capacity.
+    non_finite = tuple(
+        name
+        for name, value in zip(
+            ("dot_product", "approximation_sq_norm", "target_sq_norm"), values
+        )
+        if not math.isfinite(value)
+    )
+    finite = not non_finite
     sensor_valid = finite and (
         not projection_sensor
         or _projection_sensor_valid(
@@ -2294,6 +2313,7 @@ def certificate_from_projection_stats(
             output_relative_error=None,
             sensor_valid=False,
             sensor_invalid_batches=1,
+            non_finite_quantities=non_finite,
         )
 
     output_error = stats.output_error

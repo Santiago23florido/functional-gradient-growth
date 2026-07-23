@@ -3734,7 +3734,22 @@ def run_pipeline(
                                 # failing it is a statement about this
                                 # direction, and adding directions changes
                                 # the tangent space and hence the direction.
-                                force=not certify_previous_step_committed,
+                                # Growth fires on the CERTIFICATE and nothing
+                                # else: eps >= 1/2 and only that. Forcing it
+                                # whenever a step failed to commit was mine,
+                                # added to break a deadlock whose cause -- the
+                                # held-out descent gate -- has since been
+                                # removed, so it now solves a problem that no
+                                # longer exists while firing on problems it
+                                # cannot fix. MEASURED on the small synthetic
+                                # run: 262 growths against 7 committed steps,
+                                # and 242 of those 262 grew with eps ALREADY
+                                # certified, many at eps = 0.0000. The trigger
+                                # was a non-finite validation measurement --
+                                # the model overflowing on unseen data, which
+                                # is a symptom of overfitting and which more
+                                # capacity makes worse, not better.
+                                force=False,
                                 progress=progress,
                             )
                             if certify_result.growths:
@@ -4392,9 +4407,20 @@ def run_pipeline(
                 if fgd_loss_descent_valid is False:
                     warnings.append("validation functional loss increased")
                 if fgd_sensor_valid is False:
+                    reasons = getattr(
+                        validation_certificate_for_next_epoch,
+                        "non_finite_quantities",
+                        (),
+                    ) if validation_certificate_for_next_epoch else ()
                     warnings.append(
                         f"sensor invalid on "
                         f"{fgd_sensor_invalid_batches} validation batch(es)"
+                        # Name what overflowed. Without it the message reads as
+                        # a defect in the certificate machinery; with
+                        # projection_sensor off the only test is finiteness, so
+                        # what failed is the MODEL producing non-finite values
+                        # on unseen data, not our arithmetic.
+                        + (f" (non-finite: {', '.join(reasons)})" if reasons else "")
                     )
                 diagnostic_bound_suffix = (
                     " (trajectory diagnostic, not an acceptance gate)"
