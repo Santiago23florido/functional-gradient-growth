@@ -353,6 +353,21 @@ class FGDApproxConfig:
     # object, turning the flow into stochastic FGD rather than exact descent
     # on a fixed 256 points.
     probe_resample: bool = False
+    # Materialise the exact Jacobian in CHUNKS of output rows. jacrev vmaps
+    # one backward pass per output row and holds the batched activations for
+    # all of them at once, so its peak memory scales with
+    # (output rows) x (activations), NOT with the size of J itself. MEASURED:
+    # a 3840 x ~600 Jacobian is only ~9 MB, yet computing it in one call ran
+    # the GPU out of memory -- the matrix was never the problem.
+    #
+    # Chunking rebuilds the SAME matrix row-block by row-block, so the result
+    # is bit-for-bit the exact Jacobian; only the peak drops, to
+    # (chunk) x (activations). It costs one extra forward per chunk. This is
+    # what makes certifying over a whole dataset affordable instead of over a
+    # subsample, which is the difference between the certificate being a
+    # statement about the training loss and a statement about 256 points.
+    # 0 disables chunking.
+    jacobian_row_chunk: int = 0
     certify_realize_path: bool = False
     certify_realize_max_iterations: int = 40
     certify_realize_tolerance: float = 0.05
@@ -1406,13 +1421,32 @@ def _compute_exact_tangent_projection_step(
         state.update(buffers)
         return functional_call(model, state, (x,)).reshape(-1)
 
+    chunk = int(getattr(config, "jacobian_row_chunk", 0) or 0)
     try:
-        jacobian = jacrev(call_with_parameters)(parameters)
+        if chunk > 0 and chunk < output_numel:
+            blocks = []
+            for start in range(0, output_numel, chunk):
+                stop = min(start + chunk, output_numel)
+
+                def call_rows(
+                    parameter_values: tuple[torch.Tensor, ...],
+                    _start: int = start,
+                    _stop: int = stop,
+                ) -> torch.Tensor:
+                    return call_with_parameters(parameter_values)[_start:_stop]
+
+                blocks.append(
+                    _flatten_jacobian(jacrev(call_rows)(parameters), stop - start)
+                )
+                _clear_inaccessible_tensor_caches(model)
+            jacobian_matrix = torch.cat(blocks, dim=0)
+        else:
+            jacobian_matrix = _flatten_jacobian(
+                jacrev(call_with_parameters)(parameters), output_numel
+            )
     finally:
         model.train(was_training)
         _clear_inaccessible_tensor_caches(model)
-
-    jacobian_matrix = _flatten_jacobian(jacobian, output_numel)
     if return_system:
         return ExactTangentSystem(
             jacobian=jacobian_matrix,

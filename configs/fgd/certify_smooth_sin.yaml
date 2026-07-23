@@ -117,6 +117,15 @@ fgd_approx:
   # full set there is no sampling at all and the certificate is a statement
   # about the training loss itself, which is what the theory is about.
   probe_batches: 10
+  # Assemble that Jacobian in row-blocks. jacrev vmaps one backward pass per
+  # output row and holds the batched activations for all of them at once, so
+  # its peak scales with (rows) x (activations), not with J. MEASURED: the
+  # 3840 x ~600 Jacobian is only ~9 MB and computing it in ONE call still ran
+  # the GPU out of memory -- the matrix was never the problem. Blocks rebuild
+  # the identical matrix (tests/test_jacobian_chunking.py) at a bounded peak,
+  # for one extra forward per block. This is what makes certifying over the
+  # whole dataset affordable rather than over a subsample.
+  jacobian_row_chunk: 256
   # A rejected fallback family is skipped until this many ACCEPTED outer
   # steps have been committed since the rejection (weight updates change the
   # tangent space, so rejection is never permanent at a fixed architecture).
