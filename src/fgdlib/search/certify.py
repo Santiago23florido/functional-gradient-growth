@@ -76,9 +76,32 @@ def exact_relative_error(
 ) -> float:
     """``eps`` from the FULL Jacobian -- no CG, no surrogate.
 
+    Measured at the SAME regularisation the step will use. That sounds like
+    bookkeeping and is not: with ``projection_damping_auto`` the step solves
+    at a ``lambda`` chosen per outer step, while this measured at the fixed
+    ``config.projection_damping``, so growth and stepping were driven by two
+    different certificates. Growth would then chase an ``eps`` that no step
+    ever saw, and the cycle's own rule -- train until the relative error
+    stops being satisfied, then grow -- refers to a quantity that has to be
+    one quantity.
+
     Returns ``inf`` when the projection is degenerate, which the caller must
     read as "nothing of ``r`` is representable yet".
     """
+    if config.projection_damping_auto:
+        # Imported here: damping.py imports from tangent.py, and certify.py
+        # is imported by the pipeline before either -- a module-level import
+        # would close the cycle.
+        from fgdlib.search.damping import select_projection_damping
+
+        choice = select_projection_damping(model, x, y, config)
+        if choice is not None:
+            return float(choice.candidate.relative_error)
+        # No regularisation both certifies and realises a step. That is not a
+        # missing measurement -- it is the structure being inadequate, which
+        # is exactly what the caller grows on.
+        return float("inf")
+
     step = _compute_exact_tangent_projection_step(
         model=model, x=x, y=y, config=config
     )

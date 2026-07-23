@@ -131,27 +131,46 @@ def test_an_uncertified_structure_takes_no_step_at_all(config) -> None:
     assert result.sensor_failure is False   # not a numerical failure
 
 
-def test_numerical_failure_still_blocks_the_step(config) -> None:
-    """Sensors are arithmetic, not theory: a non-finite measurement rejects."""
+def test_a_held_out_sensor_failure_is_reported_but_does_not_block(config) -> None:
+    """It is a statement about the fit, not about admissibility.
+
+    Both sensors a trial carries are the HELD-OUT one: ``certificate`` is
+    built from the validation measurement and ``epoch_result.sensor_valid``
+    is copied from it, so there is no train-side sensor in a trial at all.
+    With the projector invariants off there, the only test is finiteness --
+    failing it says the MODEL produced non-finite values on unseen data.
+
+    Letting it reject was the deadlock in its final form: MEASURED,
+    eps = 0.4808 certified so no growth fired while this sensor rejected
+    every step, and epochs 85-92 came out bit-identical at loss 0.1092, 1
+    committed step against 21 growths.
+    """
     result = _apply_lemma35_step(
         relative_error=0.3,
         evaluate_trial=lambda rate: _Trial(sensor_valid=False),
         config=config,
     )
-    assert result.accepted is None
-    assert result.sensor_failure is True
-    assert result.last_trial is not None    # kept for diagnostics
+    assert result.accepted is not None          # committed anyway
+    assert result.sensor_failure is True        # and reported
 
 
-def test_a_skipped_batch_blocks_the_step(config) -> None:
-    """A skipped batch means the measurement is incomplete, not that it passed."""
-    result = _apply_lemma35_step(
-        relative_error=0.3,
-        evaluate_trial=lambda rate: _Trial(skipped=1),
-        config=config,
-    )
-    assert result.accepted is None
-    assert result.sensor_failure is True
+def test_admissibility_comes_from_the_train_side_measurement(config) -> None:
+    """A non-finite eps on the certified sample DOES block, via the rate.
+
+    That is the guard the held-out sensor was standing in for, and it sits
+    where the lemma puts it: NaN fails ``eps < 1/2``, so no rate is issued
+    and no trial is ever evaluated.
+    """
+
+    def evaluate(rate: float) -> _Trial:  # pragma: no cover - must not run
+        raise AssertionError("a step was taken without a finite eps")
+
+    for epsilon in (float("nan"), float("inf"), None):
+        result = _apply_lemma35_step(
+            relative_error=epsilon, evaluate_trial=evaluate, config=config
+        )
+        assert result.accepted is None
+        assert result.trial_count == 0
 
 
 # --- the rate that maximises what the lemma guarantees ----------------------

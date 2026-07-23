@@ -1356,22 +1356,33 @@ def _finish_lemma35_step(
     learning_rate: float,
     evaluate_trial: Callable[[float], _FGDTrial],
 ) -> _FGDSearchResult:
-    """Evaluate the chosen rate once and commit it unless arithmetic failed.
+    """Evaluate the certified rate once and commit it.
 
-    The finiteness sensor is the only thing that can still reject. That is a
-    condition of the arithmetic, not of the theory: a non-finite loss or a
-    skipped batch means the measurement is meaningless, and no lemma covers
-    a computation that overflowed.
+    Nothing here rejects, and that is deliberate. The sensors this used to
+    consult are BOTH the held-out one: ``trial.certificate`` is built from
+    ``direction_stats``, measured on the validation probe, and
+    ``epoch_result.sensor_valid`` is copied from that same certificate --
+    there is no train-side sensor in a trial at all. With the projector
+    invariants off, as they are there, that sensor tests only finiteness, so
+    failing it says the MODEL produced non-finite values on unseen data.
+
+    That is a statement about the fit, not about admissibility. Admissibility
+    is decided upstream, on the TRAIN probe, which is the sample Lemma 3.5
+    speaks about -- and a non-finite measurement there already blocks the
+    step, because ``lemma35_learning_rate`` withholds a rate whenever ``eps``
+    fails ``eps < 1/2`` and NaN fails it.
+
+    Letting the held-out sensor reject was the deadlock in its final form:
+    MEASURED, ``eps = 0.4808`` certified so no growth fired, while this
+    sensor rejected every step, and epochs 85-92 came out bit-identical at
+    loss 0.1092 -- 1 committed step against 21 growths. The earlier ``force``
+    workaround papered over it by buying capacity, which is the one response
+    guaranteed to make an overflowing model overflow harder.
     """
     trial = evaluate_trial(learning_rate)
-    sensor_valid = (
-        trial.epoch_result.sensor_valid
-        and trial.epoch_result.skipped_batches == 0
-        and trial.certificate.sensor_valid
+    return _FGDSearchResult(
+        trial, trial, 1, not trial.certificate.sensor_valid
     )
-    if not sensor_valid:
-        return _FGDSearchResult(None, trial, 1, True)
-    return _FGDSearchResult(trial, trial, 1, False)
 
 
 def _search_fgd_certified_trial(
@@ -3914,6 +3925,27 @@ def run_pipeline(
                                         config.fgd_approx,
                                     )
                                 )
+                            elif config.fgd_approx.certify_apply_in_interval:
+                                # DIAGNOSTIC, not a gate. This variant decides
+                                # admissibility from eps on the training
+                                # probe, which is the sample Lemma 3.5 speaks
+                                # about; with the projector invariants off,
+                                # this held-out sensor tests only finiteness,
+                                # so failing it says the MODEL overflowed on
+                                # unseen data, not that the certified step is
+                                # inadmissible.
+                                #
+                                # Letting it block was the deadlock in its
+                                # final form: MEASURED, eps = 0.4808
+                                # certified so no growth fired, while this
+                                # sensor rejected every step, and epochs
+                                # 85-92 came out bit-identical at loss 0.1092
+                                # with 1 step against 21 growths. The earlier
+                                # force= workaround papered over it by buying
+                                # capacity, which is the one response
+                                # guaranteed to make an overflowing model
+                                # overflow harder.
+                                direction_sensor_failure = True
                             else:
                                 direction_sensor_failure = True
                                 direction_stats = None
