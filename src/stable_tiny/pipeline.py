@@ -3526,6 +3526,9 @@ def run_pipeline(
                                 max_growths=(
                                     config.fgd_approx.certify_max_growths
                                 ),
+                                function_preserving=(
+                                    config.fgd_approx.certify_function_preserving
+                                ),
                                 progress=progress,
                             )
                             if certify_result.growths:

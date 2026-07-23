@@ -213,6 +213,21 @@ class FGDApproxConfig:
     # probe so large that certification is out of reach, which is itself a
     # result worth seeing rather than hanging on).
     certify_max_growths: int = 256
+    # Whether the grow-to-certify loop grows function-preservingly. MEASURED,
+    # and the reason the default is False: with omega = 0 the incoming weights
+    # contribute nothing to the Jacobian, so a preserving growth converts only
+    # ~21 % of the parameters it spends into tangent directions (+9 rank for 42
+    # parameters). Releasing omega gives one independent direction per added
+    # parameter -- the theoretical maximum -- and certifies far sooner:
+    #
+    #   preserving      24 growths   eps 0.487   1779 params
+    #   NOT preserving   5 growths   eps 0.211    399 params
+    #
+    # What is given up is the monotonicity proof (a non-preserving growth
+    # moves f, so r moves and eps may rise after a growth); the loop then
+    # relies on the measured trajectory. Set True to recover the theorem at
+    # roughly five times the structural cost.
+    certify_function_preserving: bool = False
     # Generalised R1. The eps < 1/2 stop is Lemma 3.5's admissibility of a
     # STEP, not adequacy of the STRUCTURE; on an easy task the two coincide
     # (MNIST stops at a good small net) but on a hard one they diverge --

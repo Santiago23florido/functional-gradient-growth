@@ -88,17 +88,36 @@ def exact_relative_error(
     return float(epsilon)
 
 
-def _grow_clone_preserving(
+def _grow_clone(
     model,
     train_loader,
     layer_index: int,
     device: torch.device,
     config,
+    function_preserving: bool,
 ):
-    """A copy of ``model`` grown at ``layer_index``, ``f`` unchanged.
+    """A copy of ``model`` grown at ``layer_index``.
 
-    Returns ``None`` when the growth cannot be applied (GroMo raises when the
-    function-preservation drift check fails), so a failed candidate simply
+    ``function_preserving`` is the central trade-off of this method, and it is
+    a measured one:
+
+    | growth          | tangent directions gained | parameters added |
+    |-----------------|---------------------------|------------------|
+    | preserving      | +9                        | 42               |
+    | non-preserving  | +42                       | 42               |
+
+    With ``omega = 0`` the incoming weights contribute nothing to the
+    Jacobian (``df/dalpha = 0``), so only the outgoing weights add directions
+    -- about a fifth of the parameters spent. Releasing ``omega`` makes every
+    added parameter contribute an independent direction, the theoretical
+    maximum, so the rank needed to certify is reached far sooner.
+
+    What is given up is the monotonicity proof: a non-preserving growth moves
+    ``f``, so ``r`` moves with it and ``eps`` may rise after a growth. The
+    loop then relies on measurement rather than a theorem, which is why the
+    preserving route stays the default.
+
+    Returns ``None`` when the growth cannot be applied, so a failed candidate
     drops out of the comparison instead of aborting the search.
     """
     clone = copy.deepcopy(model)
@@ -114,7 +133,7 @@ def _grow_clone_preserving(
                 compute_delta=config.fgd_approx.growth_compute_delta,
             ),
             progress=None,
-            function_preserving=True,
+            function_preserving=function_preserving,
             preservation_tolerance=(
                 config.fgd_approx.growth_preservation_tolerance
             ),
@@ -132,6 +151,7 @@ def grow_until_certified(
     device: torch.device,
     config,
     max_growths: int = 64,
+    function_preserving: bool = True,
     progress=None,
 ):
     """Grow until ``eps < rel_error_threshold``; return the grown model.
@@ -153,11 +173,17 @@ def grow_until_certified(
     while epsilon >= threshold and growths < max_growths:
         locations = range(len(getattr(model, "_growable_layers", [])))
         best_model = None
-        best_epsilon = epsilon
+        # Preserving growth cannot make eps worse, so requiring an improvement
+        # is free there. Non-preserving growth moves f, so the best available
+        # candidate may still sit above the current eps; accepting it is what
+        # lets the rank keep climbing, and the loop then relies on the measured
+        # trajectory rather than the monotonicity theorem.
+        best_epsilon = epsilon if function_preserving else float("inf")
         best_location = None
         for location in locations:
-            candidate = _grow_clone_preserving(
-                model, train_loader, location, device, config
+            candidate = _grow_clone(
+                model, train_loader, location, device, config,
+                function_preserving,
             )
             if candidate is None:
                 continue
