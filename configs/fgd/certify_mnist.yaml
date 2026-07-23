@@ -149,9 +149,20 @@ fgd_approx:
   certify_max_growths: 1500
   # PAPER-PURE STEP. Lemma 3.5 does not offer descent as a condition to
   # verify -- it PROVES it: eps < 1/2 implies every eta in (0, eta_bar(eps))
-  # descends. So once eps is certified we take eta = theory_lr_safety *
-  # eta_bar(eps) (0.95 of the interval) and apply, with no sweep and no
-  # empirical descent gate, exactly as the paper's algorithm does.
+  # descends. So the flow keeps the rate the certificate licenses (the same
+  # theory_lr_safety * eta_bar the ordinary sweep would start from, 0.95 of
+  # the interval) and simply applies it -- one rate, no sweep, no empirical
+  # descent gate, exactly as the paper's algorithm does.
+  #
+  # The rate must come from THAT certificate and not be recomputed from
+  # another sample. MEASURED: deriving it from the train-probe eps the grow
+  # loop certifies looks like the same formula but is a different number --
+  # small eps means large eta_bar, and at eps ~ 0.42 it gave eta = 0.86
+  # against |u| = 15, a parameter displacement of ~13 that left the linear
+  # regime and diverged (validation loss 4.1e3 -> 2.7e4 in five steps).
+  # Lemma 3.5 governs a FUNCTION-space step f - eta g; what is taken is a
+  # PARAMETER-space step theta - eta u, and they agree only while eta |u| is
+  # small enough for f(theta - eta u) ~ f(theta) - eta J u to hold.
   #
   # Why this matters here, MEASURED: with the gate on, the flow deadlocked.
   # eps = 0.475 certified the structure so no growth fired, while no rate
