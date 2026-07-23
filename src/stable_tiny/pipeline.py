@@ -3656,20 +3656,24 @@ def run_pipeline(
                                 function_preserving=(
                                     config.fgd_approx.certify_function_preserving
                                 ),
-                                # Growing because a step failed only makes
-                                # sense while a step CAN fail for structural
-                                # reasons. Under certify_apply_in_interval it
-                                # cannot: eps < 1/2 is the sole gate and the
-                                # loop below already grows until it holds, so
-                                # forcing would add capacity for no stated
-                                # reason. Without that flag the realised
-                                # descent is a separate gate, and a step that
-                                # passed eps < 1/2 yet failed it has shown the
-                                # structure did not deliver -- grow anyway.
-                                force=(
-                                    not config.fgd_approx.certify_apply_in_interval
-                                    and not certify_previous_step_committed
-                                ),
+                                # A step that did not commit while eps was
+                                # already certified means the structure, not
+                                # the step size, is what has to change --
+                                # eps < 1/2 said the tangent space was
+                                # adequate and the step still could not be
+                                # taken, so grow anyway. MEASURED: without
+                                # this the linearisation control froze the
+                                # synthetic run, epochs 12-16 bit-identical
+                                # at loss 0.1072 with eps = 0.388 (certified,
+                                # so no growth) and no rate inside the
+                                # regime the lemma describes (so no step).
+                                # Growth is the right remedy here in a way it
+                                # was not for the descent gate: the defect is
+                                # measured on the SAME probe as eps, so
+                                # failing it is a statement about this
+                                # direction, and adding directions changes
+                                # the tangent space and hence the direction.
+                                force=not certify_previous_step_committed,
                                 progress=progress,
                             )
                             if certify_result.growths:
