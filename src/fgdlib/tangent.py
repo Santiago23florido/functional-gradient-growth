@@ -248,6 +248,28 @@ class FGDApproxConfig:
     # interval by default) and APPLY. Finiteness sensors still gate -- those
     # catch numerical failure, not theory -- but realised descent does not.
     certify_apply_in_interval: bool = False
+    # LINEARISATION TOLERANCE. Lemma 3.5's subject is the FUNCTION-space step
+    # f - eta g; what is performed is the PARAMETER-space step theta - eta u,
+    # and f(theta - eta u) = f(theta) - eta g + O(eta^2 |u|^2). The remainder
+    # is not controlled by L_s but by the curvature of the parameter-to-
+    # function map, which no certificate here measures.
+    #
+    # MEASURED on the synthetic task with sum-MSE -- the theory's best case,
+    # exact PL constant mu = 2 with L* = 0 -- applying the certified rate
+    # without this guard diverged while the certificate stayed healthy:
+    # eta 0.005 -> 0.855 as eps FELL 0.50 -> 0.085, loss 2.3e3 -> 7.5e7,
+    # accuracy 0.087 -> 0.004. The failure is self-reinforcing: eta_bar(eps)
+    # rises towards 2/L_s as eps -> 0, so the better the certificate the
+    # larger the step it authorises and the further outside the linear
+    # regime that step lands.
+    #
+    # This is NOT the descent check that was removed -- it never looks at the
+    # loss. It measures
+    #     delta(eta) = |f(theta - eta u) - (f(theta) - eta g)| / (eta |g|)
+    # and narrows eta INSIDE the certified interval until the step is the
+    # object the lemma describes. Enforcing a hypothesis, not adding a gate.
+    # None disables it (the raw certified rate is applied).
+    certify_linearization_tolerance: float | None = None
     # Generalised R1. The eps < 1/2 stop is Lemma 3.5's admissibility of a
     # STEP, not adequacy of the STRUCTURE; on an easy task the two coincide
     # (MNIST stops at a good small net) but on a hard one they diverge --

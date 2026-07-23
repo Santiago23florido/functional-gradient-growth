@@ -22,7 +22,7 @@ data:
   train_batches: 10
   validation_batches: 10
   test_batches: 1
-  batch_size: 512
+  batch_size: 128
   train_seed: 0
   validation_seed: 2
   test_seed: 1
@@ -98,7 +98,13 @@ fgd_approx:
   # statement about 64 samples x 10 classes = 640 output dimensions. Measured
   # cost: 2.4 s per exact eps at this size against 11.1 s at 4 batches, and
   # the loop pays that per candidate per growth.
-  probe_batches: 4
+  # 2 x 128 = 256 samples x 3 outputs = 768 output dimensions. Sized so the
+  # loop can actually finish: the residual lives in N*K dimensions, so that
+  # is how much rank the tangent space must acquire to capture 80 % of the
+  # gradient energy, and the exact solver materialises a (N*K) x P Jacobian
+  # per candidate per growth. At 4 x 512 = 6144 rows the run died of CUDA
+  # OOM after 23 growths, with eps still at 0.545.
+  probe_batches: 2
   # A rejected fallback family is skipped until this many ACCEPTED outer
   # steps have been committed since the rejection (weight updates change the
   # tangent space, so rejection is never permanent at a fixed architecture).
@@ -169,6 +175,19 @@ fgd_approx:
   # probe and descent was demanded on the VALIDATION probe, and Lemma 3.5
   # guarantees descent only on the sample where eps was measured.
   certify_apply_in_interval: true
+  # Enforce Lemma 3.5's HYPOTHESIS: that theta - eta u is the function-space
+  # step f - eta g the lemma is about. Without it this exact config diverged
+  # while the certificate stayed healthy -- eta rose 0.005 -> 0.855 as eps
+  # FELL 0.50 -> 0.085, loss 2.3e3 -> 7.5e7, accuracy 0.087 -> 0.004 -- because
+  # eta_bar(eps) -> 2/L_s as eps -> 0, so the better the certificate the larger
+  # the step it authorises and the further outside the linear regime it lands.
+  #
+  # 0.1: the realised displacement must match the predicted one to within
+  # 10 % of its size. This is not the descent check that was removed -- the
+  # defect never looks at the loss (tests/test_linearization.py pins that
+  # reversing the update's sign leaves it unchanged). It only narrows eta
+  # INSIDE the certified interval.
+  certify_linearization_tolerance: 0.1
   tangent_measured_descent: false
   growth_selection: unified_expansion
   # Generalised R1: eps < 1/2 is Lemma 3.5 step-admissibility, not structural

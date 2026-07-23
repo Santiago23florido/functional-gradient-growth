@@ -65,6 +65,7 @@ from fgdlib.search.unified import (
     rank_candidates,
     rank_limiting_locations,
 )
+from fgdlib.search.linearization import certified_linear_learning_rate
 from fgdlib.search.growth import (
     GrowthResult,
     ScalingLineSearchConfig,
@@ -1262,6 +1263,10 @@ def _apply_lemma35_step(
     relative_error: float | None,
     evaluate_trial: Callable[[float], _FGDTrial],
     config: FGDApproxConfig,
+    model: GrowingMLP | None = None,
+    probe_inputs: torch.Tensor | None = None,
+    updates: tuple[torch.Tensor, ...] | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> _FGDSearchResult:
     """Take the certified step and commit it -- assume the lemma, don't check it.
 
@@ -1296,6 +1301,37 @@ def _apply_lemma35_step(
         # the cycle turns: no step, grow instead. The caller's grow loop
         # runs before every outer step, so that happens on the next pass.
         return _FGDSearchResult(None, None, 0, False)
+
+    if (
+        config.certify_linearization_tolerance is not None
+        and model is not None
+        and probe_inputs is not None
+        and updates is not None
+    ):
+        # Enforce the lemma's own hypothesis: that theta - eta u really is
+        # the function-space step f - eta g the theorem is about. Narrows
+        # eta INSIDE the certified interval; never enlarges it, never looks
+        # at the loss.
+        linearized = certified_linear_learning_rate(
+            model, probe_inputs, updates, learning_rate, config
+        )
+        if progress is not None:
+            progress(
+                f"[LINEAR] eta {learning_rate:.4g} -> "
+                + (
+                    f"{linearized.learning_rate:.4g}"
+                    if linearized.learning_rate is not None
+                    else "none"
+                )
+                + f" (defect {linearized.defect:.3e}, "
+                f"{linearized.backtracks} backtracks)"
+            )
+        if linearized.learning_rate is None:
+            # No admissible rate puts this direction inside the regime the
+            # lemma describes. The structure, not the step size, is what has
+            # to change -- so take no step and let the grow loop act.
+            return _FGDSearchResult(None, None, 0, False)
+        learning_rate = linearized.learning_rate
 
     trial = evaluate_trial(learning_rate)
     sensor_valid = (
@@ -3739,6 +3775,10 @@ def run_pipeline(
                                 relative_error=certified_relative_error,
                                 evaluate_trial=evaluate_trial,
                                 config=config.fgd_approx,
+                                model=model,
+                                probe_inputs=fgd_train_probe[0],
+                                updates=tangent_direction,
+                                progress=progress,
                             )
                         elif (
                             config.fgd_approx.tangent_measured_descent
