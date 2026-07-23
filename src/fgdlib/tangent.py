@@ -293,6 +293,28 @@ class FGDApproxConfig:
     # the theorem's. Measured to land within 9 % of the hand-tuned constant on
     # the task the constant was tuned for.
     projection_damping_auto: bool = False
+    # WHICH admissible g inside the tangent space to use. Lemma 3.5 fixes only
+    # RelErr(g, r) <= 1/2 and says nothing about which g in T = range(J) to
+    # take; that freedom is ours, and how it is resolved decides whether the
+    # step generalises.
+    #
+    # "descent" (default): the rung maximising eta * ||g||^2, the decrease the
+    # lemma guarantees. This is the LEAST regularised admissible step, so it
+    # fits every component of r including the sample-specific part. MEASURED:
+    # train accuracy 0.980 with test 0.234 -- exact interpolation of the
+    # training set.
+    #
+    # "gcv": the rung minimising generalized cross-validation,
+    #     GCV(lambda) = (1/N)||r - H_lambda r||^2 / (1 - df(lambda)/N)^2,
+    # the classical leave-one-out risk estimate for ridge, with
+    # df = tr H_lambda = sum sigma_i^2/(sigma_i^2 + lambda). The projection IS
+    # kernel ridge regression in the tangent kernel, so this is the selector
+    # that problem calls for. It uses no held-out data (structural decisions
+    # stay pure), has no tunable constant (an argmin), and is free (sigma and
+    # U^T r are already formed here). The (1 - df/N)^2 denominator diverges as
+    # df -> N, so it refuses exactly the interpolating regime the descent rule
+    # walks into.
+    projection_damping_objective: str = "descent"
     # REALISE THE CERTIFIED STEP AS A PATH instead of a single jump. Lemma 3.5
     # licenses a move in FUNCTION space, f -> f - eta g; theta - eta u is only
     # the first Gauss-Newton iteration of "find theta' with f(theta') = f_target".

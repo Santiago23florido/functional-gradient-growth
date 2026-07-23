@@ -128,6 +128,14 @@ class DampingCandidate:
     certified_learning_rate: float | None
     learning_rate: float | None
     guaranteed_decrease: float
+    #: tr H_lambda = sum sigma_i^2/(sigma_i^2 + lambda) -- the effective
+    #: number of degrees of freedom this rung spends. Ranges from rank(J) at
+    #: lambda = 0 down towards 0 as lambda grows.
+    effective_dof: float
+    #: Generalized cross-validation score, the leave-one-out risk estimate
+    #: (1/N)||r - H_lambda r||^2 / (1 - df/N)^2. Lower is better; it is
+    #: +inf once df >= N, which is exactly the interpolating regime.
+    gcv: float
 
 
 @dataclass(frozen=True)
@@ -137,6 +145,54 @@ class DampingChoice:
     candidate: DampingCandidate
     parameter_updates: tuple[torch.Tensor, ...]
     candidates: tuple[DampingCandidate, ...]
+
+
+def minimal_relative_error(
+    model,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    config: FGDApproxConfig,
+) -> float:
+    """The smallest ``eps`` the tangent space can reach, at least damping.
+
+    This is the growth signal, and it is the RIGHT one for two reasons that
+    coincide. First, ``eps`` is increasing in ``lambda`` (more regularisation
+    is a worse approximation), so its minimum is at the least-regularised end
+    of the bracket. Second, that minimum is ``< 1/2`` if and only if SOME
+    ``lambda`` certifies -- exactly the condition ``select_projection_damping``
+    checks for. So growing until this crosses ``1/2`` is identical to growing
+    until a certified step exists, and unlike the certified ``eps`` it stays
+    FINITE while the structure is still inadequate, which is what lets the
+    growth loop rank one candidate structure against another.
+
+    Returns ``inf`` when the system is degenerate.
+    """
+    system = exact_tangent_system(model, x, y, config)
+    if system is None:
+        return float("inf")
+    jacobian = system.jacobian.to(dtype=torch.float64)
+    target = system.target.reshape(-1).to(dtype=torch.float64)
+    if jacobian.numel() == 0 or target.numel() == 0:
+        return float("inf")
+    left, singular_values, right = torch.linalg.svd(jacobian, full_matrices=False)
+    if singular_values.numel() == 0:
+        return float("inf")
+    scale = float(singular_values.max()) ** 2
+    if not scale > 0.0:
+        return float("inf")
+    coefficients = left.t() @ target
+    absolute = DAMPING_BRACKET[0] * scale
+    denominator = singular_values.square() + absolute
+    approximation = left @ (singular_values.square() / denominator * coefficients)
+    stats = _output_relative_error_from_tensors(
+        approximation=approximation.to(system.target.dtype),
+        target=system.target.reshape(-1),
+        eps=config.eps,
+    )
+    value = stats.output_error.relative_error
+    if value is None or not float(value) == float(value):
+        return float("inf")
+    return float(value)
 
 
 def select_projection_damping(
@@ -170,21 +226,39 @@ def select_projection_damping(
     if not scale > 0.0:
         return None
     coefficients = left.t() @ target
+    n_observations = int(target.numel())
+    target_sq_norm = float(target.square().sum())
 
     threshold = min(config.rel_error_threshold, 0.5)
+    objective = getattr(config, "projection_damping_objective", "descent")
 
     def solve(relative_damping: float):
         """Re-weight the factorisation -- no new Jacobian, no new SVD."""
         absolute = relative_damping * scale
         denominator = singular_values.square() + absolute
-        approximation = left @ (
-            singular_values.square() / denominator * coefficients
-        )
+        filters = singular_values.square() / denominator     # sigma^2/(sigma^2+lambda)
+        approximation = left @ (filters * coefficients)
         flat_update = right.t() @ (singular_values / denominator * coefficients)
-        return absolute, approximation, flat_update
+        return absolute, approximation, flat_update, filters
+
+    def gcv_at(filters: torch.Tensor, approximation: torch.Tensor) -> tuple[float, float]:
+        """Return (df, GCV) for a rung, from its spectral filters.
+
+        df = tr H_lambda = sum sigma_i^2/(sigma_i^2 + lambda) is the sum of
+        the filter values -- H_lambda's eigenvalues -- and the GCV residual
+        ||r - H_lambda r|| is exact from the same quantities, no extra solve.
+        GCV is +inf once df >= N: that is the interpolating regime, refused
+        by construction rather than by a threshold.
+        """
+        degrees = float(filters.sum())
+        residual_sq = float((target - approximation).square().sum())
+        gap = 1.0 - degrees / n_observations
+        if gap <= 0.0:
+            return degrees, float("inf")
+        return degrees, (residual_sq / n_observations) / (gap * gap)
 
     def relative_error_at(relative_damping: float) -> float:
-        _, approximation, flat_update = solve(relative_damping)
+        _, approximation, flat_update, _ = solve(relative_damping)
         if not torch.isfinite(flat_update).all():
             return float("inf")
         stats = _output_relative_error_from_tensors(
@@ -216,9 +290,23 @@ def select_projection_damping(
     candidates: list[DampingCandidate] = []
     best: tuple[DampingCandidate, tuple[torch.Tensor, ...]] | None = None
 
+    def is_better(candidate: DampingCandidate, incumbent: DampingCandidate | None) -> bool:
+        """Rank certified, realisable rungs by the configured objective.
+
+        "descent": maximise eta * ||g||^2, the decrease Lemma 3.5 guarantees.
+        "gcv":     minimise the leave-one-out risk estimate.
+        Both only ever compare rungs that certify AND realise a step; a rung
+        that does neither has score 0 / +inf and never wins.
+        """
+        if incumbent is None:
+            return True
+        if objective == "gcv":
+            return candidate.gcv < incumbent.gcv
+        return candidate.guaranteed_decrease > incumbent.guaranteed_decrease
+
     for index in range(DAMPING_FAN_STEPS + 1):
         relative_damping = boundary * (DAMPING_FAN_RATIO**index)
-        absolute_damping, approximation, flat_update = solve(relative_damping)
+        absolute_damping, approximation, flat_update, filters = solve(relative_damping)
         if not torch.isfinite(flat_update).all():
             continue
 
@@ -230,6 +318,7 @@ def select_projection_damping(
         relative_error = stats.output_error.relative_error
         update_norm = float(torch.linalg.vector_norm(flat_update))
         approximation_norm = stats.output_error.approximation_norm
+        degrees, gcv = gcv_at(filters, approximation)
 
         certified_rate: float | None = None
         learning_rate: float | None = None
@@ -251,8 +340,8 @@ def select_projection_damping(
 
         # Lemma 3.5's own guaranteed decrease is proportional to
         # eta * ||g||^2, so that -- not eps, and not the rate alone -- is what
-        # the rungs are ranked by. A tiny eps bought with an unrealisable step
-        # scores zero, which is exactly right.
+        # the descent objective ranks by. A tiny eps bought with an
+        # unrealisable step scores zero, which is exactly right.
         decrease = (
             learning_rate * approximation_norm**2
             if learning_rate is not None
@@ -271,10 +360,14 @@ def select_projection_damping(
             certified_learning_rate=certified_rate,
             learning_rate=learning_rate,
             guaranteed_decrease=decrease,
+            effective_dof=degrees,
+            gcv=gcv,
         )
         candidates.append(candidate)
-        if decrease > 0.0 and (
-            best is None or decrease > best[0].guaranteed_decrease
+        # A rung only competes if it both certifies and realises a step --
+        # the certificate is never traded away regardless of objective.
+        if learning_rate is not None and decrease > 0.0 and is_better(
+            candidate, best[0] if best else None
         ):
             best = (candidate, updates)
 

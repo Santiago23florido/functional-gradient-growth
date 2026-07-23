@@ -92,15 +92,18 @@ def exact_relative_error(
         # Imported here: damping.py imports from tangent.py, and certify.py
         # is imported by the pipeline before either -- a module-level import
         # would close the cycle.
-        from fgdlib.search.damping import select_projection_damping
+        from fgdlib.search.damping import minimal_relative_error
 
-        choice = select_projection_damping(model, x, y, config)
-        if choice is not None:
-            return float(choice.candidate.relative_error)
-        # No regularisation both certifies and realises a step. That is not a
-        # missing measurement -- it is the structure being inadequate, which
-        # is exactly what the caller grows on.
-        return float("inf")
+        # The growth signal is the SMALLEST eps the tangent space can reach,
+        # at least regularisation. It is < 1/2 exactly when a certified step
+        # exists (eps is increasing in lambda, so its minimum decides), and
+        # unlike the certified eps it stays finite while the structure is
+        # still inadequate -- which is what lets the loop rank one candidate
+        # structure against another. Growth and stepping thus share the SAME
+        # spectrum, measured at the same probe; they read different points of
+        # it (growth the minimum, the step the selected lambda), which is the
+        # correct division of labour rather than the two-certificates bug.
+        return minimal_relative_error(model, x, y, config)
 
     step = _compute_exact_tangent_projection_step(
         model=model, x=x, y=y, config=config
