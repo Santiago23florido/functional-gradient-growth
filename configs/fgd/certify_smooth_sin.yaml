@@ -188,6 +188,21 @@ fgd_approx:
   # reversing the update's sign leaves it unchanged). It only narrows eta
   # INSIDE the certified interval.
   certify_linearization_tolerance: 0.1
+  # Choose the projection's regularisation by measurement rather than by the
+  # fixed projection_damping above. It is the knob arbitrating between the
+  # certificate (eps) and the realisability of the step (|u|), and they pull
+  # opposite ways -- MEASURED on one grown model here:
+  #
+  #   lambda 0     eps 0.045   |u| 3.6e5   no admissible rate
+  #   lambda 1e-2  eps 0.495   |u| 3.9e1   eta 1.6e-4
+  #   lambda 1e0   eps 0.845   |u| 4.1e0   eps >= 1/2
+  #
+  # Only a narrow window satisfies both, and 1e-2 lands in it by luck at THIS
+  # scale of J. Selection locates the window per step and picks the rung
+  # maximising eta*||g||^2, the decrease Lemma 3.5 guarantees; measured to
+  # land within 9 % of the hand-tuned constant on the task it was tuned for,
+  # with nothing dataset-specific in the rule.
+  projection_damping_auto: true
   tangent_measured_descent: false
   growth_selection: unified_expansion
   # Generalised R1: eps < 1/2 is Lemma 3.5 step-admissibility, not structural

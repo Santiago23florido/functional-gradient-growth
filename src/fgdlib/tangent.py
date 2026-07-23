@@ -270,6 +270,29 @@ class FGDApproxConfig:
     # object the lemma describes. Enforcing a hypothesis, not adding a gate.
     # None disables it (the raw certified rate is applied).
     certify_linearization_tolerance: float | None = None
+    # CHOOSE THE PROJECTION'S REGULARISATION BY MEASUREMENT, not by a constant.
+    # The damping in J u ~ r arbitrates between the two conditions this method
+    # needs at once, and they pull in OPPOSITE directions: lowering it makes
+    # eps small (certificate easy) while |u| explodes (step unrealisable);
+    # raising it does the reverse. MEASURED on one grown synthetic model --
+    #
+    #   lambda 0     eps 0.045   |u| 3.6e5   no admissible rate
+    #   lambda 1e-2  eps 0.495   |u| 3.9e1   eta 1.6e-4
+    #   lambda 1e0   eps 0.845   |u| 4.1e0   eps >= 1/2
+    #
+    # Only a narrow window satisfies both, and a fixed constant lands in it by
+    # luck: 1e-2 works here, and nothing makes it work at another scale of J,
+    # which changes with the dataset, the architecture and the point in
+    # training. That is precisely what stops a configuration from transferring.
+    #
+    # When true, fgdlib/search/damping.py locates the window per step --
+    # bisecting for the certified boundary, then fanning below it -- and picks
+    # the rung maximising eta * ||g||^2, the decrease Lemma 3.5 itself
+    # guarantees. Nothing dataset-specific enters: the bracket is relative to
+    # sigma_max^2, the filter is the method's own certificate, the objective is
+    # the theorem's. Measured to land within 9 % of the hand-tuned constant on
+    # the task the constant was tuned for.
+    projection_damping_auto: bool = False
     # Generalised R1. The eps < 1/2 stop is Lemma 3.5's admissibility of a
     # STEP, not adequacy of the STRUCTURE; on an easy task the two coincide
     # (MNIST stops at a good small net) but on a hard one they diverge --
@@ -1226,12 +1249,43 @@ def _conjugate_gradient(
     return x
 
 
+@dataclass(frozen=True)
+class ExactTangentSystem:
+    """The materialised system ``J u ~ r`` at the current model.
+
+    Exposed so a caller can solve it more than once without paying for the
+    Jacobian again. The projection is linear in the regularisation, so a
+    single factorisation answers a whole ladder of damping values; recomputing
+    ``jacrev`` per value would multiply the dominant cost by the ladder size
+    for no new information.
+    """
+
+    jacobian: torch.Tensor
+    target: torch.Tensor
+    parameters: tuple[torch.Tensor, ...]
+    loss: float
+
+
+def exact_tangent_system(
+    model: GrowingMLP,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    config: FGDApproxConfig,
+) -> ExactTangentSystem | None:
+    """Materialise ``J`` and ``r = grad_f L`` -- returns ``None`` if degenerate."""
+    step = _compute_exact_tangent_projection_step(
+        model=model, x=x, y=y, config=config, return_system=True
+    )
+    return step if isinstance(step, ExactTangentSystem) else None
+
+
 def _compute_exact_tangent_projection_step(
     model: GrowingMLP,
     x: torch.Tensor,
     y: torch.Tensor,
     config: FGDApproxConfig,
-) -> _TangentProjectionStep:
+    return_system: bool = False,
+) -> _TangentProjectionStep | ExactTangentSystem | None:
     """Compute g = P_T grad L by explicitly materializing the full Jacobian."""
     named_parameters = _trainable_named_parameters(model)
     if not named_parameters:
@@ -1268,6 +1322,8 @@ def _compute_exact_tangent_projection_step(
             target_sq_norm=0.0,
             eps=config.eps,
         )
+        if return_system:
+            return None
         return _TangentProjectionStep(
             output_error=output_error,
             parameter_updates=zero_updates,
@@ -1294,6 +1350,13 @@ def _compute_exact_tangent_projection_step(
         _clear_inaccessible_tensor_caches(model)
 
     jacobian_matrix = _flatten_jacobian(jacobian, output_numel)
+    if return_system:
+        return ExactTangentSystem(
+            jacobian=jacobian_matrix,
+            target=target,
+            parameters=parameters,
+            loss=float(loss.detach().item()),
+        )
     flat_update, approximation = _solve_tangent_projection(
         jacobian_matrix=jacobian_matrix,
         target=target,

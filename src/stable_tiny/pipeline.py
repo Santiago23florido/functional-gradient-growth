@@ -1263,6 +1263,7 @@ def _apply_lemma35_step(
     relative_error: float | None,
     evaluate_trial: Callable[[float], _FGDTrial],
     config: FGDApproxConfig,
+    learning_rate: float | None = None,
     model: GrowingMLP | None = None,
     probe_inputs: torch.Tensor | None = None,
     updates: tuple[torch.Tensor, ...] | None = None,
@@ -1295,7 +1296,16 @@ def _apply_lemma35_step(
     the theory but of the arithmetic: a non-finite loss or a skipped batch
     means the measurement itself is meaningless.
     """
-    learning_rate = lemma35_learning_rate(relative_error, config)
+    if learning_rate is None:
+        learning_rate = lemma35_learning_rate(relative_error, config)
+    elif lemma35_learning_rate(relative_error, config) is None:
+        # A rate supplied from outside never overrides the certificate: if
+        # eps fails the criterion there is no admissible rate to supply.
+        learning_rate = None
+    else:
+        # Already scored against the linearisation control by the selection
+        # that produced it, so it is applied as given.
+        return _finish_lemma35_step(learning_rate, evaluate_trial)
     if learning_rate is None:
         # The relative-error criterion is not satisfied, so this is where
         # the cycle turns: no step, grow instead. The caller's grow loop
@@ -1333,6 +1343,20 @@ def _apply_lemma35_step(
             return _FGDSearchResult(None, None, 0, False)
         learning_rate = linearized.learning_rate
 
+    return _finish_lemma35_step(learning_rate, evaluate_trial)
+
+
+def _finish_lemma35_step(
+    learning_rate: float,
+    evaluate_trial: Callable[[float], _FGDTrial],
+) -> _FGDSearchResult:
+    """Evaluate the chosen rate once and commit it unless arithmetic failed.
+
+    The finiteness sensor is the only thing that can still reject. That is a
+    condition of the arithmetic, not of the theory: a non-finite loss or a
+    skipped batch means the measurement is meaningless, and no lemma covers
+    a computation that overflowed.
+    """
     trial = evaluate_trial(learning_rate)
     sensor_valid = (
         trial.epoch_result.sensor_valid
@@ -3689,20 +3713,68 @@ def run_pipeline(
                                     f"(stopped at {certify_result.relative_error:.4f} "
                                     f"after {certify_result.growths} growths)"
                                 )
-                        direction_step = _compute_tangent_projection_step(
-                            model=model,
-                            x=fgd_train_probe[0],
-                            y=fgd_train_probe[1],
-                            config=config.fgd_approx,
-                        )
-                        if _projection_step_sensor_valid(
-                            direction_step,
-                            config.fgd_approx,
-                        ):
-                            tangent_direction = direction_step.parameter_updates
-                            certified_relative_error = (
-                                direction_step.output_error.relative_error
+                        damping_choice = (
+                            select_projection_damping(
+                                model,
+                                fgd_train_probe[0],
+                                fgd_train_probe[1],
+                                config.fgd_approx,
                             )
+                            if config.fgd_approx.projection_damping_auto
+                            else None
+                        )
+                        if damping_choice is not None:
+                            # The damping is the knob that arbitrates between
+                            # the certificate (eps) and the realisability of
+                            # the step (|u|); a fixed constant lands in the
+                            # window satisfying both only by luck. Selection
+                            # re-derives it from measurement, scored by the
+                            # decrease Lemma 3.5 itself guarantees.
+                            tangent_direction = damping_choice.parameter_updates
+                            certified_relative_error = (
+                                damping_choice.candidate.relative_error
+                            )
+                            selected_learning_rate = (
+                                damping_choice.candidate.learning_rate
+                            )
+                            if progress is not None:
+                                chosen = damping_choice.candidate
+                                progress(
+                                    f"[DAMPING] rho={chosen.relative_damping:.2e} "
+                                    f"lambda={chosen.absolute_damping:.3e} "
+                                    f"eps={chosen.relative_error:.4f} "
+                                    f"|u|={chosen.update_norm:.3e} "
+                                    f"eta={chosen.learning_rate:.4e} "
+                                    f"decrease={chosen.guaranteed_decrease:.4e}"
+                                )
+                        elif config.fgd_approx.projection_damping_auto:
+                            # No damping both certifies and realises a step:
+                            # the structure has to change, so leave the
+                            # direction unset and let growth act.
+                            direction_sensor_failure = True
+                        if (
+                            tangent_direction is None
+                            and not direction_sensor_failure
+                        ):
+                            direction_step = _compute_tangent_projection_step(
+                                model=model,
+                                x=fgd_train_probe[0],
+                                y=fgd_train_probe[1],
+                                config=config.fgd_approx,
+                            )
+                            if _projection_step_sensor_valid(
+                                direction_step,
+                                config.fgd_approx,
+                            ):
+                                tangent_direction = (
+                                    direction_step.parameter_updates
+                                )
+                                certified_relative_error = (
+                                    direction_step.output_error.relative_error
+                                )
+                            else:
+                                direction_sensor_failure = True
+                        if tangent_direction is not None:
                             fgd_update_norm = math.sqrt(
                                 sum(
                                     float(
