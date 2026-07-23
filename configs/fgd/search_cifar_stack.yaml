@@ -1,35 +1,63 @@
-# Launch config with EVERY approximation family enabled, in the order
-# tangent -> rkhs_head -> parametric_gd -> parametric_descent, with
-# function-preserving growth probed only after all of them fail. Edit
-# fgd_approx.family_order below to remove or reorder families; every listed
-# family commits through its full certificate (see the per-family sections).
+# Default certified growth-and-train configuration (Algorithm 5).
+#
+# Starts from a minimal 3x2 network and grows only when the paper's
+# structural criterion fires: Lemma 3.5 admissibility failure
+# (eps >= rel_error_threshold) proposes growth, and R1 -- a certified
+# family step that no longer REDUCES eps -- decides whether training may
+# render the proposal unnecessary. Both are comparisons between measured
+# certificate quantities, with no parameter budget, no growth schedule and
+# no per-dataset threshold, so the method transfers unchanged to data that
+# has never been trained on.
 run:
-  name: exp_E10_capped_10k
+  name: fgd_cifar_stack
   results_dir: results
   save_plot: false
   show_plot: false
 
+# ONLY the data block changes from the MNIST search. Nothing in the growth
+# criterion is dataset-specific: every constant governing the loop is either
+# from the theory (Lemma 3.5's 1/2, rank J <= min_l w_l) or reused from
+# GroMo. That transferability is the property the whole design was for, and
+# this is the run that tests it rather than asserting it.
 data:
-  kind: mnist
-  in_features: 784
+  kind: cifar10
+  in_features: 3072
   out_features: 10
   data_dir:
   batch_size: 64
   train_seed: 0
   validation_seed: 2
   test_seed: 1
-  mnist_train_samples: 10000
-  mnist_validation_samples: 2000
-  mnist_test_samples: 2000
+  cifar_grayscale: false
+  cifar_train_samples: 10000
+  cifar_validation_samples: 2000
+  cifar_test_samples: 2000
 
+# Start at 3x2, the incumbent's start. MEASURED reason: the value-per-
+# parameter hierarchy only exists when cheap late locations are available.
+# At two hidden layers of width 8 the ranking spans 39,000x -- a neuron on a
+# cheap late layer scores 0.101 per parameter, one on the 784-wide input
+# projection 2.6e-6, with depth in between at 4.3e-4. Starting from a single
+# hidden layer removes every cheap location, so each purchase costs 795 and
+# the search burns parameters at the worst available rate until Lemma 3.5
+# stops it (measured: 784->9->10, 7165 params, 89.0%).
 model:
-  hidden_size: 10
-  number_hidden_layers: 3
   model_seed: 0
+  # Declarative architecture: decide exactly where each mlp / dropout /
+  # batchnorm goes. Each `mlp` is a block (width, num_layers); `batchnorm` /
+  # `dropout` attach to the mlp above. All mlp layers are growable -- the
+  # certified SENN search widens them from here. See fgdlib/models/stack.py.
+  stack:
+    - {mlp: [2, 1]}
+    - batchnorm
+    - {mlp: [2, 1]}
+    - {dropout: 0.2}
+    - {mlp: [2, 1]}
+    - batchnorm
 
 training:
   method: fgd_approx
-  epochs: 60
+  epochs: 120
   accuracy_tolerance: 0.1
   gradient_clip_norm:
   log_every: 1
@@ -75,7 +103,7 @@ fgd_approx:
   lr_min_factor: 0.001
   global_bound_action: grow
   rel_error_compute_delta: true
-  growth_compute_delta: false
+  growth_compute_delta: true
   projection_group_size: 1
   projection_group_auto: true
   projection_group_max:
@@ -96,8 +124,39 @@ fgd_approx:
   # diagnostics. false (default): legacy behavior — non-strict descent and
   # Cstat/Cglob as acceptance gates.
   outer_steps_per_epoch: 8
-  growth_patience: 3
-  max_total_parameters: 10000
+  growth_patience: 1
+  # Certified functional: cross-entropy keeps convexity (global optimality)
+  # and is 4x smoother than MSE (wider admissible interval), but has NO
+  # global PL constant, so the C_glob linear envelope is left undefined.
+  # See report/CROSS_ENTROPY_FGD.md.
+  functional_loss: cross_entropy
+  # Cross-entropy's infimum is not attained (f_c -> inf), so SOME family
+  # step always certifies. Without this the structural step would be
+  # postponed for ever while the network stays inadequate. Self-limiting
+  # through eps -- no parameter budget involved.
+  admissibility_failure_forces_growth: false
+  growth_limit_criterion: epsilon_stationary
+  # SENN's where (arXiv:2307.04526). Locations are ranked by the natural
+  # expansion score -- GroMo's sum(eigenvalues_extension^2), which is the
+  # extension's first-order loss decrease -- and capacity is added at the
+  # argmax, with the scores RECOMPUTED after each addition (their Ingredient
+  # 4 adds and repeats). The addition budget per growth event equals the
+  # number of growable layers, exactly what uniform widening spends, so the
+  # comparison against search_ce_uniform.yaml isolates the ALLOCATION.
+  growth_selection: unified_expansion
+  # Generalised R1: eps < 1/2 is Lemma 3.5 step-admissibility, not structural
+  # adequacy. Before stopping, check whether growing the bottleneck reaches a
+  # strictly lower eps than training longer would (both clones trained the
+  # same steps -- an apples-to-apples look-ahead). Verified a strict
+  # generalisation: MNIST on==off (identical growths, 0 firings while eps>1/2).
+  # Only pays its cost in the tail (eps<1/2), and reuses tiny_statistical_
+  # threshold as the margin -- no new constant.
+  growth_lookahead_adequacy: true
+  growth_lookahead_steps: 10
+  # The fallback families must stay available once the structure becomes
+  # adequate (eps < 1/2): otherwise growth correctly stops and the flow is
+  # left with the tangent alone, which freezes it.
+  families_available_without_growth: true
   local_acceptance_conditions: true
   eps: 1.0e-12
   tiny_use_covariance: true
@@ -105,13 +164,41 @@ fgd_approx:
   tiny_omega_zero: false
   tiny_use_projection: true
   tiny_ignore_singular_values: false
+  # MEASURED: leave this false. Enabling the output-side Kronecker factor
+  # makes the score rank layer 2 top (37.7 vs 11.0 for layer 0) while the
+  # scaling line search then rejects that very extension outright
+  # (best_scaling = 0.000, train_loss 0.187 -- the WORST of the three). In
+  # the end-to-end run 7 of 8 growth events took scaling 0, adding dead
+  # parameters, so eps never improved, R1 re-fired every epoch and the run
+  # stalled at 65.6%. The Fisher-preconditioned score was anti-correlated
+  # with the realized outcome here.
+  #
+  # This is also the metric SENN's own theory states (their 3.4: "for the
+  # purposes of simplicity we choose the euclidean metric, corresponding to
+  # F := (1/N) J^T J"), and the one the bridge identity in
+  # report/SENN_EXPANSION_SCORE.md is derived under. KFAC S (x) A is their
+  # practical approximation to it, not the definition.
   tiny_use_fisher: false
-  tiny_maximum_added_neurons: 3
+  # ONE purchase per growth event -- one neuron or one layer. Maximum
+  # resolution, and every structural step is attributable to a single
+  # measured certificate, which is what the ranking by Delta(N eta)/cost
+  # compares. At 4 the input projection was bought 4 neurons at a time
+  # (+3180 parameters per event) and overshot to ~7175 before Lemma 3.5
+  # stopped it.
+  tiny_maximum_added_neurons: 1
   tiny_numerical_threshold: 1.0e-6
   tiny_statistical_threshold: 1.0e-3
   #function preserving or no
-  growth_function_preserving: true
-  growth_preservation_tolerance: 1.0e-4
+  growth_function_preserving: false
+  growth_prefer_lower_error: true
+  growth_select_by_descent: true
+  growth_requires_admissibility_failure: true
+  # Inert here: growth_selection: natural_expansion is checked first and
+  # brings its own allocation loop. Left false so the config cannot be
+  # misread as running both.
+  growth_uniform: false
+  max_total_parameters:
+  growth_preservation_tolerance: 1.0e-6
   # Ordered ladder of approximation families, evaluated top to bottom.
   # "tangent" must come first (it is the epoch's main transactional
   # search). Each following family is consulted only after every family
@@ -224,6 +311,13 @@ scaling_line_search:
   iterations: 12
   tolerance: 0.001
 
+# NOT a schedule under method: fgd_approx. Only `enabled` is read here, as
+# a master on/off switch for architecture changes; `every`, `first_epoch`
+# and `layer_policy` are consulted exclusively by method: normal. Growth
+# timing comes from the certificate alone -- Lemma 3.5 (eps >= 0.5) proposes
+# it and R1 (eps no longer decreasing) decides whether training may render
+# the proposal unnecessary. should_trigger_fgd_growth() opens with
+# `del epoch, last_growth_epoch`: no epoch, dwell or cap participates.
 growth_schedule:
   enabled: true
   every: 100
@@ -231,14 +325,14 @@ growth_schedule:
   layer_policy: round_robin
 
 wandb:
-  enabled: false
+  enabled: true
   project: stable-tiny
   entity:
   run_name:
-  group: fgd-mnist
+  group: fgd-growth
   job_type: train
-  tags: [fgd_approx, gromo, mnist, exact_kernel_eigh, width_2, function_preserving_growth]
-  notes:
+  tags: [fgd_approx, certified_growth, cifar10, color, stack, unified, senn]
+  notes: Algorithm 5 - certified growth-and-train from a 3x2 network, no parameter budget
   mode: online
   dir: results
   log_code: false

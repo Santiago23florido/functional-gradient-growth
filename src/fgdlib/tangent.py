@@ -1164,6 +1164,16 @@ def _compute_exact_tangent_projection_step(
     parameters = tuple(named_parameters.values())
     buffers = OrderedDict(model.named_buffers())
 
+    # Measure in eval. Besides the usual reason (the projection is a statement
+    # about f, so dropout is the identity and batch-norm uses its fixed running
+    # stats), there is a hard requirement: a batch-norm in TRAIN mode updates
+    # its running buffers in place, and inside a functorch transform (jacrev /
+    # jvp) that in-place update wraps the buffers in functorch tensors that
+    # leak out -- the next transform then dies with a level-escape. eval()
+    # removes it and is a no-op on the plain MLP. Restored in the finally.
+    was_training = model.training
+    model.eval()
+
     output = model(x)
     loss = batch_functional_loss(output, y, config.functional_loss)
     if not torch.isfinite(loss).all():
@@ -1203,6 +1213,7 @@ def _compute_exact_tangent_projection_step(
     try:
         jacobian = jacrev(call_with_parameters)(parameters)
     finally:
+        model.train(was_training)
         _clear_inaccessible_tensor_caches(model)
 
     jacobian_matrix = _flatten_jacobian(jacobian, output_numel)
@@ -1248,6 +1259,16 @@ def _compute_cg_tangent_projection_step(
     parameter_names = tuple(named_parameters.keys())
     parameters = tuple(named_parameters.values())
     buffers = OrderedDict(model.named_buffers())
+
+    # Measure in eval. Besides the usual reason (the projection is a statement
+    # about f, so dropout is the identity and batch-norm uses its fixed running
+    # stats), there is a hard requirement: a batch-norm in TRAIN mode updates
+    # its running buffers in place, and inside a functorch transform (jacrev /
+    # jvp) that in-place update wraps the buffers in functorch tensors that
+    # leak out -- the next transform then dies with a level-escape. eval()
+    # removes it and is a no-op on the plain MLP. Restored in the finally.
+    was_training = model.training
+    model.eval()
 
     output = model(x)
     loss = batch_functional_loss(output, y, config.functional_loss)
@@ -1355,6 +1376,7 @@ def _compute_cg_tangent_projection_step(
             parameter_updates = _unflatten_parameter_update(flat_update, parameters)
             approximation = jvp_parameters_to_output(parameter_updates)
     finally:
+        model.train(was_training)
         _clear_inaccessible_tensor_caches(model)
 
     if (
@@ -2117,6 +2139,14 @@ def measure_direction_projection(
     parameters through a Jacobian-vector product (the Jacobian is never
     materialized).
     """
+    # The tangent direction u comes from a projection solve that may leave its
+    # tensors attached to an autograd graph or a functorch level. jvp's
+    # make_dual then fails with a functorch level-escape (seen with batch-norm
+    # models). Detach the tangents to a clean, graph-free state -- they are a
+    # fixed direction here, not something to differentiate through.
+    parameter_updates = tuple(
+        update.detach() for update in parameter_updates
+    )
     named_parameters = _trainable_named_parameters(model)
     if not named_parameters:
         raise RuntimeError(
@@ -2126,24 +2156,34 @@ def measure_direction_projection(
     parameters = tuple(named_parameters.values())
     buffers = OrderedDict(model.named_buffers())
 
-    with torch.no_grad():
-        output = model(x)
-    target = functional_gradient(output, y, config.functional_loss).reshape(-1)
-
-    def call_with_parameters(
-        parameter_values: tuple[torch.Tensor, ...],
-    ) -> torch.Tensor:
-        state = OrderedDict(zip(parameter_names, parameter_values))
-        state.update(buffers)
-        return functional_call(model, state, (x,)).reshape(-1)
-
+    # Measure in eval. The certificate is a statement about the represented
+    # function f, so dropout must be the identity and batch-norm must use its
+    # fixed running statistics -- and there is a hard requirement too: a
+    # batch-norm in TRAIN mode updates its running buffers in place during the
+    # forward, which is not valid inside forward-mode AD (jvp) and raises a
+    # functorch level-escape. eval() removes both problems; it is a no-op on
+    # the plain MLP.
+    was_training = model.training
+    model.eval()
     try:
+        with torch.no_grad():
+            output = model(x)
+        target = functional_gradient(output, y, config.functional_loss).reshape(-1)
+
+        def call_with_parameters(
+            parameter_values: tuple[torch.Tensor, ...],
+        ) -> torch.Tensor:
+            state = OrderedDict(zip(parameter_names, parameter_values))
+            state.update(buffers)
+            return functional_call(model, state, (x,)).reshape(-1)
+
         _, approximation = jvp(
             call_with_parameters,
             (parameters,),
             (tuple(parameter_updates),),
         )
     finally:
+        model.train(was_training)
         _clear_inaccessible_tensor_caches(model)
     return _output_relative_error_from_tensors(
         approximation=approximation.detach(),

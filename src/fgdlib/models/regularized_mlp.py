@@ -16,11 +16,13 @@ before every certificate):
   and passes the extension through unchanged, so it also does not perturb the
   TINY statistics that select where to grow.
 
-The composition module below implements GroMo's ``extended_post_layer_function``
-protocol (``growing_module.py``): a ``post_layer_function`` may process both
-the main pre-activation ``x`` and the extension ``x_ext``. The activation is
-element-wise so it applies to both; dropout masks only the main path, matching
-``GrowingDropout``'s own convention.
+Normalization (batch-norm) is realised as a plain ``nn.Sequential`` on
+purpose: GroMo already threads a growth candidate's extension through a
+Sequential (``_apply_extended_post_layer_function``) and reads its activation
+gradient correctly (``activation_gradient`` skips ``_BatchNorm`` and uses the
+activation's known derivative). A CUSTOM module gets neither -- GroMo falls
+back to a numerical ``torch.func.grad`` of the whole thing on a 0-D scalar,
+which batch-norm cannot process. See ``make_hidden_post_function``.
 """
 
 from __future__ import annotations
@@ -34,41 +36,72 @@ ensure_gromo_importable()
 
 from gromo.modules.growing_dropout import GrowingDropout
 
-__all__ = ["ActivationThenDropout", "make_post_layer_function"]
+from gromo.modules.growing_normalisation import GrowingBatchNorm1d
+
+__all__ = [
+    "make_hidden_post_function",
+    "make_post_layer_function",
+    "sync_normalization",
+]
 
 
-class ActivationThenDropout(nn.Module):
-    """``dropout(activation(x))``, honouring the extended-forward protocol.
+def make_hidden_post_function(
+    num_features: int,
+    activation: nn.Module,
+    dropout_rate: float,
+    device: torch.device | None = None,
+) -> nn.Sequential:
+    """``Sequential(BatchNorm1d, activation[, Dropout])`` for a hidden layer.
 
-    In the plain forward this is just activation followed by dropout. In
-    ``extended_forward`` -- used while a growth candidate's extension flows
-    through the network -- the activation is applied to both the main and the
-    extension pre-activations (it is element-wise), while dropout masks only
-    the main path, so a new neuron's contribution is never randomly zeroed
-    before it has been measured.
+    A Sequential rather than a custom module so GroMo handles both the
+    extended-forward threading and the activation-gradient inspection (a custom
+    module forces a numerical fallback that batch-norm cannot survive).
+    Dropout is appended only when the rate is positive.
     """
+    modules: list[nn.Module] = [
+        GrowingBatchNorm1d(num_features, device=device),
+        activation,
+    ]
+    if dropout_rate > 0.0:
+        modules.append(GrowingDropout(dropout_rate=dropout_rate))
+    return nn.Sequential(*modules)
 
-    def __init__(self, activation: nn.Module, dropout_rate: float) -> None:
-        super().__init__()
-        self.activation = activation
-        self.dropout = GrowingDropout(dropout_rate=dropout_rate)
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        return self.dropout(self.activation(inputs))
+def _hidden_norm(post_function: nn.Module | None) -> GrowingBatchNorm1d | None:
+    """The growable batch-norm inside a hidden post-function, if any.
 
-    def extended_forward(
-        self, x: torch.Tensor | None, x_ext: torch.Tensor | None
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        main = None if x is None else self.activation(x)
-        extension = None if x_ext is None else self.activation(x_ext)
-        # Dropout on the main path only; the extension passes through so the
-        # growth measurement sees the new capacity undropped.
-        if main is not None:
-            main, _ = self.dropout.extended_forward(main, None)
-        return main, extension
+    Handles both a bare batch-norm and the ``Sequential`` post-function
+    :func:`make_hidden_post_function` builds.
+    """
+    if isinstance(post_function, GrowingBatchNorm1d):
+        return post_function
+    if isinstance(post_function, nn.Sequential):
+        for module in post_function:
+            if isinstance(module, GrowingBatchNorm1d):
+                return module
+    return None
 
-    def extra_repr(self) -> str:
-        return f"dropout_rate={float(self.dropout.p):.3g}"
+
+def sync_normalization(model: nn.Module) -> None:
+    """Grow each hidden batch-norm to match the width it normalises.
+
+    A no-op on the plain MLP (no batch-norm present), so it is safe to call
+    unconditionally from the growth path. Where a hidden layer has widened,
+    its paired batch-norm is grown by the deficit with GroMo's identity
+    defaults (weight 1, bias 0, running mean 0, running var 1), which keeps
+    the structural step function-preserving.
+    """
+    layers = getattr(model, "layers", None)
+    if layers is None:
+        return
+    for layer in layers:
+        norm = _hidden_norm(getattr(layer, "post_layer_function", None))
+        if norm is None:
+            continue
+        width = int(layer.out_features)
+        current = int(norm.num_features)
+        if width > current:
+            norm.grow(width - current)
 
 
 def make_post_layer_function(
@@ -78,8 +111,11 @@ def make_post_layer_function(
 
     With ``dropout_rate == 0`` this is the activation itself, so a model built
     with regularization off is byte-identical to the plain MLP -- the property
-    that keeps the MNIST result untouched.
+    that keeps the MNIST result untouched. With dropout it is a Sequential,
+    for the same reason :func:`make_hidden_post_function` is: GroMo reads a
+    Sequential's activation gradient correctly (the activation's known
+    derivative), where a custom module forces a numerical fallback.
     """
     if dropout_rate <= 0.0:
         return activation
-    return ActivationThenDropout(activation, dropout_rate)
+    return nn.Sequential(activation, GrowingDropout(dropout_rate=dropout_rate))
