@@ -337,6 +337,27 @@ class FGDApproxConfig:
     # metrics are untouched because they come from the loaders, against the
     # true y. 0.0 disables it.
     functional_tikhonov_gamma: float = 0.0
+    # ROUGHNESS PENALTY -- the RIGHT regulariser, in the function-space norm.
+    # functional_tikhonov above penalises ||f||^2 (magnitude), which shrinks f
+    # toward 0 but still lets it memorise a shrunk copy. This penalises
+    # ROUGHNESS: L_rough(f) = L_data(f) + gamma f^T Lambda f, where Lambda is
+    # the graph Laplacian over the probe inputs. f^T Lambda f is the Dirichlet
+    # energy -- it measures how much f varies between NEIGHBOURING inputs, so
+    # penalising it biases toward smooth fits, which is what generalises for a
+    # smooth target. It is the discrete form of the ||Df||^2 Sobolev norm the
+    # paper's Banach space B is built on.
+    #
+    # Lambda is PSD, so L_rough stays convex (P1) and K-smooth with
+    # K -> K + 2 gamma lambda_max(Lambda): Lemma 3.5 applies VERBATIM and the
+    # eps < 1/2 criterion is untouched. For sum-MSE the regularised functional
+    # gradient is r_rough = 2(f - y) + 2 gamma Lambda f, i.e. the data gradient
+    # plus a smoothing term -- injected once at the exact target, so growth,
+    # projection, realisation and GCV all inherit it. 0 disables it.
+    roughness_gamma: float = 0.0
+    # Neighbourhood width of the graph affinity, as a multiple of the median
+    # pairwise input distance (the median heuristic -- a standard tuning-free
+    # bandwidth, not a per-dataset constant).
+    roughness_bandwidth: float = 1.0
     # REALISE THE CERTIFIED STEP AS A PATH instead of a single jump. Lemma 3.5
     # licenses a move in FUNCTION space, f -> f - eta g; theta - eta u is only
     # the first Gauss-Newton iteration of "find theta' with f(theta') = f_target".
@@ -791,6 +812,46 @@ class _TangentProjectionStep:
     dot_product: float
     approximation_sq_norm: float
     target_sq_norm: float
+
+
+def graph_laplacian(x: torch.Tensor, bandwidth: float = 1.0) -> torch.Tensor:
+    """Unnormalised graph Laplacian ``Lambda = D - W`` over the probe inputs.
+
+    ``W_ij = exp(-||x_i - x_j||^2 / (2 sigma^2))`` with ``sigma`` set by the
+    MEDIAN heuristic -- ``bandwidth`` times the median pairwise distance. The
+    median heuristic is the standard tuning-free bandwidth: it adapts to the
+    scale of the data rather than fixing a constant, so nothing here is tuned
+    per dataset.
+
+    ``Lambda`` is symmetric PSD (``f^T Lambda f = 1/2 sum_ij W_ij (f_i-f_j)^2``
+    >= 0), which is what keeps ``L_data + gamma f^T Lambda f`` convex and
+    K-smooth so Lemma 3.5 survives unchanged.
+    """
+    distances = torch.cdist(x, x)
+    off_diagonal = distances[~torch.eye(x.shape[0], dtype=torch.bool, device=x.device)]
+    median = torch.median(off_diagonal)
+    sigma = bandwidth * median.clamp_min(torch.finfo(x.dtype).eps)
+    affinity = torch.exp(-(distances**2) / (2.0 * sigma**2))
+    affinity.fill_diagonal_(0.0)
+    degree = affinity.sum(dim=1)
+    return torch.diag(degree) - affinity
+
+
+def _roughness_target(
+    output: torch.Tensor,
+    x: torch.Tensor,
+    config: FGDApproxConfig,
+) -> torch.Tensor | None:
+    """``2 gamma Lambda f`` -- the roughness term added to the data gradient.
+
+    Returns ``None`` when the penalty is off, so callers add nothing. Only for
+    sum-MSE, where the functional gradient is the simple ``r + 2 gamma Lambda f``;
+    left off for cross-entropy, whose gradient does not add so cleanly.
+    """
+    if config.roughness_gamma <= 0.0 or config.functional_loss != "mse":
+        return None
+    laplacian = graph_laplacian(x.detach(), config.roughness_bandwidth)
+    return 2.0 * config.roughness_gamma * (laplacian @ output.detach())
 
 
 def mse_functional_gradient(
@@ -1437,6 +1498,12 @@ def _compute_exact_tangent_projection_step(
         raise RuntimeError(f"Non-finite FGD loss detected before projection: {loss}.")
 
     target_tensor = torch.autograd.grad(loss, output)[0].detach()
+    # Roughness penalty: r_rough = r_data + 2 gamma Lambda f. Injected here so
+    # growth (via minimal_relative_error), the projection, the realise path
+    # and GCV all certify against the SAME regularised gradient.
+    roughness = _roughness_target(output, x, config)
+    if roughness is not None:
+        target_tensor = target_tensor + roughness.to(target_tensor.dtype)
     target = target_tensor.reshape(-1)
     output_numel = target.numel()
 

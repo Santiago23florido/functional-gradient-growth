@@ -24,7 +24,7 @@
 # PL constant (mu = 2, L* = 0) where cross-entropy has none, and an epoch
 # costs seconds instead of minutes.
 run:
-  name: fgd_certify_tiny_gamma_1p0
+  name: fgd_certify_tiny_stochastic
   results_dir: results
   save_plot: false
   show_plot: false
@@ -53,7 +53,7 @@ model:
 
 training:
   method: fgd_approx
-  epochs: 60
+  epochs: 120
   accuracy_tolerance: 0.1
   gradient_clip_norm:
   log_every: 1
@@ -130,7 +130,7 @@ fgd_approx:
   # exactly when no residual is left on the probe to approximate. With the
   # full set there is no sampling at all and the certificate is a statement
   # about the training loss itself, which is what the theory is about.
-  probe_batches: 4
+  probe_batches: 1
   # Assemble that Jacobian in row-blocks. jacrev vmaps one backward pass per
   # output row and holds the batched activations for all of them at once, so
   # its peak scales with (rows) x (activations), not with J. MEASURED: the
@@ -243,7 +243,7 @@ fgd_approx:
   # would freeze. Generalisation comes from functional Tikhonov gamma, which
   # regularises r itself; the two roles are separate.
   projection_damping_objective: descent
-  functional_tikhonov_gamma: 1.0
+  functional_tikhonov_gamma: 0.0
   # Realise the certified functional step by INTEGRATING toward it instead of
   # jumping at it. theta - eta u is only the first Gauss-Newton iteration of
   # "find theta' with f(theta') = f - eta g"; shrinking eta until that single
@@ -263,7 +263,7 @@ fgd_approx:
   certify_optimal_rate: true
   # Nothing to resample: probe_batches covers the entire training set, so the
   # certificate is exact over all of it rather than over a draw from it.
-  probe_resample: false
+  probe_resample: true
   certify_realize_path: true
   certify_realize_max_iterations: 20
   certify_realize_tolerance: 0.05
@@ -453,7 +453,7 @@ wandb:
   run_name:
   group: fgd-growth
   job_type: train
-  tags: [fgd_approx, certified_growth, smooth_sin_tiny, tikhonov, gamma_1p0, gcv]
+  tags: [fgd_approx, certified_growth, smooth_sin_tiny, tikhonov, gamma_0p0, gcv]
   notes: Fully exact Lemma 3.5 cycle at minimum scale - full-dataset Jacobian, certified rate, integrated step
   mode: online
   dir: results

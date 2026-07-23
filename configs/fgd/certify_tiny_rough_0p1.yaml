@@ -24,7 +24,7 @@
 # PL constant (mu = 2, L* = 0) where cross-entropy has none, and an epoch
 # costs seconds instead of minutes.
 run:
-  name: fgd_certify_tiny_gamma_1p0
+  name: fgd_certify_tiny_rough_0p1
   results_dir: results
   save_plot: false
   show_plot: false
@@ -243,7 +243,8 @@ fgd_approx:
   # would freeze. Generalisation comes from functional Tikhonov gamma, which
   # regularises r itself; the two roles are separate.
   projection_damping_objective: descent
-  functional_tikhonov_gamma: 1.0
+  functional_tikhonov_gamma: 0.0
+  roughness_gamma: 0.1
   # Realise the certified functional step by INTEGRATING toward it instead of
   # jumping at it. theta - eta u is only the first Gauss-Newton iteration of
   # "find theta' with f(theta') = f - eta g"; shrinking eta until that single
@@ -453,7 +454,7 @@ wandb:
   run_name:
   group: fgd-growth
   job_type: train
-  tags: [fgd_approx, certified_growth, smooth_sin_tiny, tikhonov, gamma_1p0, gcv]
+  tags: [fgd_approx, certified_growth, smooth_sin_tiny, tikhonov, gamma_0p0, gcv]
   notes: Fully exact Lemma 3.5 cycle at minimum scale - full-dataset Jacobian, certified rate, integrated step
   mode: online
   dir: results

@@ -24,7 +24,7 @@
 # PL constant (mu = 2, L* = 0) where cross-entropy has none, and an epoch
 # costs seconds instead of minutes.
 run:
-  name: fgd_certify_tiny_gamma_1p0
+  name: fgd_certify_tiny_N1024
   results_dir: results
   save_plot: false
   show_plot: false
@@ -33,8 +33,8 @@ data:
   kind: smooth_sin
   in_features: 4
   out_features: 1
-  train_batches: 4
-  validation_batches: 4
+  train_batches: 16
+  validation_batches: 16
   test_batches: 1
   batch_size: 64
   train_seed: 0
@@ -53,7 +53,7 @@ model:
 
 training:
   method: fgd_approx
-  epochs: 60
+  epochs: 40
   accuracy_tolerance: 0.1
   gradient_clip_norm:
   log_every: 1
@@ -130,7 +130,7 @@ fgd_approx:
   # exactly when no residual is left on the probe to approximate. With the
   # full set there is no sampling at all and the certificate is a statement
   # about the training loss itself, which is what the theory is about.
-  probe_batches: 4
+  probe_batches: 16
   # Assemble that Jacobian in row-blocks. jacrev vmaps one backward pass per
   # output row and holds the batched activations for all of them at once, so
   # its peak scales with (rows) x (activations), not with J. MEASURED: the
@@ -139,7 +139,7 @@ fgd_approx:
   # the identical matrix (tests/test_jacobian_chunking.py) at a bounded peak,
   # for one extra forward per block. This is what makes certifying over the
   # whole dataset affordable rather than over a subsample.
-  jacobian_row_chunk: 0
+  jacobian_row_chunk: 256
   # A rejected fallback family is skipped until this many ACCEPTED outer
   # steps have been committed since the rejection (weight updates change the
   # tangent space, so rejection is never permanent at a fixed architecture).
@@ -243,7 +243,7 @@ fgd_approx:
   # would freeze. Generalisation comes from functional Tikhonov gamma, which
   # regularises r itself; the two roles are separate.
   projection_damping_objective: descent
-  functional_tikhonov_gamma: 1.0
+  functional_tikhonov_gamma: 0.0
   # Realise the certified functional step by INTEGRATING toward it instead of
   # jumping at it. theta - eta u is only the first Gauss-Newton iteration of
   # "find theta' with f(theta') = f - eta g"; shrinking eta until that single
@@ -453,7 +453,7 @@ wandb:
   run_name:
   group: fgd-growth
   job_type: train
-  tags: [fgd_approx, certified_growth, smooth_sin_tiny, tikhonov, gamma_1p0, gcv]
+  tags: [fgd_approx, certified_growth, smooth_sin_tiny, tikhonov, gamma_0p0, gcv]
   notes: Fully exact Lemma 3.5 cycle at minimum scale - full-dataset Jacobian, certified rate, integrated step
   mode: online
   dir: results
