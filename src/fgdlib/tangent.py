@@ -815,17 +815,22 @@ class _TangentProjectionStep:
 
 
 def graph_laplacian(x: torch.Tensor, bandwidth: float = 1.0) -> torch.Tensor:
-    """Unnormalised graph Laplacian ``Lambda = D - W`` over the probe inputs.
+    """Symmetric NORMALISED graph Laplacian over the probe inputs.
 
-    ``W_ij = exp(-||x_i - x_j||^2 / (2 sigma^2))`` with ``sigma`` set by the
-    MEDIAN heuristic -- ``bandwidth`` times the median pairwise distance. The
-    median heuristic is the standard tuning-free bandwidth: it adapts to the
-    scale of the data rather than fixing a constant, so nothing here is tuned
-    per dataset.
+    ``Lambda_sym = I - D^{-1/2} W D^{-1/2}`` with Gaussian affinity
+    ``W_ij = exp(-||x_i - x_j||^2 / (2 sigma^2))`` and ``sigma`` from the
+    MEDIAN heuristic -- ``bandwidth`` times the median pairwise distance, the
+    standard tuning-free bandwidth that adapts to the data scale.
 
-    ``Lambda`` is symmetric PSD (``f^T Lambda f = 1/2 sum_ij W_ij (f_i-f_j)^2``
-    >= 0), which is what keeps ``L_data + gamma f^T Lambda f`` convex and
-    K-smooth so Lemma 3.5 survives unchanged.
+    Normalised, not the raw ``D - W``, for a concrete reason: the unnormalised
+    Laplacian's eigenvalues scale with the node degrees (~ N here), so the
+    roughness term ``2 gamma Lambda f`` swamped the data gradient ``2(f - y)``
+    by ~250x at gamma = 1 and collapsed f to a constant (MEASURED: train 0.000).
+    ``Lambda_sym`` has eigenvalues in ``[0, 2]``, so gamma sits on the same
+    scale as the data term and is dataset-independent.
+
+    Still symmetric PSD (``f^T Lambda_sym f >= 0``), so ``L_data + gamma
+    f^T Lambda_sym f`` stays convex and K-smooth and Lemma 3.5 is untouched.
     """
     distances = torch.cdist(x, x)
     off_diagonal = distances[~torch.eye(x.shape[0], dtype=torch.bool, device=x.device)]
@@ -834,7 +839,9 @@ def graph_laplacian(x: torch.Tensor, bandwidth: float = 1.0) -> torch.Tensor:
     affinity = torch.exp(-(distances**2) / (2.0 * sigma**2))
     affinity.fill_diagonal_(0.0)
     degree = affinity.sum(dim=1)
-    return torch.diag(degree) - affinity
+    inverse_sqrt_degree = degree.clamp_min(torch.finfo(x.dtype).eps).rsqrt()
+    normalised = affinity * inverse_sqrt_degree.unsqueeze(0) * inverse_sqrt_degree.unsqueeze(1)
+    return torch.eye(x.shape[0], dtype=x.dtype, device=x.device) - normalised
 
 
 def _roughness_target(
