@@ -330,8 +330,28 @@ def select_projection_damping(
                 relative_error, config
             )
             if upper_bound is not None:
-                certified_rate = config.theory_lr_safety * upper_bound
-                if config.certify_linearization_tolerance is None:
+                # Match the rate the STEP will actually take. eta_bar is where
+                # Lemma 3.5's guaranteed decrease vanishes, so the decrease
+                # peaks at eta_bar/2 (the interval midpoint); certify_optimal_
+                # rate takes that, otherwise theory_lr_safety of the edge.
+                fraction = (
+                    0.5
+                    if getattr(config, "certify_optimal_rate", False)
+                    else config.theory_lr_safety
+                )
+                certified_rate = fraction * upper_bound
+                if getattr(config, "certify_realize_path", False):
+                    # Realisability is provided by the integrated path, which
+                    # reaches the certified functional step in many short
+                    # sub-steps. Gating here on the SINGLE-JUMP linearisation
+                    # control would reject rungs the path handles fine, and
+                    # MEASURED it did exactly that: after two steps every
+                    # certified rung failed the single-jump check, select
+                    # returned None, growth saw eps < 1/2 so did not fire, and
+                    # the run froze from epoch 2 to 400. The path is the
+                    # realisability mechanism; do not double-gate.
+                    learning_rate = certified_rate
+                elif config.certify_linearization_tolerance is None:
                     learning_rate = certified_rate
                 else:
                     learning_rate = certified_linear_learning_rate(

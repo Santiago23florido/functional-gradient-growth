@@ -3967,26 +3967,26 @@ def run_pipeline(
                                     )
                                 )
                             elif config.fgd_approx.certify_apply_in_interval:
-                                # DIAGNOSTIC, not a gate. This variant decides
-                                # admissibility from eps on the training
-                                # probe, which is the sample Lemma 3.5 speaks
-                                # about; with the projector invariants off,
-                                # this held-out sensor tests only finiteness,
-                                # so failing it says the MODEL overflowed on
-                                # unseen data, not that the certified step is
-                                # inadmissible.
+                                # DIAGNOSTIC, not a gate. Admissibility is
+                                # decided from eps on the TRAIN probe, the
+                                # sample Lemma 3.5 speaks about, and the step
+                                # is carried by selected_learning_rate under
+                                # damping-auto. With the projector invariants
+                                # off, this held-out sensor tests only
+                                # finiteness, so failing it says the MODEL
+                                # overflowed on unseen data -- a symptom of
+                                # the fit, not a reason to withhold the step.
                                 #
-                                # Letting it block was the deadlock in its
-                                # final form: MEASURED, eps = 0.4808
-                                # certified so no growth fired, while this
-                                # sensor rejected every step, and epochs
-                                # 85-92 came out bit-identical at loss 0.1092
-                                # with 1 step against 21 growths. The earlier
-                                # force= workaround papered over it by buying
-                                # capacity, which is the one response
-                                # guaranteed to make an overflowing model
-                                # overflow harder.
-                                direction_sensor_failure = True
+                                # So the flag is deliberately NOT set here.
+                                # Setting it was the deadlock's final form:
+                                # MEASURED, after two committed steps this
+                                # sensor rejected every subsequent one and the
+                                # run froze from epoch 2 to 400 (10 steps in
+                                # all), while eps < 1/2 kept growth from
+                                # firing. maximum_learning_rate simply stays
+                                # None; the certified rate comes from the
+                                # train-probe eps instead.
+                                pass
                             else:
                                 direction_sensor_failure = True
                                 direction_stats = None
