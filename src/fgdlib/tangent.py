@@ -315,6 +315,28 @@ class FGDApproxConfig:
     # df -> N, so it refuses exactly the interpolating regime the descent rule
     # walks into.
     projection_damping_objective: str = "descent"
+    # FUNCTIONAL TIKHONOV. Step-level ridge (the lambda above) chooses which g
+    # in T to use, but MEASURED it is CLIPPED by the certificate: eps < 1/2
+    # forces df/N ~ 0.53 on the grown model, GCV wants far less, and the
+    # certified+realisable window collapses to a single rung. The certificate
+    # forbids the regularisation generalisation needs, because it is a
+    # statement about approximating r, and r is the UNREGULARISED gradient.
+    #
+    # The fix is to regularise r itself: certify against the gradient of
+    #     L_gamma(f) = L_data(f) + gamma ||f||^2
+    # instead of L_data alone. The paper's H is a Hilbert space, so this keeps
+    # convexity (P1) and keeps K-smoothness with K -> K + 2 gamma, i.e.
+    # Lemma 3.5 applies VERBATIM. For sum-MSE the regularised gradient is
+    #     r_gamma = 2(f - y) + 2 gamma f = 2((1+gamma) f - y),
+    # which points exactly like the ordinary MSE gradient toward the shrunk
+    # target y/(1+gamma) -- and the certified parameter step it produces is
+    # identical to plain MSE toward y/(1+gamma) with L_s = 2. So it is
+    # implemented as that single change: the projection probe's targets are
+    # shrunk by 1/(1+gamma). Growth, projection, realisation and GCV all
+    # inherit it through the one probe, and the reported train/val/test
+    # metrics are untouched because they come from the loaders, against the
+    # true y. 0.0 disables it.
+    functional_tikhonov_gamma: float = 0.0
     # REALISE THE CERTIFIED STEP AS A PATH instead of a single jump. Lemma 3.5
     # licenses a move in FUNCTION space, f -> f - eta g; theta - eta u is only
     # the first Gauss-Newton iteration of "find theta' with f(theta') = f_target".

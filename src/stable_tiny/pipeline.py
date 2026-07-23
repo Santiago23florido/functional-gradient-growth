@@ -622,6 +622,32 @@ def is_classification_task(config: PipelineConfig) -> bool:
     return config.data.kind in {"cifar10", "mnist"}
 
 
+def _functional_tikhonov_probe(
+    probe: tuple[torch.Tensor, torch.Tensor] | None,
+    config: FGDApproxConfig,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Shrink a probe's targets to certify against L_data + gamma ||f||^2.
+
+    For sum-MSE the regularised functional gradient r_gamma = 2((1+gamma)f - y)
+    points exactly like the plain MSE gradient toward y/(1+gamma), and the
+    certified parameter step is identical to plain MSE toward that shrunk
+    target with L_s = 2. So functional Tikhonov is precisely this one
+    operation on the direction probe; everything downstream -- growth,
+    projection, realisation, GCV -- inherits it, while the reported metrics
+    stay against the true targets in the loaders.
+
+    Only for the sum-MSE functional: cross-entropy's ||f||^2 penalty does not
+    reduce to a target shift, so gamma is ignored there rather than applied
+    incorrectly.
+    """
+    if probe is None or config.functional_tikhonov_gamma <= 0.0:
+        return probe
+    if config.functional_loss != "mse":
+        return probe
+    x, y = probe
+    return x, y / (1.0 + config.functional_tikhonov_gamma)
+
+
 def build_model(config: PipelineConfig, device: torch.device) -> GrowingMLP:
     data_config = config.data
     model_config = config.model
@@ -3458,6 +3484,15 @@ def run_pipeline(
                 config.fgd_approx.probe_batches,
                 device,
             )
+            # Functional Tikhonov: certify against L_data + gamma ||f||^2 by
+            # shrinking the direction probe's targets. One point, and growth,
+            # projection, realisation and GCV all inherit it.
+            fgd_train_probe = _functional_tikhonov_probe(
+                fgd_train_probe, config.fgd_approx
+            )
+            fgd_validation_probe = _functional_tikhonov_probe(
+                fgd_validation_probe, config.fgd_approx
+            )
         validation_certificate_for_next_epoch = None
         if (
             config.training.method == "fgd_approx"
@@ -3685,15 +3720,21 @@ def run_pipeline(
                             # one over the dataset, which is the object the
                             # theory is about; the flow becomes stochastic FGD
                             # instead of exact descent on 256 fixed points.
-                            fgd_train_probe = build_projection_probe(
-                                train_loader,
-                                config.fgd_approx.probe_batches,
-                                device,
+                            fgd_train_probe = _functional_tikhonov_probe(
+                                build_projection_probe(
+                                    train_loader,
+                                    config.fgd_approx.probe_batches,
+                                    device,
+                                ),
+                                config.fgd_approx,
                             )
-                            fgd_validation_probe = build_projection_probe(
-                                validation_loader,
-                                config.fgd_approx.probe_batches,
-                                device,
+                            fgd_validation_probe = _functional_tikhonov_probe(
+                                build_projection_probe(
+                                    validation_loader,
+                                    config.fgd_approx.probe_batches,
+                                    device,
+                                ),
+                                config.fgd_approx,
                             )
                         tangent_direction: tuple[torch.Tensor, ...] | None = None
                         direction_stats: _FunctionalStepStats | None = None
