@@ -65,6 +65,7 @@ from fgdlib.search.unified import (
     rank_candidates,
     rank_limiting_locations,
 )
+from fgdlib.search.damping import select_projection_damping
 from fgdlib.search.linearization import certified_linear_learning_rate
 from fgdlib.search.growth import (
     GrowthResult,
@@ -3659,6 +3660,10 @@ def run_pipeline(
                         # grow loop drives below the threshold. Lemma 3.5's
                         # interval is defined from this one.
                         certified_relative_error: float | None = None
+                        # Set when the damping is chosen by measurement: the
+                        # rate that selection already scored, so it is not
+                        # recomputed from a damping that no longer applies.
+                        selected_learning_rate: float | None = None
                         direction_sensor_failure = False
                         if config.fgd_approx.grow_to_certify:
                             # GROW-TO-CERTIFY. Make the structure satisfy
@@ -3849,6 +3854,7 @@ def run_pipeline(
                             # outside its domain.
                             search_result = _apply_lemma35_step(
                                 relative_error=certified_relative_error,
+                                learning_rate=selected_learning_rate,
                                 evaluate_trial=evaluate_trial,
                                 config=config.fgd_approx,
                                 model=model,
