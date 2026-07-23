@@ -228,6 +228,26 @@ class FGDApproxConfig:
     # relies on the measured trajectory. Set True to recover the theorem at
     # roughly five times the structural cost.
     certify_function_preserving: bool = False
+    # PAPER-PURE STEP. Lemma 3.5 does not ask for descent to be verified -- it
+    # PROVES it: if eps < 1/2 then EVERY eta in (0, eta_bar(eps)) descends.
+    # Checking it empirically afterwards is therefore strictly stronger than
+    # the theory, and that extra gate is what deadlocked the certify flow: the
+    # structure was certified (eps = 0.475, interval (1e-5, 0.0974) non-empty)
+    # yet no rate produced HELD-OUT descent, so nothing ever committed and
+    # epochs 2-4 came out bit-identical (loss 0.0619, acc 0.566).
+    #
+    # The mismatch was structural, not numerical: eps is certified on the
+    # TRAIN probe (where the direction is computed) while descent was demanded
+    # on the VALIDATION probe. Lemma 3.5 is a statement about ONE sample --
+    # it guarantees descent where eps was measured and says nothing across a
+    # split -- so the gate was asking the lemma for something outside its
+    # domain, and a failure meant a generalisation gap, not a bad step.
+    #
+    # With this flag on the flow does what the paper's algorithm does: certify
+    # eps < 1/2, take eta = theory_lr_safety * eta_bar(eps) (0.95 of the
+    # interval by default) and APPLY. Finiteness sensors still gate -- those
+    # catch numerical failure, not theory -- but realised descent does not.
+    certify_apply_in_interval: bool = False
     # Generalised R1. The eps < 1/2 stop is Lemma 3.5's admissibility of a
     # STEP, not adequacy of the STRUCTURE; on an easy task the two coincide
     # (MNIST stops at a good small net) but on a hard one they diverge --

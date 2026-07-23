@@ -42,6 +42,7 @@ from fgdlib.tangent import (
     functional_gradient,
     select_tiny_growth_layer_index,
     should_trigger_fgd_growth,
+    theoretical_learning_rate_upper_bound,
     tiny_optimal_update_kwargs,
     train_one_epoch_fgd_approx,
     validate_family_order,
@@ -1224,6 +1225,73 @@ def _evaluate_secant_fgd_trial(
         initial_functional_gap=initial_functional_gap,
         theory_loss_star=theory_loss_star,
     )
+
+
+def lemma35_learning_rate(
+    relative_error: float,
+    config: FGDApproxConfig,
+) -> float | None:
+    """The rate Lemma 3.5 certifies: ``safety * eta_bar(eps)``.
+
+    Returns ``None`` exactly when the lemma does not apply -- ``eps >= 1/2``
+    (or above a stricter configured threshold), or an interval so degenerate
+    that no rate sits strictly inside ``(theory_lr_min, eta_bar)``.
+
+    This is the *whole* step-size rule of the paper's algorithm. Given
+    ``eps < 1/2`` the lemma proves descent for every ``eta`` in the open
+    interval, so there is nothing to search over and nothing to verify: any
+    interior point works, and ``theory_lr_safety`` (0.95) picks one close to
+    the fastest admissible rate while staying strictly inside.
+    """
+    if not relative_error < min(config.rel_error_threshold, 0.5):
+        return None
+    upper_bound = theoretical_learning_rate_upper_bound(relative_error, config)
+    if upper_bound is None:
+        return None
+    learning_rate = config.theory_lr_safety * upper_bound
+    if learning_rate <= config.theory_lr_min + config.eps:
+        return None
+    return learning_rate
+
+
+def _apply_lemma35_step(
+    *,
+    relative_error: float | None,
+    evaluate_trial: Callable[[float], _FGDTrial],
+    config: FGDApproxConfig,
+) -> _FGDSearchResult:
+    """Take the certified step and commit it -- no descent gate.
+
+    The ordinary path (:func:`_search_fgd_certified_trial`) sweeps rates
+    downward and keeps the largest whose step is *observed* to descend on
+    held-out data. That is strictly stronger than the theory: Lemma 3.5 does
+    not offer descent as something to check, it derives it. Under
+    ``certify_apply_in_interval`` we therefore evaluate ONE rate -- the one
+    the lemma certifies -- and accept it.
+
+    What still gates is the finiteness sensor. That is not a theory
+    condition but a numerical one: a non-finite loss or a skipped batch means
+    the measurement itself is meaningless, and no lemma covers arithmetic
+    that overflowed.
+    """
+    learning_rate = lemma35_learning_rate(
+        relative_error if relative_error is not None else float("inf"),
+        config,
+    )
+    if learning_rate is None:
+        # eps >= 1/2: the structure is NOT certified, so no step is
+        # admissible. Growth is the answer, and the caller has already run it.
+        return _FGDSearchResult(None, None, 0, False)
+
+    trial = evaluate_trial(learning_rate)
+    sensor_valid = (
+        trial.epoch_result.sensor_valid
+        and trial.epoch_result.skipped_batches == 0
+        and trial.certificate.sensor_valid
+    )
+    if not sensor_valid:
+        return _FGDSearchResult(None, trial, 1, True)
+    return _FGDSearchResult(trial, trial, 1, False)
 
 
 def _search_fgd_certified_trial(
@@ -3512,6 +3580,7 @@ def run_pipeline(
                         tangent_direction: tuple[torch.Tensor, ...] | None = None
                         direction_stats: _FunctionalStepStats | None = None
                         maximum_learning_rate: float | None = None
+                        train_probe_relative_error: float | None = None
                         direction_sensor_failure = False
                         if config.fgd_approx.grow_to_certify:
                             # GROW-TO-CERTIFY. Make the structure satisfy
@@ -3533,13 +3602,20 @@ def run_pipeline(
                                 function_preserving=(
                                     config.fgd_approx.certify_function_preserving
                                 ),
-                                # eps < 1/2 certifies that an admissible RATE
-                                # exists; the realised descent is a separate
-                                # condition. When the last epoch satisfied the
-                                # former and still failed the latter, the
-                                # structure -- not the step size -- is what did
-                                # not deliver, so grow anyway.
-                                force=not certify_previous_step_committed,
+                                # Growing because a step failed only makes
+                                # sense while a step CAN fail for structural
+                                # reasons. Under certify_apply_in_interval it
+                                # cannot: eps < 1/2 is the sole gate and the
+                                # loop below already grows until it holds, so
+                                # forcing would add capacity for no stated
+                                # reason. Without that flag the realised
+                                # descent is a separate gate, and a step that
+                                # passed eps < 1/2 yet failed it has shown the
+                                # structure did not deliver -- grow anyway.
+                                force=(
+                                    not config.fgd_approx.certify_apply_in_interval
+                                    and not certify_previous_step_committed
+                                ),
                                 progress=progress,
                             )
                             if certify_result.growths:
@@ -3566,6 +3642,15 @@ def run_pipeline(
                             config.fgd_approx,
                         ):
                             tangent_direction = direction_step.parameter_updates
+                            # eps on the SAME probe the direction came from.
+                            # This is the quantity Lemma 3.5 speaks about:
+                            # the lemma bounds the loss on the sample where
+                            # the projection was taken, so the certified rate
+                            # must be derived from this eps and not from the
+                            # held-out one.
+                            train_probe_relative_error = (
+                                direction_step.output_error.relative_error
+                            )
                             fgd_update_norm = math.sqrt(
                                 sum(
                                     float(
@@ -3626,6 +3711,25 @@ def run_pipeline(
                             )
 
                         if (
+                            config.fgd_approx.certify_apply_in_interval
+                            and tangent_direction is not None
+                            and direction_stats is not None
+                        ):
+                            # Lemma 3.5 exactly as the paper states it: the
+                            # structure is certified (eps < 1/2 on the train
+                            # probe, enforced by the grow loop above), so a
+                            # rate inside (0, eta_bar(eps)) is PROVEN to
+                            # descend. Apply it. No sweep, no descent gate --
+                            # verifying a conclusion of the lemma would only
+                            # impose a condition the theory never asked for,
+                            # and demanding it on held-out data asks the
+                            # lemma for a guarantee outside its domain.
+                            search_result = _apply_lemma35_step(
+                                relative_error=train_probe_relative_error,
+                                evaluate_trial=evaluate_trial,
+                                config=config.fgd_approx,
+                            )
+                        elif (
                             config.fgd_approx.tangent_measured_descent
                             and tangent_direction is not None
                             and direction_stats is not None

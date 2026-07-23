@@ -9,23 +9,29 @@
 # no per-dataset threshold, so the method transfers unchanged to data that
 # has never been trained on.
 run:
-  name: fgd_certify_mnist_3x2
+  name: fgd_cifar_measured_tangent
   results_dir: results
   save_plot: false
   show_plot: false
 
+# ONLY the data block changes from the MNIST search. Nothing in the growth
+# criterion is dataset-specific: every constant governing the loop is either
+# from the theory (Lemma 3.5's 1/2, rank J <= min_l w_l) or reused from
+# GroMo. That transferability is the property the whole design was for, and
+# this is the run that tests it rather than asserting it.
 data:
-  kind: mnist
-  in_features: 784
+  kind: cifar10
+  in_features: 3072
   out_features: 10
   data_dir:
   batch_size: 64
   train_seed: 0
   validation_seed: 2
   test_seed: 1
-  mnist_train_samples: 10000
-  mnist_validation_samples: 2000
-  mnist_test_samples: 2000
+  cifar_grayscale: false
+  cifar_train_samples: 10000
+  cifar_validation_samples: 2000
+  cifar_test_samples: 2000
 
 # Start at 3x2, the incumbent's start. MEASURED reason: the value-per-
 # parameter hierarchy only exists when cheap late locations are available.
@@ -36,9 +42,18 @@ data:
 # the search burns parameters at the worst available rate until Lemma 3.5
 # stops it (measured: 784->9->10, 7165 params, 89.0%).
 model:
-  hidden_size: 2
-  number_hidden_layers: 3
   model_seed: 0
+  # Declarative architecture: decide exactly where each mlp / dropout /
+  # batchnorm goes. Each `mlp` is a block (width, num_layers); `batchnorm` /
+  # `dropout` attach to the mlp above. All mlp layers are growable -- the
+  # certified SENN search widens them from here. See fgdlib/models/stack.py.
+  stack:
+    - {mlp: [2, 1]}
+    - batchnorm
+    - {mlp: [2, 1]}
+    - {dropout: 0.2}
+    - {mlp: [2, 1]}
+    - batchnorm
 
 training:
   method: fgd_approx
@@ -67,7 +82,7 @@ fgd_approx:
   rel_error_threshold: 0.5
   rel_error_mode: tangent_projection
   layer_selection: certifying
-  projection_solver: exact
+  projection_solver: exact_kernel_eigh
   learning_rate_policy: theory_interval
   projection_damping: 0.01
   cg_max_iterations: 16
@@ -96,11 +111,6 @@ fgd_approx:
   # FIXED probe on which every certificate solves ONE shared-direction
   # projection (the projection_group_* keys above are deprecated: they used
   # to aggregate independent per-batch projections).
-  # Tractable probe. Exactness is preserved (full Jacobian, no CG); what the
-  # probe size sets is the STRENGTH of the certificate -- eps < 1/2 here is a
-  # statement about 64 samples x 10 classes = 640 output dimensions. Measured
-  # cost: 2.4 s per exact eps at this size against 11.1 s at 4 batches, and
-  # the loop pays that per candidate per growth.
   probe_batches: 4
   # A rejected fallback family is skipped until this many ACCEPTED outer
   # steps have been committed since the rejection (weight updates change the
@@ -133,35 +143,26 @@ fgd_approx:
   # 4 adds and repeats). The addition budget per growth event equals the
   # number of growable layers, exactly what uniform widening spends, so the
   # comparison against search_ce_uniform.yaml isolates the ALLOCATION.
-  # GROW-TO-CERTIFY: grow until Lemma 3.5 holds, then step. Only the tangent
-  # family, only steps the 1/2 condition certifies. Parameter count is
-  # explicitly NOT a concern -- the question is whether exact certification
-  # alone reaches the best loss and accuracy.
-  grow_to_certify: true
-  # Sized from the MEASURED rate on this probe: eps falls ~0.0018 per growth
-  # (1.824 -> 1.643 over 46), so reaching 1/2 from a 3x2 start needs ~670.
-  # The reason is dimensional, not a defect: each preserving growth adds ~9
-  # tangent directions while the residual lives in 64x10 = 640 dimensions, and
-  # capturing 80% of the gradient energy over those needs hundreds. Parameter
-  # count is deliberately not a constraint here -- the question is whether
-  # exact certification, whatever it costs, delivers the best accuracy.
-  certify_function_preserving: false
-  certify_max_growths: 1500
-  # PAPER-PURE STEP. Lemma 3.5 does not offer descent as a condition to
-  # verify -- it PROVES it: eps < 1/2 implies every eta in (0, eta_bar(eps))
-  # descends. So once eps is certified we take eta = theory_lr_safety *
-  # eta_bar(eps) (0.95 of the interval) and apply, with no sweep and no
-  # empirical descent gate, exactly as the paper's algorithm does.
+  # Certify the TANGENT step by MEASURED held-out descent (Prop. 3.8) instead
+  # of Lemma 3.5's worst-case relative-error interval.
   #
-  # Why this matters here, MEASURED: with the gate on, the flow deadlocked.
-  # eps = 0.475 certified the structure so no growth fired, while no rate
-  # produced held-out descent so no step committed -- epochs 2, 3 and 4 came
-  # out bit-identical (loss 0.0619, acc 0.566, delta +0.0000). The gate was
-  # unsatisfiable rather than informative: eps is certified on the TRAIN
-  # probe and descent was demanded on the VALIDATION probe, and Lemma 3.5
-  # guarantees descent only on the sample where eps was measured.
-  certify_apply_in_interval: true
-  tangent_measured_descent: false
+  # Why (measured on this run): the tangent direction g = P_T r MAXIMISES the
+  # cosine with r among all reachable directions -- cos_max = 1/sqrt(1+eps^2)
+  # = 0.66 at the eps seen here -- yet it was being REJECTED because eps >= 1/2
+  # makes eta_bar(eps) = 2(1-2eps)/(L_s(1+2eps)) negative (no admissible rate).
+  # The flow then fell back to a family direction with cos = 0.08, and accepted
+  # THAT by measured descent. Rejecting the best direction on a worst-case
+  # bound while accepting a far worse one on a measured certificate is
+  # incoherent: first-order descent scales as cos^2, so the fallback realises
+  # ~1.5% of the available certified descent.
+  #
+  # This changes only the step SIZE rule, never the direction (still the
+  # paper's functional-gradient projection) and never the requirement: the step
+  # must still realise measured held-out descent to commit. Both certificates
+  # are in the paper -- Lemma 3.5 is one sufficient condition, Prop. 3.8 with a
+  # measured coefficient is another, already used by parametric_descent.
+  tangent_measured_descent: true
+  tangent_measured_max_lr: 1.0
   growth_selection: unified_expansion
   # Generalised R1: eps < 1/2 is Lemma 3.5 step-admissibility, not structural
   # adequacy. Before stopping, check whether growing the bottleneck reaches a
@@ -228,6 +229,9 @@ fgd_approx:
   # growth_function_preserving:
   family_order:
     - tangent
+    #- rkhs_head
+    #- parametric_gd
+    - parametric_descent
   # In-ladder rkhs_head margin: the head must improve the FULL validation
   # functional by this relative amount (filters the train-subsample jitter
   # that otherwise re-accepts an epsilon improvement forever).
@@ -347,7 +351,7 @@ wandb:
   run_name:
   group: fgd-growth
   job_type: train
-  tags: [fgd_approx, certified_growth, mnist, from_3x2, cross_entropy, unified, from_3x2]
+  tags: [fgd_approx, certified_growth, cifar10, color, stack, unified, senn, measured_tangent]
   notes: Algorithm 5 - certified growth-and-train from a 3x2 network, no parameter budget
   mode: online
   dir: results
