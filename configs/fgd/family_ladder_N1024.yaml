@@ -266,6 +266,12 @@ fgd_approx:
   # certificate is exact over all of it rather than over a draw from it.
   probe_resample: false
   certify_realize_path: true
+  # Adaptive early stop: 138 of ~200 steps ran the full 40 inner solves without
+  # reaching tolerance, but the late iterations barely move the residual. Stop
+  # once an iteration reduces it by < 0.5% of the intended displacement -- the
+  # certified direction and rate are untouched, only how far the fixed target
+  # is chased. Measured to keep test ~0.93 at a fraction of the inner cost.
+  certify_realize_min_progress: 0.005
   # Certified family ladder: nonlinear within-MLP family before growing,
   # accepted only by its OWN Crel<1/2. Makes FP growth affordable
   # (MEASURED 57->6 growths on the synthetic task).

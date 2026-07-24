@@ -127,12 +127,25 @@ def realize_functional_step(
 
         travelled = 0.0
         iterations = 0
+        previous_remaining = intended
+        min_progress = float(getattr(config, "certify_realize_min_progress", 0.0))
         for _ in range(max_iterations):
             with torch.no_grad():
                 current = model(x).detach()
             remaining = float(torch.linalg.vector_norm(target - current))
             if remaining <= tolerance * intended:
                 break
+            # Diminishing returns: once an iteration reduces the residual by
+            # less than min_progress of the intended displacement, the rest of
+            # the budget buys almost nothing -- stop and let the next outer
+            # step continue. The certified direction/rate are untouched.
+            if (
+                min_progress > 0.0
+                and iterations > 0
+                and (previous_remaining - remaining) < min_progress * intended
+            ):
+                break
+            previous_remaining = remaining
 
             # The functional residual still to be covered, in the same
             # convention the projection expects (it solves J v ~ d for a

@@ -472,6 +472,18 @@ class FGDApproxConfig:
     certify_realize_path: bool = False
     certify_realize_max_iterations: int = 40
     certify_realize_tolerance: float = 0.05
+    # ADAPTIVE EARLY STOP for the realise integration. MEASURED, 138 of ~200
+    # steps run the full 40 inner solves without reaching the residual
+    # tolerance -- but each iteration only chips the residual down a little, so
+    # the late iterations buy almost no extra realised displacement at full
+    # cost. This stops the integration once one iteration reduces the residual
+    # by less than this fraction of the INTENDED displacement, i.e. once the
+    # returns have diminished. It does NOT touch the certificate: the certified
+    # direction g and rate eta are unchanged; this only decides how far along
+    # the fixed target f - eta g the step is carried, and the next outer step
+    # continues from there. 0.0 keeps the current behaviour (stop only at the
+    # tolerance or the iteration cap).
+    certify_realize_min_progress: float = 0.0
     # Generalised R1. The eps < 1/2 stop is Lemma 3.5's admissibility of a
     # STEP, not adequacy of the STRUCTURE; on an easy task the two coincide
     # (MNIST stops at a good small net) but on a hard one they diverge --
