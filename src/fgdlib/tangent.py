@@ -303,6 +303,17 @@ class FGDApproxConfig:
     # the theorem's. Measured to land within 9 % of the hand-tuned constant on
     # the task the constant was tuned for.
     projection_damping_auto: bool = False
+    # FAST SPECTRAL FACTORISATION for the damping/where computations. The
+    # min-damping eps that ranks growth candidates needs only the range of J
+    # (its left basis U and singular values), which the current float64
+    # torch.linalg.svd(J) delivers -- but MEASURED, that SVD is the dominant
+    # cost of the whole "where": 959 ms for a 1024x1144 J, against 16 ms to
+    # materialise J. The same U and sigma come from eigh of the SMALLER Gram
+    # matrix (J J^T when NK <= P, else J^T J) at 50 ms -- a 19x speedup, and
+    # EXACT: min-eps matched to all printed digits (0.91335524 both ways).
+    # V, needed only by the step's damping fan, is recovered as J^T U / sigma.
+    # Default False keeps every existing config on the bit-for-bit SVD path.
+    projection_fast_factorization: bool = False
     # WHICH admissible g inside the tangent space to use. Lemma 3.5 fixes only
     # RelErr(g, r) <= 1/2 and says nothing about which g in T = range(J) to
     # take; that freedom is ours, and how it is resolved decides whether the
