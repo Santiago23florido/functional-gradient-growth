@@ -24,7 +24,7 @@
 # PL constant (mu = 2, L* = 0) where cross-entropy has none, and an epoch
 # costs seconds instead of minutes.
 run:
-  name: fgd_certify_tiny_N1024
+  name: conv_N1024
   results_dir: results
   save_plot: false
   show_plot: false
@@ -35,7 +35,7 @@ data:
   out_features: 1
   train_batches: 16
   validation_batches: 16
-  test_batches: 1
+  test_batches: 128
   batch_size: 64
   train_seed: 0
   validation_seed: 2
@@ -151,7 +151,7 @@ fgd_approx:
   # the stationary/global bounds are computed and logged as trajectory
   # diagnostics. false (default): legacy behavior — non-strict descent and
   # Cstat/Cglob as acceptance gates.
-  outer_steps_per_epoch: 4
+  outer_steps_per_epoch: 8
   growth_patience: 1
   # Certified functional: cross-entropy keeps convexity (global optimality)
   # and is 4x smoother than MSE (wider admissible interval), but has NO
@@ -238,12 +238,6 @@ fgd_approx:
   # land within 9 % of the hand-tuned constant on the task it was tuned for,
   # with nothing dataset-specific in the rule.
   projection_damping_auto: true
-  # DESCENT selects lambda: the interior rung with the best guaranteed
-  # decrease, which avoids the boundary (eps->1/2, eta->0, no step) where GCV
-  # would freeze. Generalisation comes from functional Tikhonov gamma, which
-  # regularises r itself; the two roles are separate.
-  projection_damping_objective: descent
-  functional_tikhonov_gamma: 0.0
   # Realise the certified functional step by INTEGRATING toward it instead of
   # jumping at it. theta - eta u is only the first Gauss-Newton iteration of
   # "find theta' with f(theta') = f - eta g"; shrinking eta until that single
@@ -265,7 +259,7 @@ fgd_approx:
   # certificate is exact over all of it rather than over a draw from it.
   probe_resample: false
   certify_realize_path: true
-  certify_realize_max_iterations: 20
+  certify_realize_max_iterations: 40
   certify_realize_tolerance: 0.05
   tangent_measured_descent: false
   growth_selection: unified_expansion
@@ -453,7 +447,7 @@ wandb:
   run_name:
   group: fgd-growth
   job_type: train
-  tags: [fgd_approx, certified_growth, smooth_sin_tiny, tikhonov, gamma_0p0, gcv]
+  tags: [fgd_approx, certified_growth, smooth_sin_tiny, from_3x2, mse, lemma35_cycle, fully_exact]
   notes: Fully exact Lemma 3.5 cycle at minimum scale - full-dataset Jacobian, certified rate, integrated step
   mode: online
   dir: results

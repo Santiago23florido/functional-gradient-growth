@@ -66,6 +66,13 @@ class CertifyResult:
     growths: int
     certified: bool
     trajectory: tuple[float, ...]
+    #: True when a certified NON-tangent family took a step instead of growing.
+    #: The returned model has already moved, so the caller must treat it as the
+    #: outer step and not step again.
+    family_stepped: bool = False
+    #: How many family steps were taken across the loop (a family step shrinks
+    #: the residual, deferring growth).
+    family_steps: int = 0
 
 
 def exact_relative_error(
@@ -180,8 +187,17 @@ def grow_until_certified(
     function_preserving: bool = True,
     force: bool = False,
     progress=None,
+    family_step=None,
 ):
     """Grow until ``eps < rel_error_threshold``; return the grown model.
+
+    ``family_step``: an optional callable ``model -> stepped_model_or_None``.
+    Before EACH growth it is given the current model; if it returns a stepped
+    model, that means a NON-tangent family certified at the fixed structure by
+    ITS OWN relative error (never a descent criterion, never the tangent's),
+    so a certified step was taken instead of growing. The residual shrinks, so
+    growth is deferred and, when it finally happens, is cheaper -- the whole
+    point when growth is function-preserving and otherwise ruinous.
 
     At each iteration every growable location is tried on a clone and scored
     by its EXACT resulting ``eps``; the location with the lowest ``eps`` is
@@ -211,12 +227,41 @@ def grow_until_certified(
     epsilon = exact_relative_error(model, x, y, config.fgd_approx)
     trajectory = [epsilon]
     growths = 0
+    family_steps = 0
     forced_remaining = 1 if force else 0
 
     while (
         epsilon >= threshold or forced_remaining > 0
     ) and growths < max_growths:
         forced_remaining = max(0, forced_remaining - 1)
+
+        # FAMILY LADDER, before growing: the tangent could not certify (that
+        # is why we are here), so try a certified NON-tangent family at the
+        # fixed structure. Accept ONLY if the family's own projection
+        # certifies -- that gate lives inside family_step. A family step is a
+        # real certified FGD step, so it becomes the outer step and the loop
+        # returns instead of growing.
+        if family_step is not None and epsilon >= threshold:
+            stepped = family_step(model)
+            if stepped is not None:
+                model = stepped
+                family_steps += 1
+                epsilon = exact_relative_error(model, x, y, config.fgd_approx)
+                trajectory.append(epsilon)
+                if progress is not None:
+                    progress(
+                        "[CERTIFY] parametric family certified at fixed "
+                        f"structure (no growth); eps -> {epsilon:.4f}"
+                    )
+                return model, CertifyResult(
+                    relative_error=epsilon,
+                    growths=growths,
+                    certified=epsilon < threshold,
+                    trajectory=tuple(trajectory),
+                    family_stepped=True,
+                    family_steps=family_steps,
+                )
+
         locations = range(len(getattr(model, "_growable_layers", [])))
         best_model = None
         # Preserving growth cannot make eps worse, so requiring an improvement
@@ -269,4 +314,6 @@ def grow_until_certified(
         growths=growths,
         certified=epsilon < threshold,
         trajectory=tuple(trajectory),
+        family_stepped=False,
+        family_steps=family_steps,
     )
