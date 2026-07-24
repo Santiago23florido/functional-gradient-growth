@@ -1,0 +1,83 @@
+# Phase 0: is ~90 % attainable on this task at all?
+#
+# NOT a tuned baseline and not something the method competes against on
+# parameter count -- a feasibility read. Accuracy here is
+# |f - y| < accuracy_tolerance = 0.1 on a REGRESSION target, so 90 % demands
+# RMSE well under 0.05. If ordinary AdamW on a comfortably sized fixed
+# network cannot reach it either, then the target does not exist and the
+# certified method would be chased against an impossible bar. Same data,
+# same seeds, same accuracy definition as certify_smooth_sin_tiny.yaml; the
+# ONLY differences are a fixed structure and a plain optimiser.
+run:
+  name: adamw_reference_smooth_sin_tiny
+  results_dir: results
+  save_plot: false
+  show_plot: false
+
+data:
+  kind: smooth_sin
+  in_features: 4
+  out_features: 1
+  train_batches: 4
+  validation_batches: 4
+  test_batches: 1
+  batch_size: 64
+  train_seed: 0
+  validation_seed: 2
+  test_seed: 1
+  active_features: 3
+  frequency: 1.5
+  phase_shift: 0.5
+  interaction_strength: 0.25
+  linear_strength: 0.1
+
+# Comfortably over-sized on purpose: this is asking what the TASK allows,
+# not what is frugal.
+model:
+  hidden_size: 64
+  number_hidden_layers: 3
+  model_seed: 0
+
+training:
+  method: normal
+  epochs: 400
+  accuracy_tolerance: 0.1
+  gradient_clip_norm:
+  log_every: 20
+  device: auto
+
+optimizer:
+  name: adamw
+  learning_rate: 0.003
+  momentum: 0.0
+  weight_decay: 0.01
+  nesterov: false
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+lr_scheduler:
+  name: cosineannealing
+  t_max: 400
+  eta_min: 0.0
+  restart_on_growth: false
+
+# No growth: `enabled: false` is what method: normal reads as "never change
+# the architecture".
+growth_schedule:
+  enabled: false
+  every: 1000
+  first_epoch: 1000
+  layer_policy: round_robin
+
+wandb:
+  enabled: true
+  project: stable-tiny
+  entity:
+  run_name:
+  group: fgd-growth
+  job_type: train
+  tags: [baseline, adamw, fixed_structure, smooth_sin_tiny, feasibility]
+  notes: Phase 0 feasibility read - can ANY fixed net reach ~90% train and test here
+  mode: online
+  dir: results
+  log_code: false

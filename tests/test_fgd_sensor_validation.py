@@ -290,7 +290,7 @@ def test_secant_certificate_allows_non_projector_hilbert_approximation() -> None
 
 
 def test_secant_search_keeps_architecture_fixed() -> None:
-    config = load_pipeline_config("configs/fgd/default.yaml")
+    config = load_pipeline_config("configs/experiments/default.yaml")
     config = replace(
         config,
         data=replace(
@@ -345,7 +345,7 @@ def test_pipeline_uses_rkhs_phase_when_growth_does_not_improve_fgd(
     tmp_path,
 ) -> None:
     """The certified RKHS head phase replaces the Hilbert-secant search."""
-    config = load_pipeline_config("configs/fgd/default.yaml")
+    config = load_pipeline_config("configs/experiments/default.yaml")
     config = replace(
         config,
         model=replace(config.model, hidden_size=2, number_hidden_layers=2),
@@ -404,7 +404,7 @@ def test_pipeline_uses_rkhs_phase_when_growth_does_not_improve_fgd(
 
 
 def test_build_dataloaders_returns_distinct_validation_split() -> None:
-    config = load_pipeline_config("configs/fgd/default.yaml")
+    config = load_pipeline_config("configs/experiments/default.yaml")
     config = replace(
         config,
         data=replace(
@@ -560,7 +560,7 @@ def test_lr_search_rejects_rates_below_positive_theory_floor() -> None:
 
 
 def test_train_epoch_does_not_evaluate_theory_conditions(monkeypatch) -> None:
-    config = load_pipeline_config("configs/fgd/default.yaml")
+    config = load_pipeline_config("configs/experiments/default.yaml")
     config = replace(
         config,
         data=replace(
@@ -622,7 +622,7 @@ def test_pipeline_clips_learning_rate_from_validation_certificate(
     monkeypatch,
     tmp_path,
 ) -> None:
-    config = load_pipeline_config("configs/fgd/default.yaml")
+    config = load_pipeline_config("configs/experiments/default.yaml")
     config = replace(
         config,
         training=replace(config.training, epochs=1, device="cpu", log_every=1),
@@ -721,7 +721,7 @@ def test_failed_lr_trials_do_not_modify_the_committed_model(
     monkeypatch,
     tmp_path,
 ) -> None:
-    config = load_pipeline_config("configs/fgd/default.yaml")
+    config = load_pipeline_config("configs/experiments/default.yaml")
     config = replace(
         config,
         training=replace(config.training, epochs=1, device="cpu", log_every=1),
@@ -807,7 +807,7 @@ def test_growth_sets_lr_to_new_architecture_certified_maximum(
     monkeypatch,
     tmp_path,
 ) -> None:
-    config = load_pipeline_config("configs/fgd/default.yaml")
+    config = load_pipeline_config("configs/experiments/default.yaml")
     config = replace(
         config,
         training=replace(config.training, epochs=1, device="cpu", log_every=1),

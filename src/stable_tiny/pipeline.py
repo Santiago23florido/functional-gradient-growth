@@ -42,6 +42,7 @@ from fgdlib.tangent import (
     functional_gradient,
     select_tiny_growth_layer_index,
     should_trigger_fgd_growth,
+    theoretical_learning_rate_upper_bound,
     tiny_optimal_update_kwargs,
     train_one_epoch_fgd_approx,
     validate_family_order,
@@ -56,6 +57,8 @@ from fgdlib.rkhs import (
     KernelDictionaryModel,
 )
 from fgdlib.gromo_setup import ensure_gromo_importable
+from fgdlib.search.certify import grow_until_certified
+from fgdlib.search.families import certify_parametric_step
 from fgdlib.search.depth import insert_identity_layer
 from fgdlib.search.unified import (
     Candidate,
@@ -63,6 +66,9 @@ from fgdlib.search.unified import (
     rank_candidates,
     rank_limiting_locations,
 )
+from fgdlib.search.damping import select_projection_damping
+from fgdlib.search.realize import realize_functional_step
+from fgdlib.search.linearization import certified_linear_learning_rate
 from fgdlib.search.growth import (
     GrowthResult,
     ScalingLineSearchConfig,
@@ -615,6 +621,32 @@ def build_dataloaders(
 
 def is_classification_task(config: PipelineConfig) -> bool:
     return config.data.kind in {"cifar10", "mnist"}
+
+
+def _functional_tikhonov_probe(
+    probe: tuple[torch.Tensor, torch.Tensor] | None,
+    config: FGDApproxConfig,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Shrink a probe's targets to certify against L_data + gamma ||f||^2.
+
+    For sum-MSE the regularised functional gradient r_gamma = 2((1+gamma)f - y)
+    points exactly like the plain MSE gradient toward y/(1+gamma), and the
+    certified parameter step is identical to plain MSE toward that shrunk
+    target with L_s = 2. So functional Tikhonov is precisely this one
+    operation on the direction probe; everything downstream -- growth,
+    projection, realisation, GCV -- inherits it, while the reported metrics
+    stay against the true targets in the loaders.
+
+    Only for the sum-MSE functional: cross-entropy's ||f||^2 penalty does not
+    reduce to a target shift, so gamma is ignored there rather than applied
+    incorrectly.
+    """
+    if probe is None or config.functional_tikhonov_gamma <= 0.0:
+        return probe
+    if config.functional_loss != "mse":
+        return probe
+    x, y = probe
+    return x, y / (1.0 + config.functional_tikhonov_gamma)
 
 
 def build_model(config: PipelineConfig, device: torch.device) -> GrowingMLP:
@@ -1222,6 +1254,161 @@ def _evaluate_secant_fgd_trial(
         theory_state=theory_state,
         initial_functional_gap=initial_functional_gap,
         theory_loss_star=theory_loss_star,
+    )
+
+
+def lemma35_learning_rate(
+    relative_error: float | None,
+    config: FGDApproxConfig,
+) -> float | None:
+    """``theory_lr_safety * eta_bar(eps)`` -- 0.95 of the admissible interval.
+
+    ``relative_error`` must be the eps that is actually CERTIFIED, i.e. the
+    one measured on the probe the direction was solved on and driven below
+    ``rel_error_threshold`` by the grow loop. That is the eps Lemma 3.5
+    speaks about, and ``eta_bar(eps) = 2(1 - 2 eps) / (L_s (1 + 2 eps))`` is
+    its interval.
+
+    Returns ``None`` exactly when the certificate does not hold -- eps at or
+    above the threshold, unmeasured, or an interval so degenerate that no
+    rate sits strictly inside ``(theory_lr_min, eta_bar)``. That is the
+    signal to grow, not to step.
+    """
+    if relative_error is None:
+        return None
+    if not relative_error < min(config.rel_error_threshold, 0.5):
+        return None
+    upper_bound = theoretical_learning_rate_upper_bound(relative_error, config)
+    if upper_bound is None:
+        return None
+    # eta_bar is where Lemma 3.5's bracket VANISHES, so the guaranteed
+    # decrease eta * bracket(eta) -- a parabola -- peaks at eta_bar/2. Taking
+    # a fraction close to 1 maximises the step and minimises what it buys.
+    fraction = 0.5 if config.certify_optimal_rate else config.theory_lr_safety
+    learning_rate = fraction * upper_bound
+    if learning_rate <= config.theory_lr_min + config.eps:
+        return None
+    return learning_rate
+
+
+def _apply_lemma35_step(
+    *,
+    relative_error: float | None,
+    evaluate_trial: Callable[[float], _FGDTrial],
+    config: FGDApproxConfig,
+    learning_rate: float | None = None,
+    model: GrowingMLP | None = None,
+    probe_inputs: torch.Tensor | None = None,
+    updates: tuple[torch.Tensor, ...] | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> _FGDSearchResult:
+    """Take the certified step and commit it -- assume the lemma, don't check it.
+
+    The cycle this serves: grow until eps < 1/2, then train with the tangent
+    approximation at ``eta = 0.95 * eta_bar(eps)``, and keep training until
+    eps stops satisfying the criterion -- at which point the caller grows
+    again. Nothing else is verified. The additional condition is ASSUMED to
+    hold, on the grounds that both of its premises do: the rate lies inside
+    the admissible interval and the relative error satisfies the criterion.
+
+    The ordinary path (:func:`_search_fgd_certified_trial`) instead sweeps
+    rates downward from the bound and keeps the largest whose step is
+    *observed* to descend on held-out data. That gate is what deadlocked
+    this flow -- eps = 0.475 certified the structure so no growth fired,
+    while no rate produced held-out descent so no step committed, and
+    epochs 2, 3 and 4 came out bit-identical.
+
+    Deriving the rate from the HELD-OUT certificate instead deadlocks it a
+    second way, which is worth recording because it looks like a fix: that
+    eps measures ~1.0 (on validation the direction is a secant, not a
+    projection), so ``eta_bar`` is undefined there, no rate is produced and
+    the flow sits still again. Only the certified eps has an interval at
+    all.
+
+    What still gates is the finiteness sensor. That is not a condition of
+    the theory but of the arithmetic: a non-finite loss or a skipped batch
+    means the measurement itself is meaningless.
+    """
+    if learning_rate is None:
+        learning_rate = lemma35_learning_rate(relative_error, config)
+    elif lemma35_learning_rate(relative_error, config) is None:
+        # A rate supplied from outside never overrides the certificate: if
+        # eps fails the criterion there is no admissible rate to supply.
+        learning_rate = None
+    else:
+        # Already scored against the linearisation control by the selection
+        # that produced it, so it is applied as given.
+        return _finish_lemma35_step(learning_rate, evaluate_trial)
+    if learning_rate is None:
+        # The relative-error criterion is not satisfied, so this is where
+        # the cycle turns: no step, grow instead. The caller's grow loop
+        # runs before every outer step, so that happens on the next pass.
+        return _FGDSearchResult(None, None, 0, False)
+
+    if (
+        config.certify_linearization_tolerance is not None
+        and model is not None
+        and probe_inputs is not None
+        and updates is not None
+    ):
+        # Enforce the lemma's own hypothesis: that theta - eta u really is
+        # the function-space step f - eta g the theorem is about. Narrows
+        # eta INSIDE the certified interval; never enlarges it, never looks
+        # at the loss.
+        linearized = certified_linear_learning_rate(
+            model, probe_inputs, updates, learning_rate, config
+        )
+        if progress is not None:
+            progress(
+                f"[LINEAR] eta {learning_rate:.4g} -> "
+                + (
+                    f"{linearized.learning_rate:.4g}"
+                    if linearized.learning_rate is not None
+                    else "none"
+                )
+                + f" (defect {linearized.defect:.3e}, "
+                f"{linearized.backtracks} backtracks)"
+            )
+        if linearized.learning_rate is None:
+            # No admissible rate puts this direction inside the regime the
+            # lemma describes. The structure, not the step size, is what has
+            # to change -- so take no step and let the grow loop act.
+            return _FGDSearchResult(None, None, 0, False)
+        learning_rate = linearized.learning_rate
+
+    return _finish_lemma35_step(learning_rate, evaluate_trial)
+
+
+def _finish_lemma35_step(
+    learning_rate: float,
+    evaluate_trial: Callable[[float], _FGDTrial],
+) -> _FGDSearchResult:
+    """Evaluate the certified rate once and commit it.
+
+    Nothing here rejects, and that is deliberate. The sensors this used to
+    consult are BOTH the held-out one: ``trial.certificate`` is built from
+    ``direction_stats``, measured on the validation probe, and
+    ``epoch_result.sensor_valid`` is copied from that same certificate --
+    there is no train-side sensor in a trial at all. With the projector
+    invariants off, as they are there, that sensor tests only finiteness, so
+    failing it says the MODEL produced non-finite values on unseen data.
+
+    That is a statement about the fit, not about admissibility. Admissibility
+    is decided upstream, on the TRAIN probe, which is the sample Lemma 3.5
+    speaks about -- and a non-finite measurement there already blocks the
+    step, because ``lemma35_learning_rate`` withholds a rate whenever ``eps``
+    fails ``eps < 1/2`` and NaN fails it.
+
+    Letting the held-out sensor reject was the deadlock in its final form:
+    MEASURED, ``eps = 0.4808`` certified so no growth fired, while this
+    sensor rejected every step, and epochs 85-92 came out bit-identical at
+    loss 0.1092 -- 1 committed step against 21 growths. The earlier ``force``
+    workaround papered over it by buying capacity, which is the one response
+    guaranteed to make an overflowing model overflow harder.
+    """
+    trial = evaluate_trial(learning_rate)
+    return _FGDSearchResult(
+        trial, trial, 1, not trial.certificate.sensor_valid
     )
 
 
@@ -3281,6 +3468,10 @@ def run_pipeline(
         # FIXED certification probes, materialized once for the whole run:
         # every certificate, family comparison and growth-layer trial solves
         # one joint shared-direction projection over the same sample.
+        # Grow-to-certify: remembers whether the previous epoch managed to
+        # commit a step. A certified structure that still cannot step is the
+        # deadlock this closes (see grow_until_certified's `force`).
+        certify_previous_step_committed = True
         fgd_validation_probe: tuple[torch.Tensor, torch.Tensor] | None = None
         fgd_train_probe: tuple[torch.Tensor, torch.Tensor] | None = None
         if config.training.method == "fgd_approx":
@@ -3293,6 +3484,15 @@ def run_pipeline(
                 train_loader,
                 config.fgd_approx.probe_batches,
                 device,
+            )
+            # Functional Tikhonov: certify against L_data + gamma ||f||^2 by
+            # shrinking the direction probe's targets. One point, and growth,
+            # projection, realisation and GCV all inherit it.
+            fgd_train_probe = _functional_tikhonov_probe(
+                fgd_train_probe, config.fgd_approx
+            )
+            fgd_validation_probe = _functional_tikhonov_probe(
+                fgd_validation_probe, config.fgd_approx
             )
         validation_certificate_for_next_epoch = None
         if (
@@ -3504,21 +3704,272 @@ def run_pipeline(
                         # model f_t, certify THAT direction on the fixed
                         # validation probe BEFORE any update, then search the
                         # step size eta for the single update theta - eta * u*.
+                        if config.fgd_approx.probe_resample:
+                            # A FIXED probe turns the method into Newton's
+                            # method on one subsample: the certified step is
+                            # now delivered in full, so the residual on those
+                            # samples is driven to zero and the network
+                            # interpolates them. MEASURED: train accuracy
+                            # 0.320 against validation 0.150, with the logged
+                            # tangent relative error exploding to 1077 --
+                            # RelErr is normalised by ||g||, so it diverges
+                            # precisely when there is no residual left on the
+                            # probe to approximate.
+                            #
+                            # Drawing a fresh probe each outer step makes the
+                            # functional gradient an unbiased estimate of the
+                            # one over the dataset, which is the object the
+                            # theory is about; the flow becomes stochastic FGD
+                            # instead of exact descent on 256 fixed points.
+                            fgd_train_probe = _functional_tikhonov_probe(
+                                build_projection_probe(
+                                    train_loader,
+                                    config.fgd_approx.probe_batches,
+                                    device,
+                                ),
+                                config.fgd_approx,
+                            )
+                            fgd_validation_probe = _functional_tikhonov_probe(
+                                build_projection_probe(
+                                    validation_loader,
+                                    config.fgd_approx.probe_batches,
+                                    device,
+                                ),
+                                config.fgd_approx,
+                            )
                         tangent_direction: tuple[torch.Tensor, ...] | None = None
                         direction_stats: _FunctionalStepStats | None = None
                         maximum_learning_rate: float | None = None
+                        # The eps that is CERTIFIED: measured on the probe
+                        # the direction is solved on, and the quantity the
+                        # grow loop drives below the threshold. Lemma 3.5's
+                        # interval is defined from this one.
+                        certified_relative_error: float | None = None
+                        # Set when the damping is chosen by measurement: the
+                        # rate that selection already scored, so it is not
+                        # recomputed from a damping that no longer applies.
+                        selected_learning_rate: float | None = None
                         direction_sensor_failure = False
-                        direction_step = _compute_tangent_projection_step(
-                            model=model,
-                            x=fgd_train_probe[0],
-                            y=fgd_train_probe[1],
-                            config=config.fgd_approx,
+                        if config.fgd_approx.grow_to_certify:
+                            # GROW-TO-CERTIFY. Make the structure satisfy
+                            # Lemma 3.5 BEFORE stepping, instead of stepping
+                            # and growing when it fails. Every growth is
+                            # function-preserving, so f does not move here --
+                            # only the certified step below moves it -- and
+                            # eps decreases monotonically, so this terminates.
+                            # Certified family ladder: try a nonlinear
+                            # within-MLP family before each growth, accepting
+                            # its step only when its OWN relative error
+                            # certifies. It certifies at a far smaller
+                            # structure than the linear tangent, so it defers
+                            # growth (MEASURED 57 -> 6 FP growths).
+                            _family_step = None
+                            if config.fgd_approx.certify_family_ladder:
+                                _fp = fgd_train_probe
+
+                                def _family_step(candidate_model):
+                                    return certify_parametric_step(
+                                        candidate_model,
+                                        _fp[0],
+                                        _fp[1],
+                                        config.fgd_approx,
+                                        functional_learning_rate=(
+                                            config.fgd_approx.certify_family_functional_lr
+                                        ),
+                                        inner_steps=(
+                                            config.fgd_approx.certify_family_inner_steps
+                                        ),
+                                        inner_learning_rate=(
+                                            config.fgd_approx.certify_family_inner_learning_rate
+                                        ),
+                                    ).model
+                            model, certify_result = grow_until_certified(
+                                model=model,
+                                x=fgd_train_probe[0],
+                                y=fgd_train_probe[1],
+                                train_loader=train_loader,
+                                device=device,
+                                config=config,
+                                max_growths=(
+                                    config.fgd_approx.certify_max_growths
+                                ),
+                                function_preserving=(
+                                    config.fgd_approx.certify_function_preserving
+                                ),
+                                family_step=_family_step,
+                                # A step that did not commit while eps was
+                                # already certified means the structure, not
+                                # the step size, is what has to change --
+                                # eps < 1/2 said the tangent space was
+                                # adequate and the step still could not be
+                                # taken, so grow anyway. MEASURED: without
+                                # this the linearisation control froze the
+                                # synthetic run, epochs 12-16 bit-identical
+                                # at loss 0.1072 with eps = 0.388 (certified,
+                                # so no growth) and no rate inside the
+                                # regime the lemma describes (so no step).
+                                # Growth is the right remedy here in a way it
+                                # was not for the descent gate: the defect is
+                                # measured on the SAME probe as eps, so
+                                # failing it is a statement about this
+                                # direction, and adding directions changes
+                                # the tangent space and hence the direction.
+                                # Growth fires on the CERTIFICATE and nothing
+                                # else: eps >= 1/2 and only that. Forcing it
+                                # whenever a step failed to commit was mine,
+                                # added to break a deadlock whose cause -- the
+                                # held-out descent gate -- has since been
+                                # removed, so it now solves a problem that no
+                                # longer exists while firing on problems it
+                                # cannot fix. MEASURED on the small synthetic
+                                # run: 262 growths against 7 committed steps,
+                                # and 242 of those 262 grew with eps ALREADY
+                                # certified, many at eps = 0.0000. The trigger
+                                # was a non-finite validation measurement --
+                                # the model overflowing on unseen data, which
+                                # is a symptom of overfitting and which more
+                                # capacity makes worse, not better.
+                                force=False,
+                                progress=progress,
+                            )
+                            if certify_result.growths or certify_result.family_steps:
+                                growth_count += certify_result.growths
+                                optimizer = build_optimizer(
+                                    model, config.optimizer
+                                )
+                                _clear_inaccessible_tensor_caches(model)
+                                if (
+                                    certify_result.family_steps
+                                    and progress is not None
+                                ):
+                                    progress(
+                                        "[CERTIFY] family ladder took "
+                                        f"{certify_result.family_steps} step(s) "
+                                        f"in {certify_result.growths} growths"
+                                    )
+                            if progress is not None and not certify_result.certified:
+                                progress(
+                                    f"[CERTIFY] Epoch {epoch}: could NOT reach "
+                                    f"eps < {config.fgd_approx.rel_error_threshold} "
+                                    f"(stopped at {certify_result.relative_error:.4f} "
+                                    f"after {certify_result.growths} growths)"
+                                )
+                        damping_choice = (
+                            select_projection_damping(
+                                model,
+                                fgd_train_probe[0],
+                                fgd_train_probe[1],
+                                config.fgd_approx,
+                            )
+                            if config.fgd_approx.projection_damping_auto
+                            else None
                         )
-                        if _projection_step_sensor_valid(
-                            direction_step,
-                            config.fgd_approx,
+                        if damping_choice is not None:
+                            # The damping is the knob that arbitrates between
+                            # the certificate (eps) and the realisability of
+                            # the step (|u|); a fixed constant lands in the
+                            # window satisfying both only by luck. Selection
+                            # re-derives it from measurement, scored by the
+                            # decrease Lemma 3.5 itself guarantees.
+                            tangent_direction = damping_choice.parameter_updates
+                            certified_relative_error = (
+                                damping_choice.candidate.relative_error
+                            )
+                            selected_learning_rate = (
+                                damping_choice.candidate.learning_rate
+                            )
+                            if (
+                                config.fgd_approx.certify_realize_path
+                                and damping_choice.candidate.certified_learning_rate
+                            ):
+                                # Realise the FULL certified functional step
+                                # by integrating toward it, then express the
+                                # path travelled as the equivalent single
+                                # update so everything downstream -- the
+                                # validation certificate, the trial, the
+                                # accounting -- sees an ordinary outer step
+                                # and reproduces this exact point.
+                                nominal = (
+                                    damping_choice.candidate
+                                    .certified_learning_rate
+                                )
+                                walker = copy.deepcopy(model)
+                                realization = realize_functional_step(
+                                    walker,
+                                    fgd_train_probe[0],
+                                    fgd_train_probe[1],
+                                    tangent_direction,
+                                    nominal,
+                                    config.fgd_approx,
+                                    max_iterations=(
+                                        config.fgd_approx
+                                        .certify_realize_max_iterations
+                                    ),
+                                    tolerance=(
+                                        config.fgd_approx
+                                        .certify_realize_tolerance
+                                    ),
+                                )
+                                if realization.iterations > 0:
+                                    with torch.no_grad():
+                                        tangent_direction = tuple(
+                                            (before.detach() - after.detach())
+                                            / nominal
+                                            for before, after in zip(
+                                                model.parameters(),
+                                                walker.parameters(),
+                                            )
+                                        )
+                                    selected_learning_rate = nominal
+                                    if progress is not None:
+                                        progress(
+                                            "[REALIZE] "
+                                            f"eta={nominal:.4e} "
+                                            "realised="
+                                            f"{realization.realised_fraction:.1%} "
+                                            "residual="
+                                            f"{realization.residual_fraction:.1%} "
+                                            f"iters={realization.iterations}"
+                                        )
+                                del walker
+                            if progress is not None:
+                                chosen = damping_choice.candidate
+                                progress(
+                                    f"[DAMPING] rho={chosen.relative_damping:.2e} "
+                                    f"lambda={chosen.absolute_damping:.3e} "
+                                    f"eps={chosen.relative_error:.4f} "
+                                    f"|u|={chosen.update_norm:.3e} "
+                                    f"eta={chosen.learning_rate:.4e} "
+                                    f"decrease={chosen.guaranteed_decrease:.4e}"
+                                )
+                        elif config.fgd_approx.projection_damping_auto:
+                            # No damping both certifies and realises a step:
+                            # the structure has to change, so leave the
+                            # direction unset and let growth act.
+                            direction_sensor_failure = True
+                        if (
+                            tangent_direction is None
+                            and not direction_sensor_failure
                         ):
-                            tangent_direction = direction_step.parameter_updates
+                            direction_step = _compute_tangent_projection_step(
+                                model=model,
+                                x=fgd_train_probe[0],
+                                y=fgd_train_probe[1],
+                                config=config.fgd_approx,
+                            )
+                            if _projection_step_sensor_valid(
+                                direction_step,
+                                config.fgd_approx,
+                            ):
+                                tangent_direction = (
+                                    direction_step.parameter_updates
+                                )
+                                certified_relative_error = (
+                                    direction_step.output_error.relative_error
+                                )
+                            else:
+                                direction_sensor_failure = True
+                        if tangent_direction is not None:
                             fgd_update_norm = math.sqrt(
                                 sum(
                                     float(
@@ -3552,6 +4003,27 @@ def run_pipeline(
                                         config.fgd_approx,
                                     )
                                 )
+                            elif config.fgd_approx.certify_apply_in_interval:
+                                # DIAGNOSTIC, not a gate. Admissibility is
+                                # decided from eps on the TRAIN probe, the
+                                # sample Lemma 3.5 speaks about, and the step
+                                # is carried by selected_learning_rate under
+                                # damping-auto. With the projector invariants
+                                # off, this held-out sensor tests only
+                                # finiteness, so failing it says the MODEL
+                                # overflowed on unseen data -- a symptom of
+                                # the fit, not a reason to withhold the step.
+                                #
+                                # So the flag is deliberately NOT set here.
+                                # Setting it was the deadlock's final form:
+                                # MEASURED, after two committed steps this
+                                # sensor rejected every subsequent one and the
+                                # run froze from epoch 2 to 400 (10 steps in
+                                # all), while eps < 1/2 kept growth from
+                                # firing. maximum_learning_rate simply stays
+                                # None; the certified rate comes from the
+                                # train-probe eps instead.
+                                pass
                             else:
                                 direction_sensor_failure = True
                                 direction_stats = None
@@ -3579,6 +4051,29 @@ def run_pipeline(
                             )
 
                         if (
+                            config.fgd_approx.certify_apply_in_interval
+                            and tangent_direction is not None
+                            and direction_stats is not None
+                        ):
+                            # Lemma 3.5 as the paper applies it: take a rate
+                            # inside the certified interval and step. Same
+                            # rate the sweep would have started from -- only
+                            # the verification is dropped, because descent is
+                            # a CONCLUSION of the lemma, not a condition it
+                            # asks to be checked, and demanding it on
+                            # held-out data asks the lemma for a guarantee
+                            # outside its domain.
+                            search_result = _apply_lemma35_step(
+                                relative_error=certified_relative_error,
+                                learning_rate=selected_learning_rate,
+                                evaluate_trial=evaluate_trial,
+                                config=config.fgd_approx,
+                                model=model,
+                                probe_inputs=fgd_train_probe[0],
+                                updates=tangent_direction,
+                                progress=progress,
+                            )
+                        elif (
                             config.fgd_approx.tangent_measured_descent
                             and tangent_direction is not None
                             and direction_stats is not None
@@ -3926,6 +4421,9 @@ def run_pipeline(
                 accuracy_tolerance=config.training.accuracy_tolerance,
                 classification=classification,
             )
+            # Drives the grow-to-certify `force`: a certified structure that
+            # still could not commit a step is the deadlock to break.
+            certify_previous_step_committed = bool(fgd_candidate_accepted)
             epoch_entry = HistoryEntry(
                 step=epoch,
                 step_type=step_type,
@@ -4019,9 +4517,20 @@ def run_pipeline(
                 if fgd_loss_descent_valid is False:
                     warnings.append("validation functional loss increased")
                 if fgd_sensor_valid is False:
+                    reasons = getattr(
+                        validation_certificate_for_next_epoch,
+                        "non_finite_quantities",
+                        (),
+                    ) if validation_certificate_for_next_epoch else ()
                     warnings.append(
                         f"sensor invalid on "
                         f"{fgd_sensor_invalid_batches} validation batch(es)"
+                        # Name what overflowed. Without it the message reads as
+                        # a defect in the certificate machinery; with
+                        # projection_sensor off the only test is finiteness, so
+                        # what failed is the MODEL producing non-finite values
+                        # on unseen data, not our arithmetic.
+                        + (f" (non-finite: {', '.join(reasons)})" if reasons else "")
                     )
                 diagnostic_bound_suffix = (
                     " (trajectory diagnostic, not an acceptance gate)"

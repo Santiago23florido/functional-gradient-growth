@@ -23,7 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path("configs/fgd/default.yaml"),
+        default=Path("configs/fgd/family_ladder_N1024.yaml"),
         help="YAML file with pipeline hyperparameters.",
     )
     parser.add_argument("--results-dir", type=Path)

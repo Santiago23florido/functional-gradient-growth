@@ -23,7 +23,7 @@ def _model(hidden_size: int = 4):
     from dataclasses import replace
 
     device = torch.device("cpu")
-    config = load_pipeline_config("configs/fgd/default.yaml")
+    config = load_pipeline_config("configs/experiments/default.yaml")
     config = replace(
         config,
         model=replace(
@@ -106,7 +106,7 @@ def test_depth_cost_is_comparable_to_neuron_cost() -> None:
     # Use the real MNIST search config: the interesting price spread only
     # exists when the input projection is genuinely wide.
     device = torch.device("cpu")
-    config = load_pipeline_config("configs/fgd/search_ce_uniform.yaml")
+    config = load_pipeline_config("configs/experiments/search_ce_uniform.yaml")
     config = replace(config, model=replace(config.model, hidden_size=8))
     model = build_model(config, device)
 

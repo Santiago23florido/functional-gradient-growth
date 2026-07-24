@@ -74,7 +74,7 @@ def test_mixed_starting_widths_are_rejected_for_now() -> None:
 
 def test_stack_config_builds_through_build_model() -> None:
     """The pipeline entry point routes a `model.stack` to the stack builder."""
-    config = load_pipeline_config("configs/fgd/default.yaml")
+    config = load_pipeline_config("configs/experiments/default.yaml")
     config = replace(
         config,
         model=replace(
@@ -95,7 +95,7 @@ def test_stack_grows_and_forwards() -> None:
     from fgdlib.tangent import tiny_optimal_update_kwargs
 
     device = torch.device("cpu")
-    config = load_pipeline_config("configs/fgd/default.yaml")
+    config = load_pipeline_config("configs/experiments/default.yaml")
     model = build_stack_model(
         stack=[{"mlp": [3, 1]}, "batchnorm", {"mlp": [3, 1]}],
         in_features=config.data.in_features,

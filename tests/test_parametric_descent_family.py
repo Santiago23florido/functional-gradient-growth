@@ -201,7 +201,7 @@ def test_measured_descent_direction_screen_rejects_everything() -> None:
 
 def test_all_families_config_wires_the_full_ladder() -> None:
     config = load_pipeline_config(
-        REPO_ROOT / "configs" / "fgd" / "mnist_3x2_all_families.yaml"
+        REPO_ROOT / "configs" / "experiments" / "mnist_3x2_all_families.yaml"
     )
     # The ladder composition is a user toggle in this config; only check
     # that it is a valid order with the measured-descent family available.
@@ -216,7 +216,7 @@ def test_all_families_config_wires_the_full_ladder() -> None:
 
 def test_base_config_keeps_families_commented() -> None:
     config = load_pipeline_config(
-        REPO_ROOT / "configs" / "fgd" / "mnist_3x2_fp_growth.yaml"
+        REPO_ROOT / "configs" / "experiments" / "mnist_3x2_fp_growth.yaml"
     )
     assert config.fgd_approx.family_order == ("tangent",)
     config.parametric_descent.validate()

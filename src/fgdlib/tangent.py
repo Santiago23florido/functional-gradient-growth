@@ -193,6 +193,264 @@ class FGDApproxConfig:
     #                         functional, which is what makes the method
     #                         loss-agnostic.
     growth_limit_criterion: GrowthLimitCriterion = "progress_floor"
+    # GROW-TO-CERTIFY. Inverts the flow: instead of growing where it is
+    # cheapest and stepping when it can, the structure is grown until it
+    # PROVABLY satisfies Lemma 3.5 (eps < rel_error_threshold), and only then
+    # is a step taken. Every growth is function-preserving, so f never moves,
+    # r is fixed and eps decreases monotonically -- termination is a theorem
+    # (tests/test_grow_to_certify_theorem.py), not a hope.
+    #
+    # This exists to answer one question: does enforcing the conditions
+    # EXACTLY -- never approximated, never bypassed -- reach the best loss and
+    # accuracy, whatever structure that costs? Parameter count is explicitly
+    # not a concern here. Use with family_order = ("tangent",),
+    # projection_solver = "exact" and tangent_measured_descent = False, so the
+    # only thing that can commit a step is the 1/2 condition itself.
+    # Default False: every existing config is untouched.
+    grow_to_certify: bool = False
+    # Iteration guard for that loop. NOT a budget: the theorem says the loop
+    # terminates on its own, so this only catches a numerical pathology (or a
+    # probe so large that certification is out of reach, which is itself a
+    # result worth seeing rather than hanging on).
+    certify_max_growths: int = 256
+    # Whether the grow-to-certify loop grows function-preservingly. MEASURED,
+    # and the reason the default is False: with omega = 0 the incoming weights
+    # contribute nothing to the Jacobian, so a preserving growth converts only
+    # ~21 % of the parameters it spends into tangent directions (+9 rank for 42
+    # parameters). Releasing omega gives one independent direction per added
+    # parameter -- the theoretical maximum -- and certifies far sooner:
+    #
+    #   preserving      24 growths   eps 0.487   1779 params
+    #   NOT preserving   5 growths   eps 0.211    399 params
+    #
+    # What is given up is the monotonicity proof (a non-preserving growth
+    # moves f, so r moves and eps may rise after a growth); the loop then
+    # relies on the measured trajectory. Set True to recover the theorem at
+    # roughly five times the structural cost.
+    certify_function_preserving: bool = False
+    # PAPER-PURE STEP. Lemma 3.5 does not ask for descent to be verified -- it
+    # PROVES it: if eps < 1/2 then EVERY eta in (0, eta_bar(eps)) descends.
+    # Checking it empirically afterwards is therefore strictly stronger than
+    # the theory, and that extra gate is what deadlocked the certify flow: the
+    # structure was certified (eps = 0.475, interval (1e-5, 0.0974) non-empty)
+    # yet no rate produced HELD-OUT descent, so nothing ever committed and
+    # epochs 2-4 came out bit-identical (loss 0.0619, acc 0.566).
+    #
+    # The mismatch was structural, not numerical: eps is certified on the
+    # TRAIN probe (where the direction is computed) while descent was demanded
+    # on the VALIDATION probe. Lemma 3.5 is a statement about ONE sample --
+    # it guarantees descent where eps was measured and says nothing across a
+    # split -- so the gate was asking the lemma for something outside its
+    # domain, and a failure meant a generalisation gap, not a bad step.
+    #
+    # With this flag on the flow does what the paper's algorithm does: certify
+    # eps < 1/2, take eta = theory_lr_safety * eta_bar(eps) (0.95 of the
+    # interval by default) and APPLY. Finiteness sensors still gate -- those
+    # catch numerical failure, not theory -- but realised descent does not.
+    certify_apply_in_interval: bool = False
+    # LINEARISATION TOLERANCE. Lemma 3.5's subject is the FUNCTION-space step
+    # f - eta g; what is performed is the PARAMETER-space step theta - eta u,
+    # and f(theta - eta u) = f(theta) - eta g + O(eta^2 |u|^2). The remainder
+    # is not controlled by L_s but by the curvature of the parameter-to-
+    # function map, which no certificate here measures.
+    #
+    # MEASURED on the synthetic task with sum-MSE -- the theory's best case,
+    # exact PL constant mu = 2 with L* = 0 -- applying the certified rate
+    # without this guard diverged while the certificate stayed healthy:
+    # eta 0.005 -> 0.855 as eps FELL 0.50 -> 0.085, loss 2.3e3 -> 7.5e7,
+    # accuracy 0.087 -> 0.004. The failure is self-reinforcing: eta_bar(eps)
+    # rises towards 2/L_s as eps -> 0, so the better the certificate the
+    # larger the step it authorises and the further outside the linear
+    # regime that step lands.
+    #
+    # This is NOT the descent check that was removed -- it never looks at the
+    # loss. It measures
+    #     delta(eta) = |f(theta - eta u) - (f(theta) - eta g)| / (eta |g|)
+    # and narrows eta INSIDE the certified interval until the step is the
+    # object the lemma describes. Enforcing a hypothesis, not adding a gate.
+    # None disables it (the raw certified rate is applied).
+    certify_linearization_tolerance: float | None = None
+    # CHOOSE THE PROJECTION'S REGULARISATION BY MEASUREMENT, not by a constant.
+    # The damping in J u ~ r arbitrates between the two conditions this method
+    # needs at once, and they pull in OPPOSITE directions: lowering it makes
+    # eps small (certificate easy) while |u| explodes (step unrealisable);
+    # raising it does the reverse. MEASURED on one grown synthetic model --
+    #
+    #   lambda 0     eps 0.045   |u| 3.6e5   no admissible rate
+    #   lambda 1e-2  eps 0.495   |u| 3.9e1   eta 1.6e-4
+    #   lambda 1e0   eps 0.845   |u| 4.1e0   eps >= 1/2
+    #
+    # Only a narrow window satisfies both, and a fixed constant lands in it by
+    # luck: 1e-2 works here, and nothing makes it work at another scale of J,
+    # which changes with the dataset, the architecture and the point in
+    # training. That is precisely what stops a configuration from transferring.
+    #
+    # When true, fgdlib/search/damping.py locates the window per step --
+    # bisecting for the certified boundary, then fanning below it -- and picks
+    # the rung maximising eta * ||g||^2, the decrease Lemma 3.5 itself
+    # guarantees. Nothing dataset-specific enters: the bracket is relative to
+    # sigma_max^2, the filter is the method's own certificate, the objective is
+    # the theorem's. Measured to land within 9 % of the hand-tuned constant on
+    # the task the constant was tuned for.
+    projection_damping_auto: bool = False
+    # WHICH admissible g inside the tangent space to use. Lemma 3.5 fixes only
+    # RelErr(g, r) <= 1/2 and says nothing about which g in T = range(J) to
+    # take; that freedom is ours, and how it is resolved decides whether the
+    # step generalises.
+    #
+    # "descent" (default): the rung maximising eta * ||g||^2, the decrease the
+    # lemma guarantees. This is the LEAST regularised admissible step, so it
+    # fits every component of r including the sample-specific part. MEASURED:
+    # train accuracy 0.980 with test 0.234 -- exact interpolation of the
+    # training set.
+    #
+    # "gcv": the rung minimising generalized cross-validation,
+    #     GCV(lambda) = (1/N)||r - H_lambda r||^2 / (1 - df(lambda)/N)^2,
+    # the classical leave-one-out risk estimate for ridge, with
+    # df = tr H_lambda = sum sigma_i^2/(sigma_i^2 + lambda). The projection IS
+    # kernel ridge regression in the tangent kernel, so this is the selector
+    # that problem calls for. It uses no held-out data (structural decisions
+    # stay pure), has no tunable constant (an argmin), and is free (sigma and
+    # U^T r are already formed here). The (1 - df/N)^2 denominator diverges as
+    # df -> N, so it refuses exactly the interpolating regime the descent rule
+    # walks into.
+    projection_damping_objective: str = "descent"
+    # FUNCTIONAL TIKHONOV. Step-level ridge (the lambda above) chooses which g
+    # in T to use, but MEASURED it is CLIPPED by the certificate: eps < 1/2
+    # forces df/N ~ 0.53 on the grown model, GCV wants far less, and the
+    # certified+realisable window collapses to a single rung. The certificate
+    # forbids the regularisation generalisation needs, because it is a
+    # statement about approximating r, and r is the UNREGULARISED gradient.
+    #
+    # The fix is to regularise r itself: certify against the gradient of
+    #     L_gamma(f) = L_data(f) + gamma ||f||^2
+    # instead of L_data alone. The paper's H is a Hilbert space, so this keeps
+    # convexity (P1) and keeps K-smoothness with K -> K + 2 gamma, i.e.
+    # Lemma 3.5 applies VERBATIM. For sum-MSE the regularised gradient is
+    #     r_gamma = 2(f - y) + 2 gamma f = 2((1+gamma) f - y),
+    # which points exactly like the ordinary MSE gradient toward the shrunk
+    # target y/(1+gamma) -- and the certified parameter step it produces is
+    # identical to plain MSE toward y/(1+gamma) with L_s = 2. So it is
+    # implemented as that single change: the projection probe's targets are
+    # shrunk by 1/(1+gamma). Growth, projection, realisation and GCV all
+    # inherit it through the one probe, and the reported train/val/test
+    # metrics are untouched because they come from the loaders, against the
+    # true y. 0.0 disables it.
+    functional_tikhonov_gamma: float = 0.0
+    # CERTIFIED FAMILY LADDER before growing. With the tangent alone, eps >= 1/2
+    # forces growth, and function-preserving growth is ruinous (it keeps f and
+    # hence r fixed, so the tangent must capture 80% of the FULL residual --
+    # MEASURED 57 growths to certify). This tries a NONLINEAR within-MLP family
+    # (fgdlib/search/families.py) at the fixed structure before each growth, and
+    # accepts its step ONLY if the family's OWN relative error certifies,
+    # RelErr(g_family, r) < 1/2 -- never a descent criterion, never the
+    # tangent's projection. The nonlinear family certifies at a far smaller
+    # structure than the linear tangent, so growth is deferred: MEASURED
+    # 57 -> 6 FP growths (1102 -> 70 params) on the synthetic task. Only for
+    # sum-MSE; MLP only. 0/False keeps the tangent-only behaviour.
+    certify_family_ladder: bool = False
+    certify_family_inner_steps: int = 400
+    certify_family_inner_learning_rate: float = 0.01
+    certify_family_functional_lr: float = 1.0
+    # ROUGHNESS PENALTY -- the RIGHT regulariser, in the function-space norm.
+    # functional_tikhonov above penalises ||f||^2 (magnitude), which shrinks f
+    # toward 0 but still lets it memorise a shrunk copy. This penalises
+    # ROUGHNESS: L_rough(f) = L_data(f) + gamma f^T Lambda f, where Lambda is
+    # the graph Laplacian over the probe inputs. f^T Lambda f is the Dirichlet
+    # energy -- it measures how much f varies between NEIGHBOURING inputs, so
+    # penalising it biases toward smooth fits, which is what generalises for a
+    # smooth target. It is the discrete form of the ||Df||^2 Sobolev norm the
+    # paper's Banach space B is built on.
+    #
+    # Lambda is PSD, so L_rough stays convex (P1) and K-smooth with
+    # K -> K + 2 gamma lambda_max(Lambda): Lemma 3.5 applies VERBATIM and the
+    # eps < 1/2 criterion is untouched. For sum-MSE the regularised functional
+    # gradient is r_rough = 2(f - y) + 2 gamma Lambda f, i.e. the data gradient
+    # plus a smoothing term -- injected once at the exact target, so growth,
+    # projection, realisation and GCV all inherit it. 0 disables it.
+    roughness_gamma: float = 0.0
+    # Neighbourhood width of the graph affinity, as a multiple of the median
+    # pairwise input distance (the median heuristic -- a standard tuning-free
+    # bandwidth, not a per-dataset constant).
+    roughness_bandwidth: float = 1.0
+    # REALISE THE CERTIFIED STEP AS A PATH instead of a single jump. Lemma 3.5
+    # licenses a move in FUNCTION space, f -> f - eta g; theta - eta u is only
+    # the first Gauss-Newton iteration of "find theta' with f(theta') = f_target".
+    # Shrinking eta until that one iteration is accurate also shrinks the
+    # FUNCTIONAL movement by the same factor -- MEASURED at 512x and 2047x --
+    # so the method delivered a fraction of the step it had certified. That is
+    # the stall, and growth cannot fix it: growth lowers eps, which widens
+    # eta_bar, which widens the gap.
+    #
+    # With this on, the step is integrated: each inner iteration re-solves the
+    # tangent projection against the functional residual that remains and takes
+    # the largest sub-step that reduces it. MEASURED on one grown model, same
+    # direction and certificate:
+    #
+    #   one jump                        loss 9.580e1 -> 9.576e1   delta  0.043
+    #   integrated, residual criterion  loss 9.580e1 -> 8.567e1   delta 10.13
+    #
+    # 236x, realising 96.2 % of the intended displacement. Both rules hold:
+    # only the tangent family (every inner iteration IS the tangent projection)
+    # and only steps certified by 1/2 (the certificate is computed once, on g;
+    # what iterates is the realisation, never the certification).
+    # TAKE THE RATE THAT MAXIMISES THE GUARANTEED DECREASE, not the largest
+    # admissible one. Lemma 3.5 bounds
+    #
+    #   L(f_t+1) <= L(f_t) - eta[alpha - K eta/2 - (beta + K eta) c] ||grad L||^2
+    #
+    # with c = (3/2) e/(1-e). The guaranteed decrease is eta * bracket(eta), a
+    # PARABOLA in eta, so it is maximised at the vertex and eta_bar is where
+    # the bracket vanishes -- hence eta* = eta_bar / 2, the interval's
+    # MIDPOINT, always.
+    #
+    # theory_lr_safety = 0.95 therefore picks the worst admissible rate: it
+    # maximises the step and minimises what the step is guaranteed to buy. At
+    # eps ~ 0 with L_s = 2 the bracket is (1 - eta), so 0.95 leaves a
+    # coefficient of 0.05 against 0.5 at the midpoint -- twenty times worse.
+    # For sum-MSE, where r = 2(f - y), the arithmetic is stark:
+    # f_new - y = (1 - 2 eta)(f - y), so eta = 0.5 lands exactly on the target
+    # while eta = 0.95 gives -0.9(f - y) -- the error FLIPS SIGN and shrinks
+    # only 10 %, oscillating at the edge of stability.
+    #
+    # MEASURED: with the full certified step finally being delivered, 0.95
+    # sent train_loss 0.0917 -> 0.3991 in one epoch and validation accuracy
+    # 0.248 -> 0.123. It was harmless before only because the linearisation
+    # control was cutting eta by ~500x and landing in a good regime by
+    # accident.
+    certify_optimal_rate: bool = False
+    # RESAMPLE THE CERTIFICATION PROBE EVERY OUTER STEP. A fixed probe was
+    # harmless while steps were tiny; once the certified step is delivered in
+    # full it makes the method Newton's method on one subsample, driving the
+    # residual on those points to zero and interpolating them. MEASURED:
+    # train accuracy 0.320 against validation 0.150, and the logged tangent
+    # relative error diverging to 1077 -- RelErr is normalised by ||g||, so it
+    # blows up exactly when no residual is left on the probe.
+    #
+    # The theory's L is the loss over the DATASET; the probe exists only
+    # because the exact Jacobian over all of it is intractable. Redrawing it
+    # each step makes the functional gradient an unbiased estimate of that
+    # object, turning the flow into stochastic FGD rather than exact descent
+    # on a fixed 256 points.
+    probe_resample: bool = False
+    # Materialise the exact Jacobian in CHUNKS of output rows. jacrev vmaps
+    # one backward pass per output row and holds the batched activations for
+    # all of them at once, so its peak memory scales with
+    # (output rows) x (activations), NOT with the size of J itself. MEASURED:
+    # a 3840 x ~600 Jacobian is only ~9 MB, yet computing it in one call ran
+    # the GPU out of memory -- the matrix was never the problem.
+    #
+    # Chunking rebuilds the SAME matrix row-block by row-block, so the result
+    # is bit-for-bit the exact Jacobian; only the peak drops, to
+    # (chunk) x (activations). It costs one extra forward per chunk. This is
+    # what makes certifying over a whole dataset affordable instead of over a
+    # subsample, which is the difference between the certificate being a
+    # statement about the training loss and a statement about 256 points.
+    # 0 disables chunking.
+    jacobian_row_chunk: int = 0
+    certify_realize_path: bool = False
+    certify_realize_max_iterations: int = 40
+    certify_realize_tolerance: float = 0.05
     # Generalised R1. The eps < 1/2 stop is Lemma 3.5's admissibility of a
     # STEP, not adequacy of the STRUCTURE; on an easy task the two coincide
     # (MNIST stops at a good small net) but on a hard one they diverge --
@@ -544,6 +802,10 @@ class FGDValidationCertificate:
     output_relative_error: FGDOutputRelError | None
     sensor_valid: bool
     sensor_invalid_batches: int
+    #: Names of the quantities that came out non-finite, when that is why the
+    #: sensor rejected. Empty otherwise. Reported so a rejection says what
+    #: actually overflowed instead of only that something did.
+    non_finite_quantities: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -565,6 +827,53 @@ class _TangentProjectionStep:
     dot_product: float
     approximation_sq_norm: float
     target_sq_norm: float
+
+
+def graph_laplacian(x: torch.Tensor, bandwidth: float = 1.0) -> torch.Tensor:
+    """Symmetric NORMALISED graph Laplacian over the probe inputs.
+
+    ``Lambda_sym = I - D^{-1/2} W D^{-1/2}`` with Gaussian affinity
+    ``W_ij = exp(-||x_i - x_j||^2 / (2 sigma^2))`` and ``sigma`` from the
+    MEDIAN heuristic -- ``bandwidth`` times the median pairwise distance, the
+    standard tuning-free bandwidth that adapts to the data scale.
+
+    Normalised, not the raw ``D - W``, for a concrete reason: the unnormalised
+    Laplacian's eigenvalues scale with the node degrees (~ N here), so the
+    roughness term ``2 gamma Lambda f`` swamped the data gradient ``2(f - y)``
+    by ~250x at gamma = 1 and collapsed f to a constant (MEASURED: train 0.000).
+    ``Lambda_sym`` has eigenvalues in ``[0, 2]``, so gamma sits on the same
+    scale as the data term and is dataset-independent.
+
+    Still symmetric PSD (``f^T Lambda_sym f >= 0``), so ``L_data + gamma
+    f^T Lambda_sym f`` stays convex and K-smooth and Lemma 3.5 is untouched.
+    """
+    distances = torch.cdist(x, x)
+    off_diagonal = distances[~torch.eye(x.shape[0], dtype=torch.bool, device=x.device)]
+    median = torch.median(off_diagonal)
+    sigma = bandwidth * median.clamp_min(torch.finfo(x.dtype).eps)
+    affinity = torch.exp(-(distances**2) / (2.0 * sigma**2))
+    affinity.fill_diagonal_(0.0)
+    degree = affinity.sum(dim=1)
+    inverse_sqrt_degree = degree.clamp_min(torch.finfo(x.dtype).eps).rsqrt()
+    normalised = affinity * inverse_sqrt_degree.unsqueeze(0) * inverse_sqrt_degree.unsqueeze(1)
+    return torch.eye(x.shape[0], dtype=x.dtype, device=x.device) - normalised
+
+
+def _roughness_target(
+    output: torch.Tensor,
+    x: torch.Tensor,
+    config: FGDApproxConfig,
+) -> torch.Tensor | None:
+    """``2 gamma Lambda f`` -- the roughness term added to the data gradient.
+
+    Returns ``None`` when the penalty is off, so callers add nothing. Only for
+    sum-MSE, where the functional gradient is the simple ``r + 2 gamma Lambda f``;
+    left off for cross-entropy, whose gradient does not add so cleanly.
+    """
+    if config.roughness_gamma <= 0.0 or config.functional_loss != "mse":
+        return None
+    laplacian = graph_laplacian(x.detach(), config.roughness_bandwidth)
+    return 2.0 * config.roughness_gamma * (laplacian @ output.detach())
 
 
 def mse_functional_gradient(
@@ -1149,12 +1458,43 @@ def _conjugate_gradient(
     return x
 
 
+@dataclass(frozen=True)
+class ExactTangentSystem:
+    """The materialised system ``J u ~ r`` at the current model.
+
+    Exposed so a caller can solve it more than once without paying for the
+    Jacobian again. The projection is linear in the regularisation, so a
+    single factorisation answers a whole ladder of damping values; recomputing
+    ``jacrev`` per value would multiply the dominant cost by the ladder size
+    for no new information.
+    """
+
+    jacobian: torch.Tensor
+    target: torch.Tensor
+    parameters: tuple[torch.Tensor, ...]
+    loss: float
+
+
+def exact_tangent_system(
+    model: GrowingMLP,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    config: FGDApproxConfig,
+) -> ExactTangentSystem | None:
+    """Materialise ``J`` and ``r = grad_f L`` -- returns ``None`` if degenerate."""
+    step = _compute_exact_tangent_projection_step(
+        model=model, x=x, y=y, config=config, return_system=True
+    )
+    return step if isinstance(step, ExactTangentSystem) else None
+
+
 def _compute_exact_tangent_projection_step(
     model: GrowingMLP,
     x: torch.Tensor,
     y: torch.Tensor,
     config: FGDApproxConfig,
-) -> _TangentProjectionStep:
+    return_system: bool = False,
+) -> _TangentProjectionStep | ExactTangentSystem | None:
     """Compute g = P_T grad L by explicitly materializing the full Jacobian."""
     named_parameters = _trainable_named_parameters(model)
     if not named_parameters:
@@ -1180,6 +1520,12 @@ def _compute_exact_tangent_projection_step(
         raise RuntimeError(f"Non-finite FGD loss detected before projection: {loss}.")
 
     target_tensor = torch.autograd.grad(loss, output)[0].detach()
+    # Roughness penalty: r_rough = r_data + 2 gamma Lambda f. Injected here so
+    # growth (via minimal_relative_error), the projection, the realise path
+    # and GCV all certify against the SAME regularised gradient.
+    roughness = _roughness_target(output, x, config)
+    if roughness is not None:
+        target_tensor = target_tensor + roughness.to(target_tensor.dtype)
     target = target_tensor.reshape(-1)
     output_numel = target.numel()
 
@@ -1191,6 +1537,8 @@ def _compute_exact_tangent_projection_step(
             target_sq_norm=0.0,
             eps=config.eps,
         )
+        if return_system:
+            return None
         return _TangentProjectionStep(
             output_error=output_error,
             parameter_updates=zero_updates,
@@ -1210,13 +1558,39 @@ def _compute_exact_tangent_projection_step(
         state.update(buffers)
         return functional_call(model, state, (x,)).reshape(-1)
 
+    chunk = int(getattr(config, "jacobian_row_chunk", 0) or 0)
     try:
-        jacobian = jacrev(call_with_parameters)(parameters)
+        if chunk > 0 and chunk < output_numel:
+            blocks = []
+            for start in range(0, output_numel, chunk):
+                stop = min(start + chunk, output_numel)
+
+                def call_rows(
+                    parameter_values: tuple[torch.Tensor, ...],
+                    _start: int = start,
+                    _stop: int = stop,
+                ) -> torch.Tensor:
+                    return call_with_parameters(parameter_values)[_start:_stop]
+
+                blocks.append(
+                    _flatten_jacobian(jacrev(call_rows)(parameters), stop - start)
+                )
+                _clear_inaccessible_tensor_caches(model)
+            jacobian_matrix = torch.cat(blocks, dim=0)
+        else:
+            jacobian_matrix = _flatten_jacobian(
+                jacrev(call_with_parameters)(parameters), output_numel
+            )
     finally:
         model.train(was_training)
         _clear_inaccessible_tensor_caches(model)
-
-    jacobian_matrix = _flatten_jacobian(jacobian, output_numel)
+    if return_system:
+        return ExactTangentSystem(
+            jacobian=jacobian_matrix,
+            target=target,
+            parameters=parameters,
+            loss=float(loss.detach().item()),
+        )
     flat_update, approximation = _solve_tangent_projection(
         jacobian_matrix=jacobian_matrix,
         target=target,
@@ -2034,7 +2408,22 @@ def certificate_from_projection_stats(
         stats.approximation_sq_norm,
         stats.target_sq_norm,
     )
-    finite = all(math.isfinite(value) for value in values)
+    # Name the quantity that failed. "sensor invalid" on its own reads as a
+    # numerical defect in the certificate machinery, which sent this
+    # investigation the wrong way for a while: with projection_sensor off the
+    # ONLY test here is finiteness, so a failure means one of these three
+    # overflowed. For sum-MSE target_sq_norm = 4*sum (f - y)^2, so what
+    # overflows is the MODEL's output on unseen data, not our arithmetic --
+    # the Jacobian is exact either way. It is a symptom of the fit, and the
+    # right response is emphatically not to add capacity.
+    non_finite = tuple(
+        name
+        for name, value in zip(
+            ("dot_product", "approximation_sq_norm", "target_sq_norm"), values
+        )
+        if not math.isfinite(value)
+    )
+    finite = not non_finite
     sensor_valid = finite and (
         not projection_sensor
         or _projection_sensor_valid(
@@ -2057,6 +2446,7 @@ def certificate_from_projection_stats(
             output_relative_error=None,
             sensor_valid=False,
             sensor_invalid_batches=1,
+            non_finite_quantities=non_finite,
         )
 
     output_error = stats.output_error

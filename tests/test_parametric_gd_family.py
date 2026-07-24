@@ -191,7 +191,7 @@ def test_parametric_gd_cosine_screen_rejects_before_certification() -> None:
 
 def test_fp_growth_config_wires_families_and_parametric_gd() -> None:
     config = load_pipeline_config(
-        REPO_ROOT / "configs" / "fgd" / "mnist_3x2_fp_growth.yaml"
+        REPO_ROOT / "configs" / "experiments" / "mnist_3x2_fp_growth.yaml"
     )
     assert config.fgd_approx.family_order == ("tangent",)
     assert config.parametric_gd.optimizer == "sgd"
@@ -201,7 +201,7 @@ def test_fp_growth_config_wires_families_and_parametric_gd() -> None:
 
 def test_family_order_yaml_validation(tmp_path: Path) -> None:
     source = (
-        REPO_ROOT / "configs" / "fgd" / "mnist_3x2_fp_growth.yaml"
+        REPO_ROOT / "configs" / "experiments" / "mnist_3x2_fp_growth.yaml"
     ).read_text(encoding="utf-8")
     bad = source.replace(
         "  family_order:\n    - tangent\n",
