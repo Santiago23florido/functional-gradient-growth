@@ -337,6 +337,21 @@ class FGDApproxConfig:
     # metrics are untouched because they come from the loaders, against the
     # true y. 0.0 disables it.
     functional_tikhonov_gamma: float = 0.0
+    # CERTIFIED FAMILY LADDER before growing. With the tangent alone, eps >= 1/2
+    # forces growth, and function-preserving growth is ruinous (it keeps f and
+    # hence r fixed, so the tangent must capture 80% of the FULL residual --
+    # MEASURED 57 growths to certify). This tries a NONLINEAR within-MLP family
+    # (fgdlib/search/families.py) at the fixed structure before each growth, and
+    # accepts its step ONLY if the family's OWN relative error certifies,
+    # RelErr(g_family, r) < 1/2 -- never a descent criterion, never the
+    # tangent's projection. The nonlinear family certifies at a far smaller
+    # structure than the linear tangent, so growth is deferred: MEASURED
+    # 57 -> 6 FP growths (1102 -> 70 params) on the synthetic task. Only for
+    # sum-MSE; MLP only. 0/False keeps the tangent-only behaviour.
+    certify_family_ladder: bool = False
+    certify_family_inner_steps: int = 400
+    certify_family_inner_learning_rate: float = 0.01
+    certify_family_functional_lr: float = 1.0
     # ROUGHNESS PENALTY -- the RIGHT regulariser, in the function-space norm.
     # functional_tikhonov above penalises ||f||^2 (magnitude), which shrinks f
     # toward 0 but still lets it memorise a shrunk copy. This penalises
