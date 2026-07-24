@@ -35,7 +35,7 @@ def test_growth_reset_is_modeled_by_clearing_the_rejection_state() -> None:
 
 def test_rejected_family_is_skipped_while_nothing_is_accepted(tmp_path) -> None:
     """With zero accepted outer steps the cooldown never elapses."""
-    config = load_pipeline_config("configs/fgd/default.yaml")
+    config = load_pipeline_config("configs/experiments/default.yaml")
     config = replace(
         config,
         model=replace(config.model, hidden_size=2, number_hidden_layers=2),
@@ -88,7 +88,7 @@ def test_rejected_family_is_skipped_while_nothing_is_accepted(tmp_path) -> None:
 
 
 def test_zero_cooldown_retries_the_family_every_epoch(tmp_path) -> None:
-    config = load_pipeline_config("configs/fgd/default.yaml")
+    config = load_pipeline_config("configs/experiments/default.yaml")
     config = replace(
         config,
         model=replace(config.model, hidden_size=2, number_hidden_layers=2),

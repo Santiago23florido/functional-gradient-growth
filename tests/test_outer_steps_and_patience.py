@@ -9,7 +9,7 @@ from stable_tiny.pipeline import load_pipeline_config, run_pipeline
 
 
 def test_multiple_certified_outer_steps_per_epoch(tmp_path) -> None:
-    config = load_pipeline_config("configs/fgd/default.yaml")
+    config = load_pipeline_config("configs/experiments/default.yaml")
     config = replace(
         config,
         model=replace(config.model, hidden_size=2, number_hidden_layers=2),
@@ -44,7 +44,7 @@ def test_multiple_certified_outer_steps_per_epoch(tmp_path) -> None:
 
 
 def test_growth_patience_defers_the_probe(tmp_path) -> None:
-    config = load_pipeline_config("configs/fgd/default.yaml")
+    config = load_pipeline_config("configs/experiments/default.yaml")
     config = replace(
         config,
         model=replace(config.model, hidden_size=2, number_hidden_layers=2),
@@ -92,7 +92,7 @@ def test_growth_patience_defers_the_probe(tmp_path) -> None:
 
 def test_growth_requires_lemma35_admissibility_failure(tmp_path) -> None:
     """Growth must not fire while the reachable set still represents r."""
-    config = load_pipeline_config("configs/fgd/default.yaml")
+    config = load_pipeline_config("configs/experiments/default.yaml")
     config = replace(
         config,
         model=replace(config.model, hidden_size=2, number_hidden_layers=2),
@@ -134,7 +134,7 @@ def test_committed_family_does_not_veto_growth_when_lemma35_fails(tmp_path) -> N
     always certifies, so without this the structural step is postponed for
     ever while the network stays inadequate.
     """
-    config = load_pipeline_config("configs/fgd/default.yaml")
+    config = load_pipeline_config("configs/experiments/default.yaml")
     config = replace(
         config,
         model=replace(config.model, hidden_size=2, number_hidden_layers=2),
@@ -192,7 +192,7 @@ def test_families_still_run_when_growth_is_not_due(tmp_path) -> None:
     requested; if the ladder lived inside that trigger the flow would be
     left with the tangent family alone and freeze.
     """
-    config = load_pipeline_config("configs/fgd/default.yaml")
+    config = load_pipeline_config("configs/experiments/default.yaml")
     config = replace(
         config,
         model=replace(config.model, hidden_size=2, number_hidden_layers=2),
@@ -245,7 +245,7 @@ def test_r1_does_not_claim_a_lemma35_failure_that_did_not_happen(tmp_path) -> No
     an R1 event printed statements like "eps=0.438 >= 0.5", which is
     arithmetically false and corrupts the certificate record.
     """
-    config = load_pipeline_config("configs/fgd/default.yaml")
+    config = load_pipeline_config("configs/experiments/default.yaml")
     config = replace(
         config,
         model=replace(config.model, hidden_size=2, number_hidden_layers=2),

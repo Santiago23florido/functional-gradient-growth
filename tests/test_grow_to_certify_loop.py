@@ -12,7 +12,7 @@ from stable_tiny.pipeline import build_model, load_pipeline_config
 
 def _fixture(samples: int, hidden_size: int = 3):
     device = torch.device("cpu")
-    config = load_pipeline_config("configs/fgd/default.yaml")
+    config = load_pipeline_config("configs/experiments/default.yaml")
     config = replace(
         config,
         model=replace(

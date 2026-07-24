@@ -22,7 +22,7 @@ from stable_tiny.pipeline import build_dataloaders, build_model, load_pipeline_c
 
 @pytest.fixture
 def setup():
-    cfg = load_pipeline_config("configs/fgd/certify_smooth_sin_tiny.yaml")
+    cfg = load_pipeline_config("configs/experiments/certify_smooth_sin_tiny.yaml")
     device = torch.device("cpu")
     torch.manual_seed(0)
     tl, _, _ = build_dataloaders(cfg, device)

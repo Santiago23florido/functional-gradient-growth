@@ -26,7 +26,7 @@ from stable_tiny.pipeline import load_pipeline_config
 
 @pytest.fixture
 def config():
-    base = load_pipeline_config("configs/fgd/default.yaml").fgd_approx
+    base = load_pipeline_config("configs/experiments/default.yaml").fgd_approx
     return replace(base, certify_linearization_tolerance=0.1)
 
 

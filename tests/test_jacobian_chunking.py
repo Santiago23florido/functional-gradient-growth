@@ -21,7 +21,7 @@ from stable_tiny.pipeline import build_model, load_pipeline_config
 
 @pytest.fixture
 def setup():
-    config = load_pipeline_config("configs/fgd/default.yaml")
+    config = load_pipeline_config("configs/experiments/default.yaml")
     config = replace(
         config,
         model=replace(config.model, hidden_size=6, number_hidden_layers=2),

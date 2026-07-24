@@ -30,7 +30,7 @@ from stable_tiny.pipeline import (
 
 
 def _config(dropout_rate: float, hidden: int = 8):
-    config = load_pipeline_config("configs/fgd/search_ce_unified.yaml")
+    config = load_pipeline_config("configs/experiments/search_ce_unified.yaml")
     return replace(
         config,
         model=replace(

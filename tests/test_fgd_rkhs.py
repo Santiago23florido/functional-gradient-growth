@@ -384,7 +384,7 @@ def test_kernel_dictionary_model_forward() -> None:
 
 
 def test_pipeline_dispatch_fgd_rkhs(tmp_path) -> None:
-    config = load_pipeline_config("configs/fgd/rkhs_default.yaml")
+    config = load_pipeline_config("configs/experiments/rkhs_default.yaml")
     config = replace(
         config,
         data=replace(
@@ -441,7 +441,7 @@ fgd_rkhs:
     assert config.fgd_rkhs.levels == (8, 16)
     assert config.fgd_rkhs.steps_per_epoch == 4
     # Default configs still parse (levels: null -> None).
-    default_config = load_pipeline_config("configs/fgd/rkhs_default.yaml")
+    default_config = load_pipeline_config("configs/experiments/rkhs_default.yaml")
     assert default_config.fgd_rkhs.levels is None
 
 
@@ -665,7 +665,7 @@ fgd_rkhs:
     assert config.fgd_rkhs.feature_activation == "tanh"
     assert config.fgd_rkhs.feature_seed == 5
     # The shipped configs now request the fixed 3x18 MLP structure.
-    for shipped in ("configs/fgd/rkhs_default.yaml", "configs/fgd/rkhs_mnist.yaml"):
+    for shipped in ("configs/experiments/rkhs_default.yaml", "configs/experiments/rkhs_mnist.yaml"):
         shipped_config = load_pipeline_config(shipped)
         assert shipped_config.fgd_rkhs.kernel == "linear"
         assert shipped_config.fgd_rkhs.feature_hidden_layers == 3
@@ -743,7 +743,7 @@ def test_certified_head_writeback_matches_grown_network() -> None:
 
 
 def test_grow_cycle_pipeline_end_to_end(tmp_path) -> None:
-    config = load_pipeline_config("configs/fgd/rkhs_default.yaml")
+    config = load_pipeline_config("configs/experiments/rkhs_default.yaml")
     config = replace(
         config,
         data=replace(

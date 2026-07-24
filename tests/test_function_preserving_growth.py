@@ -115,7 +115,7 @@ def test_default_growth_is_unchanged_without_the_flag() -> None:
 
 def test_fp_growth_config_wires_flag_and_disables_rkhs_phase() -> None:
     config = load_pipeline_config(
-        REPO_ROOT / "configs" / "fgd" / "mnist_3x2_fp_growth.yaml"
+        REPO_ROOT / "configs" / "experiments" / "mnist_3x2_fp_growth.yaml"
     )
     assert config.training.method == "fgd_approx"
     assert config.fgd_approx.growth_function_preserving is True

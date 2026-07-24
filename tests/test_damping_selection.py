@@ -25,7 +25,7 @@ from stable_tiny.pipeline import build_model, load_pipeline_config
 
 @pytest.fixture
 def setup():
-    config = load_pipeline_config("configs/fgd/default.yaml")
+    config = load_pipeline_config("configs/experiments/default.yaml")
     config = replace(
         config,
         # Wide enough that the tangent space can certify at all: a fresh 3x2
@@ -138,7 +138,7 @@ def test_an_inadequate_tangent_space_yields_no_choice(setup) -> None:
     state a run actually starts in.
     """
     _, x, y, fa = setup
-    config = load_pipeline_config("configs/fgd/default.yaml")
+    config = load_pipeline_config("configs/experiments/default.yaml")
     config = replace(
         config,
         model=replace(config.model, hidden_size=1, number_hidden_layers=1),

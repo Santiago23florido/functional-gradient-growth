@@ -25,7 +25,7 @@ from stable_tiny.pipeline import load_pipeline_config
 
 @pytest.fixture
 def config():
-    return load_pipeline_config("configs/fgd/certify_smooth_sin_tiny.yaml").fgd_approx
+    return load_pipeline_config("configs/experiments/certify_smooth_sin_tiny.yaml").fgd_approx
 
 
 def _stats(*, dot=1.0, approx_sq=1.0, target_sq=1.0):

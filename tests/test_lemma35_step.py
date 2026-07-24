@@ -24,7 +24,7 @@ from stable_tiny.pipeline import (
 
 @pytest.fixture
 def config():
-    return load_pipeline_config("configs/fgd/certify_mnist.yaml").fgd_approx
+    return load_pipeline_config("configs/experiments/certify_mnist.yaml").fgd_approx
 
 
 class _Trial:

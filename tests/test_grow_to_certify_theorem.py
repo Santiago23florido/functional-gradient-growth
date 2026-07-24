@@ -42,7 +42,7 @@ def _fixture(hidden_size: int = 3, samples: int = 200):
     be much larger than the parameter count.
     """
     device = torch.device("cpu")
-    config = load_pipeline_config("configs/fgd/default.yaml")
+    config = load_pipeline_config("configs/experiments/default.yaml")
     config = replace(
         config,
         model=replace(
