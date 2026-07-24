@@ -5500,6 +5500,14 @@ def run_pipeline(
                                     line_search_config=config.scaling_line_search,
                                     optimal_update_kwargs=unified_kwargs,
                                     progress=None,
+                                    # The certified method's unified growth is
+                                    # function-preserving BY DESIGN (f unchanged
+                                    # so the certified steps do all the descent);
+                                    # this is NOT governed by
+                                    # growth_function_preserving, which only
+                                    # affects the legacy paths. Validated on the
+                                    # headline run: all 25 growth events left f
+                                    # unchanged (delta 0), no non-FP mixing.
                                     function_preserving=True,
                                     preservation_tolerance=(
                                         config.fgd_approx

@@ -111,8 +111,15 @@ class FGDApproxConfig:
     tiny_maximum_added_neurons: int | None = None
     tiny_numerical_threshold: float = 1e-6
     tiny_statistical_threshold: float = 1e-3
-    # Function-preserving growth: new neurons keep zero outgoing weights, no
-    # delta and no scaling line search, so growth never changes the function.
+    # Function-preserving growth for the LEGACY growth paths only (SENN /
+    # uniform / expansion-per-parameter). New neurons keep zero outgoing
+    # weights, no delta and no scaling line search, so growth never changes the
+    # function. NOTE: the CERTIFIED method's growth is function-preserving BY
+    # DESIGN and does not read this flag -- the grow-to-certify loop uses
+    # certify_function_preserving (below), and the unified / rank-cap expansion
+    # enforces FP unconditionally (pipeline.py `_certificate_for` candidates).
+    # This flag governs only the legacy paths, so it must not be read as "is
+    # the certified method's growth FP" -- that is always yes.
     growth_function_preserving: bool = False
     growth_preservation_tolerance: float = 1e-6
     # Ordered ladder of approximation families. "tangent" must come first (it
@@ -213,7 +220,10 @@ class FGDApproxConfig:
     # probe so large that certification is out of reach, which is itself a
     # result worth seeing rather than hanging on).
     certify_max_growths: int = 256
-    # Whether the grow-to-certify loop grows function-preservingly. MEASURED,
+    # Whether the GROW-TO-CERTIFY loop grows function-preservingly. This is the
+    # FP control for the certify path only; the standard/unified growth path is
+    # FP by design and unconditional (see growth_function_preserving above,
+    # which governs only the legacy paths). MEASURED,
     # and the reason the default is False: with omega = 0 the incoming weights
     # contribute nothing to the Jacobian, so a preserving growth converts only
     # ~21 % of the parameters it spends into tangent directions (+9 rank for 42

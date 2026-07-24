@@ -314,8 +314,20 @@ fgd_approx:
   tiny_maximum_added_neurons: 1
   tiny_numerical_threshold: 1.0e-6
   tiny_statistical_threshold: 1.0e-3
-  #function preserving or no
-  growth_function_preserving: false
+  # FUNCTION-PRESERVING GROWTH. Two flags govern two DIFFERENT growth
+  # mechanisms, and both are function-preserving for the certified method:
+  #   * certify_function_preserving (below) drives the grow-to-certify loop.
+  #   * growth_function_preserving (this flag) drives the standard growth path.
+  # The certified method's ACTIVE growth -- grow-to-certify and the unified /
+  # rank-cap expansion (growth_selection: unified_expansion) -- is
+  # function-preserving BY DESIGN (the theory needs f unchanged so the
+  # certified steps do all the descent), and the unified path enforces that
+  # regardless of this flag. This flag only affects the LEGACY SENN / uniform /
+  # expansion-per-parameter paths, which this config never runs. It is set
+  # true so the config reads honestly as function-preserving throughout and is
+  # never mistaken for a non-FP run (the previous `false` here was an inert,
+  # misleading inheritance).
+  growth_function_preserving: true
   growth_prefer_lower_error: true
   growth_select_by_descent: true
   growth_requires_admissibility_failure: true
