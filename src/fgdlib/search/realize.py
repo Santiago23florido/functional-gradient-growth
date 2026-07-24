@@ -146,6 +146,15 @@ def realize_functional_step(
                 target=shortfall,
                 damping=config.projection_damping,
                 solver=config.projection_solver,
+                # The integration re-solves against the measured residual each
+                # iteration, so a float32 sub-step's round-off is corrected by
+                # the next one -- and this inner solve is the dominant cost of a
+                # run. float64 stays the default off the fast flag.
+                work_dtype=(
+                    torch.float32
+                    if getattr(config, "projection_fast_factorization", False)
+                    else torch.float64
+                ),
             )
             if not torch.isfinite(flat_step).all():
                 break

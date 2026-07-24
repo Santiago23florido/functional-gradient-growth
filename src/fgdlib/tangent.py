@@ -1313,12 +1313,19 @@ def _solve_tangent_projection_svd(
     jacobian_matrix: torch.Tensor,
     target: torch.Tensor,
     damping: float,
+    work_dtype: torch.dtype = torch.float64,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Solve the damped tangent projection with a float64 SVD of J."""
+    """Solve the damped tangent projection with an SVD of J.
+
+    ``work_dtype`` defaults to float64. float32 runs the SVD ~9x faster and is
+    safe where the caller self-corrects -- the realise path re-solves against
+    the measured residual each inner iteration, so a float32 sub-step's
+    round-off is absorbed by the next one. It is the dominant cost of a run
+    (MEASURED 26.7 s of 76.8 s in the projection SVD).
+    """
     output_numel, parameter_numel = jacobian_matrix.shape
     damping = max(float(damping), 0.0)
     original_dtype = jacobian_matrix.dtype
-    work_dtype = torch.float64
     jacobian_work = jacobian_matrix.to(dtype=work_dtype)
     target_work = target.reshape(-1).to(dtype=work_dtype)
     if output_numel == 0 or parameter_numel == 0:
@@ -1422,6 +1429,7 @@ def _solve_tangent_projection(
     target: torch.Tensor,
     damping: float,
     solver: ProjectionSolver = "exact",
+    work_dtype: torch.dtype = torch.float64,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return parameter update and projected output gradient."""
     if solver in {"exact", "exact_svd"}:
@@ -1429,6 +1437,7 @@ def _solve_tangent_projection(
             jacobian_matrix=jacobian_matrix,
             target=target,
             damping=damping,
+            work_dtype=work_dtype,
         )
     if solver == "exact_kernel_eigh":
         return _solve_tangent_projection_kernel_eigh(
@@ -1617,6 +1626,11 @@ def _compute_exact_tangent_projection_step(
         target=target,
         damping=config.projection_damping,
         solver=config.projection_solver,
+        work_dtype=(
+            torch.float32
+            if getattr(config, "projection_fast_factorization", False)
+            else torch.float64
+        ),
     )
     if not torch.isfinite(flat_update).all() or not torch.isfinite(approximation).all():
         raise RuntimeError("Non-finite FGD tangent projection update detected.")

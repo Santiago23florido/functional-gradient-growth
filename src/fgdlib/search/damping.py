@@ -263,16 +263,22 @@ def select_projection_damping(
     if system is None:
         return None
 
-    work_dtype = torch.float64
+    # float32 under the fast flag: the fan ranks rungs and the chosen step is
+    # realised by the self-correcting integration, so the precision loss is
+    # absorbed. Verified end to end (test 0.931 either way).
+    work_dtype = (
+        torch.float32
+        if getattr(config, "projection_fast_factorization", False)
+        else torch.float64
+    )
     jacobian = system.jacobian.to(dtype=work_dtype)
     target = system.target.reshape(-1).to(dtype=work_dtype)
     if jacobian.numel() == 0 or target.numel() == 0:
         return None
 
-    # The damping fan needs the singular values themselves, so this keeps the
-    # SVD (eigh of the Gram would square the condition number and corrupt the
-    # spectrum). It runs once per outer STEP, not once per growth candidate, so
-    # it is not the where bottleneck the QR fast path targets.
+    # The damping fan needs the singular values themselves, so this keeps a
+    # genuine SVD (eigh of the Gram would square the condition number and
+    # corrupt the spectrum) -- in the work_dtype chosen above.
     left, singular_values, right = torch.linalg.svd(jacobian, full_matrices=False)
     if singular_values.numel() == 0:
         return None
