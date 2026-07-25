@@ -529,6 +529,18 @@ class FGDApproxConfig:
     # while (eps_before - eps_after) > this fraction of (eps - threshold). Higher
     # = fewer neurons per growth (stops sooner); lower = grows more aggressively.
     certify_adaptive_growth_min_gain: float = 0.1
+    # Grow EVERY growable width location per event, not just the single best.
+    # GroMo caps the neurons added to a layer at min(fan-in, fan-out) -- on a net
+    # whose hidden layers all start at width 2, that is ~2 per event, and the
+    # unified path spends the whole event on ONE layer, so a certifying CIFAR
+    # width takes hundreds of events. Widening every layer each event instead
+    # bootstraps the widths geometrically (2 -> 4 -> 8 -> ...): each layer still
+    # adds only its GroMo-optimal count (the cap is untouched, GroMo unchanged),
+    # but the min(fan-in, fan-out) of every layer rises together, so the next
+    # event can add proportionally more. Every addition is function-preserving,
+    # so f -- and the descent certificate -- is unchanged; only the reachable set
+    # enlarges faster. false keeps one purchase per event (byte-identical).
+    certify_grow_all_width: bool = False
     # Generalised R1. The eps < 1/2 stop is Lemma 3.5's admissibility of a
     # STEP, not adequacy of the STRUCTURE; on an easy task the two coincide
     # (MNIST stops at a good small net) but on a hard one they diverge --

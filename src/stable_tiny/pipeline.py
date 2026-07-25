@@ -5839,6 +5839,84 @@ def run_pipeline(
                                     "structure left unchanged"
                                 )
                     elif (
+                        config.fgd_approx.growth_selection == "grow_all_width"
+                    ):
+                        # Widen EVERY growable layer this event (each by GroMo's
+                        # own min(fan-in,fan-out) count -- GroMo unchanged), so
+                        # the widths bootstrap geometrically (2 -> 4 -> 8 -> ...)
+                        # instead of spending the event on one layer. Every
+                        # addition is function-preserving: f and the descent
+                        # certificate are unchanged, only the reachable set grows
+                        # faster. This is the fix for GroMo's min(fan-in,fan-out)
+                        # cap on a net whose hidden layers all start at width 2.
+                        all_kwargs = tiny_optimal_update_kwargs(
+                            config.fgd_approx,
+                            compute_delta=config.fgd_approx.growth_compute_delta,
+                        )
+                        widened = 0
+                        for loc in list(
+                            range(len(getattr(model, "_growable_layers", [])))
+                        ):
+                            before = count_parameters(model)
+                            try:
+                                grow_layer(
+                                    model=model,
+                                    train_loader=train_loader,
+                                    layer_index=loc,
+                                    device=device,
+                                    line_search_config=config.scaling_line_search,
+                                    optimal_update_kwargs=all_kwargs,
+                                    progress=None,
+                                    function_preserving=True,
+                                    preservation_tolerance=(
+                                        config.fgd_approx
+                                        .growth_preservation_tolerance
+                                    ),
+                                )
+                            except RuntimeError as error:
+                                if progress is not None:
+                                    progress(
+                                        f"[GRO-WARN] Epoch {epoch}: grow-all at "
+                                        f"{loc} stopped: {error}"
+                                    )
+                                continue
+                            if count_parameters(model) > before:
+                                widened += 1
+                        if widened:
+                            growth_result = GrowthResult(
+                                layer_index=0,
+                                best_scaling_factor=1.0,
+                                best_train_loss=float("nan"),
+                                line_search=[],
+                            )
+                            layer_index = 0
+                            selected_layer_index = 0
+                            if progress is not None:
+                                post = evaluate_fgd_validation_certificate(
+                                    model=model,
+                                    data_loader=validation_loader,
+                                    device=device,
+                                    config=config.fgd_approx,
+                                    learning_rate=None,
+                                    probe=fgd_validation_probe,
+                                )
+                                _post_eps = (
+                                    post.relative_error
+                                    if post.relative_error is not None
+                                    else float("nan")
+                                )
+                                progress(
+                                    f"[GRO] Epoch {epoch}: grew ALL {widened} "
+                                    f"width locations (eps -> {_post_eps:.3f})"
+                                )
+                        else:
+                            growth_triggered = False
+                            if progress is not None:
+                                progress(
+                                    f"[GRO] Epoch {epoch}: grow-all added "
+                                    "nothing; structure left unchanged"
+                                )
+                    elif (
                         config.fgd_approx.growth_selection
                         == "expansion_per_parameter"
                     ):
