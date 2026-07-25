@@ -649,6 +649,110 @@ def _functional_tikhonov_probe(
     return x, y / (1.0 + config.functional_tikhonov_gamma)
 
 
+#: Cache of the certification rank per model, keyed by ``id(model)`` and its
+#: current parameter count, so the rank is re-estimated only when the structure
+#: has actually grown (once per growth, not once per outer step).
+_CERTIFICATION_RANK_CACHE: dict[int, tuple[int, int]] = {}
+
+
+def _estimate_certification_rank(
+    config: PipelineConfig,
+    model: torch.nn.Module,
+    loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    sizing_batches: int,
+) -> int | None:
+    """Numerical rank of ``J`` on a small sizing probe -- the interpolation floor.
+
+    eps collapses to a spurious 0 once the tangent space can represent ANY
+    residual on the probe, i.e. once ``NK <= rank(J)`` (``J`` full row rank).
+    The binding quantity is therefore ``rank(J)``, NOT the parameter count ``P``:
+    on an input-heavy net (CIFAR: a 1024->2 first layer) ``rank(J) = 536 << P =
+    2092``, so sizing by ``P`` over-samples ~4x and needlessly slows the where.
+    This measures the numerical rank directly on a bounded probe.
+    """
+    from fgdlib.tangent import exact_tangent_system
+
+    x, y = build_projection_probe(loader, sizing_batches, device)
+    system = exact_tangent_system(model, x, y, config.fgd_approx)
+    if system is None or system.jacobian.numel() == 0:
+        return None
+    singular_values = torch.linalg.svdvals(system.jacobian.to(torch.float32))
+    if singular_values.numel() == 0:
+        return None
+    largest = float(singular_values.max())
+    if not largest > 0.0:
+        return None
+    tolerance = largest * max(system.jacobian.shape) * 1e-6
+    return int((singular_values > tolerance).sum())
+
+
+def _bounded_probe_batches(
+    config: PipelineConfig,
+    model: torch.nn.Module,
+    loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    current_batches: int | None = None,
+) -> int:
+    """Probe size for the certificate, bounded to the numerical rank of ``J``.
+
+    Returns the configured ``probe_batches`` unchanged when
+    ``certify_probe_kappa`` is 0 (every synthetic run). When positive the probe
+    is sized so the number of Jacobian ROWS is ``NK = kappa * rank(J)``: enough
+    to certify (MEASURED on the K=1 synthetic: ``NK ~ 8 rank`` matches the whole-
+    dataset eps to +-0.05) and, crucially, kept ABOVE the interpolation floor
+    ``NK > rank(J)`` where eps collapses to a spurious 0. ``rank(J)`` (not ``P``)
+    is the right basis -- it is what actually bounds full-row-rank -- and it is
+    typically ``<< P``, which is what keeps the where FAST at CIFAR scale.
+
+    Capped at the dataset, so on a small dataset this is just the whole training
+    set; it only shrinks the probe where the dataset is genuinely larger,
+    decoupling the ``O(NK*P^2)`` where cost from the dataset size. ``rank(J)``
+    grows during training, so it is re-estimated (cached per structure) and the
+    probe re-materialised as it grows -- the floor holds for the CURRENT net.
+    """
+    fa = config.fgd_approx
+    kappa = float(getattr(fa, "certify_probe_kappa", 0.0) or 0.0)
+    if kappa <= 0.0:
+        return fa.probe_batches
+    batch_size = max(1, int(config.data.batch_size))
+    out_features = max(1, int(getattr(config.data, "out_features", 1)))
+    try:
+        max_batches = len(loader)
+    except TypeError:
+        max_batches = fa.probe_batches
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    # Sizing probe: the current probe (grows reactively), starting from the
+    # configured probe_batches. rank(J) <= its NK, so if rank saturates it the
+    # sizing probe is grown to re-measure on the next step.
+    base_batches = current_batches or fa.probe_batches or 4
+    sizing_batches = max(1, min(int(base_batches), max_batches))
+
+    cached = _CERTIFICATION_RANK_CACHE.get(id(model))
+    if cached is not None and cached[0] == n_params:
+        rank = cached[1]
+    else:
+        rank = _estimate_certification_rank(
+            config, model, loader, device, sizing_batches
+        )
+        _CERTIFICATION_RANK_CACHE[id(model)] = (n_params, rank if rank else -1)
+    if not rank or rank <= 0:
+        # Could not measure: fall back to the conservative P bound rather than
+        # risk an under-sized (interpolating) probe.
+        rank = n_params
+
+    sizing_rows = out_features * sizing_batches * batch_size
+    if rank >= 0.6 * sizing_rows and sizing_batches < max_batches:
+        # rank saturates the sizing probe -> it is under-measured; grow the probe
+        # so the next estimate is unclamped.
+        return min(max_batches, max(sizing_batches + 1, math.ceil(1.7 * sizing_batches)))
+
+    target_rows = max(kappa, 2.0) * float(rank)   # NK > rank, no interpolation
+    batches = math.ceil(target_rows / out_features / batch_size)
+    return max(1, min(batches, max_batches))
+
+
 def build_model(config: PipelineConfig, device: torch.device) -> GrowingMLP:
     data_config = config.data
     model_config = config.model
@@ -3475,14 +3579,25 @@ def run_pipeline(
         fgd_validation_probe: tuple[torch.Tensor, torch.Tensor] | None = None
         fgd_train_probe: tuple[torch.Tensor, torch.Tensor] | None = None
         if config.training.method == "fgd_approx":
+            # Bounded certification probe: sized to kappa*rank(J) when enabled,
+            # else the fixed probe_batches. Re-evaluated each outer step (rank
+            # grows). ``_probe_batches`` tracks the current train-probe size so
+            # the rank estimate is measured on it and the probe grows reactively.
+            _probe_batches = _bounded_probe_batches(
+                config, model, train_loader, device
+            )
+            _validation_probe_batches = _bounded_probe_batches(
+                config, model, validation_loader, device,
+                current_batches=_probe_batches,
+            )
             fgd_validation_probe = build_projection_probe(
                 validation_loader,
-                config.fgd_approx.probe_batches,
+                _validation_probe_batches,
                 device,
             )
             fgd_train_probe = build_projection_probe(
                 train_loader,
-                config.fgd_approx.probe_batches,
+                _probe_batches,
                 device,
             )
             # Functional Tikhonov: certify against L_data + gamma ||f||^2 by
@@ -3721,10 +3836,14 @@ def run_pipeline(
                             # one over the dataset, which is the object the
                             # theory is about; the flow becomes stochastic FGD
                             # instead of exact descent on 256 fixed points.
+                            _probe_batches = _bounded_probe_batches(
+                                config, model, train_loader, device,
+                                current_batches=_probe_batches,
+                            )
                             fgd_train_probe = _functional_tikhonov_probe(
                                 build_projection_probe(
                                     train_loader,
-                                    config.fgd_approx.probe_batches,
+                                    _probe_batches,
                                     device,
                                 ),
                                 config.fgd_approx,
@@ -3732,11 +3851,43 @@ def run_pipeline(
                             fgd_validation_probe = _functional_tikhonov_probe(
                                 build_projection_probe(
                                     validation_loader,
-                                    config.fgd_approx.probe_batches,
+                                    _bounded_probe_batches(
+                                        config, model, validation_loader, device,
+                                        current_batches=_probe_batches,
+                                    ),
                                     device,
                                 ),
                                 config.fgd_approx,
                             )
+                        elif config.fgd_approx.certify_probe_kappa > 0.0:
+                            # Fixed bounded probe that GROWS with P: re-materialise
+                            # only when kappa*P now needs more points than the probe
+                            # holds, so the floor s > P holds for the current
+                            # structure while candidate comparisons within a growth
+                            # round still share one probe.
+                            _needed = _bounded_probe_batches(
+                                config, model, train_loader, device,
+                                current_batches=_probe_batches,
+                            )
+                            if _needed > _probe_batches:
+                                _probe_batches = _needed
+                                fgd_train_probe = _functional_tikhonov_probe(
+                                    build_projection_probe(
+                                        train_loader, _probe_batches, device
+                                    ),
+                                    config.fgd_approx,
+                                )
+                                fgd_validation_probe = _functional_tikhonov_probe(
+                                    build_projection_probe(
+                                        validation_loader,
+                                        _bounded_probe_batches(
+                                            config, model, validation_loader, device,
+                                            current_batches=_probe_batches,
+                                        ),
+                                        device,
+                                    ),
+                                    config.fgd_approx,
+                                )
                         tangent_direction: tuple[torch.Tensor, ...] | None = None
                         direction_stats: _FunctionalStepStats | None = None
                         maximum_learning_rate: float | None = None

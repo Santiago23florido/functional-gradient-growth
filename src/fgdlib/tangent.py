@@ -484,6 +484,34 @@ class FGDApproxConfig:
     # continues from there. 0.0 keeps the current behaviour (stop only at the
     # tolerance or the iteration cap).
     certify_realize_min_progress: float = 0.0
+    # Bounded certification probe, sized to the NUMERICAL RANK of J. The
+    # certificate eps<1/2 is a statement over the NK-dimensional probe residual,
+    # but MEASURED the rank m* needed to certify grows SUBLINEARLY in NK (m*/NK:
+    # 0.22 -> 0.08 as NK x4). eps collapses to a spurious 0 exactly when the
+    # tangent space can represent any residual on the probe, i.e. NK <= rank(J)
+    # (J full row rank) -- so the binding floor is rank(J), NOT the parameter
+    # count P. On an input-heavy net rank(J) << P (CIFAR: 525 vs 2092), so sizing
+    # by P over-samples ~4x and needlessly slows the where; sizing by rank(J) is
+    # both correct and fast. This sets the probe rows to NK = kappa * rank(J)
+    # (measured on the K=1 synthetic: NK ~ 8 rank matches the whole-dataset eps
+    # to +-0.05), capped at the dataset and re-estimated as rank grows, with the
+    # floor NK > rank(J). Decouples the probe -- and the O(NK P^2) where cost --
+    # from the dataset size. 0.0 disables it: the fixed probe_batches is used
+    # unchanged (so the synthetic runs keep certifying over their whole training
+    # set). Meant for datasets whose whole-Jacobian probe is intractable
+    # (CIFAR: NK ~ 5e5). kappa in [4, 8] is the tested range.
+    #
+    # Why sizing -- and not a statistical correction on the eps formula -- is the
+    # live mechanism: the certificate is an R^2-like ratio, so a subsample's eps
+    # is biased DOWN by ~ m/NK (least-squares over-fits a finite probe). The
+    # adjusted-R^2 debiasing of that bias is derived and validated as a
+    # DIAGNOSTIC in ``fgdlib.search.damping.dof_corrected_relative_error``, but
+    # it cannot be a live gate here: this method deliberately grows ``P > NK``,
+    # where the numerical rank saturates at ``NK`` and the correction explodes
+    # (MEASURED: it froze N1024 at test 0.192). Sizing ``NK = kappa * rank``
+    # instead holds the probe above the interpolation floor by construction and
+    # leaves the eps formula -- and every synthetic certificate -- untouched.
+    certify_probe_kappa: float = 0.0
     # Generalised R1. The eps < 1/2 stop is Lemma 3.5's admissibility of a
     # STEP, not adequacy of the STRUCTURE; on an easy task the two coincide
     # (MNIST stops at a good small net) but on a hard one they diverge --

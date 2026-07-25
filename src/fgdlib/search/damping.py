@@ -60,6 +60,7 @@ matters, which is exactly why it must be located rather than guessed.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -88,6 +89,65 @@ __all__ = [
 #: at its best, step at its least realisable); the high end is heavy
 #: regularisation (the reverse). The window lies inside it wherever it sits.
 DAMPING_BRACKET: tuple[float, float] = (1e-16, 1e2)
+
+
+def _numerical_rank(singular_values: torch.Tensor) -> int:
+    """Effective number of predictors m = #{sigma_i > tol}, the DOF the tangent
+    projection spends. Matches the rank tolerance used elsewhere (relative to the
+    largest singular value)."""
+    if singular_values.numel() == 0:
+        return 0
+    largest = float(singular_values.max())
+    if not largest > 0.0:
+        return 0
+    tolerance = largest * float(singular_values.numel()) * 1e-6
+    return int((singular_values > tolerance).sum())
+
+
+def dof_corrected_relative_error(
+    raw_relative_error: float,
+    n_observations: int,
+    effective_rank: int,
+) -> float:
+    """Debias a subsample's ``eps`` for the degrees of freedom it spent.
+
+    The certificate is an R^2-like ratio -- ``rho = ||P_T r||^2/||r||^2`` is the
+    fraction of the gradient energy the tangent space captures, and ``eps^2 =
+    (1-rho)/rho``. Unlike a gradient MEAN (which subsamples without bias), a
+    least-squares ``rho`` OVER-fits a finite probe by ``~ m/NK`` (m predictors,
+    NK observations), so the raw subsample ``eps`` is biased DOWN toward the
+    spurious 0. The adjusted-R^2 correction removes exactly that bias:
+
+        rho_adj = 1 - (1 - rho_B) * (NK - 1) / (NK - m - 1)
+        eps_adj = sqrt((1 - rho_adj) / rho_adj)
+
+    and it blows up to ``inf`` once ``NK <= m + 1`` -- the interpolation regime
+    where the certificate is vacuous. On the whole-dataset probe (``NK >> m``)
+    the factor is ~1 and this is a no-op.
+
+    DIAGNOSTIC, NOT a live certificate gate. It is the rigorous ANSWER to "why
+    can a subsample certificate be dishonest", and MEASURED it debiases the eps
+    ESTIMATE (a bounded probe's eps tracks the whole-data eps once corrected).
+    But this method deliberately grows ``P > NK`` (the headline reaches
+    ``P ~ 2000`` over an ``NK = 1024`` probe and still generalises via damping),
+    where the NUMERICAL rank ``m`` saturates at ``NK`` and the factor explodes,
+    so wiring it into the growth signal froze the flow (MEASURED: N1024 test
+    0.935 -> 0.192, zero certified steps). The live mechanism that keeps a
+    subsample certificate honest is instead the BOUNDED PROBE
+    (``certify_probe_kappa``): sizing ``NK = kappa * rank`` holds the probe above
+    the interpolation floor by construction, without touching the eps formula.
+    """
+    denom = n_observations - effective_rank - 1
+    if denom <= 0:
+        return float("inf")                      # NK <= m+1: interpolation
+    if not (raw_relative_error == raw_relative_error) or raw_relative_error < 0:
+        return float("inf")
+    rho = 1.0 / (1.0 + raw_relative_error**2)
+    rho_adj = 1.0 - (1.0 - rho) * (n_observations - 1) / denom
+    if rho_adj <= 0.0:
+        return float("inf")                      # captured energy debiases to <=0
+    rho_adj = min(rho_adj, 1.0)
+    return math.sqrt(max(0.0, (1.0 - rho_adj) / rho_adj))
 
 
 def _fast_min_relative_error(
@@ -219,6 +279,7 @@ def minimal_relative_error(
     target = system.target.reshape(-1).to(dtype=torch.float64)
     if jacobian.numel() == 0 or target.numel() == 0:
         return float("inf")
+
     if getattr(config, "projection_fast_factorization", False):
         # The dominant cost of the where: same min-damped projection in
         # float32, matched to ~8e-5 and ~9x faster.
