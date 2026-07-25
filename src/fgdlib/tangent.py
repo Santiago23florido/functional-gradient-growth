@@ -373,6 +373,18 @@ class FGDApproxConfig:
     certify_family_inner_steps: int = 400
     certify_family_inner_learning_rate: float = 0.01
     certify_family_functional_lr: float = 1.0
+    # Cheapen the family clone WITHOUT changing the step it produces: stop the
+    # inner training once its alignment with the residual (cos(Delta, r)) has
+    # genuinely PLATEAUED -- no improvement above plateau_tol for a few checks.
+    # A successful clone plateaus near its best cosine (same accepted step as
+    # full training); a doomed clone plateaus below sqrt(3)/2 (same rejection).
+    # Either way the DECISION and the step are unchanged -- only the wasted tail
+    # of inner steps is cut, which is the dominant cost on a hard task where the
+    # clone is retrained on every growth attempt. Off by default so the
+    # certificate and the synthetic result are byte-identical; the acceptance
+    # criterion (RelErr < 1/2) is never touched.
+    certify_family_plateau_stop: bool = False
+    certify_family_plateau_tol: float = 0.002
     # ROUGHNESS PENALTY -- the RIGHT regulariser, in the function-space norm.
     # functional_tikhonov above penalises ||f||^2 (magnitude), which shrinks f
     # toward 0 but still lets it memorise a shrunk copy. This penalises
