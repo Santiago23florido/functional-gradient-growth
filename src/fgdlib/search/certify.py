@@ -309,6 +309,42 @@ def grow_until_certified(
                 + ("  (certified)" if epsilon < threshold else "")
             )
 
+        # ADAPTIVE COUNT: keep adding at the just-chosen best location while each
+        # increment still pays -- marginal eps reduction above min_gain of the
+        # remaining gap -- stopping the instant it certifies or the returns
+        # diminish. The number of neurons is chosen by the certificate and the
+        # value criterion, not fixed; every intermediate structure is scored by
+        # its OWN projection, so the certificate conditions are unchanged. This
+        # cuts the number of full location scans on a hard task (CIFAR) without
+        # weakening any certificate.
+        if getattr(config.fgd_approx, "certify_adaptive_growth", False):
+            min_gain = float(
+                getattr(config.fgd_approx, "certify_adaptive_growth_min_gain", 0.1)
+            )
+            while epsilon >= threshold and growths < max_growths:
+                bigger = _grow_clone(
+                    model, train_loader, best_location, device, config,
+                    function_preserving,
+                )
+                if bigger is None:
+                    break
+                bigger_epsilon = exact_relative_error(
+                    bigger, x, y, config.fgd_approx
+                )
+                gain = epsilon - bigger_epsilon
+                if not (gain > min_gain * max(epsilon - threshold, 1e-6)):
+                    break  # diminishing returns here; let the outer loop re-scan
+                model = bigger
+                epsilon = bigger_epsilon
+                growths += 1
+                trajectory.append(epsilon)
+                if progress is not None:
+                    progress(
+                        f"[CERTIFY] adaptive +growth {growths} at location "
+                        f"{best_location}: eps -> {epsilon:.4f}"
+                        + ("  (certified)" if epsilon < threshold else "")
+                    )
+
     return model, CertifyResult(
         relative_error=epsilon,
         growths=growths,

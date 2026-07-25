@@ -512,6 +512,23 @@ class FGDApproxConfig:
     # instead holds the probe above the interpolation floor by construction and
     # leaves the eps formula -- and every synthetic certificate -- untouched.
     certify_probe_kappa: float = 0.0
+    # Adaptive growth COUNT. The grow-to-certify loop adds a FIXED
+    # tiny_maximum_added_neurons per growth, so on a hard task (CIFAR) reaching a
+    # certifying width takes hundreds of full location scans -- one neuron at a
+    # time. This lets the method CHOOSE the count instead: once a growth commits
+    # the best location, it keeps adding at THAT location while each increment
+    # still pays -- its marginal eps reduction stays above min_gain of the
+    # remaining gap to the threshold -- and stops the instant it certifies or the
+    # returns diminish, then re-scans. The number of neurons is thus set by the
+    # certificate and the value criterion, not fixed. Every intermediate
+    # structure is scored by its OWN projection, so it honours exactly the
+    # certificate conditions the one-neuron path does. false keeps the fixed
+    # count (the synthetic default is unchanged and byte-identical).
+    certify_adaptive_growth: bool = False
+    # Marginal-value floor for the adaptive count: keep adding at the location
+    # while (eps_before - eps_after) > this fraction of (eps - threshold). Higher
+    # = fewer neurons per growth (stops sooner); lower = grows more aggressively.
+    certify_adaptive_growth_min_gain: float = 0.1
     # Generalised R1. The eps < 1/2 stop is Lemma 3.5's admissibility of a
     # STEP, not adequacy of the STRUCTURE; on an easy task the two coincide
     # (MNIST stops at a good small net) but on a hard one they diverge --

@@ -5753,6 +5753,83 @@ def run_pipeline(
                                     f" -> {chosen.relative_error_after:.3f}); "
                                     f"{len(candidates)} candidates considered"
                                 )
+                            # ADAPTIVE COUNT: the "re-measuring after each
+                            # purchase" ideal the note above defers. While the
+                            # certificate still demands growth, keep buying at
+                            # the chosen WIDTH location as long as each increment
+                            # still pays -- its certificate improvement stays
+                            # above min_gain of the remaining gap to threshold --
+                            # stopping the instant it certifies or the returns
+                            # diminish. Each purchase is re-measured by its OWN
+                            # validation certificate, so attribution and every
+                            # certificate condition are preserved; the COUNT is
+                            # chosen by the criterion, not fixed. Off by default
+                            # (one purchase per event, byte-identical).
+                            if (
+                                getattr(
+                                    config.fgd_approx,
+                                    "certify_adaptive_growth",
+                                    False,
+                                )
+                                and chosen.kind == "width"
+                                and ceiling_binds
+                            ):
+                                _thr = config.fgd_approx.rel_error_threshold
+                                _min_gain = float(
+                                    getattr(
+                                        config.fgd_approx,
+                                        "certify_adaptive_growth_min_gain",
+                                        0.1,
+                                    )
+                                )
+                                _eps_now = chosen.relative_error_after
+                                _added = 0
+                                while _eps_now is not None and _eps_now >= _thr:
+                                    _trial = copy.deepcopy(model)
+                                    try:
+                                        grow_layer(
+                                            model=_trial,
+                                            train_loader=train_loader,
+                                            layer_index=chosen.index,
+                                            device=device,
+                                            line_search_config=(
+                                                config.scaling_line_search
+                                            ),
+                                            optimal_update_kwargs=unified_kwargs,
+                                            progress=None,
+                                            function_preserving=True,
+                                            preservation_tolerance=(
+                                                config.fgd_approx
+                                                .growth_preservation_tolerance
+                                            ),
+                                        )
+                                    except RuntimeError:
+                                        break
+                                    _trial_eps = _certificate_for(_trial)
+                                    if _trial_eps is None:
+                                        break
+                                    _gain = _eps_now - _trial_eps
+                                    if not (
+                                        _gain
+                                        > _min_gain * max(_eps_now - _thr, 1e-6)
+                                    ):
+                                        break
+                                    model = _trial
+                                    _eps_now = _trial_eps
+                                    _added += 1
+                                if _added and progress is not None:
+                                    progress(
+                                        f"[GRO] Epoch {epoch}: adaptive count "
+                                        f"added {_added} more neuron-blocks at "
+                                        f"index {chosen.index} (eps -> "
+                                        f"{_eps_now:.3f}"
+                                        + (
+                                            "  certified"
+                                            if _eps_now < _thr
+                                            else ""
+                                        )
+                                        + ")"
+                                    )
                         else:
                             growth_triggered = False
                             if progress is not None:
