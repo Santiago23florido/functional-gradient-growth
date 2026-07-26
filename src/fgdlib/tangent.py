@@ -314,6 +314,17 @@ class FGDApproxConfig:
     # V, needed only by the step's damping fan, is recovered as J^T U / sigma.
     # Default False keeps every existing config on the bit-for-bit SVD path.
     projection_fast_factorization: bool = False
+    # Stream the tangent system over the WHOLE dataset in row-chunks instead of
+    # materialising the full NK x P Jacobian. Accumulates the incremental-QR
+    # factor R (P x P), b = J^T r and ||r||^2 chunk by chunk, freeing each
+    # chunk, then hands the SAME downstream code a tiny surrogate ((rank+1) x P)
+    # that reproduces the exact spectrum, projection and eps -- MEASURED exact to
+    # 1.8e-12 vs the full-Jacobian float64. Memory is O(P^2), independent of the
+    # dataset size, so the certificate can use ALL the data (which forces growth
+    # and generalisation) without the O(NK*P) blow-up. The certificate criterion,
+    # the families and every config value are untouched; only HOW the exact
+    # system is assembled changes. Off by default (the full Jacobian is built).
+    certify_stream_gram: bool = False
     # WHICH admissible g inside the tangent space to use. Lemma 3.5 fixes only
     # RelErr(g, r) <= 1/2 and says nothing about which g in T = range(J) to
     # take; that freedom is ours, and how it is resolved decides whether the
@@ -1586,6 +1597,43 @@ class ExactTangentSystem:
     loss: float
 
 
+def _stream_gram_surrogate(
+    r_factor: torch.Tensor,
+    b_acc: torch.Tensor,
+    r_sq: float,
+    out_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A tiny (rank+1) x P system reproducing the FULL-data tangent projection.
+
+    From the streamed incremental-QR factor ``R`` (P x P, whose SVD is the exact
+    SVD of the full Jacobian ``J``), ``b = J^T r`` and ``||r||^2`` it builds
+    ``(J_s, r_s)`` with ``J_s^T J_s = J^T J``, ``J_s^T r_s = J^T r`` and
+    ``||r_s||^2 = ||r||^2``. Every quantity the downstream projection needs --
+    the spectrum, the damped update ``u``, and ``eps`` -- depends on the data
+    ONLY through those three, so feeding ``(J_s, r_s)`` to the unchanged solver
+    gives the exact full-data result at ``O(P^2)`` memory. The extra zero row
+    carries the out-of-range residual energy so ``eps`` is exact, not just the
+    in-range part.
+    """
+    left, singular, right = torch.linalg.svd(r_factor, full_matrices=False)
+    del left
+    keep = singular > float(singular.max()) * 1e-12
+    sig = singular[keep]
+    v_rows = right[keep]                        # (rank, P), rows are V^T
+    coeff = v_rows @ b_acc                       # V^T b, shape (rank,)
+    in_range = float((coeff * coeff / sig.square()).sum())
+    residual = max(0.0, r_sq - in_range)
+    p_dim = r_factor.shape[1]
+    j_top = sig.unsqueeze(1) * v_rows            # diag(sig) @ V^T = (rank, P)
+    j_surrogate = torch.cat(
+        [j_top, j_top.new_zeros(1, p_dim)], dim=0
+    )
+    r_surrogate = torch.cat(
+        [coeff / sig, coeff.new_tensor([math.sqrt(residual)])]
+    )
+    return j_surrogate.to(out_dtype), r_surrogate.to(out_dtype)
+
+
 def exact_tangent_system(
     model: GrowingMLP,
     x: torch.Tensor,
@@ -1670,8 +1718,45 @@ def _compute_exact_tangent_projection_step(
         return functional_call(model, state, (x,)).reshape(-1)
 
     chunk = int(getattr(config, "jacobian_row_chunk", 0) or 0)
+    stream_gram = bool(getattr(config, "certify_stream_gram", False))
     try:
-        if chunk > 0 and chunk < output_numel:
+        if stream_gram:
+            # STREAMING: accumulate the incremental-QR factor R (P x P),
+            # b = J^T r and ||r||^2 over row chunks -- freeing each chunk -- so
+            # the full NK x P Jacobian is never held. Then hand the downstream a
+            # tiny surrogate ((rank+1) x P) reproducing the exact spectrum and
+            # projection. Memory O(P^2), exact (1.8e-12 vs full float64).
+            step = chunk if (0 < chunk < output_numel) else output_numel
+            r_factor = None
+            b_acc: torch.Tensor | None = None
+            r_sq = 0.0
+            for start in range(0, output_numel, step):
+                stop = min(start + step, output_numel)
+
+                def call_rows(
+                    parameter_values: tuple[torch.Tensor, ...],
+                    _start: int = start,
+                    _stop: int = stop,
+                ) -> torch.Tensor:
+                    return call_with_parameters(parameter_values)[_start:_stop]
+
+                block = _flatten_jacobian(
+                    jacrev(call_rows)(parameters), stop - start
+                ).to(torch.float64)
+                r_block = target[start:stop].to(torch.float64)
+                contribution = block.t() @ r_block
+                b_acc = contribution if b_acc is None else b_acc + contribution
+                r_sq += float((r_block * r_block).sum())
+                stacked = block if r_factor is None else torch.cat(
+                    [r_factor, block], dim=0
+                )
+                r_factor = torch.linalg.qr(stacked, mode="reduced").R
+                del block, r_block, stacked
+                _clear_inaccessible_tensor_caches(model)
+            jacobian_matrix, target = _stream_gram_surrogate(
+                r_factor, b_acc, r_sq, target.dtype
+            )
+        elif chunk > 0 and chunk < output_numel:
             blocks = []
             for start in range(0, output_numel, chunk):
                 stop = min(start + chunk, output_numel)

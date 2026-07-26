@@ -76,6 +76,37 @@ from fgdlib.tangent import (
 __all__ = ["RealizationResult", "realize_functional_step"]
 
 
+def _gram_shortfall_solve(
+    model: torch.nn.Module,
+    x: torch.Tensor,
+    shortfall: torch.Tensor,
+    surrogate_jacobian: torch.Tensor,
+    parameters: tuple[torch.Tensor, ...],
+    config: FGDApproxConfig,
+) -> torch.Tensor:
+    """Solve ``J v ~ shortfall`` via the Gram normal equations -- streaming-safe.
+
+    The damped tangent projection is ``v = (J^T J + lam) ^{-1} J^T shortfall``.
+    ``J^T J`` is exact from the streamed surrogate (``J_s^T J_s = J^T J``) and
+    ``J^T shortfall`` is a SINGLE vector-Jacobian product (one backward pass),
+    so the full ``NK x P`` Jacobian is never held. Same solution as the direct
+    solve, at ``O(P^2)`` memory.
+    """
+    output = model(x).reshape(-1)
+    scalar = (output * shortfall.to(output.dtype)).sum()
+    grads = torch.autograd.grad(scalar, parameters)
+    jt_shortfall = torch.cat([g.reshape(-1) for g in grads]).to(torch.float64)
+
+    gram = surrogate_jacobian.to(torch.float64)
+    gram = gram.t() @ gram                       # J^T J (P x P), exact
+    # Match _solve_tangent_projection_svd exactly: the damping is ABSOLUTE
+    # (denominator = sigma^2 + damping), so u = (J^T J + damping I)^-1 J^T short.
+    damping = max(float(config.projection_damping), 0.0)
+    identity = torch.eye(gram.shape[0], dtype=torch.float64, device=gram.device)
+    solution = torch.linalg.solve(gram + damping * identity, jt_shortfall)
+    return solution.to(shortfall.dtype)
+
+
 @dataclass(frozen=True)
 class RealizationResult:
     """How much of the certified functional step was actually delivered."""
@@ -154,30 +185,40 @@ def realize_functional_step(
             system = exact_tangent_system(model, x, y, config)
             if system is None:
                 break
-            flat_step, approximation = _solve_tangent_projection(
-                jacobian_matrix=system.jacobian,
-                target=shortfall,
-                damping=config.projection_damping,
-                solver=config.projection_solver,
-                # The integration re-solves against the measured residual each
-                # iteration, so a float32 sub-step's round-off is corrected by
-                # the next one -- and this inner solve is the dominant cost of a
-                # run. float64 stays the default off the fast flag.
-                work_dtype=(
-                    torch.float32
-                    if getattr(config, "projection_fast_factorization", False)
-                    else torch.float64
-                ),
-            )
+            if getattr(config, "certify_stream_gram", False):
+                # Streamed system: system.jacobian is the tiny surrogate, so the
+                # NK-dimensional shortfall cannot be projected against it
+                # directly. Solve via the Gram normal equations instead -- exact
+                # same step, at O(P^2) memory (the surrogate gives J^T J, a
+                # single VJP gives J^T shortfall).
+                flat_step = _gram_shortfall_solve(
+                    model, x, shortfall, system.jacobian, system.parameters, config
+                )
+            else:
+                flat_step, approximation = _solve_tangent_projection(
+                    jacobian_matrix=system.jacobian,
+                    target=shortfall,
+                    damping=config.projection_damping,
+                    solver=config.projection_solver,
+                    # The integration re-solves against the measured residual each
+                    # iteration, so a float32 sub-step's round-off is corrected by
+                    # the next one -- and this inner solve is the dominant cost of a
+                    # run. float64 stays the default off the fast flag.
+                    work_dtype=(
+                        torch.float32
+                        if getattr(config, "projection_fast_factorization", False)
+                        else torch.float64
+                    ),
+                )
+                stats = _output_relative_error_from_tensors(
+                    approximation=approximation, target=shortfall, eps=config.eps
+                )
+                del stats  # measured for parity with the outer solve; unused here
             if not torch.isfinite(flat_step).all():
                 break
             step_updates = _unflatten_parameter_update(
                 flat_step, system.parameters
             )
-            stats = _output_relative_error_from_tensors(
-                approximation=approximation, target=shortfall, eps=config.eps
-            )
-            del stats  # measured for parity with the outer solve; unused here
 
             sub_rate = _residual_reducing_sub_rate(
                 model, x, target, step_updates, remaining, config
