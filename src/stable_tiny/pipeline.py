@@ -649,6 +649,110 @@ def _functional_tikhonov_probe(
     return x, y / (1.0 + config.functional_tikhonov_gamma)
 
 
+#: Cache of the certification rank per model, keyed by ``id(model)`` and its
+#: current parameter count, so the rank is re-estimated only when the structure
+#: has actually grown (once per growth, not once per outer step).
+_CERTIFICATION_RANK_CACHE: dict[int, tuple[int, int]] = {}
+
+
+def _estimate_certification_rank(
+    config: PipelineConfig,
+    model: torch.nn.Module,
+    loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    sizing_batches: int,
+) -> int | None:
+    """Numerical rank of ``J`` on a small sizing probe -- the interpolation floor.
+
+    eps collapses to a spurious 0 once the tangent space can represent ANY
+    residual on the probe, i.e. once ``NK <= rank(J)`` (``J`` full row rank).
+    The binding quantity is therefore ``rank(J)``, NOT the parameter count ``P``:
+    on an input-heavy net (CIFAR: a 1024->2 first layer) ``rank(J) = 536 << P =
+    2092``, so sizing by ``P`` over-samples ~4x and needlessly slows the where.
+    This measures the numerical rank directly on a bounded probe.
+    """
+    from fgdlib.tangent import exact_tangent_system
+
+    x, y = build_projection_probe(loader, sizing_batches, device)
+    system = exact_tangent_system(model, x, y, config.fgd_approx)
+    if system is None or system.jacobian.numel() == 0:
+        return None
+    singular_values = torch.linalg.svdvals(system.jacobian.to(torch.float32))
+    if singular_values.numel() == 0:
+        return None
+    largest = float(singular_values.max())
+    if not largest > 0.0:
+        return None
+    tolerance = largest * max(system.jacobian.shape) * 1e-6
+    return int((singular_values > tolerance).sum())
+
+
+def _bounded_probe_batches(
+    config: PipelineConfig,
+    model: torch.nn.Module,
+    loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    current_batches: int | None = None,
+) -> int:
+    """Probe size for the certificate, bounded to the numerical rank of ``J``.
+
+    Returns the configured ``probe_batches`` unchanged when
+    ``certify_probe_kappa`` is 0 (every synthetic run). When positive the probe
+    is sized so the number of Jacobian ROWS is ``NK = kappa * rank(J)``: enough
+    to certify (MEASURED on the K=1 synthetic: ``NK ~ 8 rank`` matches the whole-
+    dataset eps to +-0.05) and, crucially, kept ABOVE the interpolation floor
+    ``NK > rank(J)`` where eps collapses to a spurious 0. ``rank(J)`` (not ``P``)
+    is the right basis -- it is what actually bounds full-row-rank -- and it is
+    typically ``<< P``, which is what keeps the where FAST at CIFAR scale.
+
+    Capped at the dataset, so on a small dataset this is just the whole training
+    set; it only shrinks the probe where the dataset is genuinely larger,
+    decoupling the ``O(NK*P^2)`` where cost from the dataset size. ``rank(J)``
+    grows during training, so it is re-estimated (cached per structure) and the
+    probe re-materialised as it grows -- the floor holds for the CURRENT net.
+    """
+    fa = config.fgd_approx
+    kappa = float(getattr(fa, "certify_probe_kappa", 0.0) or 0.0)
+    if kappa <= 0.0:
+        return fa.probe_batches
+    batch_size = max(1, int(config.data.batch_size))
+    out_features = max(1, int(getattr(config.data, "out_features", 1)))
+    try:
+        max_batches = len(loader)
+    except TypeError:
+        max_batches = fa.probe_batches
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    # Sizing probe: the current probe (grows reactively), starting from the
+    # configured probe_batches. rank(J) <= its NK, so if rank saturates it the
+    # sizing probe is grown to re-measure on the next step.
+    base_batches = current_batches or fa.probe_batches or 4
+    sizing_batches = max(1, min(int(base_batches), max_batches))
+
+    cached = _CERTIFICATION_RANK_CACHE.get(id(model))
+    if cached is not None and cached[0] == n_params:
+        rank = cached[1]
+    else:
+        rank = _estimate_certification_rank(
+            config, model, loader, device, sizing_batches
+        )
+        _CERTIFICATION_RANK_CACHE[id(model)] = (n_params, rank if rank else -1)
+    if not rank or rank <= 0:
+        # Could not measure: fall back to the conservative P bound rather than
+        # risk an under-sized (interpolating) probe.
+        rank = n_params
+
+    sizing_rows = out_features * sizing_batches * batch_size
+    if rank >= 0.6 * sizing_rows and sizing_batches < max_batches:
+        # rank saturates the sizing probe -> it is under-measured; grow the probe
+        # so the next estimate is unclamped.
+        return min(max_batches, max(sizing_batches + 1, math.ceil(1.7 * sizing_batches)))
+
+    target_rows = max(kappa, 2.0) * float(rank)   # NK > rank, no interpolation
+    batches = math.ceil(target_rows / out_features / batch_size)
+    return max(1, min(batches, max_batches))
+
+
 def build_model(config: PipelineConfig, device: torch.device) -> GrowingMLP:
     data_config = config.data
     model_config = config.model
@@ -3475,14 +3579,25 @@ def run_pipeline(
         fgd_validation_probe: tuple[torch.Tensor, torch.Tensor] | None = None
         fgd_train_probe: tuple[torch.Tensor, torch.Tensor] | None = None
         if config.training.method == "fgd_approx":
+            # Bounded certification probe: sized to kappa*rank(J) when enabled,
+            # else the fixed probe_batches. Re-evaluated each outer step (rank
+            # grows). ``_probe_batches`` tracks the current train-probe size so
+            # the rank estimate is measured on it and the probe grows reactively.
+            _probe_batches = _bounded_probe_batches(
+                config, model, train_loader, device
+            )
+            _validation_probe_batches = _bounded_probe_batches(
+                config, model, validation_loader, device,
+                current_batches=_probe_batches,
+            )
             fgd_validation_probe = build_projection_probe(
                 validation_loader,
-                config.fgd_approx.probe_batches,
+                _validation_probe_batches,
                 device,
             )
             fgd_train_probe = build_projection_probe(
                 train_loader,
-                config.fgd_approx.probe_batches,
+                _probe_batches,
                 device,
             )
             # Functional Tikhonov: certify against L_data + gamma ||f||^2 by
@@ -3721,10 +3836,14 @@ def run_pipeline(
                             # one over the dataset, which is the object the
                             # theory is about; the flow becomes stochastic FGD
                             # instead of exact descent on 256 fixed points.
+                            _probe_batches = _bounded_probe_batches(
+                                config, model, train_loader, device,
+                                current_batches=_probe_batches,
+                            )
                             fgd_train_probe = _functional_tikhonov_probe(
                                 build_projection_probe(
                                     train_loader,
-                                    config.fgd_approx.probe_batches,
+                                    _probe_batches,
                                     device,
                                 ),
                                 config.fgd_approx,
@@ -3732,11 +3851,43 @@ def run_pipeline(
                             fgd_validation_probe = _functional_tikhonov_probe(
                                 build_projection_probe(
                                     validation_loader,
-                                    config.fgd_approx.probe_batches,
+                                    _bounded_probe_batches(
+                                        config, model, validation_loader, device,
+                                        current_batches=_probe_batches,
+                                    ),
                                     device,
                                 ),
                                 config.fgd_approx,
                             )
+                        elif config.fgd_approx.certify_probe_kappa > 0.0:
+                            # Fixed bounded probe that GROWS with P: re-materialise
+                            # only when kappa*P now needs more points than the probe
+                            # holds, so the floor s > P holds for the current
+                            # structure while candidate comparisons within a growth
+                            # round still share one probe.
+                            _needed = _bounded_probe_batches(
+                                config, model, train_loader, device,
+                                current_batches=_probe_batches,
+                            )
+                            if _needed > _probe_batches:
+                                _probe_batches = _needed
+                                fgd_train_probe = _functional_tikhonov_probe(
+                                    build_projection_probe(
+                                        train_loader, _probe_batches, device
+                                    ),
+                                    config.fgd_approx,
+                                )
+                                fgd_validation_probe = _functional_tikhonov_probe(
+                                    build_projection_probe(
+                                        validation_loader,
+                                        _bounded_probe_batches(
+                                            config, model, validation_loader, device,
+                                            current_batches=_probe_batches,
+                                        ),
+                                        device,
+                                    ),
+                                    config.fgd_approx,
+                                )
                         tangent_direction: tuple[torch.Tensor, ...] | None = None
                         direction_stats: _FunctionalStepStats | None = None
                         maximum_learning_rate: float | None = None
@@ -5500,6 +5651,14 @@ def run_pipeline(
                                     line_search_config=config.scaling_line_search,
                                     optimal_update_kwargs=unified_kwargs,
                                     progress=None,
+                                    # The certified method's unified growth is
+                                    # function-preserving BY DESIGN (f unchanged
+                                    # so the certified steps do all the descent);
+                                    # this is NOT governed by
+                                    # growth_function_preserving, which only
+                                    # affects the legacy paths. Validated on the
+                                    # headline run: all 25 growth events left f
+                                    # unchanged (delta 0), no non-FP mixing.
                                     function_preserving=True,
                                     preservation_tolerance=(
                                         config.fgd_approx
@@ -5594,6 +5753,83 @@ def run_pipeline(
                                     f" -> {chosen.relative_error_after:.3f}); "
                                     f"{len(candidates)} candidates considered"
                                 )
+                            # ADAPTIVE COUNT: the "re-measuring after each
+                            # purchase" ideal the note above defers. While the
+                            # certificate still demands growth, keep buying at
+                            # the chosen WIDTH location as long as each increment
+                            # still pays -- its certificate improvement stays
+                            # above min_gain of the remaining gap to threshold --
+                            # stopping the instant it certifies or the returns
+                            # diminish. Each purchase is re-measured by its OWN
+                            # validation certificate, so attribution and every
+                            # certificate condition are preserved; the COUNT is
+                            # chosen by the criterion, not fixed. Off by default
+                            # (one purchase per event, byte-identical).
+                            if (
+                                getattr(
+                                    config.fgd_approx,
+                                    "certify_adaptive_growth",
+                                    False,
+                                )
+                                and chosen.kind == "width"
+                                and ceiling_binds
+                            ):
+                                _thr = config.fgd_approx.rel_error_threshold
+                                _min_gain = float(
+                                    getattr(
+                                        config.fgd_approx,
+                                        "certify_adaptive_growth_min_gain",
+                                        0.1,
+                                    )
+                                )
+                                _eps_now = chosen.relative_error_after
+                                _added = 0
+                                while _eps_now is not None and _eps_now >= _thr:
+                                    _trial = copy.deepcopy(model)
+                                    try:
+                                        grow_layer(
+                                            model=_trial,
+                                            train_loader=train_loader,
+                                            layer_index=chosen.index,
+                                            device=device,
+                                            line_search_config=(
+                                                config.scaling_line_search
+                                            ),
+                                            optimal_update_kwargs=unified_kwargs,
+                                            progress=None,
+                                            function_preserving=True,
+                                            preservation_tolerance=(
+                                                config.fgd_approx
+                                                .growth_preservation_tolerance
+                                            ),
+                                        )
+                                    except RuntimeError:
+                                        break
+                                    _trial_eps = _certificate_for(_trial)
+                                    if _trial_eps is None:
+                                        break
+                                    _gain = _eps_now - _trial_eps
+                                    if not (
+                                        _gain
+                                        > _min_gain * max(_eps_now - _thr, 1e-6)
+                                    ):
+                                        break
+                                    model = _trial
+                                    _eps_now = _trial_eps
+                                    _added += 1
+                                if _added and progress is not None:
+                                    progress(
+                                        f"[GRO] Epoch {epoch}: adaptive count "
+                                        f"added {_added} more neuron-blocks at "
+                                        f"index {chosen.index} (eps -> "
+                                        f"{_eps_now:.3f}"
+                                        + (
+                                            "  certified"
+                                            if _eps_now < _thr
+                                            else ""
+                                        )
+                                        + ")"
+                                    )
                         else:
                             growth_triggered = False
                             if progress is not None:
@@ -5601,6 +5837,84 @@ def run_pipeline(
                                     f"[GRO] Epoch {epoch}: no width or depth "
                                     "candidate enlarged the reachable set; "
                                     "structure left unchanged"
+                                )
+                    elif (
+                        config.fgd_approx.growth_selection == "grow_all_width"
+                    ):
+                        # Widen EVERY growable layer this event (each by GroMo's
+                        # own min(fan-in,fan-out) count -- GroMo unchanged), so
+                        # the widths bootstrap geometrically (2 -> 4 -> 8 -> ...)
+                        # instead of spending the event on one layer. Every
+                        # addition is function-preserving: f and the descent
+                        # certificate are unchanged, only the reachable set grows
+                        # faster. This is the fix for GroMo's min(fan-in,fan-out)
+                        # cap on a net whose hidden layers all start at width 2.
+                        all_kwargs = tiny_optimal_update_kwargs(
+                            config.fgd_approx,
+                            compute_delta=config.fgd_approx.growth_compute_delta,
+                        )
+                        widened = 0
+                        for loc in list(
+                            range(len(getattr(model, "_growable_layers", [])))
+                        ):
+                            before = count_parameters(model)
+                            try:
+                                grow_layer(
+                                    model=model,
+                                    train_loader=train_loader,
+                                    layer_index=loc,
+                                    device=device,
+                                    line_search_config=config.scaling_line_search,
+                                    optimal_update_kwargs=all_kwargs,
+                                    progress=None,
+                                    function_preserving=True,
+                                    preservation_tolerance=(
+                                        config.fgd_approx
+                                        .growth_preservation_tolerance
+                                    ),
+                                )
+                            except RuntimeError as error:
+                                if progress is not None:
+                                    progress(
+                                        f"[GRO-WARN] Epoch {epoch}: grow-all at "
+                                        f"{loc} stopped: {error}"
+                                    )
+                                continue
+                            if count_parameters(model) > before:
+                                widened += 1
+                        if widened:
+                            growth_result = GrowthResult(
+                                layer_index=0,
+                                best_scaling_factor=1.0,
+                                best_train_loss=float("nan"),
+                                line_search=[],
+                            )
+                            layer_index = 0
+                            selected_layer_index = 0
+                            if progress is not None:
+                                post = evaluate_fgd_validation_certificate(
+                                    model=model,
+                                    data_loader=validation_loader,
+                                    device=device,
+                                    config=config.fgd_approx,
+                                    learning_rate=None,
+                                    probe=fgd_validation_probe,
+                                )
+                                _post_eps = (
+                                    post.relative_error
+                                    if post.relative_error is not None
+                                    else float("nan")
+                                )
+                                progress(
+                                    f"[GRO] Epoch {epoch}: grew ALL {widened} "
+                                    f"width locations (eps -> {_post_eps:.3f})"
+                                )
+                        else:
+                            growth_triggered = False
+                            if progress is not None:
+                                progress(
+                                    f"[GRO] Epoch {epoch}: grow-all added "
+                                    "nothing; structure left unchanged"
                                 )
                     elif (
                         config.fgd_approx.growth_selection

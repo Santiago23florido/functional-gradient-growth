@@ -111,8 +111,15 @@ class FGDApproxConfig:
     tiny_maximum_added_neurons: int | None = None
     tiny_numerical_threshold: float = 1e-6
     tiny_statistical_threshold: float = 1e-3
-    # Function-preserving growth: new neurons keep zero outgoing weights, no
-    # delta and no scaling line search, so growth never changes the function.
+    # Function-preserving growth for the LEGACY growth paths only (SENN /
+    # uniform / expansion-per-parameter). New neurons keep zero outgoing
+    # weights, no delta and no scaling line search, so growth never changes the
+    # function. NOTE: the CERTIFIED method's growth is function-preserving BY
+    # DESIGN and does not read this flag -- the grow-to-certify loop uses
+    # certify_function_preserving (below), and the unified / rank-cap expansion
+    # enforces FP unconditionally (pipeline.py `_certificate_for` candidates).
+    # This flag governs only the legacy paths, so it must not be read as "is
+    # the certified method's growth FP" -- that is always yes.
     growth_function_preserving: bool = False
     growth_preservation_tolerance: float = 1e-6
     # Ordered ladder of approximation families. "tangent" must come first (it
@@ -213,7 +220,10 @@ class FGDApproxConfig:
     # probe so large that certification is out of reach, which is itself a
     # result worth seeing rather than hanging on).
     certify_max_growths: int = 256
-    # Whether the grow-to-certify loop grows function-preservingly. MEASURED,
+    # Whether the GROW-TO-CERTIFY loop grows function-preservingly. This is the
+    # FP control for the certify path only; the standard/unified growth path is
+    # FP by design and unconditional (see growth_function_preserving above,
+    # which governs only the legacy paths). MEASURED,
     # and the reason the default is False: with omega = 0 the incoming weights
     # contribute nothing to the Jacobian, so a preserving growth converts only
     # ~21 % of the parameters it spends into tangent directions (+9 rank for 42
@@ -293,6 +303,33 @@ class FGDApproxConfig:
     # the theorem's. Measured to land within 9 % of the hand-tuned constant on
     # the task the constant was tuned for.
     projection_damping_auto: bool = False
+    # FAST SPECTRAL FACTORISATION for the damping/where computations. The
+    # min-damping eps that ranks growth candidates needs only the range of J
+    # (its left basis U and singular values), which the current float64
+    # torch.linalg.svd(J) delivers -- but MEASURED, that SVD is the dominant
+    # cost of the whole "where": 959 ms for a 1024x1144 J, against 16 ms to
+    # materialise J. The same U and sigma come from eigh of the SMALLER Gram
+    # matrix (J J^T when NK <= P, else J^T J) at 50 ms -- a 19x speedup, and
+    # EXACT: min-eps matched to all printed digits (0.91335524 both ways).
+    # V, needed only by the step's damping fan, is recovered as J^T U / sigma.
+    # Default False keeps every existing config on the bit-for-bit SVD path.
+    projection_fast_factorization: bool = False
+    # Stream the tangent system over the WHOLE dataset in row-chunks instead of
+    # materialising the full NK x P Jacobian. Accumulates the incremental-QR
+    # factor R (P x P), b = J^T r and ||r||^2 chunk by chunk, freeing each
+    # chunk, then hands the SAME downstream code a tiny surrogate ((rank+1) x P)
+    # that reproduces the exact spectrum, projection and eps -- MEASURED exact to
+    # 1.8e-12 vs the full-Jacobian float64. Memory is O(P^2), independent of the
+    # dataset size, so the certificate can use ALL the data (which forces growth
+    # and generalisation) without the O(NK*P) blow-up. The certificate criterion,
+    # the families and every config value are untouched; only HOW the exact
+    # system is assembled changes. Off by default (the full Jacobian is built).
+    certify_stream_gram: bool = False
+    # SAMPLES per streaming batch. Each batch is forwarded once and its
+    # Jacobian block accumulated into G; smaller batches cap the transient
+    # jacrev memory, larger ones cut Python/jacrev overhead. Memory stays O(P^2)
+    # regardless. 0 means the whole probe in one batch. Only the streaming path.
+    certify_stream_chunk: int = 1024
     # WHICH admissible g inside the tangent space to use. Lemma 3.5 fixes only
     # RelErr(g, r) <= 1/2 and says nothing about which g in T = range(J) to
     # take; that freedom is ours, and how it is resolved decides whether the
@@ -352,6 +389,18 @@ class FGDApproxConfig:
     certify_family_inner_steps: int = 400
     certify_family_inner_learning_rate: float = 0.01
     certify_family_functional_lr: float = 1.0
+    # Cheapen the family clone WITHOUT changing the step it produces: stop the
+    # inner training once its alignment with the residual (cos(Delta, r)) has
+    # genuinely PLATEAUED -- no improvement above plateau_tol for a few checks.
+    # A successful clone plateaus near its best cosine (same accepted step as
+    # full training); a doomed clone plateaus below sqrt(3)/2 (same rejection).
+    # Either way the DECISION and the step are unchanged -- only the wasted tail
+    # of inner steps is cut, which is the dominant cost on a hard task where the
+    # clone is retrained on every growth attempt. Off by default so the
+    # certificate and the synthetic result are byte-identical; the acceptance
+    # criterion (RelErr < 1/2) is never touched.
+    certify_family_plateau_stop: bool = False
+    certify_family_plateau_tol: float = 0.002
     # ROUGHNESS PENALTY -- the RIGHT regulariser, in the function-space norm.
     # functional_tikhonov above penalises ||f||^2 (magnitude), which shrinks f
     # toward 0 but still lets it memorise a shrunk copy. This penalises
@@ -451,6 +500,75 @@ class FGDApproxConfig:
     certify_realize_path: bool = False
     certify_realize_max_iterations: int = 40
     certify_realize_tolerance: float = 0.05
+    # ADAPTIVE EARLY STOP for the realise integration. MEASURED, 138 of ~200
+    # steps run the full 40 inner solves without reaching the residual
+    # tolerance -- but each iteration only chips the residual down a little, so
+    # the late iterations buy almost no extra realised displacement at full
+    # cost. This stops the integration once one iteration reduces the residual
+    # by less than this fraction of the INTENDED displacement, i.e. once the
+    # returns have diminished. It does NOT touch the certificate: the certified
+    # direction g and rate eta are unchanged; this only decides how far along
+    # the fixed target f - eta g the step is carried, and the next outer step
+    # continues from there. 0.0 keeps the current behaviour (stop only at the
+    # tolerance or the iteration cap).
+    certify_realize_min_progress: float = 0.0
+    # Bounded certification probe, sized to the NUMERICAL RANK of J. The
+    # certificate eps<1/2 is a statement over the NK-dimensional probe residual,
+    # but MEASURED the rank m* needed to certify grows SUBLINEARLY in NK (m*/NK:
+    # 0.22 -> 0.08 as NK x4). eps collapses to a spurious 0 exactly when the
+    # tangent space can represent any residual on the probe, i.e. NK <= rank(J)
+    # (J full row rank) -- so the binding floor is rank(J), NOT the parameter
+    # count P. On an input-heavy net rank(J) << P (CIFAR: 525 vs 2092), so sizing
+    # by P over-samples ~4x and needlessly slows the where; sizing by rank(J) is
+    # both correct and fast. This sets the probe rows to NK = kappa * rank(J)
+    # (measured on the K=1 synthetic: NK ~ 8 rank matches the whole-dataset eps
+    # to +-0.05), capped at the dataset and re-estimated as rank grows, with the
+    # floor NK > rank(J). Decouples the probe -- and the O(NK P^2) where cost --
+    # from the dataset size. 0.0 disables it: the fixed probe_batches is used
+    # unchanged (so the synthetic runs keep certifying over their whole training
+    # set). Meant for datasets whose whole-Jacobian probe is intractable
+    # (CIFAR: NK ~ 5e5). kappa in [4, 8] is the tested range.
+    #
+    # Why sizing -- and not a statistical correction on the eps formula -- is the
+    # live mechanism: the certificate is an R^2-like ratio, so a subsample's eps
+    # is biased DOWN by ~ m/NK (least-squares over-fits a finite probe). The
+    # adjusted-R^2 debiasing of that bias is derived and validated as a
+    # DIAGNOSTIC in ``fgdlib.search.damping.dof_corrected_relative_error``, but
+    # it cannot be a live gate here: this method deliberately grows ``P > NK``,
+    # where the numerical rank saturates at ``NK`` and the correction explodes
+    # (MEASURED: it froze N1024 at test 0.192). Sizing ``NK = kappa * rank``
+    # instead holds the probe above the interpolation floor by construction and
+    # leaves the eps formula -- and every synthetic certificate -- untouched.
+    certify_probe_kappa: float = 0.0
+    # Adaptive growth COUNT. The grow-to-certify loop adds a FIXED
+    # tiny_maximum_added_neurons per growth, so on a hard task (CIFAR) reaching a
+    # certifying width takes hundreds of full location scans -- one neuron at a
+    # time. This lets the method CHOOSE the count instead: once a growth commits
+    # the best location, it keeps adding at THAT location while each increment
+    # still pays -- its marginal eps reduction stays above min_gain of the
+    # remaining gap to the threshold -- and stops the instant it certifies or the
+    # returns diminish, then re-scans. The number of neurons is thus set by the
+    # certificate and the value criterion, not fixed. Every intermediate
+    # structure is scored by its OWN projection, so it honours exactly the
+    # certificate conditions the one-neuron path does. false keeps the fixed
+    # count (the synthetic default is unchanged and byte-identical).
+    certify_adaptive_growth: bool = False
+    # Marginal-value floor for the adaptive count: keep adding at the location
+    # while (eps_before - eps_after) > this fraction of (eps - threshold). Higher
+    # = fewer neurons per growth (stops sooner); lower = grows more aggressively.
+    certify_adaptive_growth_min_gain: float = 0.1
+    # Grow EVERY growable width location per event, not just the single best.
+    # GroMo caps the neurons added to a layer at min(fan-in, fan-out) -- on a net
+    # whose hidden layers all start at width 2, that is ~2 per event, and the
+    # unified path spends the whole event on ONE layer, so a certifying CIFAR
+    # width takes hundreds of events. Widening every layer each event instead
+    # bootstraps the widths geometrically (2 -> 4 -> 8 -> ...): each layer still
+    # adds only its GroMo-optimal count (the cap is untouched, GroMo unchanged),
+    # but the min(fan-in, fan-out) of every layer rises together, so the next
+    # event can add proportionally more. Every addition is function-preserving,
+    # so f -- and the descent certificate -- is unchanged; only the reachable set
+    # enlarges faster. false keeps one purchase per event (byte-identical).
+    certify_grow_all_width: bool = False
     # Generalised R1. The eps < 1/2 stop is Lemma 3.5's admissibility of a
     # STEP, not adequacy of the STRUCTURE; on an easy task the two coincide
     # (MNIST stops at a good small net) but on a hard one they diverge --
@@ -1292,12 +1410,19 @@ def _solve_tangent_projection_svd(
     jacobian_matrix: torch.Tensor,
     target: torch.Tensor,
     damping: float,
+    work_dtype: torch.dtype = torch.float64,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Solve the damped tangent projection with a float64 SVD of J."""
+    """Solve the damped tangent projection with an SVD of J.
+
+    ``work_dtype`` defaults to float64. float32 runs the SVD ~9x faster and is
+    safe where the caller self-corrects -- the realise path re-solves against
+    the measured residual each inner iteration, so a float32 sub-step's
+    round-off is absorbed by the next one. It is the dominant cost of a run
+    (MEASURED 26.7 s of 76.8 s in the projection SVD).
+    """
     output_numel, parameter_numel = jacobian_matrix.shape
     damping = max(float(damping), 0.0)
     original_dtype = jacobian_matrix.dtype
-    work_dtype = torch.float64
     jacobian_work = jacobian_matrix.to(dtype=work_dtype)
     target_work = target.reshape(-1).to(dtype=work_dtype)
     if output_numel == 0 or parameter_numel == 0:
@@ -1401,6 +1526,7 @@ def _solve_tangent_projection(
     target: torch.Tensor,
     damping: float,
     solver: ProjectionSolver = "exact",
+    work_dtype: torch.dtype = torch.float64,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return parameter update and projected output gradient."""
     if solver in {"exact", "exact_svd"}:
@@ -1408,6 +1534,7 @@ def _solve_tangent_projection(
             jacobian_matrix=jacobian_matrix,
             target=target,
             damping=damping,
+            work_dtype=work_dtype,
         )
     if solver == "exact_kernel_eigh":
         return _solve_tangent_projection_kernel_eigh(
@@ -1473,6 +1600,43 @@ class ExactTangentSystem:
     target: torch.Tensor
     parameters: tuple[torch.Tensor, ...]
     loss: float
+
+
+def _stream_gram_surrogate(
+    r_factor: torch.Tensor,
+    b_acc: torch.Tensor,
+    r_sq: float,
+    out_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """A tiny (rank+1) x P system reproducing the FULL-data tangent projection.
+
+    From the streamed incremental-QR factor ``R`` (P x P, whose SVD is the exact
+    SVD of the full Jacobian ``J``), ``b = J^T r`` and ``||r||^2`` it builds
+    ``(J_s, r_s)`` with ``J_s^T J_s = J^T J``, ``J_s^T r_s = J^T r`` and
+    ``||r_s||^2 = ||r||^2``. Every quantity the downstream projection needs --
+    the spectrum, the damped update ``u``, and ``eps`` -- depends on the data
+    ONLY through those three, so feeding ``(J_s, r_s)`` to the unchanged solver
+    gives the exact full-data result at ``O(P^2)`` memory. The extra zero row
+    carries the out-of-range residual energy so ``eps`` is exact, not just the
+    in-range part.
+    """
+    left, singular, right = torch.linalg.svd(r_factor, full_matrices=False)
+    del left
+    keep = singular > float(singular.max()) * 1e-12
+    sig = singular[keep]
+    v_rows = right[keep]                        # (rank, P), rows are V^T
+    coeff = v_rows @ b_acc                       # V^T b, shape (rank,)
+    in_range = float((coeff * coeff / sig.square()).sum())
+    residual = max(0.0, r_sq - in_range)
+    p_dim = r_factor.shape[1]
+    j_top = sig.unsqueeze(1) * v_rows            # diag(sig) @ V^T = (rank, P)
+    j_surrogate = torch.cat(
+        [j_top, j_top.new_zeros(1, p_dim)], dim=0
+    )
+    r_surrogate = torch.cat(
+        [coeff / sig, coeff.new_tensor([math.sqrt(residual)])]
+    )
+    return j_surrogate.to(out_dtype), r_surrogate.to(out_dtype)
 
 
 def exact_tangent_system(
@@ -1559,8 +1723,56 @@ def _compute_exact_tangent_projection_step(
         return functional_call(model, state, (x,)).reshape(-1)
 
     chunk = int(getattr(config, "jacobian_row_chunk", 0) or 0)
+    stream_gram = bool(getattr(config, "certify_stream_gram", False))
     try:
-        if chunk > 0 and chunk < output_numel:
+        if stream_gram:
+            # STREAMING over SAMPLES: accumulate the incremental-QR factor R
+            # (P x P), b = J^T r and ||r||^2 batch by batch -- each sample
+            # forwarded EXACTLY ONCE (chunking output rows instead recomputes the
+            # whole forward per chunk, the dominant cost) -- freeing each block,
+            # so the full NK x P Jacobian is never held. The downstream then gets
+            # a tiny surrogate ((rank+1) x P) reproducing the exact spectrum and
+            # projection. Memory O(P^2), exact (1.8e-12 vs full float64).
+            n_samples = int(x.shape[0])
+            out_per_sample = output_numel // max(n_samples, 1)
+            sample_chunk = int(getattr(config, "certify_stream_chunk", 0) or 0)
+            if sample_chunk <= 0:
+                sample_chunk = n_samples
+            r_factor = None
+            b_acc: torch.Tensor | None = None
+            r_sq = 0.0
+            for start in range(0, n_samples, sample_chunk):
+                stop = min(start + sample_chunk, n_samples)
+                x_batch = x[start:stop]
+
+                def call_batch(
+                    parameter_values: tuple[torch.Tensor, ...],
+                    _xb: torch.Tensor = x_batch,
+                ) -> torch.Tensor:
+                    state = OrderedDict(zip(parameter_names, parameter_values))
+                    state.update(buffers)
+                    return functional_call(model, state, (_xb,)).reshape(-1)
+
+                rows = (stop - start) * out_per_sample
+                block = _flatten_jacobian(
+                    jacrev(call_batch)(parameters), rows
+                ).to(torch.float64)
+                r_block = target[
+                    start * out_per_sample: stop * out_per_sample
+                ].to(torch.float64)
+                contribution = block.t() @ r_block
+                b_acc = contribution if b_acc is None else b_acc + contribution
+                r_sq += float((r_block * r_block).sum())
+                stacked = block if r_factor is None else torch.cat(
+                    [r_factor, block], dim=0
+                )
+                r_factor = torch.linalg.qr(stacked, mode="reduced").R
+                del block, r_block, stacked
+                _clear_inaccessible_tensor_caches(model)
+            jacobian_matrix, target = _stream_gram_surrogate(
+                r_factor, b_acc, r_sq, target.dtype
+            )
+        elif chunk > 0 and chunk < output_numel:
             blocks = []
             for start in range(0, output_numel, chunk):
                 stop = min(start + chunk, output_numel)
@@ -1596,6 +1808,11 @@ def _compute_exact_tangent_projection_step(
         target=target,
         damping=config.projection_damping,
         solver=config.projection_solver,
+        work_dtype=(
+            torch.float32
+            if getattr(config, "projection_fast_factorization", False)
+            else torch.float64
+        ),
     )
     if not torch.isfinite(flat_update).all() or not torch.isfinite(approximation).all():
         raise RuntimeError("Non-finite FGD tangent projection update detected.")

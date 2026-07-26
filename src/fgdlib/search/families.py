@@ -97,13 +97,61 @@ def certify_parametric_step(
         clone = copy.deepcopy(model)
         clone.train()
         optimizer = torch.optim.AdamW(clone.parameters(), lr=inner_learning_rate)
-        for _ in range(max(1, inner_steps)):
+
+        # Optional plateau early stop: cut the wasted tail once the clone's
+        # alignment with the residual stops improving. Conservative (only true
+        # plateaus), so the accepted/rejected step is the one full training
+        # would give. Off by default -> the loop below is the plain full run.
+        plateau_stop = bool(getattr(config, "certify_family_plateau_stop", False))
+        n_inner = max(1, inner_steps)
+        residual_norm_inner = float(torch.linalg.vector_norm(r))
+        if plateau_stop:
+            plateau_tol = float(getattr(config, "certify_family_plateau_tol", 0.002))
+            check_every = max(1, n_inner // 20)
+            patience = 3
+            # cos(Delta, r) > target_cos is exactly RelErr < 1/2 (certification).
+            # We ONLY cut a clone that has plateaued STILL BELOW this -- a doomed
+            # attempt that would fail anyway. A clone climbing toward/past
+            # target_cos is never cut, so a SUCCESSFUL step trains to full
+            # alignment exactly as before (same accepted step, same result). The
+            # speedup comes entirely from the doomed attempts, which dominate the
+            # cost on a hard task where the family rarely certifies.
+            target_cos = math.sqrt(max(0.0, 1.0 - threshold**2))
+
+            def _clone_cosine() -> float:
+                clone.eval()
+                with torch.no_grad():
+                    delta = (f0 - clone(x).detach())
+                clone.train()
+                delta_norm = float(torch.linalg.vector_norm(delta))
+                if not (delta_norm > 0.0 and residual_norm_inner > 0.0):
+                    return -1.0
+                return float(
+                    torch.sum(delta * r) / (delta_norm * residual_norm_inner)
+                )
+
+            best_cosine = -2.0
+            stale_checks = 0
+
+        for step in range(n_inner):
             optimizer.zero_grad()
             loss = ((clone(x) - target) ** 2).sum()
             if not torch.isfinite(loss):
                 return ParametricFamilyResult(float("inf"), 0.0, False, None)
             loss.backward()
             optimizer.step()
+            if plateau_stop and (step + 1) % check_every == 0:
+                current_cosine = _clone_cosine()
+                if current_cosine > best_cosine + plateau_tol:
+                    best_cosine = current_cosine
+                    stale_checks = 0
+                else:
+                    stale_checks += 1
+                # Cut ONLY a DOOMED clone: plateaued AND still below the
+                # certification target. A certified (or still-climbing) clone
+                # keeps training to its best alignment, unchanged.
+                if stale_checks >= patience and best_cosine < target_cos:
+                    break
 
         clone.eval()
         with torch.no_grad():

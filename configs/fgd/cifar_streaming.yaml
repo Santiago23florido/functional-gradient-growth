@@ -1,3 +1,9 @@
+# CIFAR-10 (grayscale) with the BASE eps-strict method
+# (grow-to-certify + tangent + certify_family_ladder, RelErr<1/2), using
+# ALL the data via the STREAMED Gram (certify_stream_gram): O(P^2) memory,
+# never materialises the NK x P Jacobian -> cannot exhaust RAM. Exact.
+# Slow (~minutes/epoch: an exact all-data certificate is O(NK*P)); the
+# certify_family_plateau_stop cheapens the family clone. wandb online.
 # Grow-to-certify on the SMALLEST honest instance of the task.
 #
 # Same method, same exactness, sized so a step costs seconds: the point is
@@ -30,22 +36,18 @@ run:
   show_plot: false
 
 data:
-  kind: smooth_sin
-  in_features: 4
-  out_features: 1
-  train_batches: 16
-  validation_batches: 16
-  test_batches: 128
+  kind: cifar10
+  in_features: 1024
+  out_features: 10
+  data_dir:
   batch_size: 64
   train_seed: 0
   validation_seed: 2
   test_seed: 1
-  active_features: 3
-  frequency: 1.5
-  phase_shift: 0.5
-  interaction_strength: 0.25
-  linear_strength: 0.1
-
+  cifar_grayscale: true
+  cifar_train_samples: 10000
+  cifar_validation_samples: 2000
+  cifar_test_samples: 2000
 model:
   hidden_size: 2
   number_hidden_layers: 3
@@ -53,7 +55,7 @@ model:
 
 training:
   method: fgd_approx
-  epochs: 25
+  epochs: 40
   accuracy_tolerance: 0.1
   gradient_clip_norm:
   log_every: 1
@@ -130,7 +132,9 @@ fgd_approx:
   # exactly when no residual is left on the probe to approximate. With the
   # full set there is no sampling at all and the certificate is a statement
   # about the training loss itself, which is what the theory is about.
-  probe_batches: 16
+  certify_stream_gram: true
+  certify_stream_chunk: 1024
+  probe_batches: 157
   # Assemble that Jacobian in row-blocks. jacrev vmaps one backward pass per
   # output row and holds the batched activations for all of them at once, so
   # its peak scales with (rows) x (activations), not with J. MEASURED: the
@@ -279,10 +283,11 @@ fgd_approx:
   certify_family_inner_steps: 400
   certify_family_inner_learning_rate: 0.01
   certify_family_functional_lr: 1.0
+  certify_family_plateau_stop: true
   certify_realize_max_iterations: 40
   certify_realize_tolerance: 0.05
   tangent_measured_descent: false
-  growth_selection: unified_expansion
+  growth_selection: grow_all_width
   # Generalised R1: eps < 1/2 is Lemma 3.5 step-admissibility, not structural
   # adequacy. Before stopping, check whether growing the bottleneck reaches a
   # strictly lower eps than training longer would (both clones trained the
@@ -332,7 +337,7 @@ fgd_approx:
   #   * certify_function_preserving (below) drives the grow-to-certify loop.
   #   * growth_function_preserving (this flag) drives the standard growth path.
   # The certified method's ACTIVE growth -- grow-to-certify and the unified /
-  # rank-cap expansion (growth_selection: unified_expansion) -- is
+  # rank-cap expansion (growth_selection: grow_all_width) -- is
   # function-preserving BY DESIGN (the theory needs f unchanged so the
   # certified steps do all the descent), and the unified path enforces that
   # regardless of this flag. This flag only affects the LEGACY SENN / uniform /

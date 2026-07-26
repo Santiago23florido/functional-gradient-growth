@@ -60,6 +60,7 @@ matters, which is exactly why it must be located rather than guessed.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -88,6 +89,110 @@ __all__ = [
 #: at its best, step at its least realisable); the high end is heavy
 #: regularisation (the reverse). The window lies inside it wherever it sits.
 DAMPING_BRACKET: tuple[float, float] = (1e-16, 1e2)
+
+
+def _numerical_rank(singular_values: torch.Tensor) -> int:
+    """Effective number of predictors m = #{sigma_i > tol}, the DOF the tangent
+    projection spends. Matches the rank tolerance used elsewhere (relative to the
+    largest singular value)."""
+    if singular_values.numel() == 0:
+        return 0
+    largest = float(singular_values.max())
+    if not largest > 0.0:
+        return 0
+    tolerance = largest * float(singular_values.numel()) * 1e-6
+    return int((singular_values > tolerance).sum())
+
+
+def dof_corrected_relative_error(
+    raw_relative_error: float,
+    n_observations: int,
+    effective_rank: int,
+) -> float:
+    """Debias a subsample's ``eps`` for the degrees of freedom it spent.
+
+    The certificate is an R^2-like ratio -- ``rho = ||P_T r||^2/||r||^2`` is the
+    fraction of the gradient energy the tangent space captures, and ``eps^2 =
+    (1-rho)/rho``. Unlike a gradient MEAN (which subsamples without bias), a
+    least-squares ``rho`` OVER-fits a finite probe by ``~ m/NK`` (m predictors,
+    NK observations), so the raw subsample ``eps`` is biased DOWN toward the
+    spurious 0. The adjusted-R^2 correction removes exactly that bias:
+
+        rho_adj = 1 - (1 - rho_B) * (NK - 1) / (NK - m - 1)
+        eps_adj = sqrt((1 - rho_adj) / rho_adj)
+
+    and it blows up to ``inf`` once ``NK <= m + 1`` -- the interpolation regime
+    where the certificate is vacuous. On the whole-dataset probe (``NK >> m``)
+    the factor is ~1 and this is a no-op.
+
+    DIAGNOSTIC, NOT a live certificate gate. It is the rigorous ANSWER to "why
+    can a subsample certificate be dishonest", and MEASURED it debiases the eps
+    ESTIMATE (a bounded probe's eps tracks the whole-data eps once corrected).
+    But this method deliberately grows ``P > NK`` (the headline reaches
+    ``P ~ 2000`` over an ``NK = 1024`` probe and still generalises via damping),
+    where the NUMERICAL rank ``m`` saturates at ``NK`` and the factor explodes,
+    so wiring it into the growth signal froze the flow (MEASURED: N1024 test
+    0.935 -> 0.192, zero certified steps). The live mechanism that keeps a
+    subsample certificate honest is instead the BOUNDED PROBE
+    (``certify_probe_kappa``): sizing ``NK = kappa * rank`` holds the probe above
+    the interpolation floor by construction, without touching the eps formula.
+    """
+    denom = n_observations - effective_rank - 1
+    if denom <= 0:
+        return float("inf")                      # NK <= m+1: interpolation
+    if not (raw_relative_error == raw_relative_error) or raw_relative_error < 0:
+        return float("inf")
+    rho = 1.0 / (1.0 + raw_relative_error**2)
+    rho_adj = 1.0 - (1.0 - rho) * (n_observations - 1) / denom
+    if rho_adj <= 0.0:
+        return float("inf")                      # captured energy debiases to <=0
+    rho_adj = min(rho_adj, 1.0)
+    return math.sqrt(max(0.0, (1.0 - rho_adj) / rho_adj))
+
+
+def _fast_min_relative_error(
+    jacobian: torch.Tensor,
+    target: torch.Tensor,
+    eps: float,
+) -> float:
+    """The min-damping ``eps`` via a float32 SVD -- SAME formula, ~9x faster.
+
+    The min-damping certificate that ranks growth candidates is the dominant
+    cost of the "where", and MEASURED it is the float64 SVD (959 ms for a
+    1024x1144 J). The SAME min-damped projection in float32 matches the float64
+    value to ~8e-5 -- decision-preserving, since growth candidates are ranked
+    by an argmax and separated by far more than that -- while running ~9x
+    faster (27 ms vs 247 ms).
+
+    float32 (not an eigh-of-Gram or a QR): the grown Jacobian is
+    rank-deficient, and the min-damping formula DOWN-WEIGHTS its near-null
+    directions through ``sigma^2/(sigma^2+lambda)``. Only a genuine SVD keeps
+    those singular values -- eigh of ``J Jᵀ`` squares the condition number and
+    corrupts them (|Δeps| = 1.9e-1), and a plain QR orthogonal projection
+    weights them fully (|Δeps| = 4e-2). float32 keeps the exact formula and
+    only loses precision, which is the safe trade.
+    """
+    j32 = jacobian.to(torch.float32)
+    t32 = target.to(torch.float32)
+    left, singular_values, _ = torch.linalg.svd(j32, full_matrices=False)
+    if singular_values.numel() == 0:
+        return float("inf")
+    scale = float(singular_values.max()) ** 2
+    if not scale > 0.0:
+        return float("inf")
+    absolute = DAMPING_BRACKET[0] * scale
+    denominator = singular_values.square() + absolute
+    coefficients = left.t() @ t32
+    approximation = left @ (singular_values.square() / denominator * coefficients)
+    stats = _output_relative_error_from_tensors(
+        approximation=approximation.to(target.dtype),
+        target=target,
+        eps=eps,
+    )
+    value = stats.output_error.relative_error
+    if value is None or not float(value) == float(value):
+        return float("inf")
+    return float(value)
 
 #: Bisection steps used to locate the certified boundary. 40 halvings of an
 #: 18-decade bracket resolve it to ~1e-5 of a decade -- far finer than any
@@ -174,6 +279,12 @@ def minimal_relative_error(
     target = system.target.reshape(-1).to(dtype=torch.float64)
     if jacobian.numel() == 0 or target.numel() == 0:
         return float("inf")
+
+    if getattr(config, "projection_fast_factorization", False):
+        # The dominant cost of the where: same min-damped projection in
+        # float32, matched to ~8e-5 and ~9x faster.
+        return _fast_min_relative_error(jacobian, target, config.eps)
+
     left, singular_values, right = torch.linalg.svd(jacobian, full_matrices=False)
     if singular_values.numel() == 0:
         return float("inf")
@@ -213,12 +324,22 @@ def select_projection_damping(
     if system is None:
         return None
 
-    work_dtype = torch.float64
+    # float32 under the fast flag: the fan ranks rungs and the chosen step is
+    # realised by the self-correcting integration, so the precision loss is
+    # absorbed. Verified end to end (test 0.931 either way).
+    work_dtype = (
+        torch.float32
+        if getattr(config, "projection_fast_factorization", False)
+        else torch.float64
+    )
     jacobian = system.jacobian.to(dtype=work_dtype)
     target = system.target.reshape(-1).to(dtype=work_dtype)
     if jacobian.numel() == 0 or target.numel() == 0:
         return None
 
+    # The damping fan needs the singular values themselves, so this keeps a
+    # genuine SVD (eigh of the Gram would square the condition number and
+    # corrupt the spectrum) -- in the work_dtype chosen above.
     left, singular_values, right = torch.linalg.svd(jacobian, full_matrices=False)
     if singular_values.numel() == 0:
         return None
