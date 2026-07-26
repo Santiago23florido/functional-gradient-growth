@@ -325,6 +325,11 @@ class FGDApproxConfig:
     # the families and every config value are untouched; only HOW the exact
     # system is assembled changes. Off by default (the full Jacobian is built).
     certify_stream_gram: bool = False
+    # SAMPLES per streaming batch. Each batch is forwarded once and its
+    # Jacobian block accumulated into G; smaller batches cap the transient
+    # jacrev memory, larger ones cut Python/jacrev overhead. Memory stays O(P^2)
+    # regardless. 0 means the whole probe in one batch. Only the streaming path.
+    certify_stream_chunk: int = 1024
     # WHICH admissible g inside the tangent space to use. Lemma 3.5 fixes only
     # RelErr(g, r) <= 1/2 and says nothing about which g in T = range(J) to
     # take; that freedom is ours, and how it is resolved decides whether the
@@ -1721,29 +1726,40 @@ def _compute_exact_tangent_projection_step(
     stream_gram = bool(getattr(config, "certify_stream_gram", False))
     try:
         if stream_gram:
-            # STREAMING: accumulate the incremental-QR factor R (P x P),
-            # b = J^T r and ||r||^2 over row chunks -- freeing each chunk -- so
-            # the full NK x P Jacobian is never held. Then hand the downstream a
-            # tiny surrogate ((rank+1) x P) reproducing the exact spectrum and
+            # STREAMING over SAMPLES: accumulate the incremental-QR factor R
+            # (P x P), b = J^T r and ||r||^2 batch by batch -- each sample
+            # forwarded EXACTLY ONCE (chunking output rows instead recomputes the
+            # whole forward per chunk, the dominant cost) -- freeing each block,
+            # so the full NK x P Jacobian is never held. The downstream then gets
+            # a tiny surrogate ((rank+1) x P) reproducing the exact spectrum and
             # projection. Memory O(P^2), exact (1.8e-12 vs full float64).
-            step = chunk if (0 < chunk < output_numel) else output_numel
+            n_samples = int(x.shape[0])
+            out_per_sample = output_numel // max(n_samples, 1)
+            sample_chunk = int(getattr(config, "certify_stream_chunk", 0) or 0)
+            if sample_chunk <= 0:
+                sample_chunk = n_samples
             r_factor = None
             b_acc: torch.Tensor | None = None
             r_sq = 0.0
-            for start in range(0, output_numel, step):
-                stop = min(start + step, output_numel)
+            for start in range(0, n_samples, sample_chunk):
+                stop = min(start + sample_chunk, n_samples)
+                x_batch = x[start:stop]
 
-                def call_rows(
+                def call_batch(
                     parameter_values: tuple[torch.Tensor, ...],
-                    _start: int = start,
-                    _stop: int = stop,
+                    _xb: torch.Tensor = x_batch,
                 ) -> torch.Tensor:
-                    return call_with_parameters(parameter_values)[_start:_stop]
+                    state = OrderedDict(zip(parameter_names, parameter_values))
+                    state.update(buffers)
+                    return functional_call(model, state, (_xb,)).reshape(-1)
 
+                rows = (stop - start) * out_per_sample
                 block = _flatten_jacobian(
-                    jacrev(call_rows)(parameters), stop - start
+                    jacrev(call_batch)(parameters), rows
                 ).to(torch.float64)
-                r_block = target[start:stop].to(torch.float64)
+                r_block = target[
+                    start * out_per_sample: stop * out_per_sample
+                ].to(torch.float64)
                 contribution = block.t() @ r_block
                 b_acc = contribution if b_acc is None else b_acc + contribution
                 r_sq += float((r_block * r_block).sum())
