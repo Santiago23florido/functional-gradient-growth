@@ -88,3 +88,9 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=src python -m pytest tests/ -q
 | `src/fgdlib/search/realize.py` | realises the certified functional step as an integrated path |
 | `src/fgdlib/search/linearization.py` | enforces Lemma 3.5's hypothesis (the step *is* the function-space step) |
 | `src/stable_tiny/pipeline.py` | the training pipeline wiring all of the above |
+
+## License
+
+Copyright (c) 2026 Santiago Florido Gomez.
+
+This project is licensed under the [MIT License](LICENSE).
