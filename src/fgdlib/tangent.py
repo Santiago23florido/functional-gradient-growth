@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import copy
 import math
+import os
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Callable, Literal
 
 from fgdlib.gromo_setup import ensure_gromo_importable
-from fgdlib.profile import increment, set_max, set_value, timed
+from fgdlib.profile import fallback, increment, set_max, set_value, timed
 from fgdlib.search.growth import ScalingLineSearchConfig, grow_layer
 from fgdlib.training_utils.loop import RegressionMetrics, evaluate_regression_metrics
 
@@ -20,6 +21,7 @@ import torch
 from torch.func import functional_call, jacrev, jvp
 
 from gromo.containers.growing_mlp import GrowingMLP
+from gromo.modules.linear_growing_module import LinearGrowingModule
 from gromo.utils.training_utils import compute_statistics
 
 
@@ -1664,6 +1666,732 @@ def validate_exact_tangent_system(
         raise ValueError("ExactTangentSystem model evaluation state changed.")
 
 
+TangentBackend = Literal["legacy", "optimized", "auto"]
+_TANGENT_BACKENDS: tuple[TangentBackend, ...] = ("legacy", "optimized", "auto")
+
+
+def tangent_backend() -> TangentBackend:
+    """Read FGD_TANGENT_BACKEND per call so tests can monkeypatch it.
+
+    legacy    - today's path, bit-for-bit in every decision this module
+                makes. DEFAULT while the optimized backend is validated
+                (see NOTE below) -- flipping the default is a separate,
+                later commit, not this one.
+    auto      - the optimized construction (jacobian, QR, surrogate) with
+                automatic, COUNTED, REASONED fallback to legacy whenever a
+                structural predicate or a numerical check fails. Never
+                raises for a reason the fallback machinery already covers.
+    optimized - same as auto but RAISES instead of silently falling back,
+                so a test (or a benchmark) can PROVE the fast path
+                actually ran rather than having quietly degraded.
+
+    NOTE: an unset FGD_TANGENT_BACKEND resolves to "legacy". This
+    intentionally overrides an earlier planning suggestion of defaulting
+    to "auto": until every acceptance gate for this phase has passed,
+    every existing configuration keeps running the exact path it runs
+    today. Flipping the default is a separate, later commit.
+    """
+    value = os.environ.get("FGD_TANGENT_BACKEND", "legacy")
+    if value not in _TANGENT_BACKENDS:
+        raise ValueError(
+            f"Unsupported FGD_TANGENT_BACKEND '{value}'. "
+            f"Use one of: {', '.join(_TANGENT_BACKENDS)}."
+        )
+    return value  # type: ignore[return-value]
+
+
+def _tangent_verify_enabled() -> bool:
+    """FGD_TANGENT_VERIFY=1: off-by-default oracle cross-checks (C.2/C.3).
+
+    Recomputes the legacy CUDA/CPU-SVD surrogate alongside the optimized
+    result purely to compare them -- real per-call cost, never enabled in
+    production, only for CI/tests proving the fast path is exact.
+    """
+    return os.environ.get("FGD_TANGENT_VERIFY", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+@dataclass(frozen=True)
+class AnalyticMLPStructure:
+    """Everything the batched analytic Jacobian (below) needs, resolved ONCE
+    per outer step rather than re-derived from the model on every sample
+    chunk. ``linears``/``post_functions``/``use_bias`` are ordered exactly
+    like ``model.layers``; ``parameter_names`` is the expected
+    ``_trainable_named_parameters`` order the column layout matches.
+    """
+
+    linears: tuple[torch.nn.Linear, ...]
+    post_functions: tuple[torch.nn.Module, ...]
+    use_bias: tuple[bool, ...]
+    parameter_names: tuple[str, ...]
+    parameter_numel: int
+    output_features: int
+
+
+# P12.1: activations the analytic D_l recursion is derived for -- all
+# pointwise, stateless maps. Deliberately excludes BatchNorm/LayerNorm/
+# Softmax (regularized_mlp.make_hidden_post_function), which couple across
+# the batch or feature dimension and would silently break the "D_l depends
+# only on z_l[n, :]" assumption C.1 relies on.
+_ANALYTIC_ACTIVATION_TYPES = (
+    torch.nn.Identity,
+    torch.nn.SELU,
+    torch.nn.ReLU,
+    torch.nn.LeakyReLU,
+    torch.nn.ELU,
+    torch.nn.GELU,
+    torch.nn.SiLU,
+    torch.nn.Tanh,
+    torch.nn.Sigmoid,
+    torch.nn.Softplus,
+)
+
+
+def _activation_type_allowed(phi: torch.nn.Module) -> bool:
+    """P12.1: type allow-list, recursing into nn.Sequential children."""
+    if isinstance(phi, torch.nn.Sequential):
+        return len(phi) > 0 and all(_activation_type_allowed(child) for child in phi)
+    return isinstance(phi, _ANALYTIC_ACTIVATION_TYPES)
+
+
+def _activation_is_stateless(phi: torch.nn.Module) -> bool:
+    """P12.2: nothing but the pointwise map -- no learned or running state."""
+    return next(phi.parameters(), None) is None and next(phi.buffers(), None) is None
+
+
+def _activation_preserves_shape(
+    phi: torch.nn.Module, width: int, device: torch.device, dtype: torch.dtype
+) -> bool:
+    """P12.4: phi(z) has the same shape as z."""
+    with torch.no_grad():
+        probe = torch.randn(4, width, device=device, dtype=dtype)
+        return phi(probe).shape == probe.shape
+
+
+def _activation_has_no_coupling(
+    phi: torch.nn.Module, width: int, device: torch.device, dtype: torch.dtype
+) -> bool:
+    """P12.3: numeric no-coupling probe (TANGENT_PLAN.md A.4).
+
+    ``phi`` must act ENTRYWISE: build ``mixed`` equal to a fresh random
+    ``u`` everywhere except at (row 0, column j), where it holds ``t``'s
+    value; the output at (0, j) must then depend on nothing else, so it
+    must equal ``phi(t)``'s output at (0, j) BITWISE. This is the actual
+    behavioural guarantee the analytic ``D_l`` recursion relies on -- the
+    type allow-list above already excludes BatchNorm/LayerNorm/Softmax, but
+    this probe is what would catch a future stateless-looking activation
+    that still couples across the batch or feature dimension.
+    """
+    with torch.no_grad():
+        t = torch.randn(4, width, device=device, dtype=dtype)
+        full = phi(t)
+        u = torch.randn(4, width, device=device, dtype=dtype)
+        for j in range(min(width, 4)):
+            mixed = u.clone()
+            mixed[0, j] = t[0, j]
+            probed = phi(mixed)
+            if not torch.equal(full[0, j], probed[0, j]):
+                return False
+    return True
+
+
+def _activation_rejection_reason(
+    phi: torch.nn.Module, width: int, device: torch.device, dtype: torch.dtype
+) -> str | None:
+    """P12: the specific reason ``phi`` is unsupported, or None if it qualifies."""
+    if not _activation_type_allowed(phi):
+        return "activation_type_not_allowlisted"
+    if not _activation_is_stateless(phi):
+        return "activation_has_parameters_or_buffers"
+    if not _activation_preserves_shape(phi, width, device, dtype):
+        return "activation_changes_shape"
+    if not _activation_has_no_coupling(phi, width, device, dtype):
+        return "activation_has_cross_entry_coupling"
+    return None
+
+
+def _supported_analytic_structure(
+    model: torch.nn.Module, x: torch.Tensor
+) -> AnalyticMLPStructure | None:
+    """Return the structure when P1-P14 all hold, else None (reason recorded).
+
+    Every predicate is a NECESSARY condition for the batched analytic
+    Jacobian (C.1) to equal ``_flatten_jacobian(jacrev(...))`` exactly --
+    see TANGENT_PLAN.md section A.4. A failing predicate always records a
+    DISTINCT, counted reason via ``fallback`` before returning ``None``:
+    the fast path never disappears silently.
+    """
+    # P1: a gromo sequential MLP, at least one layer.
+    if not (
+        isinstance(model, GrowingMLP)
+        and isinstance(model.layers, torch.nn.ModuleList)
+        and len(model.layers) >= 1
+    ):
+        fallback(
+            "tangent_unsupported_structure_fallbacks",
+            "not_a_growing_mlp_sequential_container",
+        )
+        return None
+    layers = list(model.layers)
+
+    # P2: every layer is a LinearGrowingModule (rules out conv/attention
+    # containers this analytic form was never derived for).
+    if not all(isinstance(layer, LinearGrowingModule) for layer in layers):
+        fallback(
+            "tangent_unsupported_structure_fallbacks",
+            "layer_not_linear_growing_module",
+        )
+        return None
+
+    # P3: the inner layer is a PLAIN nn.Linear -- exact type, not a
+    # subclass, since a subclass could override forward with extra math
+    # the analytic formulas below know nothing about.
+    if not all(type(layer.layer) is torch.nn.Linear for layer in layers):
+        fallback(
+            "tangent_unsupported_structure_fallbacks",
+            "inner_layer_not_plain_linear",
+        )
+        return None
+
+    # P4: no degenerate fan-in/out -- LinearGrowingModule's safe-forward
+    # short-circuits to zeros when in_features == 0, which the analytic
+    # forward below does not special-case.
+    if not all(
+        layer.layer.in_features > 0 and layer.layer.out_features > 0 for layer in layers
+    ):
+        fallback("tangent_unsupported_structure_fallbacks", "degenerate_fan_in_or_out")
+        return None
+
+    # P5: the bias flag and the actual nn.Linear.bias agree, so use_bias
+    # can be trusted to decide the column layout below.
+    if not all(layer.use_bias == (layer.layer.bias is not None) for layer in layers):
+        fallback("tangent_unsupported_structure_fallbacks", "bias_flag_inconsistent")
+        return None
+
+    # P6: flatten is a no-op (already 2-D) or exactly the batch-preserving
+    # nn.Flatten(start_dim=1, end_dim=-1) gromo builds -- either is the
+    # plain reshape(x.shape[0], -1) the analytic forward applies.
+    flatten = model.flatten
+    flatten_ok = isinstance(flatten, torch.nn.Identity) or (
+        isinstance(flatten, torch.nn.Flatten)
+        and flatten.start_dim == 1
+        and flatten.end_dim == -1
+    )
+    if not flatten_ok:
+        fallback(
+            "tangent_unsupported_structure_fallbacks", "flatten_not_batch_preserving"
+        )
+        return None
+
+    # P7: no pending growth extension -- a mid-growth layer's forward adds
+    # extended_input_layer / extended_output_layer / optimal_delta_layer
+    # terms the analytic form does not know how to differentiate.
+    if not all(
+        layer.extended_input_layer is None
+        and layer.extended_output_layer is None
+        and layer.optimal_delta_layer is None
+        for layer in layers
+    ):
+        fallback(
+            "tangent_unsupported_structure_fallbacks", "pending_growth_extension_state"
+        )
+        return None
+
+    # P8: forward has no caching side effects -- store_input/
+    # store_pre_activity (and their internal counterparts) mutate module
+    # state on every call, which the analytic path, calling nn.Linear
+    # directly, would silently skip, leaving the two paths' model state to
+    # diverge.
+    if not all(
+        not layer.store_input
+        and not layer.store_pre_activity
+        and not layer._internal_store_input
+        and not layer._internal_store_pre_activity
+        for layer in layers
+    ):
+        fallback(
+            "tangent_unsupported_structure_fallbacks",
+            "forward_has_caching_side_effects",
+        )
+        return None
+
+    # P9: the trainable parameter set is EXACTLY (weight, bias) per layer,
+    # ascending, matching the column layout the analytic block writes into.
+    trainable = _trainable_named_parameters(model)
+    expected_names: list[str] = []
+    for index, layer in enumerate(layers):
+        expected_names.append(f"layers.{index}.layer.weight")
+        if layer.use_bias:
+            expected_names.append(f"layers.{index}.layer.bias")
+    if tuple(trainable) != tuple(expected_names) or len(
+        list(model.parameters())
+    ) != len(trainable):
+        fallback(
+            "tangent_unsupported_structure_fallbacks",
+            "unexpected_trainable_parameter_set",
+        )
+        return None
+
+    # P10: no buffers to thread through functional_call.
+    if next(model.named_buffers(), None) is not None:
+        fallback("tangent_unsupported_structure_fallbacks", "model_has_buffers")
+        return None
+
+    # P11: eval mode (dropout identity, batch-norm frozen -- moot here
+    # since P1/P2 already exclude batch-norm, but cheap and explicit).
+    if model.training is not False:
+        fallback("tangent_unsupported_structure_fallbacks", "model_not_in_eval_mode")
+        return None
+
+    # P12: every activation is pointwise and stateless. Memoised per
+    # (post_layer_function identity, width) within this call, since gromo's
+    # activation argument defaults to ONE shared nn.Module instance across
+    # every hidden layer (TANGENT_PLAN.md A.1) -- probing it once avoids
+    # repeating the numeric probe per layer for no new information.
+    first_weight = layers[0].layer.weight
+    probe_device = first_weight.device
+    probe_dtype = first_weight.dtype
+    verified_activations: dict[tuple[int, int], str | None] = {}
+    for layer in layers:
+        phi = layer.post_layer_function
+        width = layer.layer.out_features
+        key = (id(phi), width)
+        if key not in verified_activations:
+            verified_activations[key] = _activation_rejection_reason(
+                phi, width, probe_device, probe_dtype
+            )
+        reason = verified_activations[key]
+        if reason is not None:
+            fallback("tangent_unsupported_structure_fallbacks", reason)
+            return None
+
+    # P13: the flattened probe is 2-D and matches the first layer's
+    # dtype/device -- the analytic forward assumes both.
+    probe = x[: min(4, x.shape[0])]
+    with torch.no_grad():
+        flattened_probe = flatten(probe)
+    if flattened_probe.ndim != 2:
+        fallback("tangent_unsupported_structure_fallbacks", "flatten_not_2d")
+        return None
+    if flattened_probe.dtype != probe_dtype or flattened_probe.device != probe_device:
+        fallback(
+            "tangent_unsupported_structure_fallbacks",
+            "probe_dtype_or_device_mismatch",
+        )
+        return None
+
+    # P14: the model maps (N, ...) -> (N, K) -- a 2-D, row-aligned output,
+    # matching the "row n*K+k" layout the analytic block writes.
+    with torch.no_grad():
+        probe_output = model(probe)
+    if probe_output.ndim != 2 or probe_output.shape[0] != probe.shape[0]:
+        fallback("tangent_unsupported_structure_fallbacks", "output_not_2d_row_aligned")
+        return None
+
+    return AnalyticMLPStructure(
+        linears=tuple(layer.layer for layer in layers),
+        post_functions=tuple(layer.post_layer_function for layer in layers),
+        use_bias=tuple(layer.use_bias for layer in layers),
+        parameter_names=tuple(expected_names),
+        parameter_numel=sum(parameter.numel() for parameter in trainable.values()),
+        output_features=layers[-1].layer.out_features,
+    )
+
+
+def _analytic_jacobian_block(
+    structure: AnalyticMLPStructure,
+    x_block: torch.Tensor,
+    out_dtype: torch.dtype = torch.float64,
+) -> torch.Tensor:
+    """Rows n*K+k, columns in _trainable_named_parameters order. Section C.1.
+
+    Replaces ``jacrev`` + ``_flatten_jacobian`` + ``.to(float64)`` with the
+    closed-form MLP Jacobian: downstream sensitivities ``D_l`` propagate
+    backward from the identity at the last layer, activation derivatives
+    come from ``torch.autograd.grad`` on the REAL module (never hard-coded,
+    so e.g. SELU's boundary convention at ``z == 0`` matches jacrev by
+    construction), and the outer product ``D_l (x) A_l`` is written
+    directly into the preallocated output slice.
+
+    Precision rule: forward / D / gprime run in the model's OWN dtype,
+    mirroring jacrev bit-for-bit; only the final outer product is formed in
+    ``out_dtype`` (float64) from upcast factors -- strictly more accurate
+    than legacy (which multiplies in float32 THEN casts) and fuses the
+    ``.to(float64)`` cast for free.
+    """
+    linears = structure.linears
+    depth = len(linears)
+
+    with torch.no_grad():
+        a = x_block.reshape(x_block.shape[0], -1)
+        activations: list[torch.Tensor] = [a]
+        pre_activations: list[torch.Tensor] = []
+        for layer, phi in zip(linears, structure.post_functions):
+            z = layer(a)
+            pre_activations.append(z)
+            a = phi(z)
+            activations.append(a)
+
+    # Activation derivatives from autograd on the REAL module -- never
+    # hard-coded. Each is a tiny, independent graph (one tensor in, one
+    # tensor out), not the whole-network backward jacrev would build.
+    gprimes: list[torch.Tensor] = []
+    for z, phi in zip(pre_activations, structure.post_functions):
+        z_ = z.detach().requires_grad_(True)
+        a_ = phi(z_)
+        (gprime,) = torch.autograd.grad(a_, z_, torch.ones_like(a_))
+        gprimes.append(gprime.detach())
+
+    n = x_block.shape[0]
+    k = structure.output_features
+    with torch.no_grad():
+        eye_k = torch.eye(k, device=x_block.device, dtype=x_block.dtype)
+        d_list: list[torch.Tensor] = [torch.empty(0)] * depth
+        d_list[depth - 1] = eye_k.expand(n, k, k) * gprimes[-1].unsqueeze(1)
+        for layer_index in range(depth - 2, -1, -1):
+            d_list[layer_index] = (
+                d_list[layer_index + 1] @ linears[layer_index + 1].weight
+            ) * gprimes[layer_index].unsqueeze(1)
+
+        out = torch.empty(
+            n * k, structure.parameter_numel, device=x_block.device, dtype=out_dtype
+        )
+        off = 0
+        for layer_index in range(depth):
+            d64 = d_list[layer_index].to(out_dtype)
+            a64 = activations[layer_index].to(out_dtype)
+            out_features = linears[layer_index].out_features
+            in_features = linears[layer_index].in_features
+            width = out_features * in_features
+            out[:, off : off + width] = (
+                d64.unsqueeze(3) * a64.unsqueeze(1).unsqueeze(2)
+            ).reshape(n * k, width)
+            off += width
+            if structure.use_bias[layer_index]:
+                out[:, off : off + out_features] = d64.reshape(n * k, out_features)
+                off += out_features
+        assert off == structure.parameter_numel
+    return out
+
+
+def _tangent_spectrum(r_factor: torch.Tensor) -> torch.Tensor:
+    """Singular values of the streamed factor R, via CPU LAPACK.
+
+    ``R`` (P x P, upper triangular) satisfies ``R^T R = J^T J`` exactly, so
+    its singular values ARE the singular values of the full streamed
+    Jacobian ``J`` -- ``svdvals(R)`` is not an approximation, just a
+    smaller and better-conditioned input to the same exact algorithm. CPU,
+    because cuSOLVER's default float64 SVD driver is catastrophic at this
+    size (MEASURED 25.7 s CUDA vs 1.43 s CPU ``svdvals``, TANGENT_PLAN.md
+    C.4); the guard below retries on CUDA with the exact QR-based 'gesvd'
+    driver ONLY if CPU LAPACK itself errors -- never to paper over a
+    genuine inconsistency caught by the checks that follow.
+
+    Three cheap, exact sanity checks accompany the spectrum:
+
+    1. Frobenius identity ``sum(sigma_i^2) == ||R||_F^2`` -- an algebraic
+       identity, true regardless of conditioning, MEASURED to agree to the
+       last bit. A relative violation above 1e-12 means the returned
+       spectrum cannot be trusted at all, so this RAISES (there is no
+       narrower fallback for "the spectrum itself is wrong").
+    2/3. Power / inverse-power iteration corroborate sigma_max / sigma_min
+       independently of LAPACK. These are diagnostics, NOT gates: on a
+       genuinely ill-conditioned R (MEASURED cond(J) = 5.9e14 on realistic
+       input, TANGENT_PLAN.md C.0) the smallest singular value can sit too
+       close to the iteration's noise floor for 50 steps to bracket it to
+       5%, which is an expected property of a hard problem, not evidence
+       LAPACK is wrong -- so a miss here is recorded via ``fallback`` and
+       NOT raised, unlike the Frobenius identity above.
+    """
+    p_dim = r_factor.shape[-1]
+    r_cpu = r_factor.detach().to(device="cpu", dtype=torch.float64)
+    try:
+        sigma = torch.linalg.svdvals(r_cpu)
+    except torch.linalg.LinAlgError:
+        fallback("tangent_spectrum_fallbacks", "cpu_lapack_error")
+        try:
+            sigma = torch.linalg.svdvals(
+                r_factor.detach().to(dtype=torch.float64), driver="gesvd"
+            )
+        except torch.linalg.LinAlgError as retry_error:
+            raise RuntimeError(
+                "torch.linalg.svdvals failed on both the CPU default "
+                "driver and the CUDA 'gesvd' driver for the streamed "
+                "tangent factor R; cannot establish an exact spectrum."
+            ) from retry_error
+        sigma = sigma.to(device="cpu", dtype=torch.float64)
+
+    if not torch.isfinite(sigma).all():
+        fallback("tangent_spectrum_fallbacks", "non_finite_singular_values")
+        raise RuntimeError(
+            "torch.linalg.svdvals returned non-finite singular values for "
+            "the streamed tangent factor R."
+        )
+
+    frobenius_sq = float((r_cpu * r_cpu).sum())
+    spectrum_sq = float((sigma * sigma).sum())
+    frobenius_relative = abs(spectrum_sq - frobenius_sq) / max(frobenius_sq, 1e-300)
+    if frobenius_relative > 1e-12:
+        fallback("tangent_spectrum_fallbacks", "frobenius_mismatch")
+        raise RuntimeError(
+            "Spectrum Frobenius identity failed for the streamed tangent "
+            f"factor R: sum(sigma^2) relative mismatch "
+            f"{frobenius_relative:.3e} against ||R||_F^2 (tolerance 1e-12)."
+        )
+
+    sigma_max = float(sigma[0])
+    sigma_min = float(sigma[-1])
+
+    # Deterministic starting vectors (a private generator, never the
+    # global RNG the surrounding training loop depends on) so these
+    # diagnostics are reproducible run to run.
+    generator = torch.Generator()
+    generator.manual_seed(0)
+
+    # sigma_max sanity: 50 power iterations of R^T R against sigma_max^2.
+    v = torch.randn(p_dim, dtype=torch.float64, generator=generator)
+    v = v / v.norm()
+    for _ in range(50):
+        v = r_cpu.t() @ (r_cpu @ v)
+        v = v / v.norm().clamp_min(1e-300)
+    rayleigh_max = float(v @ (r_cpu.t() @ (r_cpu @ v)))
+    power_sigma_max = math.sqrt(max(rayleigh_max, 0.0))
+    if sigma_max > 0.0 and abs(power_sigma_max - sigma_max) > 0.05 * sigma_max:
+        fallback("tangent_spectrum_fallbacks", "power_iteration_sigma_max_mismatch")
+
+    # sigma_min sanity: 50 inverse power iterations, each ONE forward and
+    # ONE backward triangular solve against R^T R -- R is never inverted.
+    w = torch.randn(p_dim, dtype=torch.float64, generator=generator)
+    w = w / w.norm()
+    for _ in range(50):
+        z = torch.linalg.solve_triangular(
+            r_cpu.t(), w.unsqueeze(1), upper=False
+        ).squeeze(1)
+        w = torch.linalg.solve_triangular(r_cpu, z.unsqueeze(1), upper=True).squeeze(1)
+        w = w / w.norm().clamp_min(1e-300)
+    z = torch.linalg.solve_triangular(r_cpu.t(), w.unsqueeze(1), upper=False).squeeze(1)
+    w_final = torch.linalg.solve_triangular(r_cpu, z.unsqueeze(1), upper=True).squeeze(
+        1
+    )
+    inverse_rayleigh = float(w @ w_final)
+    power_sigma_min = (
+        1.0 / math.sqrt(inverse_rayleigh) if inverse_rayleigh > 0.0 else 0.0
+    )
+    if sigma_min > 0.0 and abs(power_sigma_min - sigma_min) > 0.05 * sigma_min:
+        fallback("tangent_spectrum_fallbacks", "inverse_power_sigma_min_mismatch")
+
+    # cond(J) = sigma_max/sigma_min; cond(J^T J) = cond(J)^2 -- the
+    # quantity that rules out a normal-equation Gram path at this scale
+    # (C.0): MEASURED cond(J) ~ 5.9e14 makes cond(J^T J) ~ 3.4e29.
+    condition = float("inf") if sigma_min <= 0.0 else sigma_max / sigma_min
+    set_value("tangent_condition_estimate", condition)
+    return sigma.to(device=r_factor.device)
+
+
+def _verify_surrogate_oracle(
+    r_factor: torch.Tensor,
+    b_acc: torch.Tensor,
+    r_sq: float,
+    out_dtype: torch.dtype,
+    j_s: torch.Tensor,
+    r_s: torch.Tensor,
+) -> None:
+    """FGD_TANGENT_VERIFY oracle: the optimized surrogate against the legacy
+    one, built from the SAME streamed ``(R, b, ||r||^2)``.
+
+    Compares exactly the quantities every downstream consumer reads --
+    ``J^T J``, ``J^T r``, ``||r||^2`` -- and, transitively, the one thing
+    every consumer ultimately derives from them,
+    ``damping.minimal_relative_error_from_system``, rather than
+    re-deriving that formula here and risking the two drifting apart.
+    Deferred import: ``fgdlib.search.damping`` imports ``fgdlib.tangent``
+    at module scope, so importing it back HERE (never at module load) is
+    what avoids the cycle.
+    """
+    from fgdlib.search import damping as _damping
+
+    legacy_j_s, legacy_r_s = _stream_gram_surrogate(r_factor, b_acc, r_sq, out_dtype)
+
+    def _gram_stats(
+        jacobian: torch.Tensor, residual: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, float]:
+        jacobian64 = jacobian.to(torch.float64)
+        residual64 = residual.to(torch.float64)
+        gram = jacobian64.t() @ jacobian64
+        rhs = jacobian64.t() @ residual64
+        return gram, rhs, float((residual64 * residual64).sum())
+
+    gram_opt, rhs_opt, rsq_opt = _gram_stats(j_s, r_s)
+    gram_leg, rhs_leg, rsq_leg = _gram_stats(legacy_j_s, legacy_r_s)
+
+    gram_rel = float((gram_opt - gram_leg).norm()) / max(float(gram_leg.norm()), 1.0)
+    rhs_rel = float((rhs_opt - rhs_leg).norm()) / max(float(rhs_leg.norm()), 1.0)
+    rsq_rel = abs(rsq_opt - rsq_leg) / max(abs(rsq_leg), 1.0)
+
+    config = FGDApproxConfig()
+    error_opt = _damping.minimal_relative_error_from_system(
+        ExactTangentSystem(jacobian=j_s, target=r_s, parameters=(), loss=0.0),
+        config,
+    )
+    error_leg = _damping.minimal_relative_error_from_system(
+        ExactTangentSystem(
+            jacobian=legacy_j_s, target=legacy_r_s, parameters=(), loss=0.0
+        ),
+        config,
+    )
+    error_rel = abs(error_opt - error_leg) / max(abs(error_leg), 1.0)
+
+    max_relative = max(gram_rel, rhs_rel, rsq_rel, error_rel)
+    set_max("tangent_oracle_max_relative_error", max_relative)
+    increment("tangent_oracle_verifications")
+    if max_relative > 1e-9:
+        raise RuntimeError(
+            "FGD_TANGENT_VERIFY oracle disagreement between the optimized "
+            f"and legacy tangent surrogates: max relative error "
+            f"{max_relative:.3e} (gram={gram_rel:.3e}, rhs={rhs_rel:.3e}, "
+            f"r_sq={rsq_rel:.3e}, min_rel_error={error_rel:.3e}) exceeds "
+            "1e-9."
+        )
+
+
+def _surrogate_from_factor(
+    r_factor: torch.Tensor,
+    b_acc: torch.Tensor,
+    r_sq: float,
+    out_dtype: torch.dtype,
+    *,
+    strict: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """SVD-free surrogate when rank == P; legacy CPU-SVD surrogate otherwise.
+
+    For triangular R, ``R^T R = J^T J`` EXACTLY (the streamed incremental-QR
+    factor), so whenever R has full column rank, R itself already IS a
+    valid surrogate: ``z = R^{-T} b`` solves ``R^T z = b`` exactly, and
+    ``[R; 0]``, ``[z; sqrt(residual)]`` reproduce ``(J_s^T J_s, J_s^T r_s,
+    ||r_s||^2, row_count)`` with no SVD at all -- see TANGENT_PLAN.md C.2.
+    ``[R; 0]`` and the legacy ``[diag(sigma) V^T; 0]`` differ by exactly one
+    orthogonal left factor, invisible to every downstream consumer
+    enumerated there.
+
+    Rank -- and whether any singular value sits in the ambiguity band where
+    CPU vs CUDA LAPACK could disagree about it -- is still decided from the
+    EXACT spectrum (``_tangent_spectrum``), so the decision matches the
+    legacy rule bit for bit; only the SVD used to BUILD the surrogate is
+    skipped when it is safe to.
+
+    ``strict`` mirrors optimized-vs-auto one level down: if the spectrum
+    itself cannot be established (``_tangent_spectrum`` exhausts its LAPACK
+    retries or fails its Frobenius identity -- both MEASURED to essentially
+    never fire), ``strict=True`` (backend="optimized") re-raises so a test
+    can prove the fast construction ran to completion; ``strict=False``
+    (backend="auto") instead falls back to the legacy surrogate built from
+    the SAME streamed ``(R, b, ||r||^2)`` -- the expensive streaming/QR
+    work is already done, so "fall back" here means redoing only the cheap
+    final assembly, never the Jacobian. Rank-deficiency and threshold
+    ambiguity, in contrast, are NORMAL, expected outcomes on realistically
+    conditioned data (TANGENT_PLAN.md risk #1) and are handled identically
+    regardless of ``strict`` -- they are not failures of the optimized
+    backend, just its other branch.
+    """
+    p_dim = r_factor.shape[-1]
+    with timed("tangent_final_factorization_seconds"):
+        try:
+            sigma = _tangent_spectrum(r_factor)
+        except RuntimeError:
+            if strict:
+                raise
+            sigma = None
+
+    if sigma is None:
+        return _stream_gram_surrogate(r_factor, b_acc, r_sq, out_dtype)
+
+    with timed("tangent_surrogate_seconds"):
+        sigma_max = float(sigma[0]) if sigma.numel() else 0.0
+        rank = int((sigma > sigma_max * 1e-12).sum().item()) if sigma.numel() else 0
+        ambiguous = False
+        if sigma.numel():
+            lower, upper = 1e-13 * sigma_max, 1e-11 * sigma_max
+            ambiguous = bool(((sigma >= lower) & (sigma <= upper)).any())
+
+    if rank == p_dim and not ambiguous:
+        with timed("tangent_surrogate_seconds"):
+            r64 = r_factor.detach().to(torch.float64)
+            b64 = b_acc.detach().to(torch.float64)
+            z = torch.linalg.solve_triangular(
+                r64.t(), b64.unsqueeze(1), upper=False
+            ).squeeze(1)
+            residual_norm = float((r64.t() @ z - b64).norm())
+            b_norm = float(b64.norm())
+            triangular_ok = residual_norm <= 1e-10 * b_norm
+
+            j_s_out = r_s_out = None
+            if triangular_ok:
+                res = max(0.0, float(r_sq) - float((z * z).sum()))
+                j_s = torch.cat([r64, r64.new_zeros(1, p_dim)], dim=0)
+                r_s = torch.cat([z, z.new_tensor([math.sqrt(res)])])
+                if not (
+                    math.isfinite(r_sq)
+                    and r_sq >= 0.0
+                    and res >= 0.0
+                    and torch.isfinite(r64).all()
+                    and torch.isfinite(b64).all()
+                    and torch.isfinite(z).all()
+                    and torch.isfinite(j_s).all()
+                    and torch.isfinite(r_s).all()
+                ):
+                    raise RuntimeError(
+                        "Non-finite quantity while building the SVD-free "
+                        "tangent surrogate."
+                    )
+                j_s_out = j_s.to(out_dtype)
+                r_s_out = r_s.to(out_dtype)
+
+        if triangular_ok:
+            if _tangent_verify_enabled():
+                _verify_surrogate_oracle(
+                    r_factor, b_acc, r_sq, out_dtype, j_s_out, r_s_out
+                )
+            return j_s_out, r_s_out
+
+        fallback("tangent_numerical_fallbacks", "triangular_residual")
+    else:
+        if rank != p_dim:
+            fallback("tangent_surrogate_svd_fallbacks", "rank_deficient")
+            increment("tangent_rank_deficient_surrogates")
+        else:
+            fallback("tangent_surrogate_svd_fallbacks", "threshold_ambiguous")
+
+    # Legacy-shaped surrogate from a full CPU SVD (still ~4x faster than
+    # the CUDA default driver, C.4), preserving the (rank+1) x P row-count
+    # contract GCV reads as n_observations.
+    with timed("tangent_final_factorization_seconds"):
+        r_cpu = r_factor.detach().to(device="cpu", dtype=torch.float64)
+        left, singular, right = torch.linalg.svd(r_cpu, full_matrices=False)
+        del left
+
+    with timed("tangent_surrogate_seconds"):
+        keep = singular > float(singular.max()) * 1e-12
+        sig = singular[keep].to(device=r_factor.device)
+        v_rows = right[keep].to(device=r_factor.device)
+        b_acc64 = b_acc.detach().to(torch.float64)
+        coeff = v_rows @ b_acc64
+        in_range = float((coeff * coeff / sig.square()).sum())
+        residual = max(0.0, float(r_sq) - in_range)
+        j_top = sig.unsqueeze(1) * v_rows
+        j_surrogate = torch.cat([j_top, j_top.new_zeros(1, p_dim)], dim=0)
+        r_surrogate = torch.cat([coeff / sig, coeff.new_tensor([math.sqrt(residual)])])
+        j_s_out = j_surrogate.to(out_dtype)
+        r_s_out = r_surrogate.to(out_dtype)
+
+    if _tangent_verify_enabled():
+        _verify_surrogate_oracle(r_factor, b_acc, r_sq, out_dtype, j_s_out, r_s_out)
+    return j_s_out, r_s_out
+
+
 def _stream_gram_surrogate(
     r_factor: torch.Tensor,
     b_acc: torch.Tensor,
@@ -1754,6 +2482,15 @@ def _compute_exact_tangent_projection_step(
     """
     increment("tangent_system_calls")
     with timed("tangent_system_total_seconds"):
+        # Resolved ONCE per call, read directly from the environment so
+        # tests can monkeypatch it: legacy keeps every decision below
+        # bit-for-bit identical to before this backend existed.
+        backend = tangent_backend()
+        if backend == "legacy":
+            increment("tangent_backend_legacy_calls")
+        else:
+            increment("tangent_backend_optimized_calls")
+
         named_parameters = _trainable_named_parameters(model)
         if not named_parameters:
             raise RuntimeError("FGD tangent projection requires trainable parameters.")
@@ -1851,6 +2588,33 @@ def _compute_exact_tangent_projection_step(
                     sample_chunk = int(getattr(config, "certify_stream_chunk", 0) or 0)
                     if sample_chunk <= 0:
                         sample_chunk = n_samples
+
+                    # Structure resolved ONCE for the whole call (not per
+                    # chunk): optimized/auto try the analytic Jacobian
+                    # block; optimized RAISES if the model/probe do not
+                    # qualify (P1-P14), auto falls back to jacrev per chunk
+                    # below with the reason already recorded by
+                    # ``_supported_analytic_structure``. Legacy never
+                    # resolves it, so it never pays the (cheap) probe cost.
+                    structure: AnalyticMLPStructure | None = None
+                    if backend != "legacy":
+                        structure = _supported_analytic_structure(model, x)
+                        if structure is None and backend == "optimized":
+                            raise RuntimeError(
+                                "FGD_TANGENT_BACKEND=optimized requires the "
+                                "analytic MLP Jacobian structure, but the "
+                                "model/probe did not satisfy it (see the "
+                                "tangent_unsupported_structure_fallbacks "
+                                "reason recorded above)."
+                            )
+
+                    # qr(mode="r") runs the same geqrf as mode="reduced" and
+                    # skips the discarded orgqr -- MEASURED bit-identical R
+                    # (C.3). This is a property of "not legacy", independent
+                    # of whether the analytic block above is available, so
+                    # it applies even when auto fell back to jacrev blocks.
+                    qr_mode = "reduced" if backend == "legacy" else "r"
+
                     r_factor = None
                     b_acc: torch.Tensor | None = None
                     r_sq = 0.0
@@ -1873,12 +2637,17 @@ def _compute_exact_tangent_projection_step(
                         increment("tangent_sample_chunk_count")
                         set_max("tangent_peak_jacobian_block_rows", rows)
                         set_max("tangent_peak_jacobian_block_columns", parameter_numel)
-                        with timed("tangent_jacrev_seconds"):
-                            jac = jacrev(call_batch)(parameters)
-                        with timed("tangent_jacobian_flatten_seconds"):
-                            flat = _flatten_jacobian(jac, rows)
-                        with timed("tangent_jacobian_cast_seconds"):
-                            block = flat.to(torch.float64)
+                        if structure is not None:
+                            with timed("tangent_analytic_jacobian_seconds"):
+                                increment("tangent_analytic_jacobian_calls")
+                                block = _analytic_jacobian_block(structure, x_batch)
+                        else:
+                            with timed("tangent_jacrev_seconds"):
+                                jac = jacrev(call_batch)(parameters)
+                            with timed("tangent_jacobian_flatten_seconds"):
+                                flat = _flatten_jacobian(jac, rows)
+                            with timed("tangent_jacobian_cast_seconds"):
+                                block = flat.to(torch.float64)
                         with timed("tangent_jtr_seconds"):
                             r_block = target[
                                 start * out_per_sample : stop * out_per_sample
@@ -1897,12 +2666,37 @@ def _compute_exact_tangent_projection_step(
                             increment("tangent_qr_calls")
                             set_max("tangent_qr_input_rows", stacked.shape[0])
                             set_max("tangent_qr_input_columns", stacked.shape[1])
-                            r_factor = torch.linalg.qr(stacked, mode="reduced").R
+                            if qr_mode == "r" and _tangent_verify_enabled():
+                                # Risk #3: mode="r" is only MEASURED bit-
+                                # identical on this build. Never pay for a
+                                # second QR in production -- only under the
+                                # opt-in oracle.
+                                r_reduced = torch.linalg.qr(stacked, mode="reduced").R
+                                r_fast = torch.linalg.qr(stacked, mode="r").R
+                                if torch.equal(r_reduced, r_fast):
+                                    r_factor = r_fast
+                                else:
+                                    fallback(
+                                        "tangent_numerical_fallbacks",
+                                        "qr_mode_r_mismatch",
+                                    )
+                                    r_factor = r_reduced
+                            else:
+                                r_factor = torch.linalg.qr(stacked, mode=qr_mode).R
                         del block, r_block, stacked
                         _clear_inaccessible_tensor_caches(model)
-                    jacobian_matrix, target = _stream_gram_surrogate(
-                        r_factor, b_acc, r_sq, target.dtype
-                    )
+                    if backend == "legacy":
+                        jacobian_matrix, target = _stream_gram_surrogate(
+                            r_factor, b_acc, r_sq, target.dtype
+                        )
+                    else:
+                        jacobian_matrix, target = _surrogate_from_factor(
+                            r_factor,
+                            b_acc,
+                            r_sq,
+                            target.dtype,
+                            strict=(backend == "optimized"),
+                        )
                 elif chunk > 0 and chunk < output_numel:
                     blocks = []
                     for start in range(0, output_numel, chunk):
