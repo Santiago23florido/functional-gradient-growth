@@ -77,7 +77,24 @@ from fgdlib.tangent import (
     validate_exact_tangent_system,
 )
 
-__all__ = ["RealizationResult", "realize_functional_step"]
+__all__ = [
+    "RealizationResult",
+    "realization_damping",
+    "realize_functional_step",
+]
+
+
+def realization_damping(
+    config: FGDApproxConfig,
+    selected_absolute_damping: float | None,
+) -> float:
+    """Choose the inner absolute damping without changing the default path."""
+    if (
+        config.certify_realize_use_selected_damping
+        and selected_absolute_damping is not None
+    ):
+        return float(selected_absolute_damping)
+    return float(config.projection_damping)
 
 
 def _jt_shortfall_vjp(
@@ -106,7 +123,7 @@ def _gram_shortfall_solve(
     shortfall: torch.Tensor,
     surrogate_jacobian: torch.Tensor,
     parameters: tuple[torch.Tensor, ...],
-    config: FGDApproxConfig,
+    damping: float,
 ) -> torch.Tensor:
     """Solve ``J v ~ shortfall`` via the Gram normal equations -- streaming-safe.
 
@@ -122,7 +139,7 @@ def _gram_shortfall_solve(
     gram = gram.t() @ gram  # J^T J (P x P), exact
     # Match _solve_tangent_projection_svd exactly: the damping is ABSOLUTE
     # (denominator = sigma^2 + damping), so u = (J^T J + damping I)^-1 J^T short.
-    damping = max(float(config.projection_damping), 0.0)
+    damping = max(float(damping), 0.0)
     identity = torch.eye(gram.shape[0], dtype=torch.float64, device=gram.device)
     solution = torch.linalg.solve(gram + damping * identity, jt_shortfall)
     return solution.to(shortfall.dtype)
@@ -197,6 +214,7 @@ def realize_functional_step(
     tolerance: float = 0.05,
     *,
     system: ExactTangentSystem | None = None,
+    damping: float | None = None,
 ) -> RealizationResult:
     """Move ``theta`` until ``f`` has travelled the certified ``-eta g``.
 
@@ -215,6 +233,9 @@ def realize_functional_step(
     if system is not None:
         validate_exact_tangent_system(system, model, x, y, config)
     initial_system = system
+    absolute_damping = (
+        float(config.projection_damping) if damping is None else float(damping)
+    )
     parameters = _trainable_named_parameters(model)
     was_training = model.training
     model.eval()
@@ -293,7 +314,7 @@ def realize_functional_step(
                     with timed("realize_factorization_seconds"):
                         frozen_factorization = _factorize_frozen_gram(
                             current_system.jacobian,
-                            config.projection_damping,
+                            absolute_damping,
                         )
                     frozen_parameters = current_system.parameters
                     jt_shortfall = _jt_shortfall_vjp(
@@ -317,14 +338,14 @@ def realize_functional_step(
                             shortfall,
                             current_system.jacobian,
                             current_system.parameters,
-                            config,
+                            absolute_damping,
                         )
                 else:
                     with timed("realize_solve_seconds"):
                         flat_step, approximation = _solve_tangent_projection(
                             jacobian_matrix=current_system.jacobian,
                             target=shortfall,
-                            damping=config.projection_damping,
+                            damping=absolute_damping,
                             solver=config.projection_solver,
                             work_dtype=(
                                 torch.float32

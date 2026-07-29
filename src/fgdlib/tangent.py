@@ -524,6 +524,10 @@ class FGDApproxConfig:
     # outer step" into "1 Jacobian + up to 39 VJPs". Off by default -> the two
     # branches below run exactly as before; on -> the frozen-Gram path.
     certify_realize_freeze_gram: bool = False
+    # Optionally precondition realization with the absolute damping selected
+    # for the certified outer direction. Off preserves the historical inner
+    # damping from projection_damping for every existing configuration.
+    certify_realize_use_selected_damping: bool = False
     # Bounded certification probe, sized to the NUMERICAL RANK of J. The
     # certificate eps<1/2 is a statement over the NK-dimensional probe residual,
     # but MEASURED the rank m* needed to certify grows SUBLINEARLY in NK (m*/NK:

@@ -67,7 +67,7 @@ from fgdlib.search.unified import (
     rank_limiting_locations,
 )
 from fgdlib.search.damping import select_projection_damping
-from fgdlib.search.realize import realize_functional_step
+from fgdlib.search.realize import realization_damping, realize_functional_step
 from fgdlib.search.linearization import certified_linear_learning_rate
 from fgdlib.search.growth import (
     GrowthResult,
@@ -4066,6 +4066,10 @@ def run_pipeline(
                                         .certify_realize_tolerance
                                     ),
                                     system=tangent_system,
+                                    damping=realization_damping(
+                                        config.fgd_approx,
+                                        damping_choice.candidate.absolute_damping,
+                                    ),
                                 )
                                 if realization.iterations > 0:
                                     with torch.no_grad():
