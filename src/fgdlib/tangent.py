@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Literal
 
 from fgdlib.gromo_setup import ensure_gromo_importable
-from fgdlib.profile import increment, set_value, timed
+from fgdlib.profile import increment, set_max, set_value, timed
 from fgdlib.search.growth import ScalingLineSearchConfig, grow_layer
 from fgdlib.training_utils.loop import RegressionMetrics, evaluate_regression_metrics
 
@@ -1605,9 +1605,7 @@ class ExactTangentSystem:
     # statistics surrogate when ``certify_stream_gram`` is enabled; candidate
     # cross-statistics still need the original rows, but retaining this vector
     # is O(NK), not the forbidden O(NKP) second Jacobian.
-    full_target: torch.Tensor | None = field(
-        default=None, repr=False, compare=False
-    )
+    full_target: torch.Tensor | None = field(default=None, repr=False, compare=False)
     owner_model: torch.nn.Module | None = field(default=None, repr=False, compare=False)
     parameter_names: tuple[str, ...] = field(default=(), repr=False)
     parameter_versions: tuple[int, ...] = field(default=(), repr=False)
@@ -1684,18 +1682,24 @@ def _stream_gram_surrogate(
     carries the out-of-range residual energy so ``eps`` is exact, not just the
     in-range part.
     """
-    left, singular, right = torch.linalg.svd(r_factor, full_matrices=False)
-    del left
-    keep = singular > float(singular.max()) * 1e-12
-    sig = singular[keep]
-    v_rows = right[keep]  # (rank, P), rows are V^T
-    coeff = v_rows @ b_acc  # V^T b, shape (rank,)
-    in_range = float((coeff * coeff / sig.square()).sum())
-    residual = max(0.0, r_sq - in_range)
-    p_dim = r_factor.shape[1]
-    j_top = sig.unsqueeze(1) * v_rows  # diag(sig) @ V^T = (rank, P)
-    j_surrogate = torch.cat([j_top, j_top.new_zeros(1, p_dim)], dim=0)
-    r_surrogate = torch.cat([coeff / sig, coeff.new_tensor([math.sqrt(residual)])])
+    # tangent_final_factorization_seconds and tangent_surrogate_seconds are
+    # EXCLUSIVE siblings: two separate `with` blocks (not one enclosing both)
+    # so that the SVD itself -- the dominant cost this profiler exists to
+    # isolate -- is never folded into the cheap assembly time around it.
+    with timed("tangent_final_factorization_seconds"):
+        left, singular, right = torch.linalg.svd(r_factor, full_matrices=False)
+    with timed("tangent_surrogate_seconds"):
+        del left
+        keep = singular > float(singular.max()) * 1e-12
+        sig = singular[keep]
+        v_rows = right[keep]  # (rank, P), rows are V^T
+        coeff = v_rows @ b_acc  # V^T b, shape (rank,)
+        in_range = float((coeff * coeff / sig.square()).sum())
+        residual = max(0.0, r_sq - in_range)
+        p_dim = r_factor.shape[1]
+        j_top = sig.unsqueeze(1) * v_rows  # diag(sig) @ V^T = (rank, P)
+        j_surrogate = torch.cat([j_top, j_top.new_zeros(1, p_dim)], dim=0)
+        r_surrogate = torch.cat([coeff / sig, coeff.new_tensor([math.sqrt(residual)])])
     return j_surrogate.to(out_dtype), r_surrogate.to(out_dtype)
 
 
@@ -1729,200 +1733,262 @@ def _compute_exact_tangent_projection_step(
     config: FGDApproxConfig,
     return_system: bool = False,
 ) -> _TangentProjectionStep | ExactTangentSystem | None:
-    """Compute g = P_T grad L by explicitly materializing the full Jacobian."""
-    named_parameters = _trainable_named_parameters(model)
-    if not named_parameters:
-        raise RuntimeError("FGD tangent projection requires trainable parameters.")
+    """Compute g = P_T grad L by explicitly materializing the full Jacobian.
 
-    parameter_names = tuple(named_parameters.keys())
-    parameters = tuple(named_parameters.values())
-    buffers = OrderedDict(model.named_buffers())
+    Profiler parent/child contract (Phase A instrumentation, no algorithmic
+    change): ``tangent_system_total_seconds`` is INCLUSIVE of this entire
+    function body -- placed here rather than in ``exact_tangent_system`` so it
+    also covers the ``_compute_tangent_projection_step`` -> exact path, which
+    reaches this function without ever calling ``exact_tangent_system``.
+    ``streamed_jacobian_seconds`` (below) is an existing, separate INCLUSIVE
+    timer around the whole streaming/jacrev construction -- it is a NESTED
+    PARENT of ``tangent_jacrev_seconds`` / ``tangent_jacobian_flatten_seconds``
+    / ``tangent_jacobian_cast_seconds`` / ``tangent_jtr_seconds`` /
+    ``tangent_qr_seconds`` / ``tangent_surrogate_seconds`` /
+    ``tangent_final_factorization_seconds``, NOT a sibling of
+    ``tangent_system_total_seconds``'s other children -- never add it to them,
+    it would double-count. All other new sub-timers introduced below are
+    EXCLUSIVE and mutually disjoint: summing them (plus
+    ``tangent_forward_target_seconds``) reproduces
+    ``tangent_system_total_seconds`` up to scheduling slack.
+    """
+    increment("tangent_system_calls")
+    with timed("tangent_system_total_seconds"):
+        named_parameters = _trainable_named_parameters(model)
+        if not named_parameters:
+            raise RuntimeError("FGD tangent projection requires trainable parameters.")
 
-    # Measure in eval. Besides the usual reason (the projection is a statement
-    # about f, so dropout is the identity and batch-norm uses its fixed running
-    # stats), there is a hard requirement: a batch-norm in TRAIN mode updates
-    # its running buffers in place, and inside a functorch transform (jacrev /
-    # jvp) that in-place update wraps the buffers in functorch tensors that
-    # leak out -- the next transform then dies with a level-escape. eval()
-    # removes it and is a no-op on the plain MLP. Restored in the finally.
-    was_training = model.training
-    model.eval()
+        parameter_names = tuple(named_parameters.keys())
+        parameters = tuple(named_parameters.values())
+        buffers = OrderedDict(model.named_buffers())
 
-    output = model(x)
-    loss = batch_functional_loss(output, y, config.functional_loss)
-    if not torch.isfinite(loss).all():
-        raise RuntimeError(f"Non-finite FGD loss detected before projection: {loss}.")
+        # Measure in eval. Besides the usual reason (the projection is a
+        # statement about f, so dropout is the identity and batch-norm uses
+        # its fixed running stats), there is a hard requirement: a batch-norm
+        # in TRAIN mode updates its running buffers in place, and inside a
+        # functorch transform (jacrev / jvp) that in-place update wraps the
+        # buffers in functorch tensors that leak out -- the next transform
+        # then dies with a level-escape. eval() removes it and is a no-op on
+        # the plain MLP. Restored in the finally.
+        was_training = model.training
+        model.eval()
 
-    target_tensor = torch.autograd.grad(loss, output)[0].detach()
-    # Roughness penalty: r_rough = r_data + 2 gamma Lambda f. Injected here so
-    # growth (via minimal_relative_error), the projection, the realise path
-    # and GCV all certify against the SAME regularised gradient.
-    roughness = _roughness_target(output, x, config)
-    if roughness is not None:
-        target_tensor = target_tensor + roughness.to(target_tensor.dtype)
-    target = target_tensor.reshape(-1)
-    full_target = target
-    output_numel = target.numel()
+        with timed("tangent_forward_target_seconds"):
+            output = model(x)
+            loss = batch_functional_loss(output, y, config.functional_loss)
+            if not torch.isfinite(loss).all():
+                raise RuntimeError(
+                    f"Non-finite FGD loss detected before projection: {loss}."
+                )
 
-    if torch.linalg.norm(target) <= torch.finfo(target.dtype).eps:
-        zero_updates = tuple(torch.zeros_like(parameter) for parameter in parameters)
-        output_error = _output_relative_error_from_stats(
-            dot_product=0.0,
-            approximation_sq_norm=0.0,
-            target_sq_norm=0.0,
-            eps=config.eps,
-        )
+            target_tensor = torch.autograd.grad(loss, output)[0].detach()
+            # Roughness penalty: r_rough = r_data + 2 gamma Lambda f. Injected
+            # here so growth (via minimal_relative_error), the projection, the
+            # realise path and GCV all certify against the SAME regularised
+            # gradient.
+            roughness = _roughness_target(output, x, config)
+            if roughness is not None:
+                target_tensor = target_tensor + roughness.to(target_tensor.dtype)
+            target = target_tensor.reshape(-1)
+            full_target = target
+            output_numel = target.numel()
+
+        # Last-value gauges (overwrite semantics is fine here -- one call, one
+        # shape): the parameter count and output row count that size every
+        # matrix built below, so a profile can be read against P and N*K
+        # without re-deriving them from the model.
+        parameter_numel = sum(parameter.numel() for parameter in parameters)
+        set_value("tangent_parameter_count", parameter_numel)
+        set_value("tangent_output_row_count", output_numel)
+
+        if torch.linalg.norm(target) <= torch.finfo(target.dtype).eps:
+            zero_updates = tuple(
+                torch.zeros_like(parameter) for parameter in parameters
+            )
+            output_error = _output_relative_error_from_stats(
+                dot_product=0.0,
+                approximation_sq_norm=0.0,
+                target_sq_norm=0.0,
+                eps=config.eps,
+            )
+            if return_system:
+                return None
+            return _TangentProjectionStep(
+                output_error=output_error,
+                parameter_updates=zero_updates,
+                learning_rate_used=0.0,
+                loss_before=float(loss.detach().item()),
+                loss_after=float(loss.detach().item()),
+                descent_ok=True,
+                dot_product=0.0,
+                approximation_sq_norm=0.0,
+                target_sq_norm=0.0,
+            )
+
+        def call_with_parameters(
+            parameter_values: tuple[torch.Tensor, ...],
+        ) -> torch.Tensor:
+            state = OrderedDict(zip(parameter_names, parameter_values))
+            state.update(buffers)
+            return functional_call(model, state, (x,)).reshape(-1)
+
+        chunk = int(getattr(config, "jacobian_row_chunk", 0) or 0)
+        stream_gram = bool(getattr(config, "certify_stream_gram", False))
+        try:
+            with timed("streamed_jacobian_seconds"):
+                if stream_gram:
+                    # STREAMING over SAMPLES: accumulate the incremental-QR
+                    # factor R (P x P), b = J^T r and ||r||^2 batch by batch --
+                    # each sample forwarded EXACTLY ONCE (chunking output rows
+                    # instead recomputes the whole forward per chunk, the
+                    # dominant cost) -- freeing each block, so the full NK x P
+                    # Jacobian is never held. The downstream then gets a tiny
+                    # surrogate ((rank+1) x P) reproducing the exact spectrum
+                    # and projection. Memory O(P^2), exact (1.8e-12 vs full
+                    # float64).
+                    n_samples = int(x.shape[0])
+                    out_per_sample = output_numel // max(n_samples, 1)
+                    sample_chunk = int(getattr(config, "certify_stream_chunk", 0) or 0)
+                    if sample_chunk <= 0:
+                        sample_chunk = n_samples
+                    r_factor = None
+                    b_acc: torch.Tensor | None = None
+                    r_sq = 0.0
+                    for start in range(0, n_samples, sample_chunk):
+                        stop = min(start + sample_chunk, n_samples)
+                        x_batch = x[start:stop]
+
+                        def call_batch(
+                            parameter_values: tuple[torch.Tensor, ...],
+                            _xb: torch.Tensor = x_batch,
+                        ) -> torch.Tensor:
+                            state = OrderedDict(zip(parameter_names, parameter_values))
+                            state.update(buffers)
+                            return functional_call(model, state, (_xb,)).reshape(-1)
+
+                        rows = (stop - start) * out_per_sample
+                        # Per-chunk bookkeeping BEFORE the block is built, so
+                        # the peak-shape gauges reflect the block about to be
+                        # materialized even if jacrev itself later raises.
+                        increment("tangent_sample_chunk_count")
+                        set_max("tangent_peak_jacobian_block_rows", rows)
+                        set_max("tangent_peak_jacobian_block_columns", parameter_numel)
+                        with timed("tangent_jacrev_seconds"):
+                            jac = jacrev(call_batch)(parameters)
+                        with timed("tangent_jacobian_flatten_seconds"):
+                            flat = _flatten_jacobian(jac, rows)
+                        with timed("tangent_jacobian_cast_seconds"):
+                            block = flat.to(torch.float64)
+                        with timed("tangent_jtr_seconds"):
+                            r_block = target[
+                                start * out_per_sample : stop * out_per_sample
+                            ].to(torch.float64)
+                            contribution = block.t() @ r_block
+                            b_acc = (
+                                contribution if b_acc is None else b_acc + contribution
+                            )
+                            r_sq += float((r_block * r_block).sum())
+                        with timed("tangent_qr_seconds"):
+                            stacked = (
+                                block
+                                if r_factor is None
+                                else torch.cat([r_factor, block], dim=0)
+                            )
+                            increment("tangent_qr_calls")
+                            set_max("tangent_qr_input_rows", stacked.shape[0])
+                            set_max("tangent_qr_input_columns", stacked.shape[1])
+                            r_factor = torch.linalg.qr(stacked, mode="reduced").R
+                        del block, r_block, stacked
+                        _clear_inaccessible_tensor_caches(model)
+                    jacobian_matrix, target = _stream_gram_surrogate(
+                        r_factor, b_acc, r_sq, target.dtype
+                    )
+                elif chunk > 0 and chunk < output_numel:
+                    blocks = []
+                    for start in range(0, output_numel, chunk):
+                        stop = min(start + chunk, output_numel)
+
+                        def call_rows(
+                            parameter_values: tuple[torch.Tensor, ...],
+                            _start: int = start,
+                            _stop: int = stop,
+                        ) -> torch.Tensor:
+                            return call_with_parameters(parameter_values)[_start:_stop]
+
+                        with timed("tangent_jacrev_seconds"):
+                            jac = jacrev(call_rows)(parameters)
+                        with timed("tangent_jacobian_flatten_seconds"):
+                            blocks.append(_flatten_jacobian(jac, stop - start))
+                        _clear_inaccessible_tensor_caches(model)
+                    jacobian_matrix = torch.cat(blocks, dim=0)
+                else:
+                    with timed("tangent_jacrev_seconds"):
+                        jac = jacrev(call_with_parameters)(parameters)
+                    with timed("tangent_jacobian_flatten_seconds"):
+                        jacobian_matrix = _flatten_jacobian(jac, output_numel)
+        finally:
+            model.train(was_training)
+            _clear_inaccessible_tensor_caches(model)
         if return_system:
-            return None
+            named_buffers = tuple(model.named_buffers())
+            return ExactTangentSystem(
+                jacobian=jacobian_matrix,
+                target=target,
+                parameters=parameters,
+                loss=float(loss.detach().item()),
+                full_target=full_target,
+                owner_model=model,
+                parameter_names=parameter_names,
+                parameter_versions=tuple(
+                    parameter._version for parameter in parameters
+                ),
+                buffer_names=tuple(name for name, _ in named_buffers),
+                buffers=tuple(buffer for _, buffer in named_buffers),
+                buffer_versions=tuple(buffer._version for _, buffer in named_buffers),
+                probe_x=x,
+                probe_y=y,
+                probe_versions=(x._version, y._version),
+                config_signature=repr(config),
+                evaluation_state=tuple(
+                    (name, module.training) for name, module in model.named_modules()
+                ),
+            )
+        with timed("tangent_projection_solve_seconds"):
+            flat_update, approximation = _solve_tangent_projection(
+                jacobian_matrix=jacobian_matrix,
+                target=target,
+                damping=config.projection_damping,
+                solver=config.projection_solver,
+                work_dtype=(
+                    torch.float32
+                    if getattr(config, "projection_fast_factorization", False)
+                    else torch.float64
+                ),
+            )
+        with timed("tangent_sensor_seconds"):
+            if (
+                not torch.isfinite(flat_update).all()
+                or not torch.isfinite(approximation).all()
+            ):
+                raise RuntimeError("Non-finite FGD tangent projection update detected.")
+
+            stats = _output_relative_error_from_tensors(
+                approximation=approximation,
+                target=target,
+                eps=config.eps,
+            )
+            parameter_updates = _unflatten_parameter_update(flat_update, parameters)
         return _TangentProjectionStep(
-            output_error=output_error,
-            parameter_updates=zero_updates,
+            output_error=stats.output_error,
+            parameter_updates=parameter_updates,
             learning_rate_used=0.0,
             loss_before=float(loss.detach().item()),
             loss_after=float(loss.detach().item()),
             descent_ok=True,
-            dot_product=0.0,
-            approximation_sq_norm=0.0,
-            target_sq_norm=0.0,
+            dot_product=stats.dot_product,
+            approximation_sq_norm=stats.approximation_sq_norm,
+            target_sq_norm=stats.target_sq_norm,
         )
-
-    def call_with_parameters(
-        parameter_values: tuple[torch.Tensor, ...],
-    ) -> torch.Tensor:
-        state = OrderedDict(zip(parameter_names, parameter_values))
-        state.update(buffers)
-        return functional_call(model, state, (x,)).reshape(-1)
-
-    chunk = int(getattr(config, "jacobian_row_chunk", 0) or 0)
-    stream_gram = bool(getattr(config, "certify_stream_gram", False))
-    try:
-        with timed("streamed_jacobian_seconds"):
-            if stream_gram:
-                # STREAMING over SAMPLES: accumulate the incremental-QR factor R
-                # (P x P), b = J^T r and ||r||^2 batch by batch -- each sample
-                # forwarded EXACTLY ONCE (chunking output rows instead recomputes the
-                # whole forward per chunk, the dominant cost) -- freeing each block,
-                # so the full NK x P Jacobian is never held. The downstream then gets
-                # a tiny surrogate ((rank+1) x P) reproducing the exact spectrum and
-                # projection. Memory O(P^2), exact (1.8e-12 vs full float64).
-                n_samples = int(x.shape[0])
-                out_per_sample = output_numel // max(n_samples, 1)
-                sample_chunk = int(getattr(config, "certify_stream_chunk", 0) or 0)
-                if sample_chunk <= 0:
-                    sample_chunk = n_samples
-                r_factor = None
-                b_acc: torch.Tensor | None = None
-                r_sq = 0.0
-                for start in range(0, n_samples, sample_chunk):
-                    stop = min(start + sample_chunk, n_samples)
-                    x_batch = x[start:stop]
-
-                    def call_batch(
-                        parameter_values: tuple[torch.Tensor, ...],
-                        _xb: torch.Tensor = x_batch,
-                    ) -> torch.Tensor:
-                        state = OrderedDict(zip(parameter_names, parameter_values))
-                        state.update(buffers)
-                        return functional_call(model, state, (_xb,)).reshape(-1)
-
-                    rows = (stop - start) * out_per_sample
-                    block = _flatten_jacobian(jacrev(call_batch)(parameters), rows).to(
-                        torch.float64
-                    )
-                    r_block = target[start * out_per_sample : stop * out_per_sample].to(
-                        torch.float64
-                    )
-                    contribution = block.t() @ r_block
-                    b_acc = contribution if b_acc is None else b_acc + contribution
-                    r_sq += float((r_block * r_block).sum())
-                    stacked = (
-                        block
-                        if r_factor is None
-                        else torch.cat([r_factor, block], dim=0)
-                    )
-                    r_factor = torch.linalg.qr(stacked, mode="reduced").R
-                    del block, r_block, stacked
-                    _clear_inaccessible_tensor_caches(model)
-                jacobian_matrix, target = _stream_gram_surrogate(
-                    r_factor, b_acc, r_sq, target.dtype
-                )
-            elif chunk > 0 and chunk < output_numel:
-                blocks = []
-                for start in range(0, output_numel, chunk):
-                    stop = min(start + chunk, output_numel)
-
-                    def call_rows(
-                        parameter_values: tuple[torch.Tensor, ...],
-                        _start: int = start,
-                        _stop: int = stop,
-                    ) -> torch.Tensor:
-                        return call_with_parameters(parameter_values)[_start:_stop]
-
-                    blocks.append(
-                        _flatten_jacobian(jacrev(call_rows)(parameters), stop - start)
-                    )
-                    _clear_inaccessible_tensor_caches(model)
-                jacobian_matrix = torch.cat(blocks, dim=0)
-            else:
-                jacobian_matrix = _flatten_jacobian(
-                    jacrev(call_with_parameters)(parameters), output_numel
-                )
-    finally:
-        model.train(was_training)
-        _clear_inaccessible_tensor_caches(model)
-    if return_system:
-        named_buffers = tuple(model.named_buffers())
-        return ExactTangentSystem(
-            jacobian=jacobian_matrix,
-            target=target,
-            parameters=parameters,
-            loss=float(loss.detach().item()),
-            full_target=full_target,
-            owner_model=model,
-            parameter_names=parameter_names,
-            parameter_versions=tuple(parameter._version for parameter in parameters),
-            buffer_names=tuple(name for name, _ in named_buffers),
-            buffers=tuple(buffer for _, buffer in named_buffers),
-            buffer_versions=tuple(buffer._version for _, buffer in named_buffers),
-            probe_x=x,
-            probe_y=y,
-            probe_versions=(x._version, y._version),
-            config_signature=repr(config),
-            evaluation_state=tuple(
-                (name, module.training) for name, module in model.named_modules()
-            ),
-        )
-    flat_update, approximation = _solve_tangent_projection(
-        jacobian_matrix=jacobian_matrix,
-        target=target,
-        damping=config.projection_damping,
-        solver=config.projection_solver,
-        work_dtype=(
-            torch.float32
-            if getattr(config, "projection_fast_factorization", False)
-            else torch.float64
-        ),
-    )
-    if not torch.isfinite(flat_update).all() or not torch.isfinite(approximation).all():
-        raise RuntimeError("Non-finite FGD tangent projection update detected.")
-
-    stats = _output_relative_error_from_tensors(
-        approximation=approximation,
-        target=target,
-        eps=config.eps,
-    )
-    parameter_updates = _unflatten_parameter_update(flat_update, parameters)
-    return _TangentProjectionStep(
-        output_error=stats.output_error,
-        parameter_updates=parameter_updates,
-        learning_rate_used=0.0,
-        loss_before=float(loss.detach().item()),
-        loss_after=float(loss.detach().item()),
-        descent_ok=True,
-        dot_product=stats.dot_product,
-        approximation_sq_norm=stats.approximation_sq_norm,
-        target_sq_norm=stats.target_sq_norm,
-    )
 
 
 def _compute_cg_tangent_projection_step(
