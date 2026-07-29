@@ -46,9 +46,13 @@ import torch
 
 from fgdlib.search.growth import grow_layer
 from fgdlib.tangent import (
+    ExactTangentSystem,
     FGDApproxConfig,
-    _compute_exact_tangent_projection_step,
+    _output_relative_error_from_tensors,
+    _solve_tangent_projection,
+    exact_tangent_system,
     tiny_optimal_update_kwargs,
+    validate_exact_tangent_system,
 )
 
 __all__ = [
@@ -73,6 +77,8 @@ class CertifyResult:
     #: How many family steps were taken across the loop (a family step shrinks
     #: the residual, deferring growth).
     family_steps: int = 0
+    #: Exact system for the returned model and probe, when non-degenerate.
+    tangent_system: ExactTangentSystem | None = None
 
 
 def exact_relative_error(
@@ -80,6 +86,8 @@ def exact_relative_error(
     x: torch.Tensor,
     y: torch.Tensor,
     config: FGDApproxConfig,
+    *,
+    system: ExactTangentSystem | None = None,
 ) -> float:
     """``eps`` from the FULL Jacobian -- no CG, no surrogate.
 
@@ -95,11 +103,18 @@ def exact_relative_error(
     Returns ``inf`` when the projection is degenerate, which the caller must
     read as "nothing of ``r`` is representable yet".
     """
+    if system is None:
+        system = exact_tangent_system(model, x, y, config)
+    else:
+        validate_exact_tangent_system(system, model, x, y, config)
+    if system is None:
+        return float("inf")
+
     if config.projection_damping_auto:
         # Imported here: damping.py imports from tangent.py, and certify.py
         # is imported by the pipeline before either -- a module-level import
         # would close the cycle.
-        from fgdlib.search.damping import minimal_relative_error
+        from fgdlib.search.damping import minimal_relative_error_from_system
 
         # The growth signal is the SMALLEST eps the tangent space can reach,
         # at least regularisation. It is < 1/2 exactly when a certified step
@@ -110,15 +125,40 @@ def exact_relative_error(
         # spectrum, measured at the same probe; they read different points of
         # it (growth the minimum, the step the selected lambda), which is the
         # correct division of labour rather than the two-certificates bug.
-        return minimal_relative_error(model, x, y, config)
+        return minimal_relative_error_from_system(system, config)
 
-    step = _compute_exact_tangent_projection_step(
-        model=model, x=x, y=y, config=config
+    _, approximation = _solve_tangent_projection(
+        jacobian_matrix=system.jacobian,
+        target=system.target,
+        damping=config.projection_damping,
+        solver=config.projection_solver,
+        work_dtype=(
+            torch.float32
+            if getattr(config, "projection_fast_factorization", False)
+            else torch.float64
+        ),
     )
-    epsilon = step.output_error.relative_error
+    stats = _output_relative_error_from_tensors(
+        approximation=approximation,
+        target=system.target,
+        eps=config.eps,
+    )
+    epsilon = stats.output_error.relative_error
     if epsilon is None or not float(epsilon) == float(epsilon):  # NaN guard
         return float("inf")
     return float(epsilon)
+
+
+def _relative_error_and_system(
+    model,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    config: FGDApproxConfig,
+) -> tuple[float, ExactTangentSystem | None]:
+    system = exact_tangent_system(model, x, y, config)
+    if system is None:
+        return float("inf"), None
+    return exact_relative_error(model, x, y, config, system=system), system
 
 
 def _grow_clone(
@@ -167,9 +207,7 @@ def _grow_clone(
             ),
             progress=None,
             function_preserving=function_preserving,
-            preservation_tolerance=(
-                config.fgd_approx.growth_preservation_tolerance
-            ),
+            preservation_tolerance=(config.fgd_approx.growth_preservation_tolerance),
         )
     except RuntimeError:
         return None
@@ -224,15 +262,13 @@ def grow_until_certified(
     Returns ``(model, CertifyResult)``.
     """
     threshold = config.fgd_approx.rel_error_threshold
-    epsilon = exact_relative_error(model, x, y, config.fgd_approx)
+    epsilon, tangent_system = _relative_error_and_system(model, x, y, config.fgd_approx)
     trajectory = [epsilon]
     growths = 0
     family_steps = 0
     forced_remaining = 1 if force else 0
 
-    while (
-        epsilon >= threshold or forced_remaining > 0
-    ) and growths < max_growths:
+    while (epsilon >= threshold or forced_remaining > 0) and growths < max_growths:
         forced_remaining = max(0, forced_remaining - 1)
 
         # FAMILY LADDER, before growing: the tangent could not certify (that
@@ -246,7 +282,9 @@ def grow_until_certified(
             if stepped is not None:
                 model = stepped
                 family_steps += 1
-                epsilon = exact_relative_error(model, x, y, config.fgd_approx)
+                epsilon, tangent_system = _relative_error_and_system(
+                    model, x, y, config.fgd_approx
+                )
                 trajectory.append(epsilon)
                 if progress is not None:
                     progress(
@@ -260,6 +298,7 @@ def grow_until_certified(
                     trajectory=tuple(trajectory),
                     family_stepped=True,
                     family_steps=family_steps,
+                    tangent_system=tangent_system,
                 )
 
         locations = range(len(getattr(model, "_growable_layers", [])))
@@ -271,20 +310,26 @@ def grow_until_certified(
         # trajectory rather than the monotonicity theorem.
         best_epsilon = epsilon if function_preserving else float("inf")
         best_location = None
+        best_system = tangent_system
         for location in locations:
             candidate = _grow_clone(
-                model, train_loader, location, device, config,
+                model,
+                train_loader,
+                location,
+                device,
+                config,
                 function_preserving,
             )
             if candidate is None:
                 continue
-            candidate_epsilon = exact_relative_error(
+            candidate_epsilon, candidate_system = _relative_error_and_system(
                 candidate, x, y, config.fgd_approx
             )
             if candidate_epsilon < best_epsilon:
                 best_epsilon = candidate_epsilon
                 best_model = candidate
                 best_location = location
+                best_system = candidate_system
 
         if best_model is None:
             # No growable location reduces eps. The theorem says this cannot
@@ -300,6 +345,7 @@ def grow_until_certified(
 
         model = best_model
         epsilon = best_epsilon
+        tangent_system = best_system
         growths += 1
         trajectory.append(epsilon)
         if progress is not None:
@@ -323,12 +369,16 @@ def grow_until_certified(
             )
             while epsilon >= threshold and growths < max_growths:
                 bigger = _grow_clone(
-                    model, train_loader, best_location, device, config,
+                    model,
+                    train_loader,
+                    best_location,
+                    device,
+                    config,
                     function_preserving,
                 )
                 if bigger is None:
                     break
-                bigger_epsilon = exact_relative_error(
+                bigger_epsilon, bigger_system = _relative_error_and_system(
                     bigger, x, y, config.fgd_approx
                 )
                 gain = epsilon - bigger_epsilon
@@ -336,6 +386,7 @@ def grow_until_certified(
                     break  # diminishing returns here; let the outer loop re-scan
                 model = bigger
                 epsilon = bigger_epsilon
+                tangent_system = bigger_system
                 growths += 1
                 trajectory.append(epsilon)
                 if progress is not None:
@@ -352,4 +403,5 @@ def grow_until_certified(
         trajectory=tuple(trajectory),
         family_stepped=False,
         family_steps=family_steps,
+        tangent_system=tangent_system,
     )

@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import math
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Literal
 
 from fgdlib.gromo_setup import ensure_gromo_importable
@@ -1593,6 +1593,62 @@ class ExactTangentSystem:
     target: torch.Tensor
     parameters: tuple[torch.Tensor, ...]
     loss: float
+    owner_model: torch.nn.Module | None = field(default=None, repr=False, compare=False)
+    parameter_names: tuple[str, ...] = field(default=(), repr=False)
+    parameter_versions: tuple[int, ...] = field(default=(), repr=False)
+    buffer_names: tuple[str, ...] = field(default=(), repr=False)
+    buffers: tuple[torch.Tensor, ...] = field(default=(), repr=False, compare=False)
+    buffer_versions: tuple[int, ...] = field(default=(), repr=False)
+    probe_x: torch.Tensor | None = field(default=None, repr=False, compare=False)
+    probe_y: torch.Tensor | None = field(default=None, repr=False, compare=False)
+    probe_versions: tuple[int, int] = field(default=(-1, -1), repr=False)
+    config_signature: str = field(default="", repr=False)
+    evaluation_state: tuple[tuple[str, bool], ...] = field(default=(), repr=False)
+
+
+def validate_exact_tangent_system(
+    system: ExactTangentSystem,
+    model: torch.nn.Module,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    config: FGDApproxConfig,
+) -> None:
+    """Reject reuse unless every object and value defining ``J`` and ``r`` matches."""
+    if system.owner_model is not model:
+        raise ValueError("ExactTangentSystem belongs to a different model instance.")
+
+    named_parameters = _trainable_named_parameters(model)
+    names = tuple(named_parameters)
+    parameters = tuple(named_parameters.values())
+    if names != system.parameter_names or len(parameters) != len(system.parameters):
+        raise ValueError("ExactTangentSystem trainable parameter ordering changed.")
+    if any(
+        current is not cached for current, cached in zip(parameters, system.parameters)
+    ):
+        raise ValueError("ExactTangentSystem trainable parameter objects changed.")
+    versions = tuple(parameter._version for parameter in parameters)
+    if versions != system.parameter_versions:
+        raise ValueError("ExactTangentSystem parameter values changed.")
+
+    named_buffers = tuple(model.named_buffers())
+    buffer_names = tuple(name for name, _ in named_buffers)
+    buffers = tuple(buffer for _, buffer in named_buffers)
+    if buffer_names != system.buffer_names or len(buffers) != len(system.buffers):
+        raise ValueError("ExactTangentSystem model buffers changed.")
+    if any(current is not cached for current, cached in zip(buffers, system.buffers)):
+        raise ValueError("ExactTangentSystem buffer objects changed.")
+    if tuple(buffer._version for buffer in buffers) != system.buffer_versions:
+        raise ValueError("ExactTangentSystem buffer values changed.")
+
+    if system.probe_x is not x or system.probe_y is not y:
+        raise ValueError("ExactTangentSystem probe or targets changed.")
+    if (x._version, y._version) != system.probe_versions:
+        raise ValueError("ExactTangentSystem probe or target values changed.")
+    if repr(config) != system.config_signature:
+        raise ValueError("ExactTangentSystem functional configuration changed.")
+    state = tuple((name, module.training) for name, module in model.named_modules())
+    if state != system.evaluation_state:
+        raise ValueError("ExactTangentSystem model evaluation state changed.")
 
 
 def _stream_gram_surrogate(
@@ -1799,11 +1855,25 @@ def _compute_exact_tangent_projection_step(
         model.train(was_training)
         _clear_inaccessible_tensor_caches(model)
     if return_system:
+        named_buffers = tuple(model.named_buffers())
         return ExactTangentSystem(
             jacobian=jacobian_matrix,
             target=target,
             parameters=parameters,
             loss=float(loss.detach().item()),
+            owner_model=model,
+            parameter_names=parameter_names,
+            parameter_versions=tuple(parameter._version for parameter in parameters),
+            buffer_names=tuple(name for name, _ in named_buffers),
+            buffers=tuple(buffer for _, buffer in named_buffers),
+            buffer_versions=tuple(buffer._version for _, buffer in named_buffers),
+            probe_x=x,
+            probe_y=y,
+            probe_versions=(x._version, y._version),
+            config_signature=repr(config),
+            evaluation_state=tuple(
+                (name, module.training) for name, module in model.named_modules()
+            ),
         )
     flat_update, approximation = _solve_tangent_projection(
         jacobian_matrix=jacobian_matrix,

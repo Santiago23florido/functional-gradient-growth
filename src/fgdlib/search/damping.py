@@ -61,18 +61,20 @@ matters, which is exactly why it must be located rather than guessed.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
 from fgdlib.profile import profiled, timed
 from fgdlib.search.linearization import certified_linear_learning_rate
 from fgdlib.tangent import (
+    ExactTangentSystem,
     FGDApproxConfig,
     _output_relative_error_from_tensors,
     _unflatten_parameter_update,
     exact_tangent_system,
     theoretical_learning_rate_upper_bound,
+    validate_exact_tangent_system,
 )
 
 __all__ = [
@@ -82,6 +84,7 @@ __all__ = [
     "DAMPING_FAN_STEPS",
     "DampingCandidate",
     "DampingChoice",
+    "minimal_relative_error_from_system",
     "select_projection_damping",
 ]
 
@@ -252,6 +255,9 @@ class DampingChoice:
     candidate: DampingCandidate
     parameter_updates: tuple[torch.Tensor, ...]
     candidates: tuple[DampingCandidate, ...]
+    tangent_system: ExactTangentSystem | None = field(
+        default=None, repr=False, compare=False
+    )
 
 
 @profiled("minimal_relative_error_seconds")
@@ -260,6 +266,8 @@ def minimal_relative_error(
     x: torch.Tensor,
     y: torch.Tensor,
     config: FGDApproxConfig,
+    *,
+    system: ExactTangentSystem | None = None,
 ) -> float:
     """The smallest ``eps`` the tangent space can reach, at least damping.
 
@@ -275,9 +283,20 @@ def minimal_relative_error(
 
     Returns ``inf`` when the system is degenerate.
     """
-    system = exact_tangent_system(model, x, y, config)
+    if system is None:
+        system = exact_tangent_system(model, x, y, config)
+    else:
+        validate_exact_tangent_system(system, model, x, y, config)
     if system is None:
         return float("inf")
+    return minimal_relative_error_from_system(system, config)
+
+
+def minimal_relative_error_from_system(
+    system: ExactTangentSystem,
+    config: FGDApproxConfig,
+) -> float:
+    """Compute the unchanged minimum-damping certificate from a built system."""
     jacobian = system.jacobian.to(dtype=torch.float64)
     target = system.target.reshape(-1).to(dtype=torch.float64)
     if jacobian.numel() == 0 or target.numel() == 0:
@@ -315,6 +334,8 @@ def select_projection_damping(
     x: torch.Tensor,
     y: torch.Tensor,
     config: FGDApproxConfig,
+    *,
+    system: ExactTangentSystem | None = None,
 ) -> DampingChoice | None:
     """Return the damping maximising Lemma 3.5's guaranteed decrease.
 
@@ -324,7 +345,10 @@ def select_projection_damping(
     approximation and a step the lemma actually describes, so the structure
     has to change.
     """
-    system = exact_tangent_system(model, x, y, config)
+    if system is None:
+        system = exact_tangent_system(model, x, y, config)
+    else:
+        validate_exact_tangent_system(system, model, x, y, config)
     if system is None:
         return None
 
@@ -523,4 +547,5 @@ def select_projection_damping(
         candidate=best[0],
         parameter_updates=best[1],
         candidates=tuple(candidates),
+        tangent_system=system,
     )

@@ -67,12 +67,14 @@ import torch
 from fgdlib.profile import increment, timed
 from fgdlib.search.linearization import predicted_displacement
 from fgdlib.tangent import (
+    ExactTangentSystem,
     FGDApproxConfig,
     _output_relative_error_from_tensors,
     _solve_tangent_projection,
     _trainable_named_parameters,
     _unflatten_parameter_update,
     exact_tangent_system,
+    validate_exact_tangent_system,
 )
 
 __all__ = ["RealizationResult", "realize_functional_step"]
@@ -148,6 +150,8 @@ def realize_functional_step(
     config: FGDApproxConfig,
     max_iterations: int = 32,
     tolerance: float = 0.05,
+    *,
+    system: ExactTangentSystem | None = None,
 ) -> RealizationResult:
     """Move ``theta`` until ``f`` has travelled the certified ``-eta g``.
 
@@ -163,6 +167,9 @@ def realize_functional_step(
     displacement, or when no sub-step reduces it -- in which case the
     realised fraction reports honestly how far it got.
     """
+    if system is not None:
+        validate_exact_tangent_system(system, model, x, y, config)
+    initial_system = system
     parameters = _trainable_named_parameters(model)
     was_training = model.training
     model.eval()
@@ -215,22 +222,30 @@ def realize_functional_step(
                     flat_step = torch.linalg.solve(frozen_gram_damped, jt_shortfall).to(
                         shortfall.dtype
                     )
+                solve_parameters = frozen_parameters
             else:
-                timing = (
-                    timed("realize_initial_system_seconds")
-                    if iterations == 0
-                    else nullcontext()
+                current_system = (
+                    initial_system
+                    if iterations == 0 and initial_system is not None
+                    else None
                 )
-                with timing:
-                    system = exact_tangent_system(model, x, y, config)
-                if system is None:
+                if current_system is None:
+                    timing = (
+                        timed("realize_initial_system_seconds")
+                        if iterations == 0
+                        else nullcontext()
+                    )
+                    with timing:
+                        current_system = exact_tangent_system(model, x, y, config)
+                if current_system is None:
                     break
+                solve_parameters = current_system.parameters
                 if freeze_gram:
                     # First inner iteration under freeze: build the Gram ONCE
                     # from the (streamed or full) Jacobian and factor-solve it;
                     # G = J^T J exactly in both cases (the streamed surrogate
                     # satisfies surrogate^T surrogate = J^T J). Store it frozen.
-                    jac64 = system.jacobian.to(torch.float64)
+                    jac64 = current_system.jacobian.to(torch.float64)
                     with timed("realize_factorization_seconds"):
                         gram = jac64.t() @ jac64
                         damping = max(float(config.projection_damping), 0.0)
@@ -238,7 +253,7 @@ def realize_functional_step(
                             gram.shape[0], dtype=torch.float64, device=gram.device
                         )
                         frozen_gram_damped = gram + damping * identity
-                    frozen_parameters = system.parameters
+                    frozen_parameters = current_system.parameters
                     jt_shortfall = _jt_shortfall_vjp(
                         model, x, shortfall, frozen_parameters
                     )
@@ -247,7 +262,8 @@ def realize_functional_step(
                             frozen_gram_damped, jt_shortfall
                         ).to(shortfall.dtype)
                 elif getattr(config, "certify_stream_gram", False):
-                    # Streamed system: system.jacobian is the tiny surrogate, so
+                    # Streamed system: current_system.jacobian is the tiny
+                    # surrogate, so
                     # the NK-dimensional shortfall cannot be projected against it
                     # directly. Solve via the Gram normal equations instead --
                     # exact same step, at O(P^2) memory (surrogate gives J^T J, a
@@ -257,14 +273,14 @@ def realize_functional_step(
                             model,
                             x,
                             shortfall,
-                            system.jacobian,
-                            system.parameters,
+                            current_system.jacobian,
+                            current_system.parameters,
                             config,
                         )
                 else:
                     with timed("realize_solve_seconds"):
                         flat_step, approximation = _solve_tangent_projection(
-                            jacobian_matrix=system.jacobian,
+                            jacobian_matrix=current_system.jacobian,
                             target=shortfall,
                             damping=config.projection_damping,
                             solver=config.projection_solver,
@@ -284,7 +300,7 @@ def realize_functional_step(
                     del stats  # measured for parity with outer solve; unused here
             if not torch.isfinite(flat_step).all():
                 break
-            step_updates = _unflatten_parameter_update(flat_step, system.parameters)
+            step_updates = _unflatten_parameter_update(flat_step, solve_parameters)
 
             with timed("realize_line_search_seconds"):
                 sub_rate = _residual_reducing_sub_rate(
