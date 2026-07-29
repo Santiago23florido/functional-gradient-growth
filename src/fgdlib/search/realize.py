@@ -141,6 +141,51 @@ class RealizationResult:
     parameter_displacement: float
 
 
+@dataclass(frozen=True)
+class _FrozenGramFactorization:
+    """One float64 ``G + lambda I`` and its reusable Cholesky factor."""
+
+    matrix: torch.Tensor
+    cholesky: torch.Tensor | None
+
+
+def _factorize_frozen_gram(
+    jacobian: torch.Tensor,
+    damping: float,
+) -> _FrozenGramFactorization:
+    """Build and factor the absolute-damped frozen Gram exactly once."""
+    jacobian64 = jacobian.to(torch.float64)
+    gram = jacobian64.t() @ jacobian64
+    identity = torch.eye(
+        gram.shape[0],
+        dtype=torch.float64,
+        device=gram.device,
+    )
+    matrix = gram + max(float(damping), 0.0) * identity
+    cholesky, info = torch.linalg.cholesky_ex(matrix, check_errors=False)
+    failed = bool(torch.any(info != 0)) or not bool(torch.isfinite(cholesky).all())
+    if failed:
+        increment("realize_cholesky_fallbacks")
+        cholesky = None
+    return _FrozenGramFactorization(matrix=matrix, cholesky=cholesky)
+
+
+def _solve_frozen_gram(
+    factorization: _FrozenGramFactorization,
+    right_hand_side: torch.Tensor,
+) -> torch.Tensor:
+    """Reuse Cholesky, or the previous direct solve when factorization failed."""
+    rhs64 = right_hand_side.to(torch.float64)
+    vector_rhs = rhs64.ndim == 1
+    if vector_rhs:
+        rhs64 = rhs64.unsqueeze(1)
+    if factorization.cholesky is None:
+        solution = torch.linalg.solve(factorization.matrix, rhs64)
+    else:
+        solution = torch.cholesky_solve(rhs64, factorization.cholesky)
+    return solution.squeeze(1) if vector_rhs else solution
+
+
 def realize_functional_step(
     model: torch.nn.Module,
     x: torch.Tensor,
@@ -188,7 +233,7 @@ def realize_functional_step(
         min_progress = float(getattr(config, "certify_realize_min_progress", 0.0))
         freeze_gram = bool(getattr(config, "certify_realize_freeze_gram", False))
         # When freezing, these are built once (first inner iteration) and reused:
-        frozen_gram_damped = None  # (G + lambda I), float64, P x P
+        frozen_factorization = None
         frozen_parameters = None  # the parameter tuple J^T shortfall needs
         for _ in range(max_iterations):
             with torch.no_grad():
@@ -213,15 +258,15 @@ def realize_functional_step(
             # DESCENT direction, so pass the negated shortfall and subtract).
             shortfall = (current - target).reshape(-1)
 
-            if freeze_gram and frozen_gram_damped is not None:
+            if freeze_gram and frozen_factorization is not None:
                 # Modified-Newton (chord): reuse the Gram from the first inner
                 # iteration; recompute only J^T shortfall (one VJP) at the moved
                 # theta. (G+lambda) is SPD -> still a residual-descent direction.
                 jt_shortfall = _jt_shortfall_vjp(model, x, shortfall, frozen_parameters)
                 with timed("realize_solve_seconds"):
-                    flat_step = torch.linalg.solve(frozen_gram_damped, jt_shortfall).to(
-                        shortfall.dtype
-                    )
+                    flat_step = _solve_frozen_gram(
+                        frozen_factorization, jt_shortfall
+                    ).to(shortfall.dtype)
                 solve_parameters = frozen_parameters
             else:
                 current_system = (
@@ -245,21 +290,18 @@ def realize_functional_step(
                     # from the (streamed or full) Jacobian and factor-solve it;
                     # G = J^T J exactly in both cases (the streamed surrogate
                     # satisfies surrogate^T surrogate = J^T J). Store it frozen.
-                    jac64 = current_system.jacobian.to(torch.float64)
                     with timed("realize_factorization_seconds"):
-                        gram = jac64.t() @ jac64
-                        damping = max(float(config.projection_damping), 0.0)
-                        identity = torch.eye(
-                            gram.shape[0], dtype=torch.float64, device=gram.device
+                        frozen_factorization = _factorize_frozen_gram(
+                            current_system.jacobian,
+                            config.projection_damping,
                         )
-                        frozen_gram_damped = gram + damping * identity
                     frozen_parameters = current_system.parameters
                     jt_shortfall = _jt_shortfall_vjp(
                         model, x, shortfall, frozen_parameters
                     )
                     with timed("realize_solve_seconds"):
-                        flat_step = torch.linalg.solve(
-                            frozen_gram_damped, jt_shortfall
+                        flat_step = _solve_frozen_gram(
+                            frozen_factorization, jt_shortfall
                         ).to(shortfall.dtype)
                 elif getattr(config, "certify_stream_gram", False):
                     # Streamed system: current_system.jacobian is the tiny
