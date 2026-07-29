@@ -65,6 +65,7 @@ from dataclasses import dataclass
 
 import torch
 
+from fgdlib.profile import profiled, timed
 from fgdlib.search.linearization import certified_linear_learning_rate
 from fgdlib.tangent import (
     FGDApproxConfig,
@@ -139,13 +140,13 @@ def dof_corrected_relative_error(
     """
     denom = n_observations - effective_rank - 1
     if denom <= 0:
-        return float("inf")                      # NK <= m+1: interpolation
+        return float("inf")  # NK <= m+1: interpolation
     if not (raw_relative_error == raw_relative_error) or raw_relative_error < 0:
         return float("inf")
     rho = 1.0 / (1.0 + raw_relative_error**2)
     rho_adj = 1.0 - (1.0 - rho) * (n_observations - 1) / denom
     if rho_adj <= 0.0:
-        return float("inf")                      # captured energy debiases to <=0
+        return float("inf")  # captured energy debiases to <=0
     rho_adj = min(rho_adj, 1.0)
     return math.sqrt(max(0.0, (1.0 - rho_adj) / rho_adj))
 
@@ -193,6 +194,7 @@ def _fast_min_relative_error(
     if value is None or not float(value) == float(value):
         return float("inf")
     return float(value)
+
 
 #: Bisection steps used to locate the certified boundary. 40 halvings of an
 #: 18-decade bracket resolve it to ~1e-5 of a decade -- far finer than any
@@ -252,6 +254,7 @@ class DampingChoice:
     candidates: tuple[DampingCandidate, ...]
 
 
+@profiled("minimal_relative_error_seconds")
 def minimal_relative_error(
     model,
     x: torch.Tensor,
@@ -306,6 +309,7 @@ def minimal_relative_error(
     return float(value)
 
 
+@profiled("select_projection_damping_seconds")
 def select_projection_damping(
     model,
     x: torch.Tensor,
@@ -340,7 +344,8 @@ def select_projection_damping(
     # The damping fan needs the singular values themselves, so this keeps a
     # genuine SVD (eigh of the Gram would square the condition number and
     # corrupt the spectrum) -- in the work_dtype chosen above.
-    left, singular_values, right = torch.linalg.svd(jacobian, full_matrices=False)
+    with timed("damping_factorization_seconds"):
+        left, singular_values, right = torch.linalg.svd(jacobian, full_matrices=False)
     if singular_values.numel() == 0:
         return None
     scale = float(singular_values.max()) ** 2
@@ -357,12 +362,14 @@ def select_projection_damping(
         """Re-weight the factorisation -- no new Jacobian, no new SVD."""
         absolute = relative_damping * scale
         denominator = singular_values.square() + absolute
-        filters = singular_values.square() / denominator     # sigma^2/(sigma^2+lambda)
+        filters = singular_values.square() / denominator  # sigma^2/(sigma^2+lambda)
         approximation = left @ (filters * coefficients)
         flat_update = right.t() @ (singular_values / denominator * coefficients)
         return absolute, approximation, flat_update, filters
 
-    def gcv_at(filters: torch.Tensor, approximation: torch.Tensor) -> tuple[float, float]:
+    def gcv_at(
+        filters: torch.Tensor, approximation: torch.Tensor
+    ) -> tuple[float, float]:
         """Return (df, GCV) for a rung, from its spectral filters.
 
         df = tr H_lambda = sum sigma_i^2/(sigma_i^2 + lambda) is the sum of
@@ -401,7 +408,7 @@ def select_projection_damping(
         boundary = high
     else:
         for _ in range(DAMPING_BISECTION_STEPS):
-            middle = (low * high) ** 0.5          # geometric: rho spans decades
+            middle = (low * high) ** 0.5  # geometric: rho spans decades
             if relative_error_at(middle) < threshold:
                 low = middle
             else:
@@ -411,7 +418,9 @@ def select_projection_damping(
     candidates: list[DampingCandidate] = []
     best: tuple[DampingCandidate, tuple[torch.Tensor, ...]] | None = None
 
-    def is_better(candidate: DampingCandidate, incumbent: DampingCandidate | None) -> bool:
+    def is_better(
+        candidate: DampingCandidate, incumbent: DampingCandidate | None
+    ) -> bool:
         """Rank certified, realisable rungs by the configured objective.
 
         "descent": maximise eta * ||g||^2, the decrease Lemma 3.5 guarantees.
@@ -447,9 +456,7 @@ def select_projection_damping(
             flat_update.to(system.target.dtype), system.parameters
         )
         if relative_error is not None and relative_error < threshold:
-            upper_bound = theoretical_learning_rate_upper_bound(
-                relative_error, config
-            )
+            upper_bound = theoretical_learning_rate_upper_bound(relative_error, config)
             if upper_bound is not None:
                 # Match the rate the STEP will actually take. eta_bar is where
                 # Lemma 3.5's guaranteed decrease vanishes, so the decrease
@@ -484,17 +491,13 @@ def select_projection_damping(
         # the descent objective ranks by. A tiny eps bought with an
         # unrealisable step scores zero, which is exactly right.
         decrease = (
-            learning_rate * approximation_norm**2
-            if learning_rate is not None
-            else 0.0
+            learning_rate * approximation_norm**2 if learning_rate is not None else 0.0
         )
         candidate = DampingCandidate(
             relative_damping=relative_damping,
             absolute_damping=absolute_damping,
             relative_error=(
-                float(relative_error)
-                if relative_error is not None
-                else float("inf")
+                float(relative_error) if relative_error is not None else float("inf")
             ),
             update_norm=update_norm,
             approximation_norm=approximation_norm,
@@ -507,8 +510,10 @@ def select_projection_damping(
         candidates.append(candidate)
         # A rung only competes if it both certifies and realises a step --
         # the certificate is never traded away regardless of objective.
-        if learning_rate is not None and decrease > 0.0 and is_better(
-            candidate, best[0] if best else None
+        if (
+            learning_rate is not None
+            and decrease > 0.0
+            and is_better(candidate, best[0] if best else None)
         ):
             best = (candidate, updates)
 
