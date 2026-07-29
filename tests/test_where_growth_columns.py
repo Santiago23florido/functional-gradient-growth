@@ -16,10 +16,9 @@ from fgdlib.tangent import (
     tiny_optimal_update_kwargs,
 )
 
-
 ensure_gromo_importable()
 
-from gromo.containers.growing_mlp import GrowingMLP  # noqa: E402
+from gromo.containers.growing_mlp import GrowingMLP
 
 
 def _prefix_coordinate_map(

@@ -46,7 +46,6 @@ from dataclasses import dataclass
 import torch
 
 from fgdlib.profile import increment, profiled
-from fgdlib.search.growth import grow_layer
 from fgdlib.search.exact_where import (
     CandidateScoringError,
     UnsupportedGrowthStructure,
@@ -55,6 +54,7 @@ from fgdlib.search.exact_where import (
     identify_growth_columns,
     stream_shared_candidate_statistics,
 )
+from fgdlib.search.growth import grow_layer
 from fgdlib.tangent import (
     ExactTangentSystem,
     FGDApproxConfig,

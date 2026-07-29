@@ -9,6 +9,7 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from fgdlib.gromo_setup import ensure_gromo_importable
+from fgdlib.profile import increment, reset, snapshot
 from fgdlib.search.certify import _grow_clone, _select_growth_candidate
 from fgdlib.search.damping import DAMPING_BRACKET, minimal_relative_error_from_system
 from fgdlib.search.exact_where import (
@@ -22,16 +23,14 @@ from fgdlib.search.exact_where import (
     identify_growth_columns,
     stream_shared_candidate_statistics,
 )
-from fgdlib.profile import increment, reset, snapshot
 from fgdlib.tangent import (
-    FGDApproxConfig,
     ExactTangentSystem,
+    FGDApproxConfig,
     _output_relative_error_from_tensors,
     _solve_tangent_projection,
     exact_tangent_system,
 )
 from stable_tiny.pipeline import build_model, load_pipeline_config
-
 
 ensure_gromo_importable()
 
@@ -291,7 +290,7 @@ def test_environment_flag_is_benchmark_only(monkeypatch) -> None:
 
 def test_fast_scan_builds_only_the_final_winners_full_system(monkeypatch) -> None:
     """With oracle-parity scores, N candidate systems collapse to one validation."""
-    import fgdlib.search.certify as certify
+    from fgdlib.search import certify
 
     config, model, x, y, loader = _problem(17, out_features=1)
     base_system = exact_tangent_system(model, x, y, config.fgd_approx)
@@ -372,7 +371,7 @@ def test_fast_scan_builds_only_the_final_winners_full_system(monkeypatch) -> Non
 
 
 def test_numerical_and_unsupported_fallbacks_are_counted(monkeypatch) -> None:
-    import fgdlib.search.certify as certify
+    from fgdlib.search import certify
 
     config, model, x, y, loader = _problem(19, out_features=1)
     base_system = exact_tangent_system(model, x, y, config.fgd_approx)

@@ -21,10 +21,9 @@ from fgdlib.tangent import (
     tiny_optimal_update_kwargs,
 )
 
-
 ensure_gromo_importable()
 
-from gromo.containers.growing_mlp import GrowingMLP  # noqa: E402
+from gromo.containers.growing_mlp import GrowingMLP
 
 
 def _grown_candidates(out_features: int = 2):
@@ -151,7 +150,7 @@ def test_streamed_base_system_is_reconstructed_only_once(monkeypatch) -> None:
         for candidate in candidates
     )
 
-    import fgdlib.search.exact_where as exact_where
+    from fgdlib.search import exact_where
 
     original = exact_where._base_jacobian_block
     calls = 0
