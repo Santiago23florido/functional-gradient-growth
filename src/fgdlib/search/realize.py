@@ -76,6 +76,24 @@ from fgdlib.tangent import (
 __all__ = ["RealizationResult", "realize_functional_step"]
 
 
+def _jt_shortfall_vjp(
+    model: torch.nn.Module,
+    x: torch.Tensor,
+    shortfall: torch.Tensor,
+    parameters: tuple[torch.Tensor, ...],
+) -> torch.Tensor:
+    """``J^T shortfall`` at the CURRENT parameters via a single VJP (float64).
+
+    One backward pass over the scalar ``<f(x), shortfall>``; the full ``NK x P``
+    Jacobian is never held. This is the only per-iteration cost that must be
+    recomputed when the Gram is frozen.
+    """
+    output = model(x).reshape(-1)
+    scalar = (output * shortfall.to(output.dtype)).sum()
+    grads = torch.autograd.grad(scalar, parameters)
+    return torch.cat([g.reshape(-1) for g in grads]).to(torch.float64)
+
+
 def _gram_shortfall_solve(
     model: torch.nn.Module,
     x: torch.Tensor,
@@ -92,10 +110,7 @@ def _gram_shortfall_solve(
     so the full ``NK x P`` Jacobian is never held. Same solution as the direct
     solve, at ``O(P^2)`` memory.
     """
-    output = model(x).reshape(-1)
-    scalar = (output * shortfall.to(output.dtype)).sum()
-    grads = torch.autograd.grad(scalar, parameters)
-    jt_shortfall = torch.cat([g.reshape(-1) for g in grads]).to(torch.float64)
+    jt_shortfall = _jt_shortfall_vjp(model, x, shortfall, parameters)
 
     gram = surrogate_jacobian.to(torch.float64)
     gram = gram.t() @ gram                       # J^T J (P x P), exact
@@ -160,6 +175,10 @@ def realize_functional_step(
         iterations = 0
         previous_remaining = intended
         min_progress = float(getattr(config, "certify_realize_min_progress", 0.0))
+        freeze_gram = bool(getattr(config, "certify_realize_freeze_gram", False))
+        # When freezing, these are built once (first inner iteration) and reused:
+        frozen_gram_damped = None   # (G + lambda I), float64, P x P
+        frozen_parameters = None    # the parameter tuple J^T shortfall needs
         for _ in range(max_iterations):
             with torch.no_grad():
                 current = model(x).detach()
@@ -182,38 +201,69 @@ def realize_functional_step(
             # convention the projection expects (it solves J v ~ d for a
             # DESCENT direction, so pass the negated shortfall and subtract).
             shortfall = (current - target).reshape(-1)
-            system = exact_tangent_system(model, x, y, config)
-            if system is None:
-                break
-            if getattr(config, "certify_stream_gram", False):
-                # Streamed system: system.jacobian is the tiny surrogate, so the
-                # NK-dimensional shortfall cannot be projected against it
-                # directly. Solve via the Gram normal equations instead -- exact
-                # same step, at O(P^2) memory (the surrogate gives J^T J, a
-                # single VJP gives J^T shortfall).
-                flat_step = _gram_shortfall_solve(
-                    model, x, shortfall, system.jacobian, system.parameters, config
+
+            if freeze_gram and frozen_gram_damped is not None:
+                # Modified-Newton (chord): reuse the Gram from the first inner
+                # iteration; recompute only J^T shortfall (one VJP) at the moved
+                # theta. (G+lambda) is SPD -> still a residual-descent direction.
+                jt_shortfall = _jt_shortfall_vjp(
+                    model, x, shortfall, frozen_parameters
                 )
+                flat_step = torch.linalg.solve(
+                    frozen_gram_damped, jt_shortfall
+                ).to(shortfall.dtype)
             else:
-                flat_step, approximation = _solve_tangent_projection(
-                    jacobian_matrix=system.jacobian,
-                    target=shortfall,
-                    damping=config.projection_damping,
-                    solver=config.projection_solver,
-                    # The integration re-solves against the measured residual each
-                    # iteration, so a float32 sub-step's round-off is corrected by
-                    # the next one -- and this inner solve is the dominant cost of a
-                    # run. float64 stays the default off the fast flag.
-                    work_dtype=(
-                        torch.float32
-                        if getattr(config, "projection_fast_factorization", False)
-                        else torch.float64
-                    ),
-                )
-                stats = _output_relative_error_from_tensors(
-                    approximation=approximation, target=shortfall, eps=config.eps
-                )
-                del stats  # measured for parity with the outer solve; unused here
+                system = exact_tangent_system(model, x, y, config)
+                if system is None:
+                    break
+                if freeze_gram:
+                    # First inner iteration under freeze: build the Gram ONCE
+                    # from the (streamed or full) Jacobian and factor-solve it;
+                    # G = J^T J exactly in both cases (the streamed surrogate
+                    # satisfies surrogate^T surrogate = J^T J). Store it frozen.
+                    jac64 = system.jacobian.to(torch.float64)
+                    gram = jac64.t() @ jac64
+                    damping = max(float(config.projection_damping), 0.0)
+                    identity = torch.eye(
+                        gram.shape[0], dtype=torch.float64, device=gram.device
+                    )
+                    frozen_gram_damped = gram + damping * identity
+                    frozen_parameters = system.parameters
+                    jt_shortfall = _jt_shortfall_vjp(
+                        model, x, shortfall, frozen_parameters
+                    )
+                    flat_step = torch.linalg.solve(
+                        frozen_gram_damped, jt_shortfall
+                    ).to(shortfall.dtype)
+                elif getattr(config, "certify_stream_gram", False):
+                    # Streamed system: system.jacobian is the tiny surrogate, so
+                    # the NK-dimensional shortfall cannot be projected against it
+                    # directly. Solve via the Gram normal equations instead --
+                    # exact same step, at O(P^2) memory (surrogate gives J^T J, a
+                    # single VJP gives J^T shortfall).
+                    flat_step = _gram_shortfall_solve(
+                        model, x, shortfall, system.jacobian,
+                        system.parameters, config,
+                    )
+                else:
+                    flat_step, approximation = _solve_tangent_projection(
+                        jacobian_matrix=system.jacobian,
+                        target=shortfall,
+                        damping=config.projection_damping,
+                        solver=config.projection_solver,
+                        work_dtype=(
+                            torch.float32
+                            if getattr(
+                                config, "projection_fast_factorization", False
+                            )
+                            else torch.float64
+                        ),
+                    )
+                    stats = _output_relative_error_from_tensors(
+                        approximation=approximation, target=shortfall,
+                        eps=config.eps,
+                    )
+                    del stats  # measured for parity with outer solve; unused here
             if not torch.isfinite(flat_step).all():
                 break
             step_updates = _unflatten_parameter_update(
