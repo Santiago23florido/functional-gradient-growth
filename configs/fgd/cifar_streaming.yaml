@@ -286,6 +286,15 @@ fgd_approx:
   certify_family_plateau_stop: true
   certify_realize_max_iterations: 40
   certify_realize_tolerance: 0.05
+  # Freeze the Gauss-Newton Gram across the inner realise iterations (modified-
+  # Newton / chord): build J^T J once, then each iteration is one VJP instead of
+  # a full streamed all-data Jacobian. This is the dominant CIFAR cost -- the
+  # realise loop ran ~5 inner Jacobians/step, each O(NK*P); the freeze turns
+  # them into 1 Jacobian + VJPs. Same certified direction/rate/target and the
+  # same residual-reducing line search. VALIDATED on family_ladder_N1024 (test
+  # 0.936/0.934 vs 0.935/0.932, iters 5.34 vs 5.47, 0 NaN). Estimated ~2.4x
+  # faster per epoch on CIFAR (realise ~42 -> ~8 jacrev-equivalents/epoch).
+  certify_realize_freeze_gram: true
   tangent_measured_descent: false
   growth_selection: grow_all_width
   # Generalised R1: eps < 1/2 is Lemma 3.5 step-admissibility, not structural

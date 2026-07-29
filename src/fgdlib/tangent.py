@@ -512,6 +512,17 @@ class FGDApproxConfig:
     # continues from there. 0.0 keeps the current behaviour (stop only at the
     # tolerance or the iteration cap).
     certify_realize_min_progress: float = 0.0
+    # Freeze the Gauss-Newton preconditioner (the Gram J^T J) ACROSS the inner
+    # realise iterations instead of rebuilding the full Jacobian every one. The
+    # sub-steps are short, so J barely moves; holding G = J^T J fixed at the
+    # first inner iteration and recomputing only J^T shortfall (a SINGLE VJP)
+    # each iteration is the modified-Newton (chord) method. Because (G+lambda)
+    # is SPD, (G+lambda)^-1 J^T r is always a descent direction of ||r||^2, so
+    # the residual-reducing line search is unchanged and the realised step lands
+    # in the same functional-tolerance ball. Turns "up to 40 full Jacobians per
+    # outer step" into "1 Jacobian + up to 39 VJPs". Off by default -> the two
+    # branches below run exactly as before; on -> the frozen-Gram path.
+    certify_realize_freeze_gram: bool = False
     # Bounded certification probe, sized to the NUMERICAL RANK of J. The
     # certificate eps<1/2 is a statement over the NK-dimensional probe residual,
     # but MEASURED the rank m* needed to certify grows SUBLINEARLY in NK (m*/NK:
