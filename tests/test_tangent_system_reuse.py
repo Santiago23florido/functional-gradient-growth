@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import math
 from dataclasses import replace
 
 import pytest
@@ -79,6 +80,18 @@ def test_exact_system_numerical_and_damping_parity(fast: bool) -> None:
     assert reused.candidates == direct.candidates
     for actual, expected in zip(reused.parameter_updates, direct.parameter_updates):
         assert torch.allclose(actual, expected, atol=tolerance, rtol=1e-8)
+
+
+def test_selected_tangent_step_has_a_finite_strict_certificate() -> None:
+    config, model, x, y, _ = _setup()
+    choice = select_projection_damping(model, x, y, config.fgd_approx)
+    assert choice is not None
+    assert choice.candidate.learning_rate is not None
+    assert math.isfinite(choice.candidate.relative_error)
+    assert choice.candidate.relative_error < min(
+        config.fgd_approx.rel_error_threshold,
+        0.5,
+    )
 
 
 def test_one_system_build_for_an_unchanged_outer_state(monkeypatch) -> None:
