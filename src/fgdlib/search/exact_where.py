@@ -21,6 +21,7 @@ from fgdlib.tangent import (
     FGDApproxConfig,
     _clear_inaccessible_tensor_caches,
     _flatten_jacobian,
+    _output_relative_error_from_stats,
     validate_exact_tangent_system,
 )
 
@@ -49,6 +50,9 @@ class CandidateStatistics:
     cross_gram: torch.Tensor
     new_gram: torch.Tensor
     new_rhs: torch.Tensor
+    # R from a streamed QR of [J_base, C, r].  It preserves every Gram and
+    # target statistic while allowing a cancellation-free Schur complement.
+    joint_factor: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -59,6 +63,32 @@ class SharedBaseStatistics:
     rhs: torch.Tensor
     target_sq_norm: torch.Tensor
     candidates: tuple[CandidateStatistics, ...]
+
+
+class CandidateScoringError(RuntimeError):
+    """A numerical invariant prevented certified fast scoring."""
+
+
+@dataclass(frozen=True)
+class BaseSpectrum:
+    """One deterministic float64 SVD shared by all candidate ridge solves."""
+
+    singular_values: torch.Tensor
+    right_vectors: torch.Tensor
+
+
+@dataclass(frozen=True)
+class ExactCandidateScore:
+    """Finite-Tikhonov score and diagnostics for one candidate."""
+
+    relative_error: float
+    absolute_damping: float
+    old_update: torch.Tensor
+    new_update: torch.Tensor
+    normal_residual: float
+    schur_residual: float
+    sensor_residual: float
+    error_bound: float
 
 
 def _flat_prefix_coordinates(
@@ -263,6 +293,7 @@ def stream_shared_candidate_statistics(
         )
         for layout in layouts
     ]
+    joint_factors: list[torch.Tensor | None] = [None for _ in layouts]
 
     base_was_training = base.training
     candidate_states = [layout.candidate.training for layout in layouts]
@@ -293,6 +324,15 @@ def stream_shared_candidate_statistics(
                 cross[index].add_(j64.t() @ c_block)
                 new_grams[index].add_(c_block.t() @ c_block)
                 new_rhs[index].add_(c_block.t() @ r64)
+                joint_block = torch.cat(
+                    [j64, c_block, r64.unsqueeze(1)], dim=1
+                )
+                stacked = (
+                    joint_block
+                    if joint_factors[index] is None
+                    else torch.cat([joint_factors[index], joint_block], dim=0)
+                )
+                joint_factors[index] = torch.linalg.qr(stacked, mode="reduced").R
             _clear_inaccessible_tensor_caches(base)
             for layout in layouts:
                 _clear_inaccessible_tensor_caches(layout.candidate)
@@ -302,9 +342,11 @@ def stream_shared_candidate_statistics(
             layout.candidate.train(was_training)
 
     candidate_statistics: list[CandidateStatistics] = []
-    for layout, candidate_cross, candidate_gram, candidate_rhs in zip(
-        layouts, cross, new_grams, new_rhs
+    for layout, candidate_cross, candidate_gram, candidate_rhs, joint_factor in zip(
+        layouts, cross, new_grams, new_rhs, joint_factors
     ):
+        if joint_factor is None:
+            raise RuntimeError("candidate statistics received an empty probe")
         nonzero = torch.diagonal(candidate_gram) != 0
         indices = tuple(
             coordinate
@@ -320,6 +362,18 @@ def stream_shared_candidate_statistics(
                 cross_gram=candidate_cross[:, nonzero],
                 new_gram=candidate_gram[nonzero][:, nonzero],
                 new_rhs=candidate_rhs[nonzero],
+                joint_factor=torch.cat(
+                    [
+                        joint_factor[:, : gram.shape[0]],
+                        joint_factor[
+                            :,
+                            gram.shape[0] : gram.shape[0]
+                            + len(layout.new_candidate_coordinates),
+                        ][:, nonzero],
+                        joint_factor[:, -1:],
+                    ],
+                    dim=1,
+                ),
             )
         )
     return SharedBaseStatistics(
@@ -327,4 +381,221 @@ def stream_shared_candidate_statistics(
         rhs=rhs,
         target_sq_norm=target_sq_norm,
         candidates=tuple(candidate_statistics),
+    )
+
+
+def factor_shared_base(system: ExactTangentSystem) -> BaseSpectrum:
+    """Factor the Phase 1 base representation once in float64."""
+    _, singular_values, right_vectors = torch.linalg.svd(
+        system.jacobian.to(torch.float64),
+        full_matrices=False,
+    )
+    if (
+        singular_values.numel() == 0
+        or not torch.isfinite(singular_values).all()
+        or not torch.isfinite(right_vectors).all()
+    ):
+        raise CandidateScoringError("nonfinite base spectrum")
+    return BaseSpectrum(
+        singular_values=singular_values,
+        right_vectors=right_vectors,
+    )
+
+
+def _spectral_solve(
+    spectrum: BaseSpectrum,
+    rhs: torch.Tensor,
+    damping: float,
+) -> torch.Tensor:
+    """Apply ``(G + damping I)^-1`` without forming an inverse."""
+    right = spectrum.right_vectors
+    coordinates = right @ rhs
+    represented = right.t() @ coordinates
+    denominator = spectrum.singular_values.square() + damping
+    if coordinates.ndim > 1:
+        denominator = denominator.unsqueeze(1)
+    range_solution = right.t() @ (
+        coordinates / denominator
+    )
+    return range_solution + (rhs - represented) / damping
+
+
+def exact_block_schur_score(
+    shared: SharedBaseStatistics,
+    candidate: CandidateStatistics,
+    spectrum: BaseSpectrum,
+    *,
+    eps: float,
+) -> ExactCandidateScore:
+    """Score one exact augmented ridge system through its block Schur solve."""
+    gram = shared.gram
+    rhs = shared.rhs
+    cross = candidate.cross_gram
+    new_gram = candidate.new_gram
+    new_rhs = candidate.new_rhs
+    tensors = (gram, rhs, cross, new_gram, new_rhs, shared.target_sq_norm)
+    if any(not torch.isfinite(tensor).all() for tensor in tensors):
+        raise CandidateScoringError("nonfinite sufficient statistics")
+    if new_rhs.numel() == 0:
+        raise CandidateScoringError("candidate has no nonzero new tangent columns")
+
+    gram_scale = max(1.0, float(torch.linalg.norm(gram)))
+    symmetry_residual = float(torch.linalg.norm(gram - gram.t())) / gram_scale
+    new_scale = max(1.0, float(torch.linalg.norm(new_gram)))
+    new_symmetry_residual = (
+        float(torch.linalg.norm(new_gram - new_gram.t())) / new_scale
+    )
+    if symmetry_residual > 1e-12 or new_symmetry_residual > 1e-12:
+        raise CandidateScoringError("nonsymmetric augmented Gram")
+
+    parameter_count = gram.shape[0]
+    new_count = new_rhs.numel()
+    joint = candidate.joint_factor
+    reduced_jacobian = joint[:, : parameter_count + new_count]
+    reduced_target = joint[:, -1]
+    reduced_base = joint[:, :parameter_count]
+    reduced_new = joint[:, parameter_count : parameter_count + new_count]
+    consistency_scale = max(
+        1.0,
+        float(torch.linalg.norm(cross)),
+        float(torch.linalg.norm(new_gram)),
+        float(torch.linalg.norm(new_rhs)),
+    )
+    consistency_residual = max(
+        float(torch.linalg.norm(reduced_base.t() @ reduced_new - cross)),
+        float(torch.linalg.norm(reduced_new.t() @ reduced_new - new_gram)),
+        float(torch.linalg.norm(reduced_new.t() @ reduced_target - new_rhs)),
+    ) / consistency_scale
+    if consistency_residual > 2e-8:
+        raise CandidateScoringError("joint factor disagrees with B, D, or c")
+    candidate_singular = torch.linalg.svdvals(reduced_jacobian)
+    largest = float(candidate_singular.max()) ** 2
+    if not largest > 0.0 or not torch.isfinite(candidate_singular).all():
+        raise CandidateScoringError("candidate tangent system is degenerate")
+    damping = 1e-16 * largest
+
+    left, base_singular, right = torch.linalg.svd(
+        reduced_base, full_matrices=False
+    )
+    if not torch.allclose(
+        base_singular,
+        spectrum.singular_values,
+        atol=1e-10,
+        rtol=1e-8,
+    ):
+        raise CandidateScoringError("candidate scan changed the base spectrum")
+    base_coordinates = left.t() @ reduced_new
+    target_coordinates = left.t() @ reduced_target
+    new_residual = reduced_new - left @ base_coordinates
+    target_residual = reduced_target - left @ target_coordinates
+    weights = damping / (base_singular.square() + damping)
+    schur = (
+        new_residual.t() @ new_residual
+        + (base_coordinates * weights.unsqueeze(1)).t() @ base_coordinates
+        + damping
+        * torch.eye(
+            new_count,
+            dtype=new_gram.dtype,
+            device=new_gram.device,
+        )
+    )
+    schur = 0.5 * (schur + schur.t())
+    schur_rhs = (
+        new_residual.t() @ target_residual
+        + base_coordinates.t() @ (weights * target_coordinates)
+    )
+    factor, info = torch.linalg.cholesky_ex(schur)
+    if int(info.max()) != 0:
+        raise CandidateScoringError("Schur Cholesky factorization failed")
+    new_update = torch.cholesky_solve(
+        schur_rhs.unsqueeze(1), factor
+    ).squeeze(1)
+    old_update = right.t() @ (
+        base_singular
+        / (base_singular.square() + damping)
+        * (target_coordinates - base_coordinates @ new_update)
+    )
+    if not torch.isfinite(old_update).all() or not torch.isfinite(new_update).all():
+        raise CandidateScoringError("nonfinite block-Schur solution")
+
+    old_normal = (
+        gram @ old_update
+        + cross @ new_update
+        + damping * old_update
+        - rhs
+    )
+    new_normal = (
+        cross.t() @ old_update
+        + new_gram @ new_update
+        + damping * new_update
+        - new_rhs
+    )
+    normal_rhs_norm = max(
+        1.0,
+        float(torch.linalg.norm(torch.cat([rhs, new_rhs]))),
+    )
+    normal_residual = float(
+        torch.linalg.norm(torch.cat([old_normal, new_normal]))
+    ) / normal_rhs_norm
+    schur_residual = float(
+        torch.linalg.norm(schur @ new_update - schur_rhs)
+    ) / max(1.0, float(torch.linalg.norm(schur_rhs)))
+    if normal_residual > 2e-6 or schur_residual > 2e-8:
+        raise CandidateScoringError("ridge or Schur residual is excessive")
+
+    gram_dot_product = float(
+        torch.dot(rhs, old_update) + torch.dot(new_rhs, new_update)
+    )
+    gram_approximation_sq = float(
+        torch.dot(old_update, gram @ old_update)
+        + 2.0 * torch.dot(old_update, cross @ new_update)
+        + torch.dot(new_update, new_gram @ new_update)
+    )
+    flat_update = torch.cat([old_update, new_update])
+    reduced_approximation = reduced_jacobian @ flat_update
+    dot_product = float(torch.dot(reduced_approximation, reduced_target))
+    approximation_sq = float(
+        torch.dot(reduced_approximation, reduced_approximation)
+    )
+    solution_sq = float(
+        torch.dot(old_update, old_update) + torch.dot(new_update, new_update)
+    )
+    alternative_sq = dot_product - damping * solution_sq
+    sensor_residual = max(
+        abs(approximation_sq - alternative_sq),
+        abs(gram_dot_product - dot_product),
+        abs(gram_approximation_sq - approximation_sq),
+    ) / max(
+        1.0,
+        abs(approximation_sq),
+        abs(alternative_sq),
+        abs(dot_product),
+    )
+    if sensor_residual > 2e-5:
+        raise CandidateScoringError(
+            "reconstructed projection sensor is inconsistent "
+            f"({sensor_residual:.3e})"
+        )
+    sensor = _output_relative_error_from_stats(
+        dot_product=dot_product,
+        approximation_sq_norm=approximation_sq,
+        target_sq_norm=float(torch.dot(reduced_target, reduced_target)),
+        eps=eps,
+    )
+    relative_error = float(sensor.relative_error)
+    if not torch.isfinite(torch.tensor(relative_error)):
+        raise CandidateScoringError("nonfinite relative error")
+    error_bound = max(
+        1e-11,
+        10.0 * (normal_residual + schur_residual + sensor_residual),
+    )
+    return ExactCandidateScore(
+        relative_error=relative_error,
+        absolute_damping=damping,
+        old_update=old_update,
+        new_update=new_update,
+        normal_residual=normal_residual,
+        schur_residual=schur_residual,
+        sensor_residual=sensor_residual,
+        error_bound=error_bound,
     )

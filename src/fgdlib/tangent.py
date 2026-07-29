@@ -331,6 +331,10 @@ class FGDApproxConfig:
     # jacrev memory, larger ones cut Python/jacrev overhead. Memory stays O(P^2)
     # regardless. 0 means the whole probe in one batch. Only the streaming path.
     certify_stream_chunk: int = 1024
+    # Exact shared-base block-Schur scoring for exhaustive function-preserving
+    # ``where`` scans.  Default-off preserves every featured configuration;
+    # benchmarks may opt in with FGD_EXACT_BLOCK_SCHUR_WHERE=1.
+    certify_exact_block_schur_where: bool = False
     # WHICH admissible g inside the tangent space to use. Lemma 3.5 fixes only
     # RelErr(g, r) <= 1/2 and says nothing about which g in T = range(J) to
     # take; that freedom is ours, and how it is resolved decides whether the

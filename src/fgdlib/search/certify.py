@@ -40,11 +40,20 @@ architecture can make at this point, established by measurement.
 from __future__ import annotations
 
 import copy
+import os
 from dataclasses import dataclass
 
 import torch
 
 from fgdlib.search.growth import grow_layer
+from fgdlib.search.exact_where import (
+    CandidateScoringError,
+    UnsupportedGrowthStructure,
+    exact_block_schur_score,
+    factor_shared_base,
+    identify_growth_columns,
+    stream_shared_candidate_statistics,
+)
 from fgdlib.tangent import (
     ExactTangentSystem,
     FGDApproxConfig,
@@ -60,6 +69,16 @@ __all__ = [
     "exact_relative_error",
     "grow_until_certified",
 ]
+
+
+def _exact_block_schur_where_enabled(config: FGDApproxConfig) -> bool:
+    value = os.environ.get("FGD_EXACT_BLOCK_SCHUR_WHERE", "")
+    return bool(config.certify_exact_block_schur_where) or value.strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 @dataclass(frozen=True)
@@ -214,6 +233,200 @@ def _grow_clone(
     return clone
 
 
+def _full_candidate_score(
+    candidate,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    config: FGDApproxConfig,
+) -> tuple[float, ExactTangentSystem | None]:
+    """The unchanged full-Jacobian candidate oracle."""
+    return _relative_error_and_system(candidate, x, y, config)
+
+
+def _select_growth_candidate(
+    model,
+    tangent_system: ExactTangentSystem | None,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    train_loader,
+    device: torch.device,
+    config,
+    function_preserving: bool,
+    current_epsilon: float,
+) -> tuple[object | None, float, int | None, ExactTangentSystem | None]:
+    """Select the same exhaustive argmin, with exact shared-base scoring if enabled."""
+    candidates: list[tuple[int, object]] = []
+    for location in range(len(getattr(model, "_growable_layers", []))):
+        candidate = _grow_clone(
+            model,
+            train_loader,
+            location,
+            device,
+            config,
+            function_preserving,
+        )
+        if candidate is not None:
+            candidates.append((location, candidate))
+
+    best_model = None
+    best_epsilon = current_epsilon if function_preserving else float("inf")
+    best_location = None
+    best_system = tangent_system
+    enabled = (
+        _exact_block_schur_where_enabled(config.fgd_approx)
+        and function_preserving
+        and tangent_system is not None
+        and bool(candidates)
+    )
+    if not enabled:
+        for location, candidate in candidates:
+            candidate_epsilon, candidate_system = _full_candidate_score(
+                candidate, x, y, config.fgd_approx
+            )
+            if candidate_epsilon < best_epsilon:
+                best_epsilon = candidate_epsilon
+                best_model = candidate
+                best_location = location
+                best_system = candidate_system
+        return best_model, best_epsilon, best_location, best_system
+
+    parity_tolerance = (
+        1e-5
+        if getattr(config.fgd_approx, "projection_fast_factorization", False)
+        else 1e-9
+    )
+    layouts = []
+    supported: list[tuple[int, object]] = []
+    full_results: dict[int, tuple[float, ExactTangentSystem | None]] = {}
+    for location, candidate in candidates:
+        try:
+            layout = identify_growth_columns(
+                model,
+                candidate,
+                x,
+                preservation_tolerance=(
+                    config.fgd_approx.growth_preservation_tolerance
+                ),
+            )
+        except UnsupportedGrowthStructure:
+            full_results[location] = _full_candidate_score(
+                candidate, x, y, config.fgd_approx
+            )
+        else:
+            layouts.append(layout)
+            supported.append((location, candidate))
+
+    fast_results: dict[int, tuple[float, float]] = {}
+    if layouts:
+        try:
+            shared = stream_shared_candidate_statistics(
+                model,
+                tangent_system,
+                tuple(layouts),
+                x,
+                y,
+                config.fgd_approx,
+            )
+            spectrum = factor_shared_base(tangent_system)
+        except (CandidateScoringError, RuntimeError):
+            for location, candidate in supported:
+                full_results[location] = _full_candidate_score(
+                    candidate, x, y, config.fgd_approx
+                )
+        else:
+            for (location, candidate), statistics in zip(
+                supported, shared.candidates
+            ):
+                try:
+                    score = exact_block_schur_score(
+                        shared,
+                        statistics,
+                        spectrum,
+                        eps=config.fgd_approx.eps,
+                    )
+                except (CandidateScoringError, RuntimeError):
+                    full_results[location] = _full_candidate_score(
+                        candidate, x, y, config.fgd_approx
+                    )
+                else:
+                    fast_results[location] = (
+                        score.relative_error,
+                        score.error_bound,
+                    )
+
+    # A numerical interval that overlaps the provisional argmin is resolved by
+    # the unchanged full oracle.  Strict enumeration order remains the tie-break.
+    provisional = {
+        location: (
+            full_results[location][0]
+            if location in full_results
+            else fast_results[location][0]
+        )
+        for location, _ in candidates
+    }
+    if provisional:
+        provisional_location = min(provisional, key=provisional.get)
+        provisional_value = provisional[provisional_location]
+        provisional_bound = fast_results.get(provisional_location, (0.0, 0.0))[1]
+        for location, candidate in candidates:
+            if location not in fast_results:
+                continue
+            value, bound = fast_results[location]
+            if abs(value - provisional_value) <= (
+                bound + provisional_bound + 2.0 * parity_tolerance
+            ):
+                full_results[location] = _full_candidate_score(
+                    candidate, x, y, config.fgd_approx
+                )
+
+    for location, candidate in candidates:
+        candidate_epsilon = (
+            full_results[location][0]
+            if location in full_results
+            else fast_results[location][0]
+        )
+        if candidate_epsilon < best_epsilon:
+            best_epsilon = candidate_epsilon
+            best_model = candidate
+            best_location = location
+            best_system = (
+                full_results[location][1] if location in full_results else None
+            )
+
+    if best_model is None:
+        return None, best_epsilon, None, tangent_system
+    if best_system is not None:
+        return best_model, best_epsilon, best_location, best_system
+
+    # Required canonical validation: the selected grown model gets a complete
+    # exact system before damping selection or realization can reuse it.
+    validated_epsilon, validated_system = _full_candidate_score(
+        best_model, x, y, config.fgd_approx
+    )
+    if abs(validated_epsilon - best_epsilon) <= parity_tolerance:
+        return best_model, validated_epsilon, best_location, validated_system
+
+    # The shared-base prediction did not match its full candidate oracle.
+    # Discard every fast result and rerun the original exhaustive selection.
+    best_model = None
+    best_epsilon = current_epsilon if function_preserving else float("inf")
+    best_location = None
+    best_system = tangent_system
+    for location, candidate in candidates:
+        if location in full_results:
+            candidate_epsilon, candidate_system = full_results[location]
+        else:
+            candidate_epsilon, candidate_system = _full_candidate_score(
+                candidate, x, y, config.fgd_approx
+            )
+        if candidate_epsilon < best_epsilon:
+            best_epsilon = candidate_epsilon
+            best_model = candidate
+            best_location = location
+            best_system = candidate_system
+    return best_model, best_epsilon, best_location, best_system
+
+
 def grow_until_certified(
     model,
     x: torch.Tensor,
@@ -301,35 +514,24 @@ def grow_until_certified(
                     tangent_system=tangent_system,
                 )
 
-        locations = range(len(getattr(model, "_growable_layers", [])))
-        best_model = None
         # Preserving growth cannot make eps worse, so requiring an improvement
         # is free there. Non-preserving growth moves f, so the best available
         # candidate may still sit above the current eps; accepting it is what
         # lets the rank keep climbing, and the loop then relies on the measured
         # trajectory rather than the monotonicity theorem.
-        best_epsilon = epsilon if function_preserving else float("inf")
-        best_location = None
-        best_system = tangent_system
-        for location in locations:
-            candidate = _grow_clone(
+        best_model, best_epsilon, best_location, best_system = (
+            _select_growth_candidate(
                 model,
+                tangent_system,
+                x,
+                y,
                 train_loader,
-                location,
                 device,
                 config,
                 function_preserving,
+                epsilon,
             )
-            if candidate is None:
-                continue
-            candidate_epsilon, candidate_system = _relative_error_and_system(
-                candidate, x, y, config.fgd_approx
-            )
-            if candidate_epsilon < best_epsilon:
-                best_epsilon = candidate_epsilon
-                best_model = candidate
-                best_location = location
-                best_system = candidate_system
+        )
 
         if best_model is None:
             # No growable location reduces eps. The theorem says this cannot
