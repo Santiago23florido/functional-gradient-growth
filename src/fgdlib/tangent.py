@@ -1597,6 +1597,13 @@ class ExactTangentSystem:
     target: torch.Tensor
     parameters: tuple[torch.Tensor, ...]
     loss: float
+    # The row-aligned full-probe target.  ``target`` is a compact sufficient-
+    # statistics surrogate when ``certify_stream_gram`` is enabled; candidate
+    # cross-statistics still need the original rows, but retaining this vector
+    # is O(NK), not the forbidden O(NKP) second Jacobian.
+    full_target: torch.Tensor | None = field(
+        default=None, repr=False, compare=False
+    )
     owner_model: torch.nn.Module | None = field(default=None, repr=False, compare=False)
     parameter_names: tuple[str, ...] = field(default=(), repr=False)
     parameter_versions: tuple[int, ...] = field(default=(), repr=False)
@@ -1750,6 +1757,7 @@ def _compute_exact_tangent_projection_step(
     if roughness is not None:
         target_tensor = target_tensor + roughness.to(target_tensor.dtype)
     target = target_tensor.reshape(-1)
+    full_target = target
     output_numel = target.numel()
 
     if torch.linalg.norm(target) <= torch.finfo(target.dtype).eps:
@@ -1865,6 +1873,7 @@ def _compute_exact_tangent_projection_step(
             target=target,
             parameters=parameters,
             loss=float(loss.detach().item()),
+            full_target=full_target,
             owner_model=model,
             parameter_names=parameter_names,
             parameter_versions=tuple(parameter._version for parameter in parameters),
