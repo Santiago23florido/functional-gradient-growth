@@ -5,10 +5,11 @@ from __future__ import annotations
 import copy
 import math
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Literal
 
 from fgdlib.gromo_setup import ensure_gromo_importable
+from fgdlib.profile import increment, set_value, timed
 from fgdlib.search.growth import ScalingLineSearchConfig, grow_layer
 from fgdlib.training_utils.loop import RegressionMetrics, evaluate_regression_metrics
 
@@ -330,6 +331,10 @@ class FGDApproxConfig:
     # jacrev memory, larger ones cut Python/jacrev overhead. Memory stays O(P^2)
     # regardless. 0 means the whole probe in one batch. Only the streaming path.
     certify_stream_chunk: int = 1024
+    # Exact shared-base block-Schur scoring for exhaustive function-preserving
+    # ``where`` scans.  Default-off preserves every featured configuration;
+    # benchmarks may opt in with FGD_EXACT_BLOCK_SCHUR_WHERE=1.
+    certify_exact_block_schur_where: bool = False
     # WHICH admissible g inside the tangent space to use. Lemma 3.5 fixes only
     # RelErr(g, r) <= 1/2 and says nothing about which g in T = range(J) to
     # take; that freedom is ours, and how it is resolved decides whether the
@@ -523,6 +528,10 @@ class FGDApproxConfig:
     # outer step" into "1 Jacobian + up to 39 VJPs". Off by default -> the two
     # branches below run exactly as before; on -> the frozen-Gram path.
     certify_realize_freeze_gram: bool = False
+    # Optionally precondition realization with the absolute damping selected
+    # for the certified outer direction. Off preserves the historical inner
+    # damping from projection_damping for every existing configuration.
+    certify_realize_use_selected_damping: bool = False
     # Bounded certification probe, sized to the NUMERICAL RANK of J. The
     # certificate eps<1/2 is a statement over the NK-dimensional probe residual,
     # but MEASURED the rank m* needed to certify grows SUBLINEARLY in NK (m*/NK:
@@ -757,13 +766,9 @@ class ParametricGDConfig:
                 "parametric_gd.optimizer must be 'sgd', 'adam' or 'adamw'."
             )
         if self.weight_decay < 0.0:
-            raise ValueError(
-                "parametric_gd.weight_decay must be non-negative."
-            )
+            raise ValueError("parametric_gd.weight_decay must be non-negative.")
         if self.inner_learning_rate <= 0.0:
-            raise ValueError(
-                "parametric_gd.inner_learning_rate must be positive."
-            )
+            raise ValueError("parametric_gd.inner_learning_rate must be positive.")
         if not self.inner_steps or any(v < 1 for v in self.inner_steps):
             raise ValueError(
                 "parametric_gd.inner_steps must contain positive integers."
@@ -777,9 +782,7 @@ class ParametricGDConfig:
         if not 0.0 < self.min_cosine <= 1.0:
             raise ValueError("parametric_gd.min_cosine must lie in (0, 1].")
         if self.parameter_penalty < 0.0:
-            raise ValueError(
-                "parametric_gd.parameter_penalty must be non-negative."
-            )
+            raise ValueError("parametric_gd.parameter_penalty must be non-negative.")
 
 
 @dataclass(frozen=True)
@@ -824,41 +827,30 @@ class ParametricDescentConfig:
     def validate(self) -> None:
         if self.optimizer not in ("sgd", "adam", "adamw"):
             raise ValueError(
-                "parametric_descent.optimizer must be 'sgd', 'adam' or "
-                "'adamw'."
+                "parametric_descent.optimizer must be 'sgd', 'adam' or 'adamw'."
             )
         if self.inner_learning_rate <= 0.0:
-            raise ValueError(
-                "parametric_descent.inner_learning_rate must be positive."
-            )
+            raise ValueError("parametric_descent.inner_learning_rate must be positive.")
         if self.weight_decay < 0.0:
-            raise ValueError(
-                "parametric_descent.weight_decay must be non-negative."
-            )
+            raise ValueError("parametric_descent.weight_decay must be non-negative.")
         if not self.inner_steps or any(v < 1 for v in self.inner_steps):
             raise ValueError(
-                "parametric_descent.inner_steps must contain positive "
-                "integers."
+                "parametric_descent.inner_steps must contain positive integers."
             )
         if not self.functional_learning_rates or any(
             v <= 0.0 for v in self.functional_learning_rates
         ):
             raise ValueError(
-                "parametric_descent.functional_learning_rates must be "
-                "positive."
+                "parametric_descent.functional_learning_rates must be positive."
             )
         if not 0.0 <= self.min_cosine <= 1.0:
-            raise ValueError(
-                "parametric_descent.min_cosine must lie in [0, 1]."
-            )
+            raise ValueError("parametric_descent.min_cosine must lie in [0, 1].")
         if self.parameter_penalty < 0.0:
             raise ValueError(
                 "parametric_descent.parameter_penalty must be non-negative."
             )
         if self.min_progress <= 0.0:
-            raise ValueError(
-                "parametric_descent.min_progress must be positive."
-            )
+            raise ValueError("parametric_descent.min_progress must be positive.")
 
 
 @dataclass(frozen=True)
@@ -984,7 +976,9 @@ def graph_laplacian(x: torch.Tensor, bandwidth: float = 1.0) -> torch.Tensor:
     affinity.fill_diagonal_(0.0)
     degree = affinity.sum(dim=1)
     inverse_sqrt_degree = degree.clamp_min(torch.finfo(x.dtype).eps).rsqrt()
-    normalised = affinity * inverse_sqrt_degree.unsqueeze(0) * inverse_sqrt_degree.unsqueeze(1)
+    normalised = (
+        affinity * inverse_sqrt_degree.unsqueeze(0) * inverse_sqrt_degree.unsqueeze(1)
+    )
     return torch.eye(x.shape[0], dtype=x.dtype, device=x.device) - normalised
 
 
@@ -1194,11 +1188,7 @@ def _relative_error_from_stats(
     target_sq_norm: float,
     config: FGDApproxConfig,
 ) -> FGDLayerRelError:
-    numerator_sq = (
-        approximation_sq_norm
-        - 2.0 * dot_product
-        + target_sq_norm
-    )
+    numerator_sq = approximation_sq_norm - 2.0 * dot_product + target_sq_norm
     numerator = math.sqrt(max(0.0, numerator_sq))
 
     denominator_sq = approximation_sq_norm
@@ -1317,8 +1307,8 @@ def theoretical_learning_rate_upper_bound(
     if smoothness <= 0.0:
         raise ValueError("fgd_approx.theory_smoothness_constant must be positive.")
 
-    return 2.0 * (1.0 - 2.0 * relative_error) / (
-        smoothness * (2.0 * relative_error + 1.0)
+    return (
+        2.0 * (1.0 - 2.0 * relative_error) / (smoothness * (2.0 * relative_error + 1.0))
     )
 
 
@@ -1611,6 +1601,69 @@ class ExactTangentSystem:
     target: torch.Tensor
     parameters: tuple[torch.Tensor, ...]
     loss: float
+    # The row-aligned full-probe target.  ``target`` is a compact sufficient-
+    # statistics surrogate when ``certify_stream_gram`` is enabled; candidate
+    # cross-statistics still need the original rows, but retaining this vector
+    # is O(NK), not the forbidden O(NKP) second Jacobian.
+    full_target: torch.Tensor | None = field(
+        default=None, repr=False, compare=False
+    )
+    owner_model: torch.nn.Module | None = field(default=None, repr=False, compare=False)
+    parameter_names: tuple[str, ...] = field(default=(), repr=False)
+    parameter_versions: tuple[int, ...] = field(default=(), repr=False)
+    buffer_names: tuple[str, ...] = field(default=(), repr=False)
+    buffers: tuple[torch.Tensor, ...] = field(default=(), repr=False, compare=False)
+    buffer_versions: tuple[int, ...] = field(default=(), repr=False)
+    probe_x: torch.Tensor | None = field(default=None, repr=False, compare=False)
+    probe_y: torch.Tensor | None = field(default=None, repr=False, compare=False)
+    probe_versions: tuple[int, int] = field(default=(-1, -1), repr=False)
+    config_signature: str = field(default="", repr=False)
+    evaluation_state: tuple[tuple[str, bool], ...] = field(default=(), repr=False)
+
+
+def validate_exact_tangent_system(
+    system: ExactTangentSystem,
+    model: torch.nn.Module,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    config: FGDApproxConfig,
+) -> None:
+    """Reject reuse unless every object and value defining ``J`` and ``r`` matches."""
+    if system.owner_model is not model:
+        raise ValueError("ExactTangentSystem belongs to a different model instance.")
+
+    named_parameters = _trainable_named_parameters(model)
+    names = tuple(named_parameters)
+    parameters = tuple(named_parameters.values())
+    if names != system.parameter_names or len(parameters) != len(system.parameters):
+        raise ValueError("ExactTangentSystem trainable parameter ordering changed.")
+    if any(
+        current is not cached for current, cached in zip(parameters, system.parameters)
+    ):
+        raise ValueError("ExactTangentSystem trainable parameter objects changed.")
+    versions = tuple(parameter._version for parameter in parameters)
+    if versions != system.parameter_versions:
+        raise ValueError("ExactTangentSystem parameter values changed.")
+
+    named_buffers = tuple(model.named_buffers())
+    buffer_names = tuple(name for name, _ in named_buffers)
+    buffers = tuple(buffer for _, buffer in named_buffers)
+    if buffer_names != system.buffer_names or len(buffers) != len(system.buffers):
+        raise ValueError("ExactTangentSystem model buffers changed.")
+    if any(current is not cached for current, cached in zip(buffers, system.buffers)):
+        raise ValueError("ExactTangentSystem buffer objects changed.")
+    if tuple(buffer._version for buffer in buffers) != system.buffer_versions:
+        raise ValueError("ExactTangentSystem buffer values changed.")
+
+    if system.probe_x is not x or system.probe_y is not y:
+        raise ValueError("ExactTangentSystem probe or targets changed.")
+    if (x._version, y._version) != system.probe_versions:
+        raise ValueError("ExactTangentSystem probe or target values changed.")
+    if repr(config) != system.config_signature:
+        raise ValueError("ExactTangentSystem functional configuration changed.")
+    state = tuple((name, module.training) for name, module in model.named_modules())
+    if state != system.evaluation_state:
+        raise ValueError("ExactTangentSystem model evaluation state changed.")
 
 
 def _stream_gram_surrogate(
@@ -1635,18 +1688,14 @@ def _stream_gram_surrogate(
     del left
     keep = singular > float(singular.max()) * 1e-12
     sig = singular[keep]
-    v_rows = right[keep]                        # (rank, P), rows are V^T
-    coeff = v_rows @ b_acc                       # V^T b, shape (rank,)
+    v_rows = right[keep]  # (rank, P), rows are V^T
+    coeff = v_rows @ b_acc  # V^T b, shape (rank,)
     in_range = float((coeff * coeff / sig.square()).sum())
     residual = max(0.0, r_sq - in_range)
     p_dim = r_factor.shape[1]
-    j_top = sig.unsqueeze(1) * v_rows            # diag(sig) @ V^T = (rank, P)
-    j_surrogate = torch.cat(
-        [j_top, j_top.new_zeros(1, p_dim)], dim=0
-    )
-    r_surrogate = torch.cat(
-        [coeff / sig, coeff.new_tensor([math.sqrt(residual)])]
-    )
+    j_top = sig.unsqueeze(1) * v_rows  # diag(sig) @ V^T = (rank, P)
+    j_surrogate = torch.cat([j_top, j_top.new_zeros(1, p_dim)], dim=0)
+    r_surrogate = torch.cat([coeff / sig, coeff.new_tensor([math.sqrt(residual)])])
     return j_surrogate.to(out_dtype), r_surrogate.to(out_dtype)
 
 
@@ -1657,9 +1706,19 @@ def exact_tangent_system(
     config: FGDApproxConfig,
 ) -> ExactTangentSystem | None:
     """Materialise ``J`` and ``r = grad_f L`` -- returns ``None`` if degenerate."""
-    step = _compute_exact_tangent_projection_step(
-        model=model, x=x, y=y, config=config, return_system=True
+    increment("exact_tangent_system_calls")
+    set_value(
+        "current_parameter_count",
+        sum(
+            parameter.numel()
+            for parameter in model.parameters()
+            if parameter.requires_grad
+        ),
     )
+    with timed("exact_tangent_system_seconds"):
+        step = _compute_exact_tangent_projection_step(
+            model=model, x=x, y=y, config=config, return_system=True
+        )
     return step if isinstance(step, ExactTangentSystem) else None
 
 
@@ -1702,6 +1761,7 @@ def _compute_exact_tangent_projection_step(
     if roughness is not None:
         target_tensor = target_tensor + roughness.to(target_tensor.dtype)
     target = target_tensor.reshape(-1)
+    full_target = target
     output_numel = target.numel()
 
     if torch.linalg.norm(target) <= torch.finfo(target.dtype).eps:
@@ -1736,83 +1796,101 @@ def _compute_exact_tangent_projection_step(
     chunk = int(getattr(config, "jacobian_row_chunk", 0) or 0)
     stream_gram = bool(getattr(config, "certify_stream_gram", False))
     try:
-        if stream_gram:
-            # STREAMING over SAMPLES: accumulate the incremental-QR factor R
-            # (P x P), b = J^T r and ||r||^2 batch by batch -- each sample
-            # forwarded EXACTLY ONCE (chunking output rows instead recomputes the
-            # whole forward per chunk, the dominant cost) -- freeing each block,
-            # so the full NK x P Jacobian is never held. The downstream then gets
-            # a tiny surrogate ((rank+1) x P) reproducing the exact spectrum and
-            # projection. Memory O(P^2), exact (1.8e-12 vs full float64).
-            n_samples = int(x.shape[0])
-            out_per_sample = output_numel // max(n_samples, 1)
-            sample_chunk = int(getattr(config, "certify_stream_chunk", 0) or 0)
-            if sample_chunk <= 0:
-                sample_chunk = n_samples
-            r_factor = None
-            b_acc: torch.Tensor | None = None
-            r_sq = 0.0
-            for start in range(0, n_samples, sample_chunk):
-                stop = min(start + sample_chunk, n_samples)
-                x_batch = x[start:stop]
+        with timed("streamed_jacobian_seconds"):
+            if stream_gram:
+                # STREAMING over SAMPLES: accumulate the incremental-QR factor R
+                # (P x P), b = J^T r and ||r||^2 batch by batch -- each sample
+                # forwarded EXACTLY ONCE (chunking output rows instead recomputes the
+                # whole forward per chunk, the dominant cost) -- freeing each block,
+                # so the full NK x P Jacobian is never held. The downstream then gets
+                # a tiny surrogate ((rank+1) x P) reproducing the exact spectrum and
+                # projection. Memory O(P^2), exact (1.8e-12 vs full float64).
+                n_samples = int(x.shape[0])
+                out_per_sample = output_numel // max(n_samples, 1)
+                sample_chunk = int(getattr(config, "certify_stream_chunk", 0) or 0)
+                if sample_chunk <= 0:
+                    sample_chunk = n_samples
+                r_factor = None
+                b_acc: torch.Tensor | None = None
+                r_sq = 0.0
+                for start in range(0, n_samples, sample_chunk):
+                    stop = min(start + sample_chunk, n_samples)
+                    x_batch = x[start:stop]
 
-                def call_batch(
-                    parameter_values: tuple[torch.Tensor, ...],
-                    _xb: torch.Tensor = x_batch,
-                ) -> torch.Tensor:
-                    state = OrderedDict(zip(parameter_names, parameter_values))
-                    state.update(buffers)
-                    return functional_call(model, state, (_xb,)).reshape(-1)
+                    def call_batch(
+                        parameter_values: tuple[torch.Tensor, ...],
+                        _xb: torch.Tensor = x_batch,
+                    ) -> torch.Tensor:
+                        state = OrderedDict(zip(parameter_names, parameter_values))
+                        state.update(buffers)
+                        return functional_call(model, state, (_xb,)).reshape(-1)
 
-                rows = (stop - start) * out_per_sample
-                block = _flatten_jacobian(
-                    jacrev(call_batch)(parameters), rows
-                ).to(torch.float64)
-                r_block = target[
-                    start * out_per_sample: stop * out_per_sample
-                ].to(torch.float64)
-                contribution = block.t() @ r_block
-                b_acc = contribution if b_acc is None else b_acc + contribution
-                r_sq += float((r_block * r_block).sum())
-                stacked = block if r_factor is None else torch.cat(
-                    [r_factor, block], dim=0
+                    rows = (stop - start) * out_per_sample
+                    block = _flatten_jacobian(jacrev(call_batch)(parameters), rows).to(
+                        torch.float64
+                    )
+                    r_block = target[start * out_per_sample : stop * out_per_sample].to(
+                        torch.float64
+                    )
+                    contribution = block.t() @ r_block
+                    b_acc = contribution if b_acc is None else b_acc + contribution
+                    r_sq += float((r_block * r_block).sum())
+                    stacked = (
+                        block
+                        if r_factor is None
+                        else torch.cat([r_factor, block], dim=0)
+                    )
+                    r_factor = torch.linalg.qr(stacked, mode="reduced").R
+                    del block, r_block, stacked
+                    _clear_inaccessible_tensor_caches(model)
+                jacobian_matrix, target = _stream_gram_surrogate(
+                    r_factor, b_acc, r_sq, target.dtype
                 )
-                r_factor = torch.linalg.qr(stacked, mode="reduced").R
-                del block, r_block, stacked
-                _clear_inaccessible_tensor_caches(model)
-            jacobian_matrix, target = _stream_gram_surrogate(
-                r_factor, b_acc, r_sq, target.dtype
-            )
-        elif chunk > 0 and chunk < output_numel:
-            blocks = []
-            for start in range(0, output_numel, chunk):
-                stop = min(start + chunk, output_numel)
+            elif chunk > 0 and chunk < output_numel:
+                blocks = []
+                for start in range(0, output_numel, chunk):
+                    stop = min(start + chunk, output_numel)
 
-                def call_rows(
-                    parameter_values: tuple[torch.Tensor, ...],
-                    _start: int = start,
-                    _stop: int = stop,
-                ) -> torch.Tensor:
-                    return call_with_parameters(parameter_values)[_start:_stop]
+                    def call_rows(
+                        parameter_values: tuple[torch.Tensor, ...],
+                        _start: int = start,
+                        _stop: int = stop,
+                    ) -> torch.Tensor:
+                        return call_with_parameters(parameter_values)[_start:_stop]
 
-                blocks.append(
-                    _flatten_jacobian(jacrev(call_rows)(parameters), stop - start)
+                    blocks.append(
+                        _flatten_jacobian(jacrev(call_rows)(parameters), stop - start)
+                    )
+                    _clear_inaccessible_tensor_caches(model)
+                jacobian_matrix = torch.cat(blocks, dim=0)
+            else:
+                jacobian_matrix = _flatten_jacobian(
+                    jacrev(call_with_parameters)(parameters), output_numel
                 )
-                _clear_inaccessible_tensor_caches(model)
-            jacobian_matrix = torch.cat(blocks, dim=0)
-        else:
-            jacobian_matrix = _flatten_jacobian(
-                jacrev(call_with_parameters)(parameters), output_numel
-            )
     finally:
         model.train(was_training)
         _clear_inaccessible_tensor_caches(model)
     if return_system:
+        named_buffers = tuple(model.named_buffers())
         return ExactTangentSystem(
             jacobian=jacobian_matrix,
             target=target,
             parameters=parameters,
             loss=float(loss.detach().item()),
+            full_target=full_target,
+            owner_model=model,
+            parameter_names=parameter_names,
+            parameter_versions=tuple(parameter._version for parameter in parameters),
+            buffer_names=tuple(name for name, _ in named_buffers),
+            buffers=tuple(buffer for _, buffer in named_buffers),
+            buffer_versions=tuple(buffer._version for _, buffer in named_buffers),
+            probe_x=x,
+            probe_y=y,
+            probe_versions=(x._version, y._version),
+            config_signature=repr(config),
+            evaluation_state=tuple(
+                (name, module.training) for name, module in model.named_modules()
+            ),
         )
     flat_update, approximation = _solve_tangent_projection(
         jacobian_matrix=jacobian_matrix,
@@ -1981,9 +2059,8 @@ def _compute_cg_tangent_projection_step(
         model.train(was_training)
         _clear_inaccessible_tensor_caches(model)
 
-    if (
-        not torch.isfinite(approximation).all()
-        or any(not torch.isfinite(update).all() for update in parameter_updates)
+    if not torch.isfinite(approximation).all() or any(
+        not torch.isfinite(update).all() for update in parameter_updates
     ):
         raise RuntimeError("Non-finite FGD CG tangent projection update detected.")
 
@@ -2050,9 +2127,7 @@ def build_projection_probe(
         if len(xs) == probe_batches:
             break
     if not xs:
-        raise ValueError(
-            "Cannot build a projection probe from an empty data loader."
-        )
+        raise ValueError("Cannot build a projection probe from an empty data loader.")
     x = torch.cat(xs)
     y = torch.cat(ys)
     if device is not None:
@@ -2117,9 +2192,7 @@ def _apply_tangent_projection_step(
     @torch.no_grad()
     def trial_loss() -> float:
         return float(
-            batch_functional_loss(model(x), y, config.functional_loss)
-            .detach()
-            .item()
+            batch_functional_loss(model(x), y, config.functional_loss).detach().item()
         )
 
     if learning_rate <= config.eps or directional_derivative <= config.eps:
@@ -2191,9 +2264,7 @@ def _apply_tangent_projection_step(
         current_loss = trial_loss()
         sufficient_decrease = (
             base_loss
-            - config.sufficient_descent_c
-            * trial_learning_rate
-            * directional_derivative
+            - config.sufficient_descent_c * trial_learning_rate * directional_derivative
         )
         if current_loss <= sufficient_decrease:
             accepted_learning_rate = trial_learning_rate
@@ -2706,13 +2777,9 @@ def certificate_from_projection_stats(
                 if config.local_acceptance_conditions:
                     # Strict interval: theory_lr_min < eta < eta_bar, with
                     # eps as the only numerical tolerance.
-                    upper_bound_ok = (
-                        learning_rate < safe_upper_bound + config.eps
-                    )
+                    upper_bound_ok = learning_rate < safe_upper_bound + config.eps
                 else:
-                    upper_bound_ok = (
-                        learning_rate <= safe_upper_bound + config.eps
-                    )
+                    upper_bound_ok = learning_rate <= safe_upper_bound + config.eps
                 interval_ok = (
                     interval_ok
                     and learning_rate > config.theory_lr_min
@@ -2762,14 +2829,10 @@ def measure_direction_projection(
     # make_dual then fails with a functorch level-escape (seen with batch-norm
     # models). Detach the tangents to a clean, graph-free state -- they are a
     # fixed direction here, not something to differentiate through.
-    parameter_updates = tuple(
-        update.detach() for update in parameter_updates
-    )
+    parameter_updates = tuple(update.detach() for update in parameter_updates)
     named_parameters = _trainable_named_parameters(model)
     if not named_parameters:
-        raise RuntimeError(
-            "FGD direction measurement requires trainable parameters."
-        )
+        raise RuntimeError("FGD direction measurement requires trainable parameters.")
     parameter_names = tuple(named_parameters.keys())
     parameters = tuple(named_parameters.values())
     buffers = OrderedDict(model.named_buffers())
@@ -2895,9 +2958,7 @@ def evaluate_secant_validation_certificate(
         candidate_output = candidate_model(x)
     target = functional_gradient(base_output, y, config.functional_loss)
     approximation = (base_output - candidate_output) / learning_rate
-    if not (
-        torch.isfinite(target).all() and torch.isfinite(approximation).all()
-    ):
+    if not (torch.isfinite(target).all() and torch.isfinite(approximation).all()):
         return FGDValidationCertificate(
             learning_rate_upper_bound=None,
             max_valid_learning_rate=None,
@@ -3010,10 +3071,7 @@ def train_one_epoch_fgd_approx(
         )
         learning_rate_sum += applied_step.learning_rate_used
         batch_count += 1
-        if (
-            applied_step.learning_rate_used <= config.eps
-            and learning_rate > config.eps
-        ):
+        if applied_step.learning_rate_used <= config.eps and learning_rate > config.eps:
             skipped_batches += 1
         if applied_step.learning_rate_used > config.eps:
             min_positive_learning_rate = (

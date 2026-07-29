@@ -67,7 +67,7 @@ from fgdlib.search.unified import (
     rank_limiting_locations,
 )
 from fgdlib.search.damping import select_projection_damping
-from fgdlib.search.realize import realize_functional_step
+from fgdlib.search.realize import realization_damping, realize_functional_step
 from fgdlib.search.linearization import certified_linear_learning_rate
 from fgdlib.search.growth import (
     GrowthResult,
@@ -3901,6 +3901,7 @@ def run_pipeline(
                         # recomputed from a damping that no longer applies.
                         selected_learning_rate: float | None = None
                         direction_sensor_failure = False
+                        tangent_system = None
                         if config.fgd_approx.grow_to_certify:
                             # GROW-TO-CERTIFY. Make the structure satisfy
                             # Lemma 3.5 BEFORE stepping, instead of stepping
@@ -3983,6 +3984,7 @@ def run_pipeline(
                                 force=False,
                                 progress=progress,
                             )
+                            tangent_system = certify_result.tangent_system
                             if certify_result.growths or certify_result.family_steps:
                                 growth_count += certify_result.growths
                                 optimizer = build_optimizer(
@@ -4011,11 +4013,13 @@ def run_pipeline(
                                 fgd_train_probe[0],
                                 fgd_train_probe[1],
                                 config.fgd_approx,
+                                system=tangent_system,
                             )
                             if config.fgd_approx.projection_damping_auto
                             else None
                         )
                         if damping_choice is not None:
+                            tangent_system = damping_choice.tangent_system
                             # The damping is the knob that arbitrates between
                             # the certificate (eps) and the realisability of
                             # the step (|u|); a fixed constant lands in the
@@ -4044,7 +4048,8 @@ def run_pipeline(
                                     damping_choice.candidate
                                     .certified_learning_rate
                                 )
-                                walker = copy.deepcopy(model)
+                                base_model = copy.deepcopy(model)
+                                walker = model
                                 realization = realize_functional_step(
                                     walker,
                                     fgd_train_probe[0],
@@ -4060,6 +4065,11 @@ def run_pipeline(
                                         config.fgd_approx
                                         .certify_realize_tolerance
                                     ),
+                                    system=tangent_system,
+                                    damping=realization_damping(
+                                        config.fgd_approx,
+                                        damping_choice.candidate.absolute_damping,
+                                    ),
                                 )
                                 if realization.iterations > 0:
                                     with torch.no_grad():
@@ -4067,7 +4077,7 @@ def run_pipeline(
                                             (before.detach() - after.detach())
                                             / nominal
                                             for before, after in zip(
-                                                model.parameters(),
+                                                base_model.parameters(),
                                                 walker.parameters(),
                                             )
                                         )
@@ -4082,6 +4092,8 @@ def run_pipeline(
                                             f"{realization.residual_fraction:.1%} "
                                             f"iters={realization.iterations}"
                                         )
+                                model = base_model
+                                tangent_system = None
                                 del walker
                             if progress is not None:
                                 chosen = damping_choice.candidate

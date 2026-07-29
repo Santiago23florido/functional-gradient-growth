@@ -40,15 +40,29 @@ architecture can make at this point, established by measurement.
 from __future__ import annotations
 
 import copy
+import os
 from dataclasses import dataclass
 
 import torch
 
+from fgdlib.profile import increment, profiled
+from fgdlib.search.exact_where import (
+    CandidateScoringError,
+    UnsupportedGrowthStructure,
+    exact_block_schur_score,
+    factor_shared_base,
+    identify_growth_columns,
+    stream_shared_candidate_statistics,
+)
 from fgdlib.search.growth import grow_layer
 from fgdlib.tangent import (
+    ExactTangentSystem,
     FGDApproxConfig,
-    _compute_exact_tangent_projection_step,
+    _output_relative_error_from_tensors,
+    _solve_tangent_projection,
+    exact_tangent_system,
     tiny_optimal_update_kwargs,
+    validate_exact_tangent_system,
 )
 
 __all__ = [
@@ -56,6 +70,16 @@ __all__ = [
     "exact_relative_error",
     "grow_until_certified",
 ]
+
+
+def _exact_block_schur_where_enabled(config: FGDApproxConfig) -> bool:
+    value = os.environ.get("FGD_EXACT_BLOCK_SCHUR_WHERE", "")
+    return bool(config.certify_exact_block_schur_where) or value.strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 @dataclass(frozen=True)
@@ -73,6 +97,8 @@ class CertifyResult:
     #: How many family steps were taken across the loop (a family step shrinks
     #: the residual, deferring growth).
     family_steps: int = 0
+    #: Exact system for the returned model and probe, when non-degenerate.
+    tangent_system: ExactTangentSystem | None = None
 
 
 def exact_relative_error(
@@ -80,6 +106,8 @@ def exact_relative_error(
     x: torch.Tensor,
     y: torch.Tensor,
     config: FGDApproxConfig,
+    *,
+    system: ExactTangentSystem | None = None,
 ) -> float:
     """``eps`` from the FULL Jacobian -- no CG, no surrogate.
 
@@ -95,11 +123,18 @@ def exact_relative_error(
     Returns ``inf`` when the projection is degenerate, which the caller must
     read as "nothing of ``r`` is representable yet".
     """
+    if system is None:
+        system = exact_tangent_system(model, x, y, config)
+    else:
+        validate_exact_tangent_system(system, model, x, y, config)
+    if system is None:
+        return float("inf")
+
     if config.projection_damping_auto:
         # Imported here: damping.py imports from tangent.py, and certify.py
         # is imported by the pipeline before either -- a module-level import
         # would close the cycle.
-        from fgdlib.search.damping import minimal_relative_error
+        from fgdlib.search.damping import minimal_relative_error_from_system
 
         # The growth signal is the SMALLEST eps the tangent space can reach,
         # at least regularisation. It is < 1/2 exactly when a certified step
@@ -110,15 +145,40 @@ def exact_relative_error(
         # spectrum, measured at the same probe; they read different points of
         # it (growth the minimum, the step the selected lambda), which is the
         # correct division of labour rather than the two-certificates bug.
-        return minimal_relative_error(model, x, y, config)
+        return minimal_relative_error_from_system(system, config)
 
-    step = _compute_exact_tangent_projection_step(
-        model=model, x=x, y=y, config=config
+    _, approximation = _solve_tangent_projection(
+        jacobian_matrix=system.jacobian,
+        target=system.target,
+        damping=config.projection_damping,
+        solver=config.projection_solver,
+        work_dtype=(
+            torch.float32
+            if getattr(config, "projection_fast_factorization", False)
+            else torch.float64
+        ),
     )
-    epsilon = step.output_error.relative_error
+    stats = _output_relative_error_from_tensors(
+        approximation=approximation,
+        target=system.target,
+        eps=config.eps,
+    )
+    epsilon = stats.output_error.relative_error
     if epsilon is None or not float(epsilon) == float(epsilon):  # NaN guard
         return float("inf")
     return float(epsilon)
+
+
+def _relative_error_and_system(
+    model,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    config: FGDApproxConfig,
+) -> tuple[float, ExactTangentSystem | None]:
+    system = exact_tangent_system(model, x, y, config)
+    if system is None:
+        return float("inf"), None
+    return exact_relative_error(model, x, y, config, system=system), system
 
 
 def _grow_clone(
@@ -167,13 +227,227 @@ def _grow_clone(
             ),
             progress=None,
             function_preserving=function_preserving,
-            preservation_tolerance=(
-                config.fgd_approx.growth_preservation_tolerance
-            ),
+            preservation_tolerance=(config.fgd_approx.growth_preservation_tolerance),
         )
     except RuntimeError:
         return None
     return clone
+
+
+def _full_candidate_score(
+    candidate,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    config: FGDApproxConfig,
+) -> tuple[float, ExactTangentSystem | None]:
+    """The unchanged full-Jacobian candidate oracle."""
+    increment("where_full_candidate_system_calls")
+    return _relative_error_and_system(candidate, x, y, config)
+
+
+@profiled("where_total_seconds")
+def _select_growth_candidate(
+    model,
+    tangent_system: ExactTangentSystem | None,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    train_loader,
+    device: torch.device,
+    config,
+    function_preserving: bool,
+    current_epsilon: float,
+) -> tuple[object | None, float, int | None, ExactTangentSystem | None]:
+    """Select the same exhaustive argmin, with exact shared-base scoring if enabled."""
+    increment("where_scans")
+    candidates: list[tuple[int, object]] = []
+    for location in range(len(getattr(model, "_growable_layers", []))):
+        candidate = _grow_clone(
+            model,
+            train_loader,
+            location,
+            device,
+            config,
+            function_preserving,
+        )
+        if candidate is not None:
+            candidates.append((location, candidate))
+    increment("where_candidates", len(candidates))
+
+    best_model = None
+    best_epsilon = current_epsilon if function_preserving else float("inf")
+    best_location = None
+    best_system = tangent_system
+    enabled = (
+        _exact_block_schur_where_enabled(config.fgd_approx)
+        and function_preserving
+        and tangent_system is not None
+        and bool(candidates)
+    )
+    if not enabled:
+        for location, candidate in candidates:
+            candidate_epsilon, candidate_system = _full_candidate_score(
+                candidate, x, y, config.fgd_approx
+            )
+            if candidate_epsilon < best_epsilon:
+                best_epsilon = candidate_epsilon
+                best_model = candidate
+                best_location = location
+                best_system = candidate_system
+        return best_model, best_epsilon, best_location, best_system
+
+    increment("where_base_system_reuses")
+    parity_tolerance = (
+        1e-5
+        if getattr(config.fgd_approx, "projection_fast_factorization", False)
+        else 1e-9
+    )
+    layouts = []
+    supported: list[tuple[int, object]] = []
+    full_results: dict[int, tuple[float, ExactTangentSystem | None]] = {}
+    for location, candidate in candidates:
+        try:
+            layout = identify_growth_columns(
+                model,
+                candidate,
+                x,
+                preservation_tolerance=(
+                    config.fgd_approx.growth_preservation_tolerance
+                ),
+            )
+        except UnsupportedGrowthStructure:
+            increment("where_full_fallbacks")
+            increment("where_unsupported_structure_fallbacks")
+            full_results[location] = _full_candidate_score(
+                candidate, x, y, config.fgd_approx
+            )
+        else:
+            layouts.append(layout)
+            supported.append((location, candidate))
+
+    fast_results: dict[int, tuple[float, float]] = {}
+    if layouts:
+        try:
+            shared = stream_shared_candidate_statistics(
+                model,
+                tangent_system,
+                tuple(layouts),
+                x,
+                y,
+                config.fgd_approx,
+            )
+            spectrum = factor_shared_base(
+                tangent_system,
+                reference_joint_factor=shared.candidates[0].joint_factor,
+            )
+        except (CandidateScoringError, RuntimeError):
+            increment("where_full_fallbacks")
+            increment("where_numerical_fallbacks")
+            for location, candidate in supported:
+                full_results[location] = _full_candidate_score(
+                    candidate, x, y, config.fgd_approx
+                )
+        else:
+            for (location, candidate), statistics in zip(
+                supported, shared.candidates
+            ):
+                try:
+                    score = exact_block_schur_score(
+                        shared,
+                        statistics,
+                        spectrum,
+                        eps=config.fgd_approx.eps,
+                    )
+                except (CandidateScoringError, RuntimeError):
+                    increment("where_full_fallbacks")
+                    increment("where_numerical_fallbacks")
+                    full_results[location] = _full_candidate_score(
+                        candidate, x, y, config.fgd_approx
+                    )
+                else:
+                    increment("where_fast_candidate_scores")
+                    fast_results[location] = (
+                        score.relative_error,
+                        score.error_bound,
+                    )
+
+    # A numerical interval that overlaps the provisional argmin is resolved by
+    # the unchanged full oracle.  Strict enumeration order remains the tie-break.
+    provisional = {
+        location: (
+            full_results[location][0]
+            if location in full_results
+            else fast_results[location][0]
+        )
+        for location, _ in candidates
+    }
+    if provisional:
+        provisional_location = min(provisional, key=provisional.get)
+        provisional_value = provisional[provisional_location]
+        provisional_bound = fast_results.get(provisional_location, (0.0, 0.0))[1]
+        for location, candidate in candidates:
+            if location not in fast_results or location == provisional_location:
+                continue
+            value, bound = fast_results[location]
+            if abs(value - provisional_value) <= (
+                bound + provisional_bound + 2.0 * parity_tolerance
+            ):
+                increment("where_full_fallbacks")
+                increment("where_ambiguous_fallbacks")
+                full_results[location] = _full_candidate_score(
+                    candidate, x, y, config.fgd_approx
+                )
+
+    for location, candidate in candidates:
+        candidate_epsilon = (
+            full_results[location][0]
+            if location in full_results
+            else fast_results[location][0]
+        )
+        if candidate_epsilon < best_epsilon:
+            best_epsilon = candidate_epsilon
+            best_model = candidate
+            best_location = location
+            best_system = (
+                full_results[location][1] if location in full_results else None
+            )
+
+    if best_model is None:
+        return None, best_epsilon, None, tangent_system
+    if best_system is not None:
+        return best_model, best_epsilon, best_location, best_system
+
+    # Required canonical validation: the selected grown model gets a complete
+    # exact system before damping selection or realization can reuse it.
+    increment("where_final_winner_full_validations")
+    validated_epsilon, validated_system = _full_candidate_score(
+        best_model, x, y, config.fgd_approx
+    )
+    if abs(validated_epsilon - best_epsilon) <= parity_tolerance:
+        return best_model, validated_epsilon, best_location, validated_system
+
+    # The shared-base prediction did not match its full candidate oracle.
+    # Discard every fast result and rerun the original exhaustive selection.
+    increment("where_full_fallbacks")
+    increment("where_winner_mismatch_fallbacks")
+    if best_location is not None:
+        full_results[best_location] = (validated_epsilon, validated_system)
+    best_model = None
+    best_epsilon = current_epsilon if function_preserving else float("inf")
+    best_location = None
+    best_system = tangent_system
+    for location, candidate in candidates:
+        if location in full_results:
+            candidate_epsilon, candidate_system = full_results[location]
+        else:
+            candidate_epsilon, candidate_system = _full_candidate_score(
+                candidate, x, y, config.fgd_approx
+            )
+        if candidate_epsilon < best_epsilon:
+            best_epsilon = candidate_epsilon
+            best_model = candidate
+            best_location = location
+            best_system = candidate_system
+    return best_model, best_epsilon, best_location, best_system
 
 
 def grow_until_certified(
@@ -224,15 +498,13 @@ def grow_until_certified(
     Returns ``(model, CertifyResult)``.
     """
     threshold = config.fgd_approx.rel_error_threshold
-    epsilon = exact_relative_error(model, x, y, config.fgd_approx)
+    epsilon, tangent_system = _relative_error_and_system(model, x, y, config.fgd_approx)
     trajectory = [epsilon]
     growths = 0
     family_steps = 0
     forced_remaining = 1 if force else 0
 
-    while (
-        epsilon >= threshold or forced_remaining > 0
-    ) and growths < max_growths:
+    while (epsilon >= threshold or forced_remaining > 0) and growths < max_growths:
         forced_remaining = max(0, forced_remaining - 1)
 
         # FAMILY LADDER, before growing: the tangent could not certify (that
@@ -246,7 +518,9 @@ def grow_until_certified(
             if stepped is not None:
                 model = stepped
                 family_steps += 1
-                epsilon = exact_relative_error(model, x, y, config.fgd_approx)
+                epsilon, tangent_system = _relative_error_and_system(
+                    model, x, y, config.fgd_approx
+                )
                 trajectory.append(epsilon)
                 if progress is not None:
                     progress(
@@ -260,31 +534,27 @@ def grow_until_certified(
                     trajectory=tuple(trajectory),
                     family_stepped=True,
                     family_steps=family_steps,
+                    tangent_system=tangent_system,
                 )
 
-        locations = range(len(getattr(model, "_growable_layers", [])))
-        best_model = None
         # Preserving growth cannot make eps worse, so requiring an improvement
         # is free there. Non-preserving growth moves f, so the best available
         # candidate may still sit above the current eps; accepting it is what
         # lets the rank keep climbing, and the loop then relies on the measured
         # trajectory rather than the monotonicity theorem.
-        best_epsilon = epsilon if function_preserving else float("inf")
-        best_location = None
-        for location in locations:
-            candidate = _grow_clone(
-                model, train_loader, location, device, config,
+        best_model, best_epsilon, best_location, best_system = (
+            _select_growth_candidate(
+                model,
+                tangent_system,
+                x,
+                y,
+                train_loader,
+                device,
+                config,
                 function_preserving,
+                epsilon,
             )
-            if candidate is None:
-                continue
-            candidate_epsilon = exact_relative_error(
-                candidate, x, y, config.fgd_approx
-            )
-            if candidate_epsilon < best_epsilon:
-                best_epsilon = candidate_epsilon
-                best_model = candidate
-                best_location = location
+        )
 
         if best_model is None:
             # No growable location reduces eps. The theorem says this cannot
@@ -300,6 +570,7 @@ def grow_until_certified(
 
         model = best_model
         epsilon = best_epsilon
+        tangent_system = best_system
         growths += 1
         trajectory.append(epsilon)
         if progress is not None:
@@ -323,12 +594,16 @@ def grow_until_certified(
             )
             while epsilon >= threshold and growths < max_growths:
                 bigger = _grow_clone(
-                    model, train_loader, best_location, device, config,
+                    model,
+                    train_loader,
+                    best_location,
+                    device,
+                    config,
                     function_preserving,
                 )
                 if bigger is None:
                     break
-                bigger_epsilon = exact_relative_error(
+                bigger_epsilon, bigger_system = _relative_error_and_system(
                     bigger, x, y, config.fgd_approx
                 )
                 gain = epsilon - bigger_epsilon
@@ -336,6 +611,7 @@ def grow_until_certified(
                     break  # diminishing returns here; let the outer loop re-scan
                 model = bigger
                 epsilon = bigger_epsilon
+                tangent_system = bigger_system
                 growths += 1
                 trajectory.append(epsilon)
                 if progress is not None:
@@ -352,4 +628,5 @@ def grow_until_certified(
         trajectory=tuple(trajectory),
         family_stepped=False,
         family_steps=family_steps,
+        tangent_system=tangent_system,
     )
