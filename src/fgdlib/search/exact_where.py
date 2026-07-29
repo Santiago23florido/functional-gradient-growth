@@ -76,6 +76,8 @@ class BaseSpectrum:
 
     singular_values: torch.Tensor
     right_vectors: torch.Tensor
+    reduced_base: torch.Tensor | None = None
+    left_vectors: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -389,11 +391,20 @@ def stream_shared_candidate_statistics(
     )
 
 
-def factor_shared_base(system: ExactTangentSystem) -> BaseSpectrum:
+def factor_shared_base(
+    system: ExactTangentSystem,
+    *,
+    reference_joint_factor: torch.Tensor | None = None,
+) -> BaseSpectrum:
     """Factor the Phase 1 base representation once in float64."""
+    reduced_base = (
+        reference_joint_factor[:, : system.jacobian.shape[1]]
+        if reference_joint_factor is not None
+        else system.jacobian.to(torch.float64)
+    )
     with timed("where_candidate_spectrum_seconds"):
-        _, singular_values, right_vectors = torch.linalg.svd(
-            system.jacobian.to(torch.float64),
+        left_vectors, singular_values, right_vectors = torch.linalg.svd(
+            reduced_base,
             full_matrices=False,
         )
     if (
@@ -405,6 +416,12 @@ def factor_shared_base(system: ExactTangentSystem) -> BaseSpectrum:
     return BaseSpectrum(
         singular_values=singular_values,
         right_vectors=right_vectors,
+        reduced_base=(
+            reduced_base if reference_joint_factor is not None else None
+        ),
+        left_vectors=(
+            left_vectors if reference_joint_factor is not None else None
+        ),
     )
 
 
@@ -475,17 +492,46 @@ def exact_block_schur_score(
         ) / consistency_scale
     if consistency_residual > 2e-8:
         raise CandidateScoringError("joint factor disagrees with B, D, or c")
-    with timed("where_candidate_spectrum_seconds"):
-        candidate_singular = torch.linalg.svdvals(reduced_jacobian)
-    largest = float(candidate_singular.max()) ** 2
-    if not largest > 0.0 or not torch.isfinite(candidate_singular).all():
-        raise CandidateScoringError("candidate tangent system is degenerate")
-    damping = 1e-16 * largest
-
-    with timed("where_candidate_spectrum_seconds"):
-        left, base_singular, right = torch.linalg.svd(
-            reduced_base, full_matrices=False
-        )
+    if spectrum.reduced_base is None or spectrum.left_vectors is None:
+        with timed("where_candidate_spectrum_seconds"):
+            left, base_singular, right = torch.linalg.svd(
+                reduced_base, full_matrices=False
+            )
+    else:
+        reference_base = spectrum.reduced_base
+        if reference_base.shape[0] < reduced_base.shape[0]:
+            reference_base = torch.cat(
+                [
+                    reference_base,
+                    reference_base.new_zeros(
+                        reduced_base.shape[0] - reference_base.shape[0],
+                        reference_base.shape[1],
+                    ),
+                ],
+                dim=0,
+            )
+        elif reference_base.shape[0] > reduced_base.shape[0]:
+            reference_base = reference_base[: reduced_base.shape[0]]
+        if not torch.allclose(
+            reduced_base, reference_base, atol=1e-10, rtol=1e-8
+        ):
+            raise CandidateScoringError("candidate scan changed the base QR factor")
+        left = spectrum.left_vectors
+        if left.shape[0] < reduced_base.shape[0]:
+            left = torch.cat(
+                [
+                    left,
+                    left.new_zeros(
+                        reduced_base.shape[0] - left.shape[0],
+                        left.shape[1],
+                    ),
+                ],
+                dim=0,
+            )
+        elif left.shape[0] > reduced_base.shape[0]:
+            left = left[: reduced_base.shape[0]]
+        base_singular = spectrum.singular_values
+        right = spectrum.right_vectors
     if not torch.allclose(
         base_singular,
         spectrum.singular_values,
@@ -497,6 +543,31 @@ def exact_block_schur_score(
     target_coordinates = left.t() @ reduced_target
     new_residual = reduced_new - left @ base_coordinates
     target_residual = reduced_target - left @ target_coordinates
+    core_factor = torch.cat(
+        [
+            torch.cat(
+                [torch.diag(base_singular), base_coordinates],
+                dim=1,
+            ),
+            torch.cat(
+                [
+                    new_residual.new_zeros(
+                        new_residual.shape[0], base_singular.numel()
+                    ),
+                    new_residual,
+                ],
+                dim=1,
+            ),
+        ],
+        dim=0,
+    )
+    with timed("where_candidate_spectrum_seconds"):
+        largest = float(
+            torch.linalg.eigvalsh(core_factor.t() @ core_factor)[-1]
+        )
+    if not largest > 0.0 or not torch.isfinite(torch.tensor(largest)):
+        raise CandidateScoringError("candidate tangent system is degenerate")
+    damping = 1e-16 * largest
     weights = damping / (base_singular.square() + damping)
     schur = (
         new_residual.t() @ new_residual

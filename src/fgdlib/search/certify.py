@@ -335,7 +335,10 @@ def _select_growth_candidate(
                 y,
                 config.fgd_approx,
             )
-            spectrum = factor_shared_base(tangent_system)
+            spectrum = factor_shared_base(
+                tangent_system,
+                reference_joint_factor=shared.candidates[0].joint_factor,
+            )
         except (CandidateScoringError, RuntimeError):
             increment("where_full_fallbacks")
             increment("where_numerical_fallbacks")
