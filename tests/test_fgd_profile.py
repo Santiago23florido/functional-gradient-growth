@@ -20,6 +20,8 @@ def test_disabled_profiling_preserves_return_values(monkeypatch) -> None:
     assert snapshot()["exact_tangent_system_calls"] == 0
     assert snapshot()["minimal_relative_error_seconds"] == 0.0
     assert snapshot()["damping_factorization_seconds"] == 0.0
+    assert snapshot()["where_scans"] == 0
+    assert snapshot()["where_total_seconds"] == 0.0
 
 
 def test_enabled_profiling_records_calls_and_time(monkeypatch) -> None:
@@ -31,3 +33,5 @@ def test_enabled_profiling_records_calls_and_time(monkeypatch) -> None:
     values = snapshot()
     assert values["exact_tangent_system_calls"] == 1
     assert values["exact_tangent_system_seconds"] >= 0.0
+    assert values["where_full_candidate_system_calls"] == 0
+    assert values["where_winner_mismatch_fallbacks"] == 0

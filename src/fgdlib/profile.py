@@ -30,6 +30,25 @@ PROFILE_FIELDS = (
     "line_search_trials",
     "current_parameter_count",
     "realize_cholesky_fallbacks",
+    "where_scans",
+    "where_candidates",
+    "where_base_system_reuses",
+    "where_full_candidate_system_calls",
+    "where_fast_candidate_scores",
+    "where_new_column_seconds",
+    "where_cross_statistics_seconds",
+    "where_candidate_spectrum_seconds",
+    "where_schur_factorization_seconds",
+    "where_schur_solve_seconds",
+    "where_sensor_seconds",
+    "where_verification_seconds",
+    "where_full_fallbacks",
+    "where_unsupported_structure_fallbacks",
+    "where_ambiguous_fallbacks",
+    "where_numerical_fallbacks",
+    "where_winner_mismatch_fallbacks",
+    "where_final_winner_full_validations",
+    "where_total_seconds",
 )
 
 _COUNTER_FIELDS = {
@@ -39,6 +58,17 @@ _COUNTER_FIELDS = {
     "line_search_trials",
     "current_parameter_count",
     "realize_cholesky_fallbacks",
+    "where_scans",
+    "where_candidates",
+    "where_base_system_reuses",
+    "where_full_candidate_system_calls",
+    "where_fast_candidate_scores",
+    "where_full_fallbacks",
+    "where_unsupported_structure_fallbacks",
+    "where_ambiguous_fallbacks",
+    "where_numerical_fallbacks",
+    "where_winner_mismatch_fallbacks",
+    "where_final_winner_full_validations",
 }
 _VALUES: dict[str, float] = {field: 0.0 for field in PROFILE_FIELDS}
 _LOCK = threading.Lock()

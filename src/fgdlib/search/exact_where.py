@@ -16,6 +16,7 @@ from dataclasses import dataclass
 import torch
 from torch.func import functional_call, jacrev
 
+from fgdlib.profile import timed
 from fgdlib.tangent import (
     ExactTangentSystem,
     FGDApproxConfig,
@@ -318,21 +319,25 @@ def stream_shared_candidate_statistics(
             j64 = j_block.to(torch.float64)
             r64 = full_target[row_start:row_stop].to(torch.float64)
             for index, layout in enumerate(layouts):
-                c_block = _candidate_new_jacobian_block(layout, x_block).to(
-                    torch.float64
-                )
-                cross[index].add_(j64.t() @ c_block)
-                new_grams[index].add_(c_block.t() @ c_block)
-                new_rhs[index].add_(c_block.t() @ r64)
-                joint_block = torch.cat(
-                    [j64, c_block, r64.unsqueeze(1)], dim=1
-                )
-                stacked = (
-                    joint_block
-                    if joint_factors[index] is None
-                    else torch.cat([joint_factors[index], joint_block], dim=0)
-                )
-                joint_factors[index] = torch.linalg.qr(stacked, mode="reduced").R
+                with timed("where_new_column_seconds"):
+                    c_block = _candidate_new_jacobian_block(layout, x_block).to(
+                        torch.float64
+                    )
+                with timed("where_cross_statistics_seconds"):
+                    cross[index].add_(j64.t() @ c_block)
+                    new_grams[index].add_(c_block.t() @ c_block)
+                    new_rhs[index].add_(c_block.t() @ r64)
+                    joint_block = torch.cat(
+                        [j64, c_block, r64.unsqueeze(1)], dim=1
+                    )
+                    stacked = (
+                        joint_block
+                        if joint_factors[index] is None
+                        else torch.cat([joint_factors[index], joint_block], dim=0)
+                    )
+                    joint_factors[index] = torch.linalg.qr(
+                        stacked, mode="reduced"
+                    ).R
             _clear_inaccessible_tensor_caches(base)
             for layout in layouts:
                 _clear_inaccessible_tensor_caches(layout.candidate)
@@ -386,10 +391,11 @@ def stream_shared_candidate_statistics(
 
 def factor_shared_base(system: ExactTangentSystem) -> BaseSpectrum:
     """Factor the Phase 1 base representation once in float64."""
-    _, singular_values, right_vectors = torch.linalg.svd(
-        system.jacobian.to(torch.float64),
-        full_matrices=False,
-    )
+    with timed("where_candidate_spectrum_seconds"):
+        _, singular_values, right_vectors = torch.linalg.svd(
+            system.jacobian.to(torch.float64),
+            full_matrices=False,
+        )
     if (
         singular_values.numel() == 0
         or not torch.isfinite(singular_values).all()
@@ -455,28 +461,31 @@ def exact_block_schur_score(
     reduced_target = joint[:, -1]
     reduced_base = joint[:, :parameter_count]
     reduced_new = joint[:, parameter_count : parameter_count + new_count]
-    consistency_scale = max(
-        1.0,
-        float(torch.linalg.norm(cross)),
-        float(torch.linalg.norm(new_gram)),
-        float(torch.linalg.norm(new_rhs)),
-    )
-    consistency_residual = max(
-        float(torch.linalg.norm(reduced_base.t() @ reduced_new - cross)),
-        float(torch.linalg.norm(reduced_new.t() @ reduced_new - new_gram)),
-        float(torch.linalg.norm(reduced_new.t() @ reduced_target - new_rhs)),
-    ) / consistency_scale
+    with timed("where_verification_seconds"):
+        consistency_scale = max(
+            1.0,
+            float(torch.linalg.norm(cross)),
+            float(torch.linalg.norm(new_gram)),
+            float(torch.linalg.norm(new_rhs)),
+        )
+        consistency_residual = max(
+            float(torch.linalg.norm(reduced_base.t() @ reduced_new - cross)),
+            float(torch.linalg.norm(reduced_new.t() @ reduced_new - new_gram)),
+            float(torch.linalg.norm(reduced_new.t() @ reduced_target - new_rhs)),
+        ) / consistency_scale
     if consistency_residual > 2e-8:
         raise CandidateScoringError("joint factor disagrees with B, D, or c")
-    candidate_singular = torch.linalg.svdvals(reduced_jacobian)
+    with timed("where_candidate_spectrum_seconds"):
+        candidate_singular = torch.linalg.svdvals(reduced_jacobian)
     largest = float(candidate_singular.max()) ** 2
     if not largest > 0.0 or not torch.isfinite(candidate_singular).all():
         raise CandidateScoringError("candidate tangent system is degenerate")
     damping = 1e-16 * largest
 
-    left, base_singular, right = torch.linalg.svd(
-        reduced_base, full_matrices=False
-    )
+    with timed("where_candidate_spectrum_seconds"):
+        left, base_singular, right = torch.linalg.svd(
+            reduced_base, full_matrices=False
+        )
     if not torch.allclose(
         base_singular,
         spectrum.singular_values,
@@ -504,73 +513,78 @@ def exact_block_schur_score(
         new_residual.t() @ target_residual
         + base_coordinates.t() @ (weights * target_coordinates)
     )
-    factor, info = torch.linalg.cholesky_ex(schur)
+    with timed("where_schur_factorization_seconds"):
+        factor, info = torch.linalg.cholesky_ex(schur)
     if int(info.max()) != 0:
         raise CandidateScoringError("Schur Cholesky factorization failed")
-    new_update = torch.cholesky_solve(
-        schur_rhs.unsqueeze(1), factor
-    ).squeeze(1)
-    old_update = right.t() @ (
-        base_singular
-        / (base_singular.square() + damping)
-        * (target_coordinates - base_coordinates @ new_update)
-    )
+    with timed("where_schur_solve_seconds"):
+        new_update = torch.cholesky_solve(
+            schur_rhs.unsqueeze(1), factor
+        ).squeeze(1)
+        old_update = right.t() @ (
+            base_singular
+            / (base_singular.square() + damping)
+            * (target_coordinates - base_coordinates @ new_update)
+        )
     if not torch.isfinite(old_update).all() or not torch.isfinite(new_update).all():
         raise CandidateScoringError("nonfinite block-Schur solution")
 
-    old_normal = (
-        gram @ old_update
-        + cross @ new_update
-        + damping * old_update
-        - rhs
-    )
-    new_normal = (
-        cross.t() @ old_update
-        + new_gram @ new_update
-        + damping * new_update
-        - new_rhs
-    )
-    normal_rhs_norm = max(
-        1.0,
-        float(torch.linalg.norm(torch.cat([rhs, new_rhs]))),
-    )
-    normal_residual = float(
-        torch.linalg.norm(torch.cat([old_normal, new_normal]))
-    ) / normal_rhs_norm
-    schur_residual = float(
-        torch.linalg.norm(schur @ new_update - schur_rhs)
-    ) / max(1.0, float(torch.linalg.norm(schur_rhs)))
+    with timed("where_verification_seconds"):
+        old_normal = (
+            gram @ old_update
+            + cross @ new_update
+            + damping * old_update
+            - rhs
+        )
+        new_normal = (
+            cross.t() @ old_update
+            + new_gram @ new_update
+            + damping * new_update
+            - new_rhs
+        )
+        normal_rhs_norm = max(
+            1.0,
+            float(torch.linalg.norm(torch.cat([rhs, new_rhs]))),
+        )
+        normal_residual = float(
+            torch.linalg.norm(torch.cat([old_normal, new_normal]))
+        ) / normal_rhs_norm
+        schur_residual = float(
+            torch.linalg.norm(schur @ new_update - schur_rhs)
+        ) / max(1.0, float(torch.linalg.norm(schur_rhs)))
     if normal_residual > 2e-6 or schur_residual > 2e-8:
         raise CandidateScoringError("ridge or Schur residual is excessive")
 
-    gram_dot_product = float(
-        torch.dot(rhs, old_update) + torch.dot(new_rhs, new_update)
-    )
-    gram_approximation_sq = float(
-        torch.dot(old_update, gram @ old_update)
-        + 2.0 * torch.dot(old_update, cross @ new_update)
-        + torch.dot(new_update, new_gram @ new_update)
-    )
-    flat_update = torch.cat([old_update, new_update])
-    reduced_approximation = reduced_jacobian @ flat_update
-    dot_product = float(torch.dot(reduced_approximation, reduced_target))
-    approximation_sq = float(
-        torch.dot(reduced_approximation, reduced_approximation)
-    )
-    solution_sq = float(
-        torch.dot(old_update, old_update) + torch.dot(new_update, new_update)
-    )
-    alternative_sq = dot_product - damping * solution_sq
-    sensor_residual = max(
-        abs(approximation_sq - alternative_sq),
-        abs(gram_dot_product - dot_product),
-        abs(gram_approximation_sq - approximation_sq),
-    ) / max(
-        1.0,
-        abs(approximation_sq),
-        abs(alternative_sq),
-        abs(dot_product),
-    )
+    with timed("where_sensor_seconds"):
+        gram_dot_product = float(
+            torch.dot(rhs, old_update) + torch.dot(new_rhs, new_update)
+        )
+        gram_approximation_sq = float(
+            torch.dot(old_update, gram @ old_update)
+            + 2.0 * torch.dot(old_update, cross @ new_update)
+            + torch.dot(new_update, new_gram @ new_update)
+        )
+        flat_update = torch.cat([old_update, new_update])
+        reduced_approximation = reduced_jacobian @ flat_update
+        dot_product = float(torch.dot(reduced_approximation, reduced_target))
+        approximation_sq = float(
+            torch.dot(reduced_approximation, reduced_approximation)
+        )
+        solution_sq = float(
+            torch.dot(old_update, old_update)
+            + torch.dot(new_update, new_update)
+        )
+        alternative_sq = dot_product - damping * solution_sq
+        sensor_residual = max(
+            abs(approximation_sq - alternative_sq),
+            abs(gram_dot_product - dot_product),
+            abs(gram_approximation_sq - approximation_sq),
+        ) / max(
+            1.0,
+            abs(approximation_sq),
+            abs(alternative_sq),
+            abs(dot_product),
+        )
     if sensor_residual > 2e-5:
         raise CandidateScoringError(
             "reconstructed projection sensor is inconsistent "

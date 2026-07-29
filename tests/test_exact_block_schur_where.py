@@ -12,7 +12,9 @@ from fgdlib.gromo_setup import ensure_gromo_importable
 from fgdlib.search.certify import _grow_clone, _select_growth_candidate
 from fgdlib.search.damping import DAMPING_BRACKET, minimal_relative_error_from_system
 from fgdlib.search.exact_where import (
+    CandidateScoringError,
     CandidateStatistics,
+    ExactCandidateScore,
     GrowthColumnLayout,
     SharedBaseStatistics,
     exact_block_schur_score,
@@ -20,6 +22,7 @@ from fgdlib.search.exact_where import (
     identify_growth_columns,
     stream_shared_candidate_statistics,
 )
+from fgdlib.profile import increment, reset, snapshot
 from fgdlib.tangent import (
     FGDApproxConfig,
     ExactTangentSystem,
@@ -284,3 +287,140 @@ def test_environment_flag_is_benchmark_only(monkeypatch) -> None:
     assert not _exact_block_schur_where_enabled(config)
     monkeypatch.setenv("FGD_EXACT_BLOCK_SCHUR_WHERE", "1")
     assert _exact_block_schur_where_enabled(config)
+
+
+def test_fast_scan_builds_only_the_final_winners_full_system(monkeypatch) -> None:
+    """With oracle-parity scores, N candidate systems collapse to one validation."""
+    import fgdlib.search.certify as certify
+
+    config, model, x, y, loader = _problem(17, out_features=1)
+    base_system = exact_tangent_system(model, x, y, config.fgd_approx)
+    assert base_system is not None
+    oracle_errors = []
+    for location in range(len(model._growable_layers)):
+        candidate = _grow_clone(
+            model,
+            loader,
+            location,
+            torch.device("cpu"),
+            config,
+            True,
+        )
+        assert candidate is not None
+        candidate_system = exact_tangent_system(
+            candidate, x, y, config.fgd_approx
+        )
+        assert candidate_system is not None
+        oracle_errors.append(
+            minimal_relative_error_from_system(
+                candidate_system, config.fgd_approx
+            )
+        )
+
+    scores = iter(oracle_errors)
+    winning_error = min(oracle_errors)
+
+    def oracle_parity_score(*args, **kwargs):
+        del args, kwargs
+        value = next(scores)
+        zero = torch.zeros(1, dtype=torch.float64)
+        return ExactCandidateScore(
+            relative_error=value,
+            absolute_damping=1.0,
+            old_update=zero,
+            new_update=zero,
+            normal_residual=0.0,
+            schur_residual=0.0,
+            sensor_residual=0.0,
+            error_bound=1e-12,
+        )
+
+    monkeypatch.setattr(certify, "exact_block_schur_score", oracle_parity_score)
+
+    def matching_final_validation(*args, **kwargs):
+        del args, kwargs
+        increment("where_full_candidate_system_calls")
+        return winning_error, base_system
+
+    monkeypatch.setattr(
+        certify,
+        "_full_candidate_score",
+        matching_final_validation,
+    )
+    monkeypatch.setenv("FGD_PROFILE", "1")
+    reset()
+    selected = _select_growth_candidate(
+        model,
+        base_system,
+        x,
+        y,
+        loader,
+        torch.device("cpu"),
+        config,
+        True,
+        float("inf"),
+    )
+    assert selected[2] == min(
+        range(len(oracle_errors)), key=oracle_errors.__getitem__
+    )
+    values = snapshot()
+    assert values["where_candidates"] == len(oracle_errors)
+    assert values["where_fast_candidate_scores"] == len(oracle_errors)
+    assert values["where_full_candidate_system_calls"] == 1
+    assert values["where_final_winner_full_validations"] == 1
+    assert values["where_winner_mismatch_fallbacks"] == 0
+
+
+def test_numerical_and_unsupported_fallbacks_are_counted(monkeypatch) -> None:
+    import fgdlib.search.certify as certify
+
+    config, model, x, y, loader = _problem(19, out_features=1)
+    base_system = exact_tangent_system(model, x, y, config.fgd_approx)
+    assert base_system is not None
+    monkeypatch.setenv("FGD_PROFILE", "1")
+
+    reset()
+    monkeypatch.setattr(
+        certify,
+        "exact_block_schur_score",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            CandidateScoringError("injected factorization failure")
+        ),
+    )
+    _select_growth_candidate(
+        model,
+        base_system,
+        x,
+        y,
+        loader,
+        torch.device("cpu"),
+        config,
+        True,
+        float("inf"),
+    )
+    numerical = snapshot()
+    assert numerical["where_numerical_fallbacks"] > 0
+    assert numerical["where_full_fallbacks"] > 0
+
+    reset()
+    monkeypatch.setattr(
+        certify,
+        "identify_growth_columns",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            certify.UnsupportedGrowthStructure("injected old-column mismatch")
+        ),
+    )
+    _select_growth_candidate(
+        model,
+        base_system,
+        x,
+        y,
+        loader,
+        torch.device("cpu"),
+        config,
+        True,
+        float("inf"),
+    )
+    unsupported = snapshot()
+    assert unsupported["where_unsupported_structure_fallbacks"] > 0
+    assert unsupported["where_full_fallbacks"] > 0

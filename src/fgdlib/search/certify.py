@@ -45,6 +45,7 @@ from dataclasses import dataclass
 
 import torch
 
+from fgdlib.profile import increment, profiled
 from fgdlib.search.growth import grow_layer
 from fgdlib.search.exact_where import (
     CandidateScoringError,
@@ -240,9 +241,11 @@ def _full_candidate_score(
     config: FGDApproxConfig,
 ) -> tuple[float, ExactTangentSystem | None]:
     """The unchanged full-Jacobian candidate oracle."""
+    increment("where_full_candidate_system_calls")
     return _relative_error_and_system(candidate, x, y, config)
 
 
+@profiled("where_total_seconds")
 def _select_growth_candidate(
     model,
     tangent_system: ExactTangentSystem | None,
@@ -255,6 +258,7 @@ def _select_growth_candidate(
     current_epsilon: float,
 ) -> tuple[object | None, float, int | None, ExactTangentSystem | None]:
     """Select the same exhaustive argmin, with exact shared-base scoring if enabled."""
+    increment("where_scans")
     candidates: list[tuple[int, object]] = []
     for location in range(len(getattr(model, "_growable_layers", []))):
         candidate = _grow_clone(
@@ -267,6 +271,7 @@ def _select_growth_candidate(
         )
         if candidate is not None:
             candidates.append((location, candidate))
+    increment("where_candidates", len(candidates))
 
     best_model = None
     best_epsilon = current_epsilon if function_preserving else float("inf")
@@ -290,6 +295,7 @@ def _select_growth_candidate(
                 best_system = candidate_system
         return best_model, best_epsilon, best_location, best_system
 
+    increment("where_base_system_reuses")
     parity_tolerance = (
         1e-5
         if getattr(config.fgd_approx, "projection_fast_factorization", False)
@@ -309,6 +315,8 @@ def _select_growth_candidate(
                 ),
             )
         except UnsupportedGrowthStructure:
+            increment("where_full_fallbacks")
+            increment("where_unsupported_structure_fallbacks")
             full_results[location] = _full_candidate_score(
                 candidate, x, y, config.fgd_approx
             )
@@ -329,6 +337,8 @@ def _select_growth_candidate(
             )
             spectrum = factor_shared_base(tangent_system)
         except (CandidateScoringError, RuntimeError):
+            increment("where_full_fallbacks")
+            increment("where_numerical_fallbacks")
             for location, candidate in supported:
                 full_results[location] = _full_candidate_score(
                     candidate, x, y, config.fgd_approx
@@ -345,10 +355,13 @@ def _select_growth_candidate(
                         eps=config.fgd_approx.eps,
                     )
                 except (CandidateScoringError, RuntimeError):
+                    increment("where_full_fallbacks")
+                    increment("where_numerical_fallbacks")
                     full_results[location] = _full_candidate_score(
                         candidate, x, y, config.fgd_approx
                     )
                 else:
+                    increment("where_fast_candidate_scores")
                     fast_results[location] = (
                         score.relative_error,
                         score.error_bound,
@@ -369,12 +382,14 @@ def _select_growth_candidate(
         provisional_value = provisional[provisional_location]
         provisional_bound = fast_results.get(provisional_location, (0.0, 0.0))[1]
         for location, candidate in candidates:
-            if location not in fast_results:
+            if location not in fast_results or location == provisional_location:
                 continue
             value, bound = fast_results[location]
             if abs(value - provisional_value) <= (
                 bound + provisional_bound + 2.0 * parity_tolerance
             ):
+                increment("where_full_fallbacks")
+                increment("where_ambiguous_fallbacks")
                 full_results[location] = _full_candidate_score(
                     candidate, x, y, config.fgd_approx
                 )
@@ -400,6 +415,7 @@ def _select_growth_candidate(
 
     # Required canonical validation: the selected grown model gets a complete
     # exact system before damping selection or realization can reuse it.
+    increment("where_final_winner_full_validations")
     validated_epsilon, validated_system = _full_candidate_score(
         best_model, x, y, config.fgd_approx
     )
@@ -408,6 +424,10 @@ def _select_growth_candidate(
 
     # The shared-base prediction did not match its full candidate oracle.
     # Discard every fast result and rerun the original exhaustive selection.
+    increment("where_full_fallbacks")
+    increment("where_winner_mismatch_fallbacks")
+    if best_location is not None:
+        full_results[best_location] = (validated_epsilon, validated_system)
     best_model = None
     best_epsilon = current_epsilon if function_preserving else float("inf")
     best_location = None
