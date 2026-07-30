@@ -2084,23 +2084,27 @@ def _analytic_jacobian_block(
 def _tangent_spectrum(r_factor: torch.Tensor) -> torch.Tensor:
     """Singular values of the streamed factor R, via CPU LAPACK.
 
-    ``R`` (P x P, upper triangular) satisfies ``R^T R = J^T J`` exactly, so
-    its singular values ARE the singular values of the full streamed
-    Jacobian ``J`` -- ``svdvals(R)`` is not an approximation, just a
-    smaller and better-conditioned input to the same exact algorithm. CPU,
-    because cuSOLVER's default float64 SVD driver is catastrophic at this
-    size (MEASURED 25.7 s CUDA vs 1.43 s CPU ``svdvals``, TANGENT_PLAN.md
-    C.4); the guard below retries on CUDA with the exact QR-based 'gesvd'
-    driver ONLY if CPU LAPACK itself errors -- never to paper over a
-    genuine inconsistency caught by the checks that follow.
+    ``R`` is P x P (upper triangular) once the streamed factor has
+    accumulated at least P functional rows; when the probe has FEWER
+    functional rows than parameters (N*K < P) it stays m x P with m < P
+    for the whole call -- ``svdvals`` handles that shape natively (it
+    just returns min(m, P) singular values), and ``R^T R = J^T J`` still
+    holds exactly regardless of shape, so this is not an approximation
+    either way, just a smaller and better-conditioned input to the same
+    exact algorithm. CPU, because cuSOLVER's default float64 SVD driver is
+    catastrophic at this size (MEASURED 25.7 s CUDA vs 1.43 s CPU
+    ``svdvals``, TANGENT_PLAN.md C.4); the guard below retries on CUDA
+    with the exact QR-based 'gesvd' driver ONLY if CPU LAPACK itself
+    errors -- never to paper over a genuine inconsistency caught by the
+    checks that follow.
 
     Three cheap, exact sanity checks accompany the spectrum:
 
     1. Frobenius identity ``sum(sigma_i^2) == ||R||_F^2`` -- an algebraic
-       identity, true regardless of conditioning, MEASURED to agree to the
-       last bit. A relative violation above 1e-12 means the returned
-       spectrum cannot be trusted at all, so this RAISES (there is no
-       narrower fallback for "the spectrum itself is wrong").
+       identity, true regardless of conditioning OR shape, MEASURED to
+       agree to the last bit. A relative violation above 1e-12 means the
+       returned spectrum cannot be trusted at all, so this RAISES (there
+       is no narrower fallback for "the spectrum itself is wrong").
     2/3. Power / inverse-power iteration corroborate sigma_max / sigma_min
        independently of LAPACK. These are diagnostics, NOT gates: on a
        genuinely ill-conditioned R (MEASURED cond(J) = 5.9e14 on realistic
@@ -2108,7 +2112,11 @@ def _tangent_spectrum(r_factor: torch.Tensor) -> torch.Tensor:
        close to the iteration's noise floor for 50 steps to bracket it to
        5%, which is an expected property of a hard problem, not evidence
        LAPACK is wrong -- so a miss here is recorded via ``fallback`` and
-       NOT raised, unlike the Frobenius identity above.
+       NOT raised, unlike the Frobenius identity above. The inverse-power
+       (sigma_min) check additionally needs a SQUARE R -- solve_triangular
+       requires it -- so on a rectangular R (m < P) it is SKIPPED, with
+       the reason recorded, rather than forced into a square solve that
+       does not exist; skipping a non-gating diagnostic must never raise.
     """
     p_dim = r_factor.shape[-1]
     r_cpu = r_factor.detach().to(device="cpu", dtype=torch.float64)
@@ -2121,6 +2129,7 @@ def _tangent_spectrum(r_factor: torch.Tensor) -> torch.Tensor:
                 r_factor.detach().to(dtype=torch.float64), driver="gesvd"
             )
         except torch.linalg.LinAlgError as retry_error:
+            fallback("tangent_spectrum_fallbacks", "cuda_gesvd_retry_failed")
             raise RuntimeError(
                 "torch.linalg.svdvals failed on both the CPU default "
                 "driver and the CUDA 'gesvd' driver for the streamed "
@@ -2168,24 +2177,42 @@ def _tangent_spectrum(r_factor: torch.Tensor) -> torch.Tensor:
 
     # sigma_min sanity: 50 inverse power iterations, each ONE forward and
     # ONE backward triangular solve against R^T R -- R is never inverted.
-    w = torch.randn(p_dim, dtype=torch.float64, generator=generator)
-    w = w / w.norm()
-    for _ in range(50):
+    # This needs a SQUARE R: solve_triangular requires a square operand,
+    # and R is only square when the streamed factor has accumulated at
+    # least P rows. Whenever the probe has fewer functional rows than
+    # parameters (N*K < P, e.g. a small probe against a wide model) R is
+    # m x P with m < P for its entire life -- rank(R) <= m < P always, so
+    # the SVD-free route can never fire for it anyway (see the rank check
+    # in ``_surrogate_from_factor``), and there is no square triangular
+    # system to invert here. This is a NON-GATING corroboration, so a
+    # shape it cannot run on is skipped, with the reason recorded, rather
+    # than forcing a square solve that does not exist.
+    is_square = r_cpu.shape[0] == r_cpu.shape[1]
+    if not is_square:
+        fallback("tangent_spectrum_fallbacks", "rectangular_factor_skips_inverse_power")
+    else:
+        w = torch.randn(p_dim, dtype=torch.float64, generator=generator)
+        w = w / w.norm()
+        for _ in range(50):
+            z = torch.linalg.solve_triangular(
+                r_cpu.t(), w.unsqueeze(1), upper=False
+            ).squeeze(1)
+            w = torch.linalg.solve_triangular(
+                r_cpu, z.unsqueeze(1), upper=True
+            ).squeeze(1)
+            w = w / w.norm().clamp_min(1e-300)
         z = torch.linalg.solve_triangular(
             r_cpu.t(), w.unsqueeze(1), upper=False
         ).squeeze(1)
-        w = torch.linalg.solve_triangular(r_cpu, z.unsqueeze(1), upper=True).squeeze(1)
-        w = w / w.norm().clamp_min(1e-300)
-    z = torch.linalg.solve_triangular(r_cpu.t(), w.unsqueeze(1), upper=False).squeeze(1)
-    w_final = torch.linalg.solve_triangular(r_cpu, z.unsqueeze(1), upper=True).squeeze(
-        1
-    )
-    inverse_rayleigh = float(w @ w_final)
-    power_sigma_min = (
-        1.0 / math.sqrt(inverse_rayleigh) if inverse_rayleigh > 0.0 else 0.0
-    )
-    if sigma_min > 0.0 and abs(power_sigma_min - sigma_min) > 0.05 * sigma_min:
-        fallback("tangent_spectrum_fallbacks", "inverse_power_sigma_min_mismatch")
+        w_final = torch.linalg.solve_triangular(
+            r_cpu, z.unsqueeze(1), upper=True
+        ).squeeze(1)
+        inverse_rayleigh = float(w @ w_final)
+        power_sigma_min = (
+            1.0 / math.sqrt(inverse_rayleigh) if inverse_rayleigh > 0.0 else 0.0
+        )
+        if sigma_min > 0.0 and abs(power_sigma_min - sigma_min) > 0.05 * sigma_min:
+            fallback("tangent_spectrum_fallbacks", "inverse_power_sigma_min_mismatch")
 
     # cond(J) = sigma_max/sigma_min; cond(J^T J) = cond(J)^2 -- the
     # quantity that rules out a normal-equation Gram path at this scale
@@ -2307,6 +2334,25 @@ def _surrogate_from_factor(
         except RuntimeError:
             if strict:
                 raise
+            # _tangent_spectrum already recorded the SPECIFIC reason
+            # (frobenius_mismatch / cpu_lapack_error / cuda_gesvd_retry_
+            # failed / non_finite_singular_values) before raising; this is
+            # the COARSER, call-site reason -- "the whole optimized
+            # surrogate construction gave up on the spectrum and deferred
+            # to the untouched legacy path" -- so no swallow-and-return
+            # here is ever silent, regardless of which of those causes it.
+            fallback(
+                "tangent_spectrum_fallbacks",
+                "spectrum_unavailable_legacy_surrogate_used",
+            )
+            # The condition estimate could not be established for this
+            # call. Leaving tangent_condition_estimate at 0.0 (the
+            # profiler's zero-init, or whatever a PREVIOUS successful call
+            # left behind) would misreport an impossible reading --
+            # condition numbers are always >= 1 -- as though it had been
+            # measured now. NaN is the explicit "not measured this call"
+            # sentinel: it prints as nan, never as a plausible number.
+            set_value("tangent_condition_estimate", float("nan"))
             sigma = None
 
     if sigma is None:
