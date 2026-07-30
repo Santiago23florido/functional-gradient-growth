@@ -381,11 +381,14 @@ def test_invalid_backend_value_raises(monkeypatch) -> None:
         tangent_backend()
 
 
-def test_unset_backend_resolves_to_legacy(monkeypatch) -> None:
-    """The default must stay ``legacy`` until every acceptance gate passes;
-    flipping it is a separate commit, so a silent flip is a regression."""
+def test_unset_backend_resolves_to_auto(monkeypatch) -> None:
+    """The default is ``auto``: the optimized construction with counted,
+    reasoned fallback. ``auto`` rather than ``optimized`` because strict
+    mode RAISES on any unsupported structure, and gromo legitimately
+    enables input caching during growth certification -- a production run
+    must degrade there, not die. Rollback stays one env var away."""
     monkeypatch.delenv("FGD_TANGENT_BACKEND", raising=False)
-    assert tangent_backend() == "legacy"
+    assert tangent_backend() == "auto"
 
 
 @pytest.mark.parametrize("value", ["legacy", "auto", "optimized"])

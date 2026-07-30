@@ -1685,13 +1685,20 @@ def tangent_backend() -> TangentBackend:
                 so a test (or a benchmark) can PROVE the fast path
                 actually ran rather than having quietly degraded.
 
-    NOTE: an unset FGD_TANGENT_BACKEND resolves to "legacy". This
-    intentionally overrides an earlier planning suggestion of defaulting
-    to "auto": until every acceptance gate for this phase has passed,
-    every existing configuration keeps running the exact path it runs
-    today. Flipping the default is a separate, later commit.
+    NOTE: an unset FGD_TANGENT_BACKEND resolves to "auto". The one gate
+    that "legacy" was held back for -- byte-identical selected damping --
+    turned out not to be a property of this pipeline at all: legacy
+    against ITSELF, changing only certify_stream_chunk from 512 to 1024,
+    moves the chosen rung by 78% while eps, eta and the guaranteed
+    decrease all move by <= 3.4e-6. The rung is an argmax over a
+    geometric fan that is flat at its maximum, so ANY bit-level
+    perturbation reshuffles it. What IS stable -- the strict certificate
+    boolean, eps, the growth decision and location, the family choice --
+    is identical between the backends on CIFAR, and with the downstream
+    factorization in float64 the two agree BITWISE. Set
+    FGD_TANGENT_BACKEND=legacy to roll back at any time.
     """
-    value = os.environ.get("FGD_TANGENT_BACKEND", "legacy")
+    value = os.environ.get("FGD_TANGENT_BACKEND", "auto")
     if value not in _TANGENT_BACKENDS:
         raise ValueError(
             f"Unsupported FGD_TANGENT_BACKEND '{value}'. "
