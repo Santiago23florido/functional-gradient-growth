@@ -2019,9 +2019,12 @@ def _analytic_jacobian_block(
 
     Precision rule: forward / D / gprime run in the model's OWN dtype,
     mirroring jacrev bit-for-bit; only the final outer product is formed in
-    ``out_dtype`` (float64) from upcast factors -- strictly more accurate
-    than legacy (which multiplies in float32 THEN casts) and fuses the
-    ``.to(float64)`` cast for free.
+    ``out_dtype``. The streamed branch passes float64 (strictly more
+    accurate than legacy, which multiplies in float32 THEN casts, and
+    fuses that cast for free); the row-chunked and full-Jacobian branches
+    pass the model's own dtype instead, matching
+    ``_flatten_jacobian(jacrev(...))``'s dtype exactly, since those
+    branches do not cast to float64 either.
     """
     linears = structure.linears
     depth = len(linears)
@@ -2573,6 +2576,40 @@ def _compute_exact_tangent_projection_step(
         stream_gram = bool(getattr(config, "certify_stream_gram", False))
         try:
             with timed("streamed_jacobian_seconds"):
+                # Structure resolved ONCE per call, SHARED by every branch
+                # below (streamed-Gram, row-chunked, full): optimized/auto
+                # try the analytic Jacobian block wherever the model/probe
+                # qualify (P1-P14); optimized RAISES if they do not; auto
+                # falls back to jacrev, per block, in whichever branch runs.
+                # A model/probe either supports the analytic form or it does
+                # not -- that has nothing to do with which of the three
+                # branches a config happens to select, so this is resolved
+                # exactly once and shared, never re-derived per branch.
+                #
+                # ``tangent_backend_inapplicable_paths`` is a second, COARSE
+                # counter alongside the specific
+                # ``tangent_unsupported_structure_fallbacks`` reason: it
+                # exists so "backend != legacy but a block was built without
+                # the analytic path" can never again go completely
+                # uncounted, regardless of which branch or future reason
+                # causes it (see the family_ladder_N1024 gap this closes).
+                structure: AnalyticMLPStructure | None = None
+                if backend != "legacy":
+                    structure = _supported_analytic_structure(model, x)
+                    if structure is None:
+                        if backend == "optimized":
+                            raise RuntimeError(
+                                "FGD_TANGENT_BACKEND=optimized requires the "
+                                "analytic MLP Jacobian structure, but the "
+                                "model/probe did not satisfy it (see the "
+                                "tangent_unsupported_structure_fallbacks "
+                                "reason recorded above)."
+                            )
+                        fallback(
+                            "tangent_backend_inapplicable_paths",
+                            "unsupported_structure",
+                        )
+
                 if stream_gram:
                     # STREAMING over SAMPLES: accumulate the incremental-QR
                     # factor R (P x P), b = J^T r and ||r||^2 batch by batch --
@@ -2588,25 +2625,6 @@ def _compute_exact_tangent_projection_step(
                     sample_chunk = int(getattr(config, "certify_stream_chunk", 0) or 0)
                     if sample_chunk <= 0:
                         sample_chunk = n_samples
-
-                    # Structure resolved ONCE for the whole call (not per
-                    # chunk): optimized/auto try the analytic Jacobian
-                    # block; optimized RAISES if the model/probe do not
-                    # qualify (P1-P14), auto falls back to jacrev per chunk
-                    # below with the reason already recorded by
-                    # ``_supported_analytic_structure``. Legacy never
-                    # resolves it, so it never pays the (cheap) probe cost.
-                    structure: AnalyticMLPStructure | None = None
-                    if backend != "legacy":
-                        structure = _supported_analytic_structure(model, x)
-                        if structure is None and backend == "optimized":
-                            raise RuntimeError(
-                                "FGD_TANGENT_BACKEND=optimized requires the "
-                                "analytic MLP Jacobian structure, but the "
-                                "model/probe did not satisfy it (see the "
-                                "tangent_unsupported_structure_fallbacks "
-                                "reason recorded above)."
-                            )
 
                     # qr(mode="r") runs the same geqrf as mode="reduced" and
                     # skips the discarded orgqr -- MEASURED bit-identical R
@@ -2698,28 +2716,68 @@ def _compute_exact_tangent_projection_step(
                             strict=(backend == "optimized"),
                         )
                 elif chunk > 0 and chunk < output_numel:
+                    # This branch chunks over OUTPUT ROWS (the flattened
+                    # n*K+k index), NOT samples -- a chunk boundary can cut
+                    # a sample in half. The analytic block builder only
+                    # knows how to build a block for a contiguous range of
+                    # SAMPLES, so for each row range [start, stop) we build
+                    # the analytic block for the smallest covering sample
+                    # range [n_start, n_stop) and slice out exactly
+                    # [start, stop) from it. Since row r within that
+                    # covering block is (n - n_start)*K + k for sample n and
+                    # output k, and the FULL flattened row is n*K + k, the
+                    # two differ by exactly n_start*K for every row in the
+                    # covering block -- so slicing
+                    # [start - n_start*K : stop - n_start*K] out of the
+                    # covering block reproduces precisely rows
+                    # [start, stop) of the full Jacobian, bit for bit.
                     blocks = []
+                    out_per_sample = output_numel // max(int(x.shape[0]), 1)
                     for start in range(0, output_numel, chunk):
                         stop = min(start + chunk, output_numel)
+                        if structure is not None:
+                            n_start = start // out_per_sample
+                            n_stop = (stop - 1) // out_per_sample + 1
+                            with timed("tangent_analytic_jacobian_seconds"):
+                                increment("tangent_analytic_jacobian_calls")
+                                sample_block = _analytic_jacobian_block(
+                                    structure,
+                                    x[n_start:n_stop],
+                                    out_dtype=x.dtype,
+                                )
+                            row_offset = start - n_start * out_per_sample
+                            blocks.append(
+                                sample_block[row_offset : row_offset + (stop - start)]
+                            )
+                        else:
 
-                        def call_rows(
-                            parameter_values: tuple[torch.Tensor, ...],
-                            _start: int = start,
-                            _stop: int = stop,
-                        ) -> torch.Tensor:
-                            return call_with_parameters(parameter_values)[_start:_stop]
+                            def call_rows(
+                                parameter_values: tuple[torch.Tensor, ...],
+                                _start: int = start,
+                                _stop: int = stop,
+                            ) -> torch.Tensor:
+                                return call_with_parameters(parameter_values)[
+                                    _start:_stop
+                                ]
 
-                        with timed("tangent_jacrev_seconds"):
-                            jac = jacrev(call_rows)(parameters)
-                        with timed("tangent_jacobian_flatten_seconds"):
-                            blocks.append(_flatten_jacobian(jac, stop - start))
+                            with timed("tangent_jacrev_seconds"):
+                                jac = jacrev(call_rows)(parameters)
+                            with timed("tangent_jacobian_flatten_seconds"):
+                                blocks.append(_flatten_jacobian(jac, stop - start))
                         _clear_inaccessible_tensor_caches(model)
                     jacobian_matrix = torch.cat(blocks, dim=0)
                 else:
-                    with timed("tangent_jacrev_seconds"):
-                        jac = jacrev(call_with_parameters)(parameters)
-                    with timed("tangent_jacobian_flatten_seconds"):
-                        jacobian_matrix = _flatten_jacobian(jac, output_numel)
+                    if structure is not None:
+                        with timed("tangent_analytic_jacobian_seconds"):
+                            increment("tangent_analytic_jacobian_calls")
+                            jacobian_matrix = _analytic_jacobian_block(
+                                structure, x, out_dtype=x.dtype
+                            )
+                    else:
+                        with timed("tangent_jacrev_seconds"):
+                            jac = jacrev(call_with_parameters)(parameters)
+                        with timed("tangent_jacobian_flatten_seconds"):
+                            jacobian_matrix = _flatten_jacobian(jac, output_numel)
         finally:
             model.train(was_training)
             _clear_inaccessible_tensor_caches(model)

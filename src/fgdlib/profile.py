@@ -75,6 +75,15 @@ PROFILE_FIELDS = (
     "tangent_rank_deficient_surrogates",
     "tangent_surrogate_svd_fallbacks",
     "tangent_oracle_verifications",
+    # Coarse net that cannot go silent: incremented whenever backend !=
+    # legacy but a Jacobian block was built WITHOUT the analytic path, for
+    # ANY reason, in ANY of the three construction branches (streamed-Gram,
+    # row-chunked, full). A specific, named reason is ALSO recorded via
+    # ``tangent_unsupported_structure_fallbacks`` (or another reasoned
+    # counter) at the same time -- this field exists so "optimized/auto ran
+    # with zero analytic calls and zero specific fallback counted" can never
+    # again happen without being caught by an invariant check.
+    "tangent_backend_inapplicable_paths",
     # Seconds accumulators. tangent_system_total_seconds is INCLUSIVE of the
     # whole exact-tangent-system construction; the rest below it are
     # EXCLUSIVE, mutually-disjoint children (see fgdlib/tangent.py for the
@@ -134,6 +143,7 @@ _COUNTER_FIELDS = {
     "tangent_rank_deficient_surrogates",
     "tangent_surrogate_svd_fallbacks",
     "tangent_oracle_verifications",
+    "tangent_backend_inapplicable_paths",
     # Integer-shape gauges, per the classification rule in the module
     # docstring: written with set_max/set_value but still rendered as ints.
     "tangent_qr_input_rows",
