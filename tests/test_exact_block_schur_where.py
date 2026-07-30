@@ -35,7 +35,13 @@ from stable_tiny.pipeline import build_model, load_pipeline_config
 ensure_gromo_importable()
 
 
-def _problem(seed: int, *, width: int = 2, out_features: int = 2):
+def _problem(
+    seed: int,
+    *,
+    width: int = 2,
+    out_features: int = 2,
+    dtype: torch.dtype = torch.float32,
+):
     torch.manual_seed(seed)
     config = load_pipeline_config("configs/experiments/default.yaml")
     config = replace(
@@ -62,6 +68,9 @@ def _problem(seed: int, *, width: int = 2, out_features: int = 2):
     model = build_model(config, torch.device("cpu"))
     x = torch.randn(32, 3)
     y = torch.randn(32, out_features)
+    if dtype is torch.float64:
+        model = model.double()
+        x, y = x.double(), y.double()
     loader = DataLoader(TensorDataset(x, y), batch_size=8, shuffle=False)
     return config, model, x, y, loader
 
@@ -75,8 +84,28 @@ def test_candidate_damping_ridge_and_relative_error_match_full_oracle(
     width: int,
     out_features: int,
 ) -> None:
+    """The fast block-Schur score must equal the full-oracle projection.
+
+    Run in float64 because this fixture's base Jacobian is EXACTLY
+    rank-deficient -- in float64 its last two singular values are 4.8e-16
+    and 2.3e-17 against sigma_max = 8.5, i.e. a genuine 2-dimensional null
+    space. With float32 parameters that null space is instead filled with
+    rounding noise at 1e-8..1e-9, and the ridge under test here,
+    DAMPING_BRACKET[0] * sigma_max**2 = 1e-16 * sigma_max**2, does not
+    regularize it. The comparison then measures which float32 noise each
+    Jacobian construction happens to produce rather than whether the
+    block-Schur algebra reproduces the full projection: MEASURED, the
+    analytic-Jacobian score lands 4.9e-4 from the float64 truth and the
+    jacrev score 1.5e-3 -- both far outside this test's rel=1e-5, in
+    opposite directions, with neither "wrong".
+
+    In float64 both constructions are exact and both agree with the oracle
+    to 1e-13, so the assertion below tests the algebra it is named for.
+    Float32 Jacobian agreement is covered separately by
+    tests/test_analytic_jacobian_parity.py.
+    """
     config, model, x, y, loader = _problem(
-        seed, width=width, out_features=out_features
+        seed, width=width, out_features=out_features, dtype=torch.float64
     )
     base_system = exact_tangent_system(model, x, y, config.fgd_approx)
     assert base_system is not None
