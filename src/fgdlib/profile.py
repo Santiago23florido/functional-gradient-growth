@@ -75,6 +75,7 @@ PROFILE_FIELDS = (
     "tangent_rank_deficient_surrogates",
     "tangent_surrogate_svd_fallbacks",
     "tangent_oracle_verifications",
+    "tangent_capture_suspensions",
     # Coarse net that cannot go silent: incremented whenever backend !=
     # legacy but a Jacobian block was built WITHOUT the analytic path, for
     # ANY reason, in ANY of the three construction branches (streamed-Gram,
@@ -143,6 +144,7 @@ _COUNTER_FIELDS = {
     "tangent_rank_deficient_surrogates",
     "tangent_surrogate_svd_fallbacks",
     "tangent_oracle_verifications",
+    "tangent_capture_suspensions",
     "tangent_backend_inapplicable_paths",
     # Integer-shape gauges, per the classification rule in the module
     # docstring: written with set_max/set_value but still rendered as ints.

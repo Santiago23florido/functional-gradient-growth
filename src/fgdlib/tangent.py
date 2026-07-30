@@ -6,6 +6,7 @@ import copy
 import math
 import os
 from collections import OrderedDict
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Callable, Literal
 
@@ -1822,7 +1823,10 @@ def _activation_rejection_reason(
 
 
 def _supported_analytic_structure(
-    model: torch.nn.Module, x: torch.Tensor
+    model: torch.nn.Module,
+    x: torch.Tensor,
+    *,
+    capture_suspended: bool = False,
 ) -> AnalyticMLPStructure | None:
     """Return the structure when P1-P14 all hold, else None (reason recorded).
 
@@ -1831,6 +1835,14 @@ def _supported_analytic_structure(
     see TANGENT_PLAN.md section A.4. A failing predicate always records a
     DISTINCT, counted reason via ``fallback`` before returning ``None``:
     the fast path never disappears silently.
+
+    ``capture_suspended`` is set by a caller that has entered gromo's
+    ``paused_computation()`` around this whole construction. P8 then holds
+    BY CONSTRUCTION -- capture is off for the duration, so there is no
+    caching side effect for the analytic path to skip -- and checking the
+    flags again would just re-observe the caller's own suspension. It is
+    never inferred here: only a caller that actually holds the context
+    may pass it.
     """
     # P1: a gromo sequential MLP, at least one layer.
     if not (
@@ -1912,8 +1924,10 @@ def _supported_analytic_structure(
     # store_pre_activity (and their internal counterparts) mutate module
     # state on every call, which the analytic path, calling nn.Linear
     # directly, would silently skip, leaving the two paths' model state to
-    # diverge.
-    if not all(
+    # diverge. Skipped only when the caller holds paused_computation(),
+    # which turns capture off for the whole construction and so satisfies
+    # the predicate rather than ignoring it.
+    if not capture_suspended and not all(
         not layer.store_input
         and not layer.store_pre_activity
         and not layer._internal_store_input
@@ -2627,6 +2641,10 @@ def _compute_exact_tangent_projection_step(
 
         chunk = int(getattr(config, "jacobian_row_chunk", 0) or 0)
         stream_gram = bool(getattr(config, "certify_stream_gram", False))
+        # Held open for the whole construction and released in the finally
+        # below, alongside the eval/train restore, so a suspended capture can
+        # never outlive the forward that needed it -- not even on an exception.
+        capture_stack = ExitStack()
         try:
             with timed("streamed_jacobian_seconds"):
                 # Structure resolved ONCE per call, SHARED by every branch
@@ -2648,7 +2666,34 @@ def _compute_exact_tangent_projection_step(
                 # causes it (see the family_ladder_N1024 gap this closes).
                 structure: AnalyticMLPStructure | None = None
                 if backend != "legacy":
-                    structure = _supported_analytic_structure(model, x)
+                    # gromo's paused_computation() suspends input/pre-activity
+                    # capture WITHOUT discarding the accumulated statistics
+                    # (reset_computation would discard them), which is exactly
+                    # what an evaluation-only forward inside a growth-
+                    # certification session needs. Entering it here satisfies
+                    # P8 by construction instead of falling back: MEASURED, the
+                    # capture flags were on for 499 of 501 constructions on
+                    # family_ladder_N1024 and 5 of 14 on CIFAR, so this is the
+                    # difference between the analytic path running everywhere
+                    # and running almost nowhere.
+                    #
+                    # Only entered when the analytic path is what we are about
+                    # to take. A legacy-jacrev fallback must keep running with
+                    # the caller's own capture state, exactly as it does today.
+                    pause = getattr(model, "paused_computation", None)
+                    if callable(pause):
+                        capture_stack.enter_context(pause())
+                        increment("tangent_capture_suspensions")
+                        structure = _supported_analytic_structure(
+                            model, x, capture_suspended=True
+                        )
+                        if structure is None:
+                            # Unsupported for some OTHER reason, so the
+                            # suspension buys nothing and must not colour the
+                            # legacy fallback: release it before falling back.
+                            capture_stack.close()
+                    else:
+                        structure = _supported_analytic_structure(model, x)
                     if structure is None:
                         if backend == "optimized":
                             raise RuntimeError(
@@ -2832,6 +2877,7 @@ def _compute_exact_tangent_projection_step(
                         with timed("tangent_jacobian_flatten_seconds"):
                             jacobian_matrix = _flatten_jacobian(jac, output_numel)
         finally:
+            capture_stack.close()
             model.train(was_training)
             _clear_inaccessible_tensor_caches(model)
         if return_system:
