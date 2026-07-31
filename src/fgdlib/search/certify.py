@@ -64,9 +64,11 @@ from fgdlib.tangent import (
     tiny_optimal_update_kwargs,
     validate_exact_tangent_system,
 )
+from fgdlib.training_utils.loop import count_parameters
 
 __all__ = [
     "CertifyResult",
+    "certify_growth_target",
     "exact_relative_error",
     "grow_until_certified",
 ]
@@ -88,6 +90,11 @@ class CertifyResult:
 
     relative_error: float
     growths: int
+    #: eps reached the GROWTH TARGET, which is ``rel_error_threshold`` unless
+    #: ``certify_growth_target`` asks for more. NOT the step certificate: a loop
+    #: that stops inside the voluntary band returns False here while
+    #: ``lemma35_learning_rate`` still yields a rate, so this must stay what it
+    #: has always been -- a log line, never a control-flow gate.
     certified: bool
     trajectory: tuple[float, ...]
     #: True when a certified NON-tangent family took a step instead of growing.
@@ -99,6 +106,71 @@ class CertifyResult:
     family_steps: int = 0
     #: Exact system for the returned model and probe, when non-degenerate.
     tangent_system: ExactTangentSystem | None = None
+    #: Why the loop returned: "certified", "growth_target_unreachable",
+    #: "parameter_budget", "no_growth_reduced_epsilon", "max_growths" or
+    #: "family_stepped". Diagnostic; nothing branches on it.
+    stop_reason: str = "certified"
+    #: The eps the loop was chasing -- ``certify_growth_target`` clamped to the
+    #: certificate, i.e. ``rel_error_threshold`` when the field is unset.
+    growth_target: float | None = None
+
+
+def certify_growth_target(config: FGDApproxConfig) -> float:
+    """The eps the grow loop CHASES -- never laxer than the certificate.
+
+    ``rel_error_threshold`` remains the STEP certificate; this is the loop's
+    aspiration, and the clamp is ``min(target, rel_error_threshold)`` and NOT
+    ``min(target, 0.5)``. A threshold above 1/2 is a deliberate looseness for
+    the LOOP (``tests/test_fast_factorization.py`` grows at 0.7 on purpose, to
+    reach an ill-conditioned structure), while the STEP clamps itself at 1/2 at
+    every site that reads Lemma 3.5; clamping here too would silently tighten
+    those runs for no gain.
+
+    ``None`` returns the threshold, so the loop's behaviour is unchanged by
+    construction rather than by a flag: the invariant ``eps >= target`` then
+    implies ``eps >= min(threshold, 1/2)``, the regime where growth is
+    unconditional.
+    """
+    target = getattr(config, "certify_growth_target", None)
+    threshold = float(config.rel_error_threshold)
+    if target is None:
+        return threshold
+    return min(float(target), threshold)
+
+
+def _growth_pays(
+    *,
+    epsilon: float,
+    candidate_epsilon: float,
+    growth_target: float,
+    certificate: float,
+    min_gain: float,
+) -> bool:
+    """Whether the best available growth is worth the parameters it costs.
+
+    Two regimes, split exactly where Lemma 3.5 splits them:
+
+    * ``epsilon >= certificate``: no step exists at ANY damping (the bisection
+      in ``damping.py`` returns None when even the least regularised solve
+      misses the line), so growth is the only move the method has. True
+      unconditionally -- which is also why this gate cannot deadlock the loop:
+      it never refuses while the structure is still inadequate, so the loop can
+      never stop in a state where no step certifies.
+    * ``certificate > epsilon >= growth_target``: a step is already available
+      and the extra accuracy is being chased VOLUNTARILY. The growth then has
+      to close at least ``min_gain`` of the gap that is left, or it is buying
+      nothing for its parameters.
+
+    ``epsilon`` carries the projection in the denominator
+    (``eps = ||g - r|| / ||g||``), so it is NOT bounded above and nothing here
+    may assume ``eps in [0, 1]``. The floor mirrors the adaptive-count idiom
+    below: a fraction of the remaining gap, with a tiny floor so that a gap of
+    exactly zero still demands a real improvement.
+    """
+    if not (epsilon < certificate):
+        return True
+    floor = min_gain * max(epsilon - growth_target, 1e-6)
+    return (epsilon - candidate_epsilon) > floor
 
 
 def exact_relative_error(
@@ -256,10 +328,23 @@ def _select_growth_candidate(
     config,
     function_preserving: bool,
     current_epsilon: float,
-) -> tuple[object | None, float, int | None, ExactTangentSystem | None]:
-    """Select the same exhaustive argmin, with exact shared-base scoring if enabled."""
+    *,
+    parameter_budget: int | None = None,
+) -> tuple[object | None, float, int | None, ExactTangentSystem | None, bool]:
+    """Select the same exhaustive argmin, with exact shared-base scoring if enabled.
+
+    ``parameter_budget`` prices each candidate by its POST-growth count, the
+    idiom the end-of-epoch path already argues for (``pipeline.py``): checking
+    the budget only before growing lets a single input-layer widening (784
+    parameters per neuron on MNIST) blow straight through it. Unaffordable
+    clones are dropped BEFORE scoring, which also saves the O(P^3) exact solve
+    each score costs. The trailing flag reports "every candidate was rejected
+    as unaffordable", so the caller can name the budget as the reason it
+    stopped instead of blaming the structure.
+    """
     increment("where_scans")
     candidates: list[tuple[int, object]] = []
+    unaffordable = 0
     for location in range(len(getattr(model, "_growable_layers", []))):
         candidate = _grow_clone(
             model,
@@ -269,8 +354,17 @@ def _select_growth_candidate(
             config,
             function_preserving,
         )
-        if candidate is not None:
-            candidates.append((location, candidate))
+        if candidate is None:
+            continue
+        if parameter_budget is not None and (
+            count_parameters(candidate) > parameter_budget
+        ):
+            unaffordable += 1
+            continue
+        candidates.append((location, candidate))
+    if unaffordable:
+        increment("certify_budget_rejected_candidates", unaffordable)
+    budget_exhausted = unaffordable > 0 and not candidates
     increment("where_candidates", len(candidates))
 
     best_model = None
@@ -293,7 +387,13 @@ def _select_growth_candidate(
                 best_model = candidate
                 best_location = location
                 best_system = candidate_system
-        return best_model, best_epsilon, best_location, best_system
+        return (
+            best_model,
+            best_epsilon,
+            best_location,
+            best_system,
+            budget_exhausted,
+        )
 
     increment("where_base_system_reuses")
     parity_tolerance = (
@@ -412,9 +512,15 @@ def _select_growth_candidate(
             )
 
     if best_model is None:
-        return None, best_epsilon, None, tangent_system
+        return None, best_epsilon, None, tangent_system, budget_exhausted
     if best_system is not None:
-        return best_model, best_epsilon, best_location, best_system
+        return (
+            best_model,
+            best_epsilon,
+            best_location,
+            best_system,
+            budget_exhausted,
+        )
 
     # Required canonical validation: the selected grown model gets a complete
     # exact system before damping selection or realization can reuse it.
@@ -423,7 +529,13 @@ def _select_growth_candidate(
         best_model, x, y, config.fgd_approx
     )
     if abs(validated_epsilon - best_epsilon) <= parity_tolerance:
-        return best_model, validated_epsilon, best_location, validated_system
+        return (
+            best_model,
+            validated_epsilon,
+            best_location,
+            validated_system,
+            budget_exhausted,
+        )
 
     # The shared-base prediction did not match its full candidate oracle.
     # Discard every fast result and rerun the original exhaustive selection.
@@ -447,7 +559,7 @@ def _select_growth_candidate(
             best_model = candidate
             best_location = location
             best_system = candidate_system
-    return best_model, best_epsilon, best_location, best_system
+    return best_model, best_epsilon, best_location, best_system, budget_exhausted
 
 
 def grow_until_certified(
@@ -463,7 +575,15 @@ def grow_until_certified(
     progress=None,
     family_step=None,
 ):
-    """Grow until ``eps < rel_error_threshold``; return the grown model.
+    """Grow until ``eps < certify_growth_target``; return the grown model.
+
+    The target defaults to ``rel_error_threshold``, which is what this loop has
+    always chased; ``certify_growth_target`` lets it aspire to a STRICTER eps
+    without touching the threshold, because that threshold is simultaneously
+    the step certificate and lowering it kills the step it is trying to earn
+    (see ``FGDApproxConfig.certify_growth_target`` for the measured MNIST
+    incident). Below the certificate the loop keeps growing only while each
+    growth still pays -- ``_growth_pays``.
 
     ``family_step``: an optional callable ``model -> stepped_model_or_None``.
     Before EACH growth it is given the current model; if it returns a stepped
@@ -497,14 +617,63 @@ def grow_until_certified(
 
     Returns ``(model, CertifyResult)``.
     """
+    # Three quantities, deliberately not one. ``certificate`` is Lemma 3.5's
+    # admissibility of a STEP, clamped at 1/2 exactly as every step site clamps
+    # it; ``target`` is what this loop CHASES and may be stricter; ``threshold``
+    # is the raw configured value, which the adaptive-count block below keeps
+    # using so that certify_adaptive_growth's meaning -- burst while no step
+    # exists -- is left untouched by the split, and so that its bursts never
+    # spend parameters inside the voluntary band behind _growth_pays's back.
     threshold = config.fgd_approx.rel_error_threshold
+    certificate = min(threshold, 0.5)
+    target = certify_growth_target(config.fgd_approx)
+    # Named apart from the adaptive-count block's own min_gain, which rebinds
+    # its local inside the loop body.
+    growth_min_gain = float(
+        getattr(config.fgd_approx, "certify_growth_min_gain", 0.1)
+    )
+    patience = max(
+        1, int(getattr(config.fgd_approx, "certify_growth_min_gain_patience", 1))
+    )
+    parameter_budget = getattr(config.fgd_approx, "max_total_parameters", None)
     epsilon, tangent_system = _relative_error_and_system(model, x, y, config.fgd_approx)
     trajectory = [epsilon]
     growths = 0
     family_steps = 0
     forced_remaining = 1 if force else 0
+    unpaid_growths = 0
+    stop_reason: str | None = None
 
-    while (epsilon >= threshold or forced_remaining > 0) and growths < max_growths:
+    # The budget exists (tangent.py) and is honoured at the end of each epoch,
+    # but was invisible to the loop that spends the most -- this one. Checked
+    # here before the first scan, because an exhausted budget makes every
+    # candidate unaffordable and one exhaustive scan costs a full exact solve
+    # per location.
+    if parameter_budget is not None and count_parameters(model) >= parameter_budget:
+        increment("certify_budget_stops")
+        if progress is not None:
+            progress(
+                f"[CERTIFY] parameter budget {parameter_budget} already spent "
+                f"({count_parameters(model)} params); no growth attempted at "
+                f"eps {epsilon:.4f}"
+            )
+        return model, CertifyResult(
+            relative_error=epsilon,
+            growths=0,
+            certified=epsilon < target,
+            trajectory=tuple(trajectory),
+            family_stepped=False,
+            family_steps=0,
+            tangent_system=tangent_system,
+            stop_reason="parameter_budget",
+            growth_target=target,
+        )
+
+    while (epsilon >= target or forced_remaining > 0) and growths < max_growths:
+        # Captured BEFORE the decrement: a forced growth is the answer to a
+        # measured deadlock and must not be vetoed by the value criterion,
+        # which would restore the deadlock it was added to break.
+        is_forced = forced_remaining > 0
         forced_remaining = max(0, forced_remaining - 1)
 
         # FAMILY LADDER, before growing: the tangent could not certify (that
@@ -513,7 +682,18 @@ def grow_until_certified(
         # certifies -- that gate lives inside family_step. A family step is a
         # real certified FGD step, so it becomes the outer step and the loop
         # returns instead of growing.
-        if family_step is not None and epsilon >= threshold:
+        #
+        # Gated on the CERTIFICATE, not the target. Gating it on the target
+        # was tried and MEASURED to be wrong: in the voluntary band the
+        # ladder certifies on essentially every outer step (its own bar is
+        # min(rel_error_threshold, 0.5), i.e. 30 degrees, and the clone
+        # reaches 22), so it pre-empts BOTH the growth scan and the tangent
+        # step -- and its step carries no Lemma 3.5 bound, because that bound
+        # is produced on the tangent path it just displaced. MNIST then
+        # diverged on held-out data, test loss 9.37 -> 44.53 over two epochs
+        # while the train loss fell. The ladder is the remedy for "no step
+        # certifies", so it belongs where no step certifies.
+        if family_step is not None and epsilon >= certificate:
             stepped = family_step(model)
             if stepped is not None:
                 model = stepped
@@ -530,11 +710,13 @@ def grow_until_certified(
                 return model, CertifyResult(
                     relative_error=epsilon,
                     growths=growths,
-                    certified=epsilon < threshold,
+                    certified=epsilon < target,
                     trajectory=tuple(trajectory),
                     family_stepped=True,
                     family_steps=family_steps,
                     tangent_system=tangent_system,
+                    stop_reason="family_stepped",
+                    growth_target=target,
                 )
 
         # Preserving growth cannot make eps worse, so requiring an improvement
@@ -542,7 +724,7 @@ def grow_until_certified(
         # candidate may still sit above the current eps; accepting it is what
         # lets the rank keep climbing, and the loop then relies on the measured
         # trajectory rather than the monotonicity theorem.
-        best_model, best_epsilon, best_location, best_system = (
+        best_model, best_epsilon, best_location, best_system, budget_exhausted = (
             _select_growth_candidate(
                 model,
                 tangent_system,
@@ -553,10 +735,24 @@ def grow_until_certified(
                 config,
                 function_preserving,
                 epsilon,
+                parameter_budget=parameter_budget,
             )
         )
 
         if best_model is None:
+            if budget_exhausted:
+                # Every candidate priced itself out of the budget. That is a
+                # statement about what can be PAID for, not about what the
+                # structure can represent, so it gets its own reason.
+                increment("certify_budget_stops")
+                if progress is not None:
+                    progress(
+                        f"[CERTIFY] parameter budget {parameter_budget} leaves "
+                        f"no affordable growth at eps {epsilon:.4f} "
+                        f"({count_parameters(model)} params)"
+                    )
+                stop_reason = "parameter_budget"
+                break
             # No growable location reduces eps. The theorem says this cannot
             # persist while the residual is non-zero, so reaching here means
             # the architecture cannot add a direction along rho at all --
@@ -566,7 +762,48 @@ def grow_until_certified(
                     f"[CERTIFY] no growth reduced eps ({epsilon:.4f}); "
                     "the structure cannot add a direction along the residual"
                 )
+            stop_reason = "no_growth_reduced_epsilon"
             break
+
+        # THE VALUE GATE, evaluated on the candidate and BEFORE committing to
+        # it: a refused growth must cost nothing, neither a parameter nor an
+        # entry in the trajectory. It is the generalisation of the exit just
+        # above -- from "no growth reduced eps" to "no growth reduced eps
+        # enough" -- and it is exact rather than sampled, because
+        # _select_growth_candidate is an exhaustive argmin over every location
+        # scored by its own exact eps. Above the certificate it never fires
+        # (see _growth_pays), so with an unset target this branch is dead by
+        # the loop invariant, not by a flag.
+        if not is_forced and not _growth_pays(
+            epsilon=epsilon,
+            candidate_epsilon=best_epsilon,
+            growth_target=target,
+            certificate=certificate,
+            min_gain=growth_min_gain,
+        ):
+            # Loud rather than frozen: refusing here while no step certifies
+            # would be the deadlock this whole design exists to avoid.
+            assert epsilon < certificate, (
+                "growth refused while no step can certify: "
+                f"eps={epsilon!r} certificate={certificate!r}"
+            )
+            increment("certify_growth_target_stalls")
+            unpaid_growths += 1
+            if unpaid_growths >= patience:
+                if progress is not None:
+                    progress(
+                        f"[CERTIFY] growth target {target} unreachable at a "
+                        f"price worth paying: eps {epsilon:.4f}, gap "
+                        f"{epsilon - target:.4f}, best growth gains "
+                        f"{epsilon - best_epsilon:.6f} "
+                        f"(needs {growth_min_gain * (epsilon - target):.6f}); "
+                        f"stopping with the step certificate {certificate} "
+                        "still met"
+                    )
+                stop_reason = "growth_target_unreachable"
+                break
+        else:
+            unpaid_growths = 0
 
         model = best_model
         epsilon = best_epsilon
@@ -577,7 +814,7 @@ def grow_until_certified(
             progress(
                 f"[CERTIFY] growth {growths} at location {best_location}: "
                 f"eps -> {epsilon:.4f}"
-                + ("  (certified)" if epsilon < threshold else "")
+                + ("  (certified)" if epsilon < target else "")
             )
 
         # ADAPTIVE COUNT: keep adding at the just-chosen best location while each
@@ -621,12 +858,16 @@ def grow_until_certified(
                         + ("  (certified)" if epsilon < threshold else "")
                     )
 
+    if stop_reason is None:
+        stop_reason = "certified" if epsilon < target else "max_growths"
     return model, CertifyResult(
         relative_error=epsilon,
         growths=growths,
-        certified=epsilon < threshold,
+        certified=epsilon < target,
         trajectory=tuple(trajectory),
         family_stepped=False,
         family_steps=family_steps,
         tangent_system=tangent_system,
+        stop_reason=stop_reason,
+        growth_target=target,
     )

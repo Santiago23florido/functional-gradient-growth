@@ -4066,11 +4066,37 @@ def run_pipeline(
                                         f"in {certify_result.growths} growths"
                                     )
                             if progress is not None and not certify_result.certified:
+                                # TWO lines are in play, and only one of them
+                                # can kill the step: the growth TARGET the loop
+                                # chases, and the step CERTIFICATE Lemma 3.5
+                                # needs (eps < min(rel_error_threshold, 1/2),
+                                # the same expression damping.py and
+                                # lemma35_learning_rate use). Missing the
+                                # target while clearing the certificate is a
+                                # normal stop -- the step still commits, which
+                                # is the whole point of separating them.
+                                # Missing the certificate means no damping and
+                                # no rate exist at all. The old single line read
+                                # "could NOT reach eps < 0.3" for both, which is
+                                # how the MNIST run with a dead tangent step
+                                # looked exactly like a run doing fine.
+                                step_certificate = min(
+                                    config.fgd_approx.rel_error_threshold, 0.5
+                                )
                                 progress(
-                                    f"[CERTIFY] Epoch {epoch}: could NOT reach "
-                                    f"eps < {config.fgd_approx.rel_error_threshold} "
-                                    f"(stopped at {certify_result.relative_error:.4f} "
-                                    f"after {certify_result.growths} growths)"
+                                    f"[CERTIFY] Epoch {epoch}: growth target "
+                                    f"eps < {certify_result.growth_target} NOT "
+                                    f"reached (stopped at "
+                                    f"{certify_result.relative_error:.4f} after "
+                                    f"{certify_result.growths} growths, reason: "
+                                    f"{certify_result.stop_reason}); step "
+                                    f"certificate eps < {step_certificate} "
+                                    + (
+                                        "HOLDS, so a step can still commit"
+                                        if certify_result.relative_error
+                                        < step_certificate
+                                        else "FAILS, so no rate is admissible"
+                                    )
                                 )
                         damping_choice = (
                             select_projection_damping(

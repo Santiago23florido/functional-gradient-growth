@@ -76,7 +76,23 @@ lr_scheduler:
   restart_on_growth: true
 
 fgd_approx:
-  rel_error_threshold: 0.3
+  # The STEP certificate, back at 1/2. At 0.3 it was also the growth goal, and
+  # the two jobs are incompatible: every step site reads Lemma 3.5 as eps <
+  # min(rel_error_threshold, 1/2), so with eps at 0.457 no damping certified,
+  # no rate was admissible, and lr was 0 in every epoch -- the tangent step was
+  # dead by construction. What kept moving the model was the family ladder at
+  # functional_lr 1.0, i.e. full functional steps with no size control, which
+  # is why accuracy oscillated 0.33 <-> 0.74 while the functional loss barely
+  # moved (0.2393 -> 0.2382) and growth ran away to P ~ 31000 without finishing
+  # one outer step in 39 minutes.
+  rel_error_threshold: 0.5
+  # The GROWTH goal keeps the 0.3 that was wanted. The loop now aspires to it
+  # while the step commits at 0.457, and stops chasing it when a growth stops
+  # paying: MEASURED here, eps falls 0.0007 per growth against a gap of 0.157,
+  # a ratio of 0.0045 against the certify_growth_min_gain floor of 0.1 -- 22x
+  # below, so the cut is not a close call. (N1024, for contrast, gains 0.00707
+  # on a gap of 0.0267, ratio 0.265, and keeps growing.)
+  certify_growth_target: 0.3
   rel_error_mode: tangent_projection
   layer_selection: certifying
   projection_solver: exact
@@ -279,10 +295,10 @@ fgd_approx:
   # accepted only by its OWN Crel<1/2. Makes FP growth affordable
   # (MEASURED 57->6 growths on the synthetic task).
   certify_family_ladder: true
-  certify_family_inner_steps: 4000
+  certify_family_inner_steps: 400
   certify_family_inner_learning_rate: 0.01
   certify_family_functional_lr: 1.0
-  certify_family_plateau_stop: false
+  certify_family_plateau_stop: true
   certify_realize_max_iterations: 40
   certify_realize_tolerance: 0.05
   # Freeze the Gauss-Newton Gram across the inner realise iterations (modified-

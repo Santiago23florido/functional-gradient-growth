@@ -68,6 +68,14 @@ PROFILE_FIELDS = (
     # deadlock -- see fgdlib/tangent.py's field comment).
     "certify_forced_growths",
     "certify_force_suppressed_nonfinite",
+    # certify_growth_target discriminators: how often the best available growth
+    # failed the certify_growth_min_gain floor (the loop was chasing a target it
+    # cannot reach at a price worth paying), how often max_total_parameters
+    # ended the loop, and how many candidate clones were dropped as unaffordable
+    # before being scored.
+    "certify_growth_target_stalls",
+    "certify_budget_stops",
+    "certify_budget_rejected_candidates",
     # --- exact tangent-system construction instrumentation (Phase A) ---
     # Counters.
     "tangent_system_calls",
@@ -141,6 +149,9 @@ _COUNTER_FIELDS = {
     "where_final_winner_full_validations",
     "certify_forced_growths",
     "certify_force_suppressed_nonfinite",
+    "certify_growth_target_stalls",
+    "certify_budget_stops",
+    "certify_budget_rejected_candidates",
     "tangent_system_calls",
     "tangent_qr_calls",
     "tangent_sample_chunk_count",

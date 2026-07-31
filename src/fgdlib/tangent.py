@@ -602,6 +602,53 @@ class FGDApproxConfig:
     # while (eps_before - eps_after) > this fraction of (eps - threshold). Higher
     # = fewer neurons per growth (stops sooner); lower = grows more aggressively.
     certify_adaptive_growth_min_gain: float = 0.1
+    # The eps the grow-to-certify loop CHASES, as distinct from the eps at which
+    # a step is CERTIFIED. rel_error_threshold does both jobs, and they are
+    # incompatible: every step site reads Lemma 3.5 as eps <
+    # min(rel_error_threshold, 1/2) (damping.py's bisection, lemma35_learning_
+    # rate), so lowering the threshold to make the loop aspire higher DISABLES
+    # the step. MEASURED on MNIST at rel_error_threshold 0.3: eps sat at 0.457,
+    # no damping and no rate ever certified, lr was 0 in every epoch, and the
+    # only thing still moving the model was the family ladder -- applied at
+    # functional_lr 1.0 WITHOUT the Lemma 3.5 bound, because that bound is
+    # produced on the tangent route the threshold had killed. Accuracy
+    # oscillated between 0.33 and 0.74 while the functional loss barely moved
+    # (0.2393 -> 0.2382) and growth ran away to P ~ 31000 without finishing one
+    # outer step in 39 minutes.
+    #
+    # Splitting them lets the loop aspire to 0.3 while a step still commits at
+    # eps 0.457 under a threshold of 0.5. Never laxer than the certificate: the
+    # loop uses min(this, rel_error_threshold), so this field can only ask for
+    # MORE structure, never license a step the lemma forbids. None means "chase
+    # the certificate" -- today's behaviour, and by construction rather than by
+    # a flag: with target == rel_error_threshold the loop invariant eps >=
+    # target already implies eps >= the certificate, the regime in which growth
+    # is unconditional.
+    certify_growth_target: float | None = None
+    # Marginal-value floor for chasing certify_growth_target BELOW the
+    # certificate. Once eps < min(rel_error_threshold, 1/2) a step exists, so
+    # every further growth is VOLUNTARY and has to earn its parameters: it must
+    # close at least this fraction of the gap that is left (eps - target). Above
+    # the certificate no step exists at any damping, growth is the only move the
+    # method has, and this floor is not applied at all -- which is why it cannot
+    # deadlock the loop.
+    #
+    # The discriminant is the dimensionless ratio gain/gap, so nothing about the
+    # dataset enters. MEASURED, at certificate 0.5 and target 0.3: MNIST eps
+    # 0.457, gap 0.157, gain per growth 0.0007 -> ratio 0.0045; N1024 eps 0.3267,
+    # gap 0.0267, gain per growth 0.00707 -> ratio 0.265. Two orders of magnitude
+    # apart, and 0.1 falls between them with 22x and 2.6x of margin. 0.0 disables
+    # the stop (every growth pays), which is the refutation experiment for a run
+    # this criterion is suspected of cutting short.
+    certify_growth_min_gain: float = 0.1
+    # How many CONSECUTIVE growths may fail the min_gain floor before the loop
+    # stops chasing the target. 1 stops at the first refusal, so not one
+    # parameter is spent on a growth that did not pay. Raise it if a bootstrap
+    # ladder appears -- the first growths of a very narrow net can under-deliver
+    # because the widths themselves are tiny -- which does not arise with
+    # tiny_maximum_added_neurons: 1 and certify_grow_all_width: false, where the
+    # count added per event is constant.
+    certify_growth_min_gain_patience: int = 1
     # Grow EVERY growable width location per event, not just the single best.
     # GroMo caps the neurons added to a layer at min(fan-in, fan-out) -- on a net
     # whose hidden layers all start at width 2, that is ~2 per event, and the
