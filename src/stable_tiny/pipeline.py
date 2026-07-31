@@ -30,7 +30,7 @@ from fgdlib.tangent import (
     _FunctionalStepStats,
     _clear_inaccessible_tensor_caches,
     _compute_tangent_projection_step,
-    _projection_step_sensor_valid,
+    _projection_step_sensor_reason,
     _trainable_named_parameters,
     batch_functional_loss,
     build_projection_probe,
@@ -57,6 +57,7 @@ from fgdlib.rkhs import (
     KernelDictionaryModel,
 )
 from fgdlib.gromo_setup import ensure_gromo_importable
+from fgdlib.profile import increment
 from fgdlib.search.certify import grow_until_certified
 from fgdlib.search.families import certify_parametric_step
 from fgdlib.search.depth import insert_identity_layer
@@ -1058,6 +1059,33 @@ def _certify_fgd_candidate(
         global_contraction=global_contraction,
         all_conditions_valid=all_conditions_valid,
     )
+
+
+def _certify_force_growth(
+    config: FGDApproxConfig,
+    *,
+    previous_step_committed: bool,
+    previous_failure_non_finite: bool,
+) -> bool:
+    """Decide grow_until_certified's `force`, discriminating WHY it failed.
+
+    See FGDApproxConfig.certify_force_growth_on_finite_step_failure for
+    the two measured incidents this balances: forcing unconditionally
+    over-fires on a non-finite validation measurement (the model
+    overflowing on unseen data, an overfitting symptom growth worsens);
+    never forcing reintroduces the MNIST deadlock (eps certified, no rate
+    produced held-out descent, nothing ever committed). Default False
+    reproduces `force=False` unconditionally -- bit-identical to today.
+    """
+    if not config.certify_force_growth_on_finite_step_failure:
+        return False
+    if previous_step_committed:
+        return False
+    if previous_failure_non_finite:
+        increment("certify_force_suppressed_nonfinite")
+        return False
+    increment("certify_forced_growths")
+    return True
 
 
 def _apply_shared_direction_step(
@@ -3576,6 +3604,12 @@ def run_pipeline(
         # commit a step. A certified structure that still cannot step is the
         # deadlock this closes (see grow_until_certified's `force`).
         certify_previous_step_committed = True
+        # Whether, when the previous epoch failed to commit, the failure's
+        # own measurement was non-finite (see
+        # certify_force_growth_on_finite_step_failure). Irrelevant while
+        # certify_previous_step_committed is True, which is why the initial
+        # value below never matters.
+        certify_previous_failure_non_finite = False
         fgd_validation_probe: tuple[torch.Tensor, torch.Tensor] | None = None
         fgd_train_probe: tuple[torch.Tensor, torch.Tensor] | None = None
         if config.training.method == "fgd_approx":
@@ -3762,6 +3796,12 @@ def run_pipeline(
             fgd_sensor_invalid_batches = 0
             fgd_update_norm: float | None = None
             fgd_trial_sensor_failure = False
+            # Whether THIS epoch's (eventual) failure to commit is due to a
+            # non-finite measurement rather than a finite one. Set inside
+            # the outer-step loop below; defaults to False for training
+            # methods that never reach it (normal SGD, fgd_approx without
+            # theory_interval), where it stays unused.
+            certify_step_failure_non_finite = False
             diagnostic_trial: _FGDTrial | None = None
             fgd_growth_requested = False
             fgd_candidate_accepted: bool | None = None
@@ -3901,6 +3941,11 @@ def run_pipeline(
                         # recomputed from a damping that no longer applies.
                         selected_learning_rate: float | None = None
                         direction_sensor_failure = False
+                        # Whether direction_sensor_failure (when set below)
+                        # came from a non-finite measurement rather than a
+                        # finite geometric/structural one -- the discriminator
+                        # certify_force_growth_on_finite_step_failure needs.
+                        direction_sensor_non_finite = False
                         tangent_system = None
                         if config.fgd_approx.grow_to_certify:
                             # GROW-TO-CERTIFY. Make the structure satisfy
@@ -3981,7 +4026,27 @@ def run_pipeline(
                                 # the model overflowing on unseen data, which
                                 # is a symptom of overfitting and which more
                                 # capacity makes worse, not better.
-                                force=False,
+                                #
+                                # Both incidents are real, and what tells
+                                # them apart is exactly that finiteness:
+                                # sane numbers violating an invariant, or
+                                # simply no admissible rate (MNIST), mean
+                                # the STRUCTURE has to change; NaN/Inf (the
+                                # over-firing run) means the MODEL failed,
+                                # which growth cannot fix. See
+                                # FGDApproxConfig.certify_force_growth_on_
+                                # finite_step_failure for the full account;
+                                # default False keeps force=False always,
+                                # bit-identical to today.
+                                force=_certify_force_growth(
+                                    config.fgd_approx,
+                                    previous_step_committed=(
+                                        certify_previous_step_committed
+                                    ),
+                                    previous_failure_non_finite=(
+                                        certify_previous_failure_non_finite
+                                    ),
+                                ),
                                 progress=progress,
                             )
                             tangent_system = certify_result.tangent_system
@@ -4120,10 +4185,11 @@ def run_pipeline(
                                 y=fgd_train_probe[1],
                                 config=config.fgd_approx,
                             )
-                            if _projection_step_sensor_valid(
+                            direction_sensor_reason = _projection_step_sensor_reason(
                                 direction_step,
                                 config.fgd_approx,
-                            ):
+                            )
+                            if direction_sensor_reason is None:
                                 tangent_direction = (
                                     direction_step.parameter_updates
                                 )
@@ -4132,6 +4198,14 @@ def run_pipeline(
                                 )
                             else:
                                 direction_sensor_failure = True
+                                # Only "non_finite" is the overfitting
+                                # signal a forced growth must not act on;
+                                # a geometric-invariant violation here is
+                                # sane, finite numbers the structure failed
+                                # to satisfy, which growth can still fix.
+                                direction_sensor_non_finite = (
+                                    direction_sensor_reason == "non_finite"
+                                )
                         if tangent_direction is not None:
                             fgd_update_norm = math.sqrt(
                                 sum(
@@ -4190,6 +4264,11 @@ def run_pipeline(
                             else:
                                 direction_sensor_failure = True
                                 direction_stats = None
+                                # This sensor runs with projection_sensor=
+                                # False (only finiteness is checked, per
+                                # the comment above), so reaching here
+                                # always means a non-finite measurement.
+                                direction_sensor_non_finite = True
                         else:
                             direction_sensor_failure = True
 
@@ -4281,6 +4360,24 @@ def run_pipeline(
                         fgd_trial_sensor_failure = (
                             fgd_trial_sensor_failure
                             or search_result.sensor_failure
+                        )
+                        # certify_force_growth_on_finite_step_failure's
+                        # discriminator. Every trial-level certificate this
+                        # search touches runs with projection_sensor=False
+                        # (finiteness only, see certificate_from_projection_
+                        # stats above), so a sensor failure with a direction
+                        # already in hand is unconditionally non-finite;
+                        # with no direction at all (direction_stats is None)
+                        # it carries direction_sensor_non_finite's own
+                        # reason instead. Overwritten every attempt, so only
+                        # the LAST (the one that may break the loop) is what
+                        # reaches the epoch-level bookkeeping below.
+                        certify_step_failure_non_finite = (
+                            search_result.sensor_failure
+                            and (
+                                direction_stats is not None
+                                or direction_sensor_non_finite
+                            )
                         )
                         accepted_trial = search_result.accepted
                         diagnostic_trial = search_result.last_trial
@@ -4587,6 +4684,11 @@ def run_pipeline(
             # Drives the grow-to-certify `force`: a certified structure that
             # still could not commit a step is the deadlock to break.
             certify_previous_step_committed = bool(fgd_candidate_accepted)
+            # Companion signal: whether THAT failure's own measurement was
+            # non-finite. _certify_force_growth ignores this whenever
+            # certify_previous_step_committed is True, so it is safe to
+            # carry forward unconditionally here.
+            certify_previous_failure_non_finite = certify_step_failure_non_finite
             epoch_entry = HistoryEntry(
                 step=epoch,
                 step_type=step_type,

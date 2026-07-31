@@ -36,18 +36,17 @@ run:
   show_plot: false
 
 data:
-  kind: cifar10
-  in_features: 1024
+  kind: mnist
+  in_features: 784
   out_features: 10
   data_dir:
   batch_size: 64
   train_seed: 0
   validation_seed: 2
   test_seed: 1
-  cifar_grayscale: true
-  cifar_train_samples: 10000
-  cifar_validation_samples: 2000
-  cifar_test_samples: 2000
+  mnist_train_samples: 10000
+  mnist_validation_samples: 2000
+  mnist_test_samples: 2000
 model:
   hidden_size: 2
   number_hidden_layers: 3
@@ -77,7 +76,7 @@ lr_scheduler:
   restart_on_growth: true
 
 fgd_approx:
-  rel_error_threshold: 0.5
+  rel_error_threshold: 0.3
   rel_error_mode: tangent_projection
   layer_selection: certifying
   projection_solver: exact
@@ -280,10 +279,10 @@ fgd_approx:
   # accepted only by its OWN Crel<1/2. Makes FP growth affordable
   # (MEASURED 57->6 growths on the synthetic task).
   certify_family_ladder: true
-  certify_family_inner_steps: 400
+  certify_family_inner_steps: 4000
   certify_family_inner_learning_rate: 0.01
   certify_family_functional_lr: 1.0
-  certify_family_plateau_stop: true
+  certify_family_plateau_stop: false
   certify_realize_max_iterations: 40
   certify_realize_tolerance: 0.05
   # Freeze the Gauss-Newton Gram across the inner realise iterations (modified-

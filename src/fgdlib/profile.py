@@ -61,6 +61,13 @@ PROFILE_FIELDS = (
     "where_winner_mismatch_fallbacks",
     "where_final_winner_full_validations",
     "where_total_seconds",
+    # certify_force_growth_on_finite_step_failure discriminator: how often
+    # a failed-to-commit step FORCED grow_until_certified's growth versus
+    # how often forcing was SUPPRESSED because the measurement behind the
+    # failure was non-finite (the over-firing symptom, not the MNIST
+    # deadlock -- see fgdlib/tangent.py's field comment).
+    "certify_forced_growths",
+    "certify_force_suppressed_nonfinite",
     # --- exact tangent-system construction instrumentation (Phase A) ---
     # Counters.
     "tangent_system_calls",
@@ -132,6 +139,8 @@ _COUNTER_FIELDS = {
     "where_numerical_fallbacks",
     "where_winner_mismatch_fallbacks",
     "where_final_winner_full_validations",
+    "certify_forced_growths",
+    "certify_force_suppressed_nonfinite",
     "tangent_system_calls",
     "tangent_qr_calls",
     "tangent_sample_chunk_count",

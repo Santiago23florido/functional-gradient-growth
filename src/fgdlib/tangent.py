@@ -224,6 +224,28 @@ class FGDApproxConfig:
     # probe so large that certification is out of reach, which is itself a
     # result worth seeing rather than hanging on).
     certify_max_growths: int = 256
+    # DISCRIMINATE why grow_until_certified's `force` is asked for. Force
+    # exists to close a REAL deadlock, MEASURED on MNIST: eps sat at 0.475
+    # -- certified, so no growth fired -- while no admissible learning
+    # rate produced held-out descent, so no step committed either;
+    # neither mechanism could act and epochs came out bit-identical. But
+    # forcing UNCONDITIONALLY whenever a step failed over-fired just as
+    # badly: MEASURED on the small synthetic run, 262 growths against 7
+    # committed steps, 242 of those with eps ALREADY certified (many at
+    # eps = 0.0000). The trigger there was a non-finite validation
+    # measurement -- the model overflowing on unseen data, a symptom of
+    # overfitting that more capacity only makes worse.
+    #
+    # Both incidents are real and what tells them apart is finiteness of
+    # the measurement behind the failure: sane numbers that violate a
+    # geometric invariant, or simply no admissible rate (the MNIST case),
+    # mean the STRUCTURE has to change, so forcing growth is right; NaN or
+    # Inf (the over-firing case) means the MODEL is what failed, and
+    # growth cannot fix that. Default False reproduces today's behaviour
+    # bit-for-bit -- force is always False. True makes force exactly (the
+    # previous step failed to commit) AND (that failure's measurement was
+    # finite).
+    certify_force_growth_on_finite_step_failure: bool = False
     # Whether the GROW-TO-CERTIFY loop grows function-preservingly. This is the
     # FP control for the certify path only; the standard/unified growth path is
     # FP by design and unconditional (see growth_function_preserving above,
@@ -1239,6 +1261,46 @@ def _output_relative_error_from_stats(
     )
 
 
+def _projection_sensor_reason(
+    *,
+    dot_product: float,
+    approximation_sq_norm: float,
+    target_sq_norm: float,
+    eps: float,
+    relative_tolerance: float = 1e-4,
+) -> str | None:
+    """Return WHY the damped projection fails, or None when it is valid.
+
+    Splits what the plain boolean sensor conflates into a NAMED cause,
+    because the causes are not interchangeable for a caller deciding
+    whether to force a growth (see FGDApproxConfig.certify_force_growth_
+    on_finite_step_failure): "non_finite" means the model itself produced
+    NaN/Inf -- an overfitting symptom that more capacity makes worse, so
+    growth must NOT be forced on it. The other three are FINITE numbers
+    that violate a geometric invariant of the exact projector (it should
+    be non-expansive and non-adversarial) -- sane measurements the
+    structure failed to satisfy, which growth can still fix.
+    """
+    values = (dot_product, approximation_sq_norm, target_sq_norm)
+    if not all(math.isfinite(value) for value in values):
+        return "non_finite"
+    if approximation_sq_norm < -eps or target_sq_norm < -eps:
+        return "negative_norm"
+
+    approximation_sq_norm = max(0.0, approximation_sq_norm)
+    target_sq_norm = max(0.0, target_sq_norm)
+    norm_product = math.sqrt(approximation_sq_norm * target_sq_norm)
+    dot_tolerance = relative_tolerance * max(norm_product, eps)
+    if dot_product < -dot_tolerance:
+        return "negative_dot_product"
+
+    norm_tolerance = relative_tolerance * max(target_sq_norm, eps)
+    if approximation_sq_norm > target_sq_norm + norm_tolerance:
+        return "norm_overshoot"
+
+    return None
+
+
 def _projection_sensor_valid(
     *,
     dot_product: float,
@@ -1248,36 +1310,35 @@ def _projection_sensor_valid(
     relative_tolerance: float = 1e-4,
 ) -> bool:
     """Return whether the damped projection satisfies exact-operator invariants."""
-    values = (dot_product, approximation_sq_norm, target_sq_norm)
-    if not all(math.isfinite(value) for value in values):
-        return False
-    if approximation_sq_norm < -eps or target_sq_norm < -eps:
-        return False
+    return (
+        _projection_sensor_reason(
+            dot_product=dot_product,
+            approximation_sq_norm=approximation_sq_norm,
+            target_sq_norm=target_sq_norm,
+            eps=eps,
+            relative_tolerance=relative_tolerance,
+        )
+        is None
+    )
 
-    approximation_sq_norm = max(0.0, approximation_sq_norm)
-    target_sq_norm = max(0.0, target_sq_norm)
-    norm_product = math.sqrt(approximation_sq_norm * target_sq_norm)
-    dot_tolerance = relative_tolerance * max(norm_product, eps)
-    if dot_product < -dot_tolerance:
-        return False
 
-    norm_tolerance = relative_tolerance * max(target_sq_norm, eps)
-    if approximation_sq_norm > target_sq_norm + norm_tolerance:
-        return False
-
-    return True
+def _projection_step_sensor_reason(
+    step: _TangentProjectionStep,
+    config: FGDApproxConfig,
+) -> str | None:
+    return _projection_sensor_reason(
+        dot_product=step.dot_product,
+        approximation_sq_norm=step.approximation_sq_norm,
+        target_sq_norm=step.target_sq_norm,
+        eps=config.eps,
+    )
 
 
 def _projection_step_sensor_valid(
     step: _TangentProjectionStep,
     config: FGDApproxConfig,
 ) -> bool:
-    return _projection_sensor_valid(
-        dot_product=step.dot_product,
-        approximation_sq_norm=step.approximation_sq_norm,
-        target_sq_norm=step.target_sq_norm,
-        eps=config.eps,
-    )
+    return _projection_step_sensor_reason(step, config) is None
 
 
 def certified_smoothness_constant(config: FGDApproxConfig) -> float:
