@@ -299,6 +299,17 @@ fgd_approx:
   certify_family_inner_learning_rate: 0.01
   certify_family_functional_lr: 1.0
   certify_family_plateau_stop: true
+  # Commit the family step at its OWN Lemma 3.5 rate, not whole.
+  # MEASURED: eps 0.292 allows eta_bar 0.263 at L_s = 2, so a full
+  # step overshoots the descent bound by 3.8x. Certifying the
+  # direction never licensed the distance.
+  certify_family_lemma35_rate: true
+  # Let the ladder work in the band between the growth target and the
+  # certificate, where growth alone buys 0.0007 of eps per 800 params
+  # while the clone reaches 22 degrees against a 30 degree bar. Safe
+  # only because the step above is now bounded by its own Lemma 3.5
+  # rate; unbounded it diverged held-out loss 9.37 -> 44.53.
+  certify_family_in_target_band: true
   certify_realize_max_iterations: 40
   certify_realize_tolerance: 0.05
   # Freeze the Gauss-Newton Gram across the inner realise iterations (modified-

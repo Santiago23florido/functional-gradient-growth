@@ -442,6 +442,18 @@ class FGDApproxConfig:
     # is byte-identical -- the acceptance criterion is never touched, only
     # how far the accepted direction is followed.
     certify_family_lemma35_rate: bool = False
+    # Try the ladder throughout the band it can help in, not only where no
+    # step certifies. Default false = the ladder runs while eps is above the
+    # step CERTIFICATE, i.e. only as the remedy for "nothing certifies".
+    # True runs it while eps is above the GROWTH TARGET, where the tangent
+    # already certifies but an aspiration is still being chased -- the band
+    # where growth would otherwise be the only tool and, on MNIST, buys 0.0007
+    # of eps for 800 parameters while the clone reaches 22 degrees against a
+    # 30 degree bar. Only safe together with certify_family_lemma35_rate:
+    # MEASURED without it, the unbounded family step diverged held-out loss
+    # 9.37 -> 44.53 in two epochs because it pre-empted the tangent path that
+    # produces the very bound it was missing.
+    certify_family_in_target_band: bool = False
     # ROUGHNESS PENALTY -- the RIGHT regulariser, in the function-space norm.
     # functional_tikhonov above penalises ||f||^2 (magnitude), which shrinks f
     # toward 0 but still lets it memorise a shrunk copy. This penalises

@@ -693,7 +693,14 @@ def grow_until_certified(
         # diverged on held-out data, test loss 9.37 -> 44.53 over two epochs
         # while the train loss fell. The ladder is the remedy for "no step
         # certifies", so it belongs where no step certifies.
-        if family_step is not None and epsilon >= certificate:
+        family_floor = (
+            target
+            if getattr(
+                config.fgd_approx, "certify_family_in_target_band", False
+            )
+            else certificate
+        )
+        if family_step is not None and epsilon >= family_floor:
             stepped = family_step(model)
             if stepped is not None:
                 model = stepped
