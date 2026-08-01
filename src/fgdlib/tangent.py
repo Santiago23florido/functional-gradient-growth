@@ -431,6 +431,17 @@ class FGDApproxConfig:
     # criterion (RelErr < 1/2) is never touched.
     certify_family_plateau_stop: bool = False
     certify_family_plateau_tol: float = 0.002
+    # Commit the family step at ITS OWN Lemma 3.5 rate instead of whole.
+    # The family certifies a DIRECTION -- cos(Delta, r) > sqrt(1 - eps^2) --
+    # and then commits the trained clone outright, which is a functional step
+    # of size 1. The lemma applied to that same eps allows far less: MEASURED
+    # on MNIST, eps 0.292 gives eta_bar = 0.263 at L_s = 2, so a full step
+    # overshoots the descent bound by 3.8x (9x at eps 0.400). The direction
+    # was certified; the distance never was, and that is what made the run
+    # oscillate with its loss flat. Off by default so every existing result
+    # is byte-identical -- the acceptance criterion is never touched, only
+    # how far the accepted direction is followed.
+    certify_family_lemma35_rate: bool = False
     # ROUGHNESS PENALTY -- the RIGHT regulariser, in the function-space norm.
     # functional_tikhonov above penalises ||f||^2 (magnitude), which shrinks f
     # toward 0 but still lets it memorise a shrunk copy. This penalises

@@ -40,12 +40,52 @@ from dataclasses import dataclass
 
 import torch
 
-from fgdlib.tangent import FGDApproxConfig, mse_functional_gradient
+from fgdlib.tangent import (
+    FGDApproxConfig,
+    mse_functional_gradient,
+    theoretical_learning_rate_upper_bound,
+)
 
 __all__ = [
     "ParametricFamilyResult",
     "certify_parametric_step",
+    "family_lemma35_rate",
 ]
+
+
+def family_lemma35_rate(
+    relative_error: float,
+    config: FGDApproxConfig,
+) -> float | None:
+    """Lemma 3.5's admissible rate for the FAMILY's own relative error.
+
+    Mirrors ``pipeline.lemma35_learning_rate`` exactly -- same interval
+    ``eta_bar = 2(1 - 2 eps)/(L_s(1 + 2 eps))``, same ``theory_lr_safety``
+    fraction, same ``theory_lr_min`` floor -- and lives here only because
+    ``pipeline`` imports this module, so the dependency cannot run the other
+    way. It is NOT a new bound: the family already measures the exact
+    quantity the lemma consumes, ``RelErr = sqrt(1 - cos^2(Delta, r))``, so
+    the lemma applies to its displacement verbatim.
+
+    Why this matters: the family used to apply its displacement WHOLE. That
+    is a functional step of size 1, and MEASURED against its own certified
+    eps the lemma allows far less -- eps 0.292 (cos 0.9564) gives
+    eta_bar = 0.263 at L_s = 2, so a full step overshoots by 3.8x, and at
+    eps 0.400 by 9x. Overshooting a descent bound by that factor is exactly
+    what made MNIST oscillate while its loss stayed flat: the direction was
+    certified, the distance was not.
+
+    Returns ``None`` when no rate sits strictly inside the interval, which
+    is the signal that this family cannot deliver a certified step here.
+    """
+    upper_bound = theoretical_learning_rate_upper_bound(relative_error, config)
+    if upper_bound is None:
+        return None
+    fraction = 0.5 if config.certify_optimal_rate else config.theory_lr_safety
+    rate = fraction * upper_bound
+    if rate <= config.theory_lr_min + config.eps:
+        return None
+    return rate
 
 
 @dataclass(frozen=True)
@@ -171,6 +211,26 @@ def certify_parametric_step(
     # AWAY from the gradient and can never certify, so clamp its contribution.
     relative_error = math.sqrt(max(0.0, 1.0 - max(cosine, 0.0) ** 2))
     certified = cosine > 0.0 and relative_error < threshold
+
+    # Certifying the DIRECTION does not license the DISTANCE. The clone is
+    # trained toward a full functional step, so committing it whole takes
+    # eta = 1 -- and Lemma 3.5, applied to the family's OWN eps, allows
+    # 0.95 * 2(1-2 eps)/(L_s(1+2 eps)), which at the measured eps 0.292 is
+    # 0.263. Scale the parameter displacement to that certified rate instead
+    # of replacing the model outright. Alignment is scale-invariant, so the
+    # certificate above is untouched: the clone still trains to its best
+    # cosine and only the committed distance changes. (Shrinking the TARGET
+    # instead was tried and MEASURED to be wrong -- it starves the clone's
+    # alignment, N=1024 test 0.921 -> 0.841 with certifications 27 -> 3.)
+    if certified and getattr(config, "certify_family_lemma35_rate", False):
+        rate = family_lemma35_rate(relative_error, config)
+        if rate is None:
+            certified = False
+        else:
+            with torch.no_grad():
+                for base, moved in zip(model.parameters(), clone.parameters()):
+                    moved.mul_(rate).add_(base, alpha=1.0 - rate)
+
     return ParametricFamilyResult(
         relative_error=relative_error,
         cosine=cosine,
