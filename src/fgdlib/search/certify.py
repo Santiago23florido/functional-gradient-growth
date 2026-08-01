@@ -888,6 +888,21 @@ def grow_until_certified(
                 + ("  (certified)" if epsilon < target else "")
             )
 
+        # HOW MUCH, answered the same organic way as WHETHER. Once a step
+        # already certifies, further growth is voluntary, so buy ONE increment
+        # and hand the turn back: the step commits, training happens, and the
+        # next outer step re-asks on a model that has actually moved. The
+        # total is then decided by how many times "growing beats training"
+        # keeps holding across genuinely different states -- no count, no
+        # parameter cap, no eps fraction. MEASURED without this, gating only
+        # the ENTRY still front-loaded: 19 growths against 8 committed steps,
+        # because one "yes" licensed an unbounded run at an unreachable
+        # target. Above the certificate nothing is voluntary -- no step exists
+        # at any damping -- so the loop keeps growing there, unchanged.
+        if growth_warranted is not None and epsilon < certificate:
+            stop_reason = "growth_turn_taken"
+            break
+
         # ADAPTIVE COUNT: keep adding at the just-chosen best location while each
         # increment still pays -- marginal eps reduction above min_gain of the
         # remaining gap -- stopping the instant it certifies or the returns
