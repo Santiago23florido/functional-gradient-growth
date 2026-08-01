@@ -5711,7 +5711,29 @@ def run_pipeline(
                             int(layer.in_features)
                             for layer in model._growable_layers
                         ]
-                        bottlenecks = set(rank_limiting_locations(widths))
+                        # The rank cap both FILTERS candidates to the width
+                        # minimum and MANDATES levelling it. Both rest on
+                        # "rank J <= min_l w_l" (unified.py:53), which is
+                        # FALSE as measured on the exact Jacobian: at NK=200,
+                        # widths (20,3,20) reach rank 200, (30,4,30) reach
+                        # 200, and even (2,2,2) reaches 25 = P, not 2. What
+                        # bounds the rank is min(NK, P), not the narrowest
+                        # layer. So the mandate levels the widths -- every
+                        # seed lands on h,h,h+1 -- and bars the search from
+                        # non-uniform shapes, for a reason that does not
+                        # hold. Disabling it leaves the exact per-candidate
+                        # eps ranking (unified.expansion_value) as the sole
+                        # criterion, which measures what each location
+                        # actually buys instead of assuming the minimum caps
+                        # it. No certificate is touched.
+                        free_shape = getattr(
+                            config.fgd_approx, "growth_free_shape", False
+                        )
+                        bottlenecks = (
+                            set()
+                            if free_shape
+                            else set(rank_limiting_locations(widths))
+                        )
                         ceiling_binds_precheck = (
                             validation_certificate.relative_error is not None
                             and validation_certificate.relative_error
@@ -5724,7 +5746,9 @@ def run_pipeline(
                         # in one event is what the inequality already says;
                         # buying one neuron per event merely made each
                         # purchase wait for R1 again.
-                        relief = bottleneck_relief_target(widths)
+                        relief = (
+                            None if free_shape else bottleneck_relief_target(widths)
+                        )
                         if (
                             relief is not None
                             and ceiling_binds_precheck

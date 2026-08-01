@@ -474,6 +474,25 @@ class FGDApproxConfig:
     # first outer step. Off by default; reuses growth_lookahead_steps and
     # tiny_statistical_threshold, so it introduces no new constant.
     certify_growth_lookahead: bool = False
+    # Let the exact per-candidate eps ranking choose the SHAPE, not just the
+    # size. The rank cap filters candidates to the width minimum and mandates
+    # levelling it, both justified by "rank J <= min_l w_l" -- which is FALSE
+    # on the exact Jacobian: MEASURED at NK=200, widths (20,3,20) and
+    # (30,4,30) both reach rank 200, and (2,2,2) reaches 25 = P, not 2. The
+    # bound is min(NK, P). So the mandate levels every run onto h,h,h+1 and
+    # bars non-uniform shapes for a reason that does not hold. With this on,
+    # unified.expansion_value decides alone -- it already scores all six
+    # candidates by their EXACT resulting eps. No certificate changes.
+    #
+    # MEASURED AND REFUTED -- do not enable. The bound really is false (see
+    # above), but the machinery built on it is load-bearing for growth to
+    # happen AT ALL: rank_candidates filters by the rank ceiling and
+    # unified.py:207-217 returns the bottleneck relief as the FALLBACK when
+    # that ceiling binds. Removing both empties the candidate list. On
+    # N=1024 the three seeds then stop at 53 / 60 / 119 parameters instead
+    # of 588 / 1074 / 659, and test accuracy collapses from 0.907-0.933 to
+    # 0.219-0.361. Kept, off, so the negative result is not rediscovered.
+    growth_free_shape: bool = False
     # ROUGHNESS PENALTY -- the RIGHT regulariser, in the function-space norm.
     # functional_tikhonov above penalises ||f||^2 (magnitude), which shrinks f
     # toward 0 but still lets it memorise a shrunk copy. This penalises
