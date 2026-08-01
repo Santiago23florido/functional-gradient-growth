@@ -3960,6 +3960,26 @@ def run_pipeline(
                             # certifies. It certifies at a far smaller
                             # structure than the linear tangent, so it defers
                             # growth (MEASURED 57 -> 6 FP growths).
+                            # "Grow now, or train now?" -- the organic turn
+                            # question. Generalised R1 already implements it
+                            # (train a grown clone and a stay clone the same
+                            # number of steps, compare the eps they reach); it
+                            # was only ever reachable from the fallback-family
+                            # loop, which is dead under family_order:
+                            # [tangent]. Bound here so the grow-to-certify
+                            # loop can use it, which is where the front-loading
+                            # actually happens.
+                            def _growth_warranted_now(candidate_model):
+                                return _growth_reduces_lookahead_epsilon(
+                                    model=candidate_model,
+                                    train_batches=frozen_train_batches,
+                                    train_loader=train_loader,
+                                    validation_loader=validation_loader,
+                                    probe=fgd_validation_probe,
+                                    device=device,
+                                    config=config,
+                                )
+
                             _family_step = None
                             if config.fgd_approx.certify_family_ladder:
                                 _fp = fgd_train_probe
@@ -3994,6 +4014,15 @@ def run_pipeline(
                                     config.fgd_approx.certify_function_preserving
                                 ),
                                 family_step=_family_step,
+                                # "Is it growth's turn?", asked once per outer
+                                # step. Passed as a callable for the same
+                                # reason family_step is: this module imports
+                                # certify, so the dependency cannot run back.
+                                growth_warranted=(
+                                    _growth_warranted_now
+                                    if config.fgd_approx.certify_growth_lookahead
+                                    else None
+                                ),
                                 # A step that did not commit while eps was
                                 # already certified means the structure, not
                                 # the step size, is what has to change --

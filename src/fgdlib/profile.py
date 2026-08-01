@@ -68,6 +68,8 @@ PROFILE_FIELDS = (
     # deadlock -- see fgdlib/tangent.py's field comment).
     "certify_forced_growths",
     "certify_force_suppressed_nonfinite",
+    "certify_family_deferral_refused",
+    "certify_growth_not_warranted",
     # certify_growth_target discriminators: how often the best available growth
     # failed the certify_growth_min_gain floor (the loop was chasing a target it
     # cannot reach at a price worth paying), how often max_total_parameters
@@ -149,6 +151,8 @@ _COUNTER_FIELDS = {
     "where_final_winner_full_validations",
     "certify_forced_growths",
     "certify_force_suppressed_nonfinite",
+    "certify_family_deferral_refused",
+    "certify_growth_not_warranted",
     "certify_growth_target_stalls",
     "certify_budget_stops",
     "certify_budget_rejected_candidates",

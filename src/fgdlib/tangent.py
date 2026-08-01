@@ -454,6 +454,26 @@ class FGDApproxConfig:
     # 9.37 -> 44.53 in two epochs because it pre-empted the tangent path that
     # produces the very bound it was missing.
     certify_family_in_target_band: bool = False
+    # A certified family step DEFERS growth, so it must earn the deferral by
+    # the same marginal-return rule growth answers to: it has to close this
+    # fraction of the remaining gap to the growth target, or growth takes the
+    # turn instead. MEASURED on MNIST without it, the ladder certified on all
+    # 20 epochs, the structure never grew (GRO=0), and accuracy plateaued at
+    # 0.113 from epoch 9 -- worse than the 0.164 the growing path reached by
+    # epoch 13. Certifying is not the same as progressing. 0.0 disables it,
+    # which is the previous behaviour exactly.
+    certify_family_min_gain: float = 0.0
+    # Ask ONCE per outer step whether it is growth's turn, by training a grown
+    # clone and a stay clone the same number of steps and comparing the eps
+    # they reach. Organic where a threshold is not: it never compares eps to a
+    # constant, so it transfers across datasets -- on MNIST every growth moves
+    # eps ~1e-3 and any fraction of any gap refuses them all equally, while a
+    # parameter cap is just another invented number. A "no" returns at once,
+    # so the step commits and training happens before the question is asked
+    # again, which is what stops the loop front-loading every growth into the
+    # first outer step. Off by default; reuses growth_lookahead_steps and
+    # tiny_statistical_threshold, so it introduces no new constant.
+    certify_growth_lookahead: bool = False
     # ROUGHNESS PENALTY -- the RIGHT regulariser, in the function-space norm.
     # functional_tikhonov above penalises ||f||^2 (magnitude), which shrinks f
     # toward 0 but still lets it memorise a shrunk copy. This penalises

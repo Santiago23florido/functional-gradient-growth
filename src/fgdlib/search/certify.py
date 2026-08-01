@@ -45,7 +45,7 @@ from dataclasses import dataclass
 
 import torch
 
-from fgdlib.profile import increment, profiled
+from fgdlib.profile import fallback, increment, profiled
 from fgdlib.search.exact_where import (
     CandidateScoringError,
     UnsupportedGrowthStructure,
@@ -574,6 +574,7 @@ def grow_until_certified(
     force: bool = False,
     progress=None,
     family_step=None,
+    growth_warranted=None,
 ):
     """Grow until ``eps < certify_growth_target``; return the grown model.
 
@@ -644,6 +645,41 @@ def grow_until_certified(
     unpaid_growths = 0
     stop_reason: str | None = None
 
+    # IS IT GROWTH'S TURN AT ALL? Asked ONCE per invocation, before the loop,
+    # not before each growth -- the question is "grow now or train now", and
+    # the answer only changes after something has moved. That placement is
+    # what restores the interleave: a "no" returns immediately, the step
+    # commits, training happens, and the NEXT outer step asks again. Asked
+    # per growth instead it would double the cost of an already exhaustive
+    # scan and still front-load, because nothing between two growths trains.
+    #
+    # The predicate itself is organic, which is the point: it does not test
+    # eps against a constant -- on MNIST every growth moves eps ~1e-3, so any
+    # fraction of any gap refuses all of them equally, and a parameter cap is
+    # just another number pulled from the air. It trains a grown clone and a
+    # stay clone the SAME number of steps and asks which reaches the lower
+    # eps, i.e. whether the structure or the training is the binding
+    # constraint. The scale it compares against is the problem's own, so it
+    # transfers between datasets without a knob.
+    if growth_warranted is not None and epsilon < certificate:
+        if not growth_warranted(model):
+            fallback("certify_growth_not_warranted", "training_beats_growing")
+            if progress is not None:
+                progress(
+                    f"[CERTIFY] eps {epsilon:.4f} certifies and training "
+                    "reaches a lower eps than growing would; stepping "
+                    "instead of growing"
+                )
+            return model, CertifyResult(
+                relative_error=epsilon,
+                growths=0,
+                certified=epsilon < target,
+                trajectory=tuple(trajectory),
+                tangent_system=tangent_system,
+                stop_reason="training_beats_growing",
+                growth_target=target,
+            )
+
     # The budget exists (tangent.py) and is honoured at the end of each epoch,
     # but was invisible to the loop that spends the most -- this one. Checked
     # here before the first scan, because an exhausted budget makes every
@@ -703,28 +739,56 @@ def grow_until_certified(
         if family_step is not None and epsilon >= family_floor:
             stepped = family_step(model)
             if stepped is not None:
-                model = stepped
-                family_steps += 1
-                epsilon, tangent_system = _relative_error_and_system(
-                    model, x, y, config.fgd_approx
+                stepped_epsilon, stepped_system = _relative_error_and_system(
+                    stepped, x, y, config.fgd_approx
                 )
-                trajectory.append(epsilon)
-                if progress is not None:
-                    progress(
-                        "[CERTIFY] parametric family certified at fixed "
-                        f"structure (no growth); eps -> {epsilon:.4f}"
+                # A certified family step DEFERS growth, so it has to earn the
+                # deferral: the same marginal-return question growth answers.
+                # MEASURED on MNIST, without this the ladder certified on all
+                # 20 epochs and the structure never grew once (GRO=0), so the
+                # net stayed at its 3x2 start and accuracy plateaued at 0.113
+                # from epoch 9 -- worse than the 0.164 the growing path reached
+                # by epoch 13. Certifying is not the same as progressing.
+                family_min_gain = float(
+                    getattr(config.fgd_approx, "certify_family_min_gain", 0.0)
+                )
+                family_pays = family_min_gain <= 0.0 or (
+                    epsilon - stepped_epsilon
+                    > family_min_gain * max(epsilon - target, 1e-6)
+                )
+                if not family_pays:
+                    fallback(
+                        "certify_family_deferral_refused",
+                        "family_step_below_min_gain",
                     )
-                return model, CertifyResult(
-                    relative_error=epsilon,
-                    growths=growths,
-                    certified=epsilon < target,
-                    trajectory=tuple(trajectory),
-                    family_stepped=True,
-                    family_steps=family_steps,
-                    tangent_system=tangent_system,
-                    stop_reason="family_stepped",
-                    growth_target=target,
-                )
+                    if progress is not None:
+                        progress(
+                            "[CERTIFY] family certified but only moved eps "
+                            f"{epsilon:.4f} -> {stepped_epsilon:.4f} "
+                            f"(needs {family_min_gain:g} of the gap to "
+                            f"{target:g}); growing instead"
+                        )
+                if family_pays:
+                    model = stepped
+                    family_steps += 1
+                    epsilon, tangent_system = stepped_epsilon, stepped_system
+                    trajectory.append(epsilon)
+                    if progress is not None:
+                        progress(
+                            "[CERTIFY] parametric family certified at fixed "
+                            f"structure (no growth); eps -> {epsilon:.4f}"
+                        )
+                    return model, CertifyResult(
+                        relative_error=epsilon,
+                        growths=growths,
+                        certified=epsilon < target,
+                        trajectory=tuple(trajectory),
+                        family_stepped=True,
+                        family_steps=family_steps,
+                        tangent_system=tangent_system,
+                        stop_reason="family_stepped",
+                        growth_target=target,
+                    )
 
         # Preserving growth cannot make eps worse, so requiring an improvement
         # is free there. Non-preserving growth moves f, so the best available

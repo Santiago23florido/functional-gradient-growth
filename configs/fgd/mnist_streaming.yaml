@@ -93,6 +93,11 @@ fgd_approx:
   # below, so the cut is not a close call. (N1024, for contrast, gains 0.00707
   # on a gap of 0.0267, ratio 0.265, and keeps growing.)
   certify_growth_target: 0.3
+  # 0 disables the eps-fraction refusal: on MNIST every growth buys
+  # ~1e-3 of eps, so any fraction of the gap rejects all of them and
+  # nothing ever grows. The cost is bounded by max_total_parameters
+  # instead, which is the quantity actually at stake.
+  certify_growth_min_gain: 0.0
   rel_error_mode: tangent_projection
   layer_selection: certifying
   projection_solver: exact
@@ -204,6 +209,11 @@ fgd_approx:
   # exact certification, whatever it costs, delivers the best accuracy.
   certify_function_preserving: true
   certify_max_growths: 200
+  # Buy neurons at the chosen location while each still pays, then
+  # stop by itself -- the repo's own 'reach far without excess'
+  # mechanism, off until now.
+  certify_adaptive_growth: true
+  certify_adaptive_growth_min_gain: 0.02
   # PAPER-PURE STEP. Lemma 3.5 does not offer descent as a condition to
   # verify -- it PROVES it: eps < 1/2 implies every eta in (0, eta_bar(eps))
   # descends. So the flow keeps the rate the certificate licenses (the same
@@ -310,6 +320,11 @@ fgd_approx:
   # only because the step above is now bounded by its own Lemma 3.5
   # rate; unbounded it diverged held-out loss 9.37 -> 44.53.
   certify_family_in_target_band: true
+  # The ladder DEFERS growth, so it must earn the deferral: close this
+  # fraction of the gap to the target or hand the turn to growth.
+  # MEASURED at 0.0 the ladder certified 20/20 epochs and the net never
+  # grew (GRO=0), plateauing at 0.113 from epoch 9.
+  certify_family_min_gain: 0.02
   certify_realize_max_iterations: 40
   certify_realize_tolerance: 0.05
   # Freeze the Gauss-Newton Gram across the inner realise iterations (modified-
@@ -388,7 +403,7 @@ fgd_approx:
   # brings its own allocation loop. Left false so the config cannot be
   # misread as running both.
   growth_uniform: false
-  max_total_parameters:
+  max_total_parameters: 30000
   growth_preservation_tolerance: 1.0e-6
   # Ordered ladder of approximation families, evaluated top to bottom.
   # "tangent" must come first (it is the epoch's main transactional
