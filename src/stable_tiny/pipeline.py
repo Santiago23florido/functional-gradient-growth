@@ -5925,7 +5925,16 @@ def run_pipeline(
                                 )
                             )
 
-                        for position in range(1, len(model.layers)):
+                        # Depth is excluded under certified_gain by default:
+                        # the reference and the exhaustive 316-architecture
+                        # search both live in the three-hidden-layer family, so
+                        # letting the net deepen would compare against neither.
+                        _allow_depth = where_mode != "certified_gain" or getattr(
+                            config.fgd_approx, "growth_where_allow_depth", False
+                        )
+                        for position in (
+                            range(1, len(model.layers)) if _allow_depth else ()
+                        ):
                             trial = copy.deepcopy(model)
                             try:
                                 insert_identity_layer(
@@ -6082,10 +6091,23 @@ def run_pipeline(
                                     )
                                 )
                             )
+                            # ceiling_binds reads the VALIDATION certificate,
+                            # which is the right signal for WHETHER to grow but
+                            # not for how far: MEASURED, it left seed 2 at 1.0
+                            # neurons per event and 241 parameters while seed 0
+                            # got 1.9 and 611. Once the event has decided to
+                            # buy, the burst's own marginal criterion is the
+                            # brake. (Gating it on the TRAIN eps instead was
+                            # tried and is worse: train certifies easily here,
+                            # so growth never fired at all -- 0 events, 25
+                            # parameters, accuracy 0.08-0.36.)
                             if (
                                 _burst_on
                                 and chosen.kind == "width"
-                                and ceiling_binds
+                                and (
+                                    ceiling_binds
+                                    or where_mode == "certified_gain"
+                                )
                             ):
                                 _thr = config.fgd_approx.rel_error_threshold
                                 _min_gain = float(
