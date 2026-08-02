@@ -2177,6 +2177,89 @@ def _wake_dormant_outgoing_weights(model: GrowingMLP, scale: float) -> None:
                 weight[:, dormant] = scale
 
 
+def _prune_negligible_units(
+    model: GrowingMLP,
+    probe: tuple[torch.Tensor, torch.Tensor],
+    tolerance: float,
+) -> int:
+    """Drop hidden units whose removal moves f by less than `tolerance`.
+
+    Growth is only allowed to change f by `growth_preservation_tolerance`;
+    removing a unit that moves f by less than that same tolerance is
+    function-preserving by exactly the same standard, so the certificate and
+    the family ladder see the same function either way.
+
+    This is the only mechanism here that lets capacity MOVE. Growth is
+    otherwise greedy and monotone from 2-2-2: whatever the first events decide
+    is sunk, and the reachable architectures at a given size are one path
+    through the space rather than the space. Freeing a unit that stopped
+    earning its place lets a later event buy it back somewhere it is worth
+    more.
+
+    MEASURED AND REFUTED as a source of improvement, but the negative is the
+    informative part: across three N=1024 seeds this fired ZERO times, and the
+    runs came out bit-identical to lookahead alone (0.921/0.899/0.903 at
+    875/875/451). The helper is not broken -- given a unit with an
+    exactly-zero outgoing column it removes it and leaves f untouched -- there
+    simply is no dead capacity: after training, every unit earns more than the
+    tolerance.
+
+    That makes the tension explicit. Function preservation is WHY the search is
+    monotone; moving capacity between layers requires changing f by more than
+    the tolerance, which is precisely what the method forbids. So within the
+    fixed constraints the search cannot be made non-monotone, and the only
+    remaining lever is the quality of the measurement at the moment of an
+    irreversible decision -- which is what lookahead improves.
+
+    Returns the number of units removed.
+    """
+    layers = getattr(model, "layers", [])
+    if len(layers) < 2:
+        return 0
+    x = probe[0]
+    removed = 0
+    with torch.no_grad():
+        reference = model(x)
+        for index in range(len(layers) - 1):
+            inner = getattr(layers[index], "layer", None)
+            nxt = getattr(layers[index + 1], "layer", None)
+            if inner is None or nxt is None:
+                continue
+            width = inner.weight.shape[0]
+            # Never prune a layer down to nothing: a width-zero layer is not a
+            # narrower model, it is a disconnected one.
+            keep = list(range(width))
+            for unit in range(width):
+                if len(keep) <= 1:
+                    break
+                saved = nxt.weight[:, unit].clone()
+                nxt.weight[:, unit] = 0.0
+                drift = float(torch.max(torch.abs(model(x) - reference)))
+                if drift <= tolerance:
+                    keep.remove(unit)
+                else:
+                    nxt.weight[:, unit] = saved
+            if len(keep) == width:
+                continue
+            idx = torch.tensor(keep, device=inner.weight.device)
+            new_in = torch.nn.Linear(
+                inner.weight.shape[1], len(keep)
+            ).to(inner.weight.device)
+            new_in.weight.copy_(inner.weight[idx])
+            if inner.bias is not None and new_in.bias is not None:
+                new_in.bias.copy_(inner.bias[idx])
+            new_out = torch.nn.Linear(
+                len(keep), nxt.weight.shape[0]
+            ).to(nxt.weight.device)
+            new_out.weight.copy_(nxt.weight[:, idx])
+            if nxt.bias is not None and new_out.bias is not None:
+                new_out.bias.copy_(nxt.bias)
+            layers[index].layer = new_in
+            layers[index + 1].layer = new_out
+            removed += width - len(keep)
+    return removed
+
+
 def _train_parametric_gd_candidate(
     *,
     base_model: GrowingMLP,
@@ -6035,6 +6118,23 @@ def run_pipeline(
                             ):
                                 return _ladder_residual(trial)
                             return _score_for(trial)
+                        if where_mode == "certified_gain" and getattr(
+                            config.fgd_approx, "growth_where_prune", False
+                        ) and fgd_train_probe is not None:
+                            _freed = _prune_negligible_units(
+                                model,
+                                fgd_train_probe,
+                                float(
+                                    config.fgd_approx
+                                    .growth_preservation_tolerance
+                                ),
+                            )
+                            if _freed and progress is not None:
+                                progress(
+                                    f"[GRO] Epoch {epoch}: freed {_freed} "
+                                    "unit(s) whose removal left f inside the "
+                                    "growth tolerance"
+                                )
                         for candidate_layer in growable:
                             trial = copy.deepcopy(model)
                             try:

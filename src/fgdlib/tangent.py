@@ -563,6 +563,12 @@ class FGDApproxConfig:
     # the same horizon it was measured over, the WHERE and the HOW MUCH stop
     # being two separate rules measured on two different quantities.
     growth_where_lookahead: int = 1
+    # Let capacity MOVE, not just accumulate. A unit whose removal shifts f by
+    # less than growth_preservation_tolerance is as function-preserving to drop
+    # as it was to add, so no new constant is needed: the config already says
+    # what "does not change f" means, it was just never used in this
+    # direction.
+    growth_where_prune: bool = False
     # ROUGHNESS PENALTY -- the RIGHT regulariser, in the function-space norm.
     # functional_tikhonov above penalises ||f||^2 (magnitude), which shrinks f
     # toward 0 but still lets it memorise a shrunk copy. This penalises
