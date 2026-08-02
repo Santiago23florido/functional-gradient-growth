@@ -6249,6 +6249,77 @@ def run_pipeline(
                                 )
                             )
 
+                        # JOINT moves: widen a layer AND the next one in the
+                        # same event, priced as ONE purchase. A new feature
+                        # upstream is worth only what the downstream can carry,
+                        # so the value of widening layer l is conditional on
+                        # widening l+1 -- a dependency no single-layer probe can
+                        # express, and the reason a funnel is unreachable by
+                        # one-layer-at-a-time growth (see Candidate.indices).
+                        # The pair is carried in `indices`; `index` stays a real
+                        # layer so every consumer that reads it keeps working.
+                        if where_mode == "certified_gain" and getattr(
+                            config.fgd_approx, "growth_where_joint", False
+                        ):
+                            for _first in growable:
+                                _second = _first + 1
+                                if _second not in growable:
+                                    continue
+                                _joint = copy.deepcopy(model)
+                                _built = True
+                                for _at in (_first, _second):
+                                    try:
+                                        grow_layer(
+                                            model=_joint,
+                                            train_loader=train_loader,
+                                            layer_index=_at,
+                                            device=device,
+                                            line_search_config=(
+                                                config.scaling_line_search
+                                            ),
+                                            optimal_update_kwargs=(
+                                                unified_kwargs
+                                            ),
+                                            progress=None,
+                                            function_preserving=True,
+                                            preservation_tolerance=(
+                                                config.fgd_approx
+                                                .growth_preservation_tolerance
+                                            ),
+                                        )
+                                    except RuntimeError as error:
+                                        if progress is not None:
+                                            progress(
+                                                f"[GRO-WARN] Epoch {epoch}: "
+                                                f"joint candidate "
+                                                f"({_first},{_second}) could "
+                                                f"not be built: {error}"
+                                            )
+                                        _built = False
+                                        break
+                                if not _built:
+                                    continue
+                                trials[("joint", _first)] = _joint
+                                candidates.append(
+                                    Candidate(
+                                        kind="joint",
+                                        index=_first,
+                                        cost=max(
+                                            count_parameters(_joint)
+                                            - base_parameters,
+                                            1,
+                                        ),
+                                        relative_error_after=(
+                                            _rank_score(_joint)
+                                        ),
+                                        relieves_rank_ceiling=(
+                                            _first in bottlenecks
+                                            or _second in bottlenecks
+                                        ),
+                                        indices=(_first, _second),
+                                    )
+                                )
+
                         # Depth is excluded under certified_gain by default:
                         # the reference and the exhaustive 316-architecture
                         # search both live in the three-hidden-layer family, so
@@ -6279,6 +6350,36 @@ def run_pipeline(
                                     relative_error_after=_score_for(trial),
                                 )
                             )
+
+                        if where_mode == "certified_gain" and (
+                            progress is not None
+                        ):
+                            # Per-candidate ledger. Without it there is no way
+                            # to tell "the joint move does not win" from "the
+                            # joint move was never evaluated" -- a distinction
+                            # an earlier attempt got wrong.
+                            _base_log = _rank_score(model)
+                            if _base_log is not None:
+                                _cols = []
+                                for _cand in candidates:
+                                    if _cand.relative_error_after is None:
+                                        continue
+                                    _gn = _base_log - _cand.relative_error_after
+                                    _tag = (
+                                        "+".join(str(i) for i in _cand.indices)
+                                        if _cand.indices
+                                        else str(_cand.index)
+                                    )
+                                    _cols.append(
+                                        f"{_cand.kind[0].upper()}{_tag}"
+                                        f":c={_cand.cost}"
+                                        f",g={_gn:+.4f}"
+                                        f",g/c={_gn / max(_cand.cost, 1):+.6f}"
+                                    )
+                                progress(
+                                    f"[WHY] Epoch {epoch} widths={widths} "
+                                    f"base={_base_log:.3f} " + " ".join(_cols)
+                                )
 
                         if where_mode == "certified_gain":
                             # The base eps must come from the SAME probe the

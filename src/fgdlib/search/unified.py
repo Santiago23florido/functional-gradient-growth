@@ -139,6 +139,17 @@ class Candidate:
     # rank J and therefore on what eps can ever reach. See
     # rank_limiting_locations.
     relieves_rank_ceiling: bool = False
+    # The layers this proposal widens, when it widens more than one. Empty
+    # means the single layer named by ``index``, which is every proposal the
+    # shipped rule makes. A JOINT proposal exists because the value of a new
+    # feature upstream is conditional on the downstream being wide enough to
+    # carry it: MEASURED at widths [5, 6, 2], widening layer 0 gains +0.0080
+    # against +0.0220 downstream, four times worse, because nothing can reach
+    # the output through a width-2 layer. By the time the downstream is wide
+    # enough to use those features, widening layer 0 costs 5 + h2 and is no
+    # longer cheap -- so a funnel is unreachable one layer at a time, however
+    # good a funnel might be.
+    indices: tuple[int, ...] = ()
 
 
 def expansion_value(

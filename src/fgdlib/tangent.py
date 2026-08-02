@@ -570,6 +570,17 @@ class FGDApproxConfig:
     # off by default; the knob stays because the horizon probe is the only way
     # measured so far to see a location's value beyond one block.
     growth_where_lookahead: int = 1
+    # Score JOINT proposals too: widen a layer and the one after it in a
+    # single event, priced as one purchase. Without this the first hidden
+    # layer never gets its moment -- MEASURED at widths [5, 6, 2] it gains
+    # +0.0080 against +0.0220 downstream because nothing reaches the output
+    # through a width-2 layer, and once the downstream is wide enough to use
+    # its features it costs 5 + h2 and is no longer cheap. Funnels are
+    # therefore unreachable one layer at a time, and the exhaustive per-shape
+    # lr grid says funnels are exactly what wins here: 4-19-13-13-1 reaches
+    # 0.9250 with 551 parameters where the grown 4-16-17-17-1 reaches 0.9135
+    # with 693.
+    growth_where_joint: bool = False
     # Let capacity MOVE, not just accumulate. A unit whose removal shifts f by
     # less than growth_preservation_tolerance is as function-preserving to drop
     # as it was to add, so no new constant is needed: the config already says
