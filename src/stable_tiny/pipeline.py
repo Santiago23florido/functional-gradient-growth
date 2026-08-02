@@ -2174,7 +2174,22 @@ def _wake_dormant_outgoing_weights(model: GrowingMLP, scale: float) -> None:
                 continue
             dormant = weight.abs().sum(dim=0) == 0
             if bool(dormant.any()):
-                weight[:, dormant] = scale
+                # Distinct directions, not one shared value. Assigning the
+                # SAME scalar to every dormant column makes the new neurons'
+                # outgoing weights identical, so their Jacobian columns are
+                # collinear: that trades the "all zero" degeneracy for an
+                # "all equal" one of rank 1. It is why a k-block lookahead
+                # measured barely more than a single block -- the horizon it
+                # probed spanned one direction, not k.
+                generator = torch.Generator(device="cpu").manual_seed(
+                    int(dormant.sum()) * 1000 + int(weight.shape[0])
+                )
+                noise = torch.randn(
+                    (weight.shape[0], int(dormant.sum())),
+                    generator=generator,
+                ).to(weight.device, weight.dtype)
+                noise = noise / noise.norm(dim=0, keepdim=True).clamp_min(1e-12)
+                weight[:, dormant] = scale * noise
 
 
 def _prune_negligible_units(
