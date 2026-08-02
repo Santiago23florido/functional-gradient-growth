@@ -545,6 +545,24 @@ class FGDApproxConfig:
     #: so function preservation and every certificate are untouched. 0
     #: disables it and restores dormant scoring.
     growth_where_wake_scale: float = 1e-3
+    # Score a candidate by what the LADDER can do with it, not by what it does
+    # at insertion. The ladder fits a disposable clone toward the functional
+    # target f - eta * r, and because growth is function-preserving that target
+    # is IDENTICAL whether it is computed from the base or from any grown
+    # candidate -- so every candidate chases the same fixed blank and the
+    # comparison needs no separately trained control. (An earlier attempt
+    # compared a TRAINED clone against an UNTRAINED base, which is why every
+    # gain came out negative: the ladder's own step raises eps 0.4497 ->
+    # 0.4806.)
+    growth_where_ladder_score: bool = False
+    growth_where_ladder_steps: int = 1
+    # How many neuron-blocks to put in when SCORING a location, and -- when the
+    # location wins -- to actually buy. Scoring one block is myopic: a layer
+    # that is a poor buy for one neuron can be the best buy for three, and that
+    # is invisible to a one-block probe. Because the winner is committed with
+    # the same horizon it was measured over, the WHERE and the HOW MUCH stop
+    # being two separate rules measured on two different quantities.
+    growth_where_lookahead: int = 1
     # ROUGHNESS PENALTY -- the RIGHT regulariser, in the function-space norm.
     # functional_tikhonov above penalises ||f||^2 (magnitude), which shrinks f
     # toward 0 but still lets it memorise a shrunk copy. This penalises

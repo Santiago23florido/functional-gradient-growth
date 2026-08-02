@@ -5907,6 +5907,83 @@ def run_pipeline(
                             except RuntimeError:
                                 return None
 
+                        def _ladder_residual(
+                            trial: GrowingMLP,
+                        ) -> float | None:
+                            """How close the LADDER can bring this candidate
+                            to the functional target it is already chasing.
+
+                            Growth is function-preserving, so f -- and with it
+                            the target f - eta * r -- is the same for the base
+                            and for every candidate. All candidates therefore
+                            aim at one fixed blank, which is what makes the
+                            scores comparable without training a separate
+                            control.
+                            """
+                            if fgd_train_probe is None:
+                                return None
+                            _pd = config.parametric_descent
+                            try:
+                                _rate = float(
+                                    _pd.functional_learning_rates[0]
+                                )
+                            except (AttributeError, IndexError, TypeError):
+                                return None
+                            _batches = [
+                                (
+                                    fgd_train_probe[0].to(device),
+                                    fgd_train_probe[1].to(device),
+                                )
+                            ]
+                            _trained = _train_parametric_gd_candidate(
+                                base_model=trial,
+                                train_batches=_batches,
+                                device=device,
+                                functional_learning_rate=_rate,
+                                steps=max(
+                                    1,
+                                    int(
+                                        getattr(
+                                            config.fgd_approx,
+                                            "growth_where_ladder_steps",
+                                            1,
+                                        )
+                                    ),
+                                ),
+                                config=_pd,
+                                functional_loss=(
+                                    config.fgd_approx.functional_loss
+                                ),
+                            )
+                            if _trained is None:
+                                return None
+                            _x, _y = _batches[0]
+                            with torch.no_grad():
+                                _f = trial(_x)
+                                _target = _f - _rate * functional_gradient(
+                                    _f, _y, config.fgd_approx.functional_loss
+                                )
+                                # Report the FRACTION of the wanted functional
+                                # move the ladder could not achieve. Since
+                                # f - target = eta * g, this is
+                                # ||trained - target|| / ||f - target||, which
+                                # is eps's own meaning and eps's own scale --
+                                # a raw MSE is not, and feeding one to a ranker
+                                # and a threshold that both speak eps is what
+                                # made this score produce 0-2 growth events.
+                                _num = float(
+                                    torch.linalg.vector_norm(
+                                        _trained(_x) - _target
+                                    )
+                                )
+                                _den = float(
+                                    torch.linalg.vector_norm(_f - _target)
+                                )
+                            if _den <= 0.0:
+                                return None
+                            _res = _num / _den
+                            return _res if math.isfinite(_res) else None
+
                         def _score_for(trial: GrowingMLP) -> float | None:
                             if where_mode != "certified_gain":
                                 return _certificate_for(trial)
@@ -5945,6 +6022,19 @@ def run_pipeline(
                                 _wake_dormant_outgoing_weights(trial, scale)
                             return _train_epsilon(trial)
 
+                        def _rank_score(trial: GrowingMLP) -> float | None:
+                            """Score used to RANK where to grow.
+
+                            Identical to _score_for unless the ladder score is
+                            switched on, so the default path is unchanged.
+                            """
+                            if where_mode == "certified_gain" and getattr(
+                                config.fgd_approx,
+                                "growth_where_ladder_score",
+                                False,
+                            ):
+                                return _ladder_residual(trial)
+                            return _score_for(trial)
                         for candidate_layer in growable:
                             trial = copy.deepcopy(model)
                             try:
@@ -5980,17 +6070,64 @@ def run_pipeline(
                                         f"could not be built: {error}"
                                     )
                                 continue
+                            # Lookahead: measure this location over a
+                            # HORIZON, not at a single block. The extra blocks
+                            # go in the same way -- function-preserving, same
+                            # tolerance -- so the trial stays a legal model,
+                            # and it is this same trial that gets committed if
+                            # the location wins, so the investment that was
+                            # measured is the investment that is made.
+                            _look = int(
+                                getattr(
+                                    config.fgd_approx,
+                                    "growth_where_lookahead",
+                                    1,
+                                )
+                            )
+                            # SEE the horizon, BUY one block. Committing the
+                            # whole horizon triples the spend for a worse mean
+                            # (MEASURED: 0.925/0.908/0.874 at 1697/1348/1733,
+                            # against 0.947/0.929/0.854 at 693/819/392), so
+                            # the horizon informs WHERE while the pace stays
+                            # exactly as it was. The scored model is a
+                            # throwaway; `trial` -- one block -- is what gets
+                            # committed if this location wins.
+                            _probe = trial
+                            if where_mode == "certified_gain" and _look > 1:
+                                _probe = copy.deepcopy(trial)
+                                for _ in range(_look - 1):
+                                    try:
+                                        grow_layer(
+                                            model=_probe,
+                                            train_loader=train_loader,
+                                            layer_index=candidate_layer,
+                                            device=device,
+                                            line_search_config=(
+                                                config.scaling_line_search
+                                            ),
+                                            optimal_update_kwargs=(
+                                                unified_kwargs
+                                            ),
+                                            progress=None,
+                                            function_preserving=True,
+                                            preservation_tolerance=(
+                                                config.fgd_approx
+                                                .growth_preservation_tolerance
+                                            ),
+                                        )
+                                    except RuntimeError:
+                                        break
                             trials[("width", candidate_layer)] = trial
                             candidates.append(
                                 Candidate(
                                     kind="width",
                                     index=candidate_layer,
                                     cost=max(
-                                        count_parameters(trial)
+                                        count_parameters(_probe)
                                         - base_parameters,
                                         1,
                                     ),
-                                    relative_error_after=_score_for(trial),
+                                    relative_error_after=_rank_score(_probe),
                                     relieves_rank_ceiling=(
                                         candidate_layer in bottlenecks
                                     ),
@@ -6032,7 +6169,7 @@ def run_pipeline(
                             # The base eps must come from the SAME probe the
                             # candidates were scored on, or the gain is a
                             # difference between two different certificates.
-                            base_train_eps = _train_epsilon(model)
+                            base_train_eps = _rank_score(model)
                             if base_train_eps is None or not math.isfinite(
                                 base_train_eps
                             ):
