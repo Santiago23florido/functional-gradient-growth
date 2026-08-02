@@ -562,6 +562,13 @@ class FGDApproxConfig:
     # is invisible to a one-block probe. Because the winner is committed with
     # the same horizon it was measured over, the WHERE and the HOW MUCH stop
     # being two separate rules measured on two different quantities.
+    # MEASURED AND REFUTED as a better WHERE. It looked like a win at free
+    # budget -- it lifted the worst seed 0.854 -> 0.903 and collapsed the
+    # spread -- but that was a difference in SPEND, not in placement. Capped at
+    # 460 parameters so both rules get the same money, it loses on all four
+    # seeds: 0.830 mean against 0.872 for the shipped rank_ceiling rule. Left
+    # off by default; the knob stays because the horizon probe is the only way
+    # measured so far to see a location's value beyond one block.
     growth_where_lookahead: int = 1
     # Let capacity MOVE, not just accumulate. A unit whose removal shifts f by
     # less than growth_preservation_tolerance is as function-preserving to drop
@@ -874,6 +881,22 @@ class FGDApproxConfig:
     # parameters, structural growth is suppressed and the flow keeps
     # training the fixed structure through the certified families. None
     # means no cap. Keeps a grow-and-train run inside a target budget.
+    # MEASURED on N=1024 (4 model seeds, train_seed fixed): free growth
+    # OVERSHOOTS. The accuracy/parameter frontier of the shipped rule is
+    #
+    #   cap 460 -> 0.872 at 467p     cap 650 -> 0.911 at 641p
+    #   cap 550 -> 0.897 at 564p     cap 750 -> 0.918 at 671p
+    #   free    -> 0.920 at 774p
+    #
+    # so 750 buys the same accuracy as free growth for 13% fewer parameters.
+    # The cap does not even bind on most seeds (588p and 659p runs are
+    # untouched); it only stops the one seed that would run to 1074p for 0.907,
+    # which lands at 756p for 0.903 instead.
+    #
+    # It also locates where this method is worth using: against conventional
+    # AdamW it is +3.5 points at ~670p (0.918 vs ~0.88) but only TIED at ~450p
+    # (0.872 vs 0.876). Below roughly 550 parameters the certified step buys
+    # nothing over ordinary training.
     max_total_parameters: int | None = None
     # Structure-burst patience: the growth probe runs only after this many
     # CONSECUTIVE epochs in which no family committed a step. With a value
