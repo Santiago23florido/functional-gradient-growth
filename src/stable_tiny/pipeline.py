@@ -6220,6 +6220,24 @@ def run_pipeline(
                                 # rule. MEASURED at target 0.30: 0.893 mean at
                                 # 761 parameters, i.e. the reference's budget
                                 # for less accuracy.
+                                # MEASURED AND REFUTED: buying at EVERY
+                                # location whose gain clears the ranker's
+                                # admission floor, to raise the pace. It does
+                                # raise it -- seed 2 goes 392 -> 1143
+                                # parameters -- but accuracy only moves 0.854
+                                # -> 0.878 while the two good seeds DEGRADE
+                                # (0.947 -> 0.925, 0.929 -> 0.895) and mean
+                                # parameters reach 1190 against the
+                                # reference's 774. It also refutes the
+                                # "seed 2 is merely undersized" reading: at
+                                # nearly double the reference's parameters it
+                                # still trails the reference's 0.933 at 659,
+                                # and 0.878 is about what an AdamW grid gives
+                                # at that size, i.e. on that seed the
+                                # certified step stops contributing the ~5
+                                # points it contributes on the others. That is
+                                # a separate pathology; more capacity does not
+                                # buy it back.
                                 _rival_rate = None
                                 if where_mode == "certified_gain" and (
                                     len(ranked) > 1
