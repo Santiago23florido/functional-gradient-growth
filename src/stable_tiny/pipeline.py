@@ -58,7 +58,10 @@ from fgdlib.rkhs import (
 )
 from fgdlib.gromo_setup import ensure_gromo_importable
 from fgdlib.profile import fallback, increment
-from fgdlib.search.certify import exact_relative_error, grow_until_certified
+from fgdlib.search.certify import (
+    exact_relative_error,
+    grow_until_certified,
+)
 from fgdlib.search.families import certify_parametric_step
 from fgdlib.search.depth import insert_identity_layer
 from fgdlib.search.unified import (
@@ -2147,6 +2150,31 @@ def _measure_secant_projection(
     cosine = dot / math.sqrt(delta_sq * target_sq)
     eta_star = dot / target_sq
     return cosine, eta_star
+
+
+
+def _wake_dormant_outgoing_weights(model: GrowingMLP, scale: float) -> None:
+    """Break the w = 0 degeneracy on a DISPOSABLE scoring clone.
+
+    A function-preserving neuron enters with its outgoing weight at zero, so
+    df/d(its incoming weights) = 0 and those Jacobian columns are identically
+    zero. Scoring there measures the neuron at its most useless moment, and
+    unevenly: the closer the layer sits to a narrow output, the fewer live
+    columns it has. Nudging the exactly-zero outgoing weights to `scale`
+    activates the latent columns while leaving f, and therefore the residual,
+    essentially unchanged.
+
+    Only ever called on a clone that is thrown away after scoring.
+    """
+    with torch.no_grad():
+        for layer in getattr(model, "layers", []):
+            inner = getattr(layer, "layer", None)
+            weight = getattr(inner, "weight", None)
+            if weight is None or weight.ndim != 2:
+                continue
+            dormant = weight.abs().sum(dim=0) == 0
+            if bool(dormant.any()):
+                weight[:, dormant] = scale
 
 
 def _train_parametric_gd_candidate(
@@ -5738,9 +5766,20 @@ def run_pipeline(
                         free_shape = getattr(
                             config.fgd_approx, "growth_free_shape", False
                         )
+                        # The filter and the levelling are separable, and
+                        # they do different jobs. The filter protects the
+                        # location a pure value ranking STARVES -- MEASURED,
+                        # free shape drives the last hidden layer to width 2-4
+                        # because a neuron there costs h2+2 and adds a single
+                        # tangent direction, so it never wins on price even
+                        # though the structure needs it. Its benefit is
+                        # indirect: it raises the ceiling for later purchases
+                        # elsewhere, which immediate eps cannot see. The
+                        # levelling is what forces h,h,h+1. Keep the first,
+                        # drop the second.
                         bottlenecks = (
                             set()
-                            if free_shape or where_mode == "certified_gain"
+                            if free_shape
                             else set(rank_limiting_locations(widths))
                         )
                         ceiling_binds_precheck = (
@@ -5869,9 +5908,42 @@ def run_pipeline(
                                 return None
 
                         def _score_for(trial: GrowingMLP) -> float | None:
-                            if where_mode == "certified_gain":
-                                return _train_epsilon(trial)
-                            return _certificate_for(trial)
+                            if where_mode != "certified_gain":
+                                return _certificate_for(trial)
+                            # Score the candidate AWAKE, not dormant, WITHOUT
+                            # moving the target. Function-preserving growth
+                            # enters the neuron with outgoing weight w = 0,
+                            # which zeroes the derivative of ALL its incoming
+                            # weights: the columns exist but are identically
+                            # zero, so at insertion the neuron contributes one
+                            # direction instead of fan_in + 1 + fan_out.
+                            # MEASURED, rank(J) goes 211 -> 600 once w leaves
+                            # zero. The bias is UNEVEN -- a neuron next to the
+                            # 1-d output adds a single dormant direction and can
+                            # never win on price, which is what drove the last
+                            # hidden layer to width 2-4 -- so the rank cap was
+                            # patching a measurement defect, not an
+                            # architectural fact.
+                            #
+                            # Training the clone to wake it does NOT isolate
+                            # this: it moves f, hence r, so eps is compared
+                            # against a different target and every gain comes
+                            # out negative (MEASURED: the ladder's own step
+                            # raises eps 0.4497 -> 0.4806, and scoring that way
+                            # produced zero growth events). Perturbing w
+                            # instead breaks the degeneracy while leaving the
+                            # residual essentially fixed, and the clone is
+                            # discarded either way -- no certificate sees it.
+                            scale = float(
+                                getattr(
+                                    config.fgd_approx,
+                                    "growth_where_wake_scale",
+                                    1e-3,
+                                )
+                            )
+                            if scale > 0.0:
+                                _wake_dormant_outgoing_weights(trial, scale)
+                            return _train_epsilon(trial)
 
                         for candidate_layer in growable:
                             trial = copy.deepcopy(model)
@@ -5985,8 +6057,17 @@ def run_pipeline(
                                     rank_ceiling_binds=ceiling_binds,
                                 )
                             else:
+                                _pool = candidates
+                                if ceiling_binds:
+                                    _binding = [
+                                        c
+                                        for c in candidates
+                                        if c.relieves_rank_ceiling
+                                    ]
+                                    if _binding:
+                                        _pool = _binding
                                 ranked = rank_candidates_by_certified_gain(
-                                    candidates,
+                                    _pool,
                                     relative_error_before=base_train_eps,
                                     gradient_sq_norm=(
                                         validation_certificate.gradient_sq_norm
@@ -6109,6 +6190,15 @@ def run_pipeline(
                                     or where_mode == "certified_gain"
                                 )
                             ):
+                                # The burst buys while the target is unmet.
+                                # Under certified_gain that target is
+                                # certify_growth_target when set, so the
+                                # aspiration -- not the certificate -- sets the
+                                # pace. MEASURED without it, a seed whose first
+                                # purchase already lands under 0.5 never bursts
+                                # at all (seed 2: 0 bursts, 241 parameters,
+                                # 0.611) while a seed landing above it bursts 6
+                                # times (seed 1: 602 parameters, 0.900).
                                 _thr = config.fgd_approx.rel_error_threshold
                                 _min_gain = float(
                                     getattr(
@@ -6117,9 +6207,45 @@ def run_pipeline(
                                         0.1,
                                     )
                                 )
+                                # HOW MUCH, without a target and without a
+                                # constant. "Keep buying here while HERE is
+                                # still the best place to spend": the runner-up
+                                # of this event's own ranking is the reference,
+                                # so the scale is the problem's own and
+                                # recalibrates every event. A target instead
+                                # (certify_growth_target driving the burst) was
+                                # tried and rejected -- it works only if you
+                                # already know where the problem ends, and it
+                                # tuned this dataset rather than solving the
+                                # rule. MEASURED at target 0.30: 0.893 mean at
+                                # 761 parameters, i.e. the reference's budget
+                                # for less accuracy.
+                                _rival_rate = None
+                                if where_mode == "certified_gain" and (
+                                    len(ranked) > 1
+                                ):
+                                    _rival = ranked[1]
+                                    _rival_gain = (
+                                        base_train_eps - _rival.relative_error_after
+                                    )
+                                    _rival_rate = _rival_gain / max(
+                                        float(_rival.cost), 1.0
+                                    )
                                 _eps_now = chosen.relative_error_after
                                 _added = 0
-                                while _eps_now is not None and _eps_now >= _thr:
+                                # MEASURED AND REFUTED: letting the burst
+                                # RELOCATE to whichever location currently
+                                # rates best (instead of ending the event) and
+                                # stopping on decay relative to the event's
+                                # opening rate. A relocation commits nothing --
+                                # it discards the trial and re-loops -- so
+                                # events cost more and buy less: 0.915/0.392/
+                                # 0.917 at 631/102/1220 parameters, against
+                                # 0.947/0.929/0.854 at 693/819/392 for ending
+                                # the event and re-ranking at the next one.
+                                while _eps_now is not None and (
+                                    _eps_now >= _thr or _rival_rate is not None
+                                ):
                                     _trial = copy.deepcopy(model)
                                     try:
                                         grow_layer(
@@ -6144,7 +6270,63 @@ def run_pipeline(
                                     if _trial_eps is None:
                                         break
                                     _gain = _eps_now - _trial_eps
-                                    if not (
+                                    if _rival_rate is not None:
+                                        # Keep buying here while HERE is still
+                                        # the best place to spend, re-measuring
+                                        # the alternatives after every
+                                        # increment. Comparing against the
+                                        # runner-up's rate from BEFORE the
+                                        # purchase is stale: MEASURED, a seed
+                                        # whose single purchases are very
+                                        # effective (eps 1.072 -> 0.477) stops
+                                        # after one and ends at 31 neurons
+                                        # where the others reach 51.
+                                        _rate = _gain / max(
+                                            float(chosen.cost), 1.0
+                                        )
+                                        _still_best = True
+                                        for _other in growable:
+                                            if _other == chosen.index:
+                                                continue
+                                            _alt = copy.deepcopy(model)
+                                            try:
+                                                grow_layer(
+                                                    model=_alt,
+                                                    train_loader=train_loader,
+                                                    layer_index=_other,
+                                                    device=device,
+                                                    line_search_config=(
+                                                        config.scaling_line_search
+                                                    ),
+                                                    optimal_update_kwargs=(
+                                                        unified_kwargs
+                                                    ),
+                                                    progress=None,
+                                                    function_preserving=True,
+                                                    preservation_tolerance=(
+                                                        config.fgd_approx
+                                                        .growth_preservation_tolerance
+                                                    ),
+                                                )
+                                            except RuntimeError:
+                                                continue
+                                            _alt_eps = _score_for(_alt)
+                                            if _alt_eps is None:
+                                                continue
+                                            _alt_cost = max(
+                                                count_parameters(_alt)
+                                                - count_parameters(model),
+                                                1,
+                                            )
+                                            _alt_rate = (
+                                                _eps_now - _alt_eps
+                                            ) / float(_alt_cost)
+                                            if _alt_rate >= _rate:
+                                                _still_best = False
+                                                break
+                                        if not _still_best:
+                                            break
+                                    elif not (
                                         _gain
                                         > _min_gain * max(_eps_now - _thr, 1e-6)
                                     ):

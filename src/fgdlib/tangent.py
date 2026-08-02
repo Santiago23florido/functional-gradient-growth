@@ -540,6 +540,11 @@ class FGDApproxConfig:
     #: This is the HOW MUCH replacement; without it growth is one neuron per
     #: epoch and cannot reach the reference's widths in its epoch budget.
     growth_where_burst: bool = True
+    #: Magnitude used to break the w = 0 degeneracy when SCORING a candidate.
+    #: Only ever applied to a disposable clone, never to the committed model,
+    #: so function preservation and every certificate are untouched. 0
+    #: disables it and restores dormant scoring.
+    growth_where_wake_scale: float = 1e-3
     # ROUGHNESS PENALTY -- the RIGHT regulariser, in the function-space norm.
     # functional_tikhonov above penalises ||f||^2 (magnitude), which shrinks f
     # toward 0 but still lets it memorise a shrunk copy. This penalises
