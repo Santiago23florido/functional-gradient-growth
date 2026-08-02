@@ -49,6 +49,7 @@ from fgdlib.tangent import (
 __all__ = [
     "ParametricFamilyResult",
     "certify_parametric_step",
+    "certify_parametric_step_swept",
     "family_lemma35_rate",
 ]
 
@@ -100,6 +101,9 @@ class ParametricFamilyResult:
     certified: bool
     #: The stepped model when certified (the trained clone), else ``None``.
     model: object | None
+    #: The eta_f whose target produced this displacement. Only interesting
+    #: under the sweep, where it says WHICH distance certified.
+    functional_learning_rate: float | None = None
 
 
 def certify_parametric_step(
@@ -124,7 +128,9 @@ def certify_parametric_step(
     """
     threshold = min(config.rel_error_threshold, 0.5)
     if config.functional_loss != "mse":
-        return ParametricFamilyResult(float("inf"), 0.0, False, None)
+        return ParametricFamilyResult(
+            float("inf"), 0.0, False, None, functional_learning_rate
+        )
 
     was_training = model.training
     model.eval()
@@ -177,7 +183,9 @@ def certify_parametric_step(
             optimizer.zero_grad()
             loss = ((clone(x) - target) ** 2).sum()
             if not torch.isfinite(loss):
-                return ParametricFamilyResult(float("inf"), 0.0, False, None)
+                return ParametricFamilyResult(
+            float("inf"), 0.0, False, None, functional_learning_rate
+        )
             loss.backward()
             optimizer.step()
             if plateau_stop and (step + 1) % check_every == 0:
@@ -202,7 +210,9 @@ def certify_parametric_step(
     displacement_norm = float(torch.linalg.vector_norm(displacement))
     residual_norm = float(torch.linalg.vector_norm(r))
     if not (displacement_norm > 0.0 and residual_norm > 0.0):
-        return ParametricFamilyResult(float("inf"), 0.0, False, None)
+        return ParametricFamilyResult(
+            float("inf"), 0.0, False, None, functional_learning_rate
+        )
 
     cosine = float(
         torch.sum(displacement * r) / (displacement_norm * residual_norm)
@@ -236,4 +246,78 @@ def certify_parametric_step(
         cosine=cosine,
         certified=certified,
         model=clone if certified else None,
+        functional_learning_rate=functional_learning_rate,
     )
+
+
+def certify_parametric_step_swept(
+    model,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    config: FGDApproxConfig,
+    functional_learning_rates,
+    inner_steps: int = 500,
+    inner_learning_rate: float = 0.003,
+    progress=None,
+) -> ParametricFamilyResult:
+    """Try several functional step sizes; keep the FIRST that certifies.
+
+    ``certify_parametric_step`` asks one question -- "can a clone realise the
+    target ``f - eta_f r`` well enough to certify?" -- at one ``eta_f``. A "no"
+    there is not a statement about the family, it is a statement about that
+    distance, and the ladder was recording it as the former. ``parametric_gd``
+    has always walked a list of functional rates for exactly this reason; the
+    tangent ladder never did.
+
+    More search at the SAME bar. Each ``eta_f`` is certified independently by
+    ``certify_parametric_step``, which measures that candidate's own
+    ``RelErr(Delta, r)`` on the same probe against the same
+    ``min(rel_error_threshold, 1/2)``. Nothing is relaxed, nothing is shared
+    between candidates, and a swept run only ever accepts steps a single-eta
+    run would also have accepted had it happened to try that value.
+
+    The candidates are walked in the order given -- largest first is the
+    intended use, so the accepted step is the LONGEST certified one -- and the
+    walk stops at the first certificate, so a run that certifies at the head
+    of the list costs exactly what it costs today.
+
+    Returns the certified result, or the LAST failure when none certifies (the
+    caller only needs ``certified``; the last failure is kept so the reported
+    ``relative_error`` belongs to a real attempt rather than a sentinel).
+    """
+    rates = tuple(float(rate) for rate in functional_learning_rates or ())
+    if not rates:
+        return certify_parametric_step(
+            model,
+            x,
+            y,
+            config,
+            functional_learning_rate=config.certify_family_functional_lr,
+            inner_steps=inner_steps,
+            inner_learning_rate=inner_learning_rate,
+        )
+
+    result = None
+    for rate in rates:
+        result = certify_parametric_step(
+            model,
+            x,
+            y,
+            config,
+            functional_learning_rate=rate,
+            inner_steps=inner_steps,
+            inner_learning_rate=inner_learning_rate,
+        )
+        if result.certified:
+            if progress is not None:
+                progress(
+                    f"[FAMILY] eta_f={rate:g} certified "
+                    f"(cos {result.cosine:.4f}, eps {result.relative_error:.4f})"
+                )
+            return result
+        if progress is not None:
+            progress(
+                f"[FAMILY] eta_f={rate:g} did not certify "
+                f"(cos {result.cosine:.4f}, eps {result.relative_error:.4f})"
+            )
+    return result

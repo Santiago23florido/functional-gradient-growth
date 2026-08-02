@@ -424,6 +424,55 @@ class FGDApproxConfig:
     certify_family_inner_steps: int = 400
     certify_family_inner_learning_rate: float = 0.01
     certify_family_functional_lr: float = 1.0
+    # SWEEP the family's functional step instead of trying one eta_f. The
+    # tangent family is the only one in family_order, and its ladder call site
+    # passed certify_family_functional_lr as a single value -- unlike
+    # parametric_gd, which declares functional_learning_rates and walks them.
+    # One eta_f is one attempt at a target the clone may simply be unable to
+    # realise, and a failure there is recorded as "the family cannot certify
+    # here" when it only means "not at that distance".
+    #
+    # The search is bounded from BOTH ends by the method itself, which is why
+    # it is a search and not a knob. Too large and the target f - eta_f r sits
+    # off the reachable manifold, so the realised Delta misaligns and the
+    # cosine bar sqrt(3)/2 fails. Too small and Delta collapses onto the
+    # first-order term, i.e. onto the tangent projection, whose eps is >= 1/2
+    # -- that is why the ladder was reached at all -- so it fails too. The
+    # ladder cannot degenerate into "certify everything with a tiny step".
+    #
+    # First certificate wins. NOTHING is weakened -- every candidate faces the
+    # same RelErr(Delta, r) < min(rel_error_threshold, 1/2) on the same probe.
+    # Empty () keeps the single-eta behaviour bit-identical.
+    #
+    # THE DIRECTION MATTERS, and it is UP. MEASURED on N=1024, 4 seeds, capped
+    # at 600 parameters:
+    #
+    #   baseline (eta_f = 1 alone)     0.941 0.830 0.904 0.925  mean 0.9000
+    #   descending [1, .5, .25, .125]  0.893 0.807 0.904 0.925  mean 0.8823
+    #   ascending  [1, 2, 4, 8]        0.941 0.887 0.931 0.933  mean 0.9230
+    #
+    # Descending LOSES, and structurally rather than by noise: a small eta_f
+    # certifies a SMALL step, and a certified family step returns from
+    # grow_until_certified at once, so it buys a growth deferral without
+    # progress -- exactly what certify_family_min_gain is for, and it is 0
+    # here. It is also self-limiting in the other direction: as eta_f -> 0 the
+    # realised Delta collapses onto the first-order term, i.e. onto the
+    # tangent projection, whose eps is >= 1/2 -- which is why the ladder was
+    # reached at all. MEASURED cos(Delta, r) at one call: 0.7871 / 0.7955 /
+    # 0.7594 / 0.7481 for eta_f 1 / 0.5 / 0.25 / 0.125, decaying toward the
+    # tangent's own.
+    #
+    # Ascending asks the clone for MORE curvature, and it pays. Note how
+    # little of it is needed: across all four seeds only 4 steps certified
+    # above eta_f = 1 (eta_f = 2 three times, eta_f = 4 once, eta_f = 8
+    # never). The gain compounds instead -- one early rescue changes the whole
+    # trajectory, and the seed that was stuck goes from 2 family
+    # certifications to 6, of which only one came from eta_f > 1.
+    #
+    # Head first, so eta_f = 1 stays the preferred distance and a run that
+    # certifies there is bit-identical to today, at today's cost; the ladder
+    # escalates ONLY where the single-eta call would have grown instead.
+    certify_family_functional_lrs: tuple[float, ...] = ()
     # Cheapen the family clone WITHOUT changing the step it produces: stop the
     # inner training once its alignment with the residual (cos(Delta, r)) has
     # genuinely PLATEAUED -- no improvement above plateau_tol for a few checks.

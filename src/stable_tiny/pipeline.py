@@ -62,7 +62,7 @@ from fgdlib.search.certify import (
     exact_relative_error,
     grow_until_certified,
 )
-from fgdlib.search.families import certify_parametric_step
+from fgdlib.search.families import certify_parametric_step_swept
 from fgdlib.search.depth import insert_identity_layer
 from fgdlib.search.unified import (
     Candidate,
@@ -362,6 +362,12 @@ def _section_dataclass(
     if section_type is FGDApproxConfig and "family_order" in values:
         values["family_order"] = tuple(
             str(value) for value in values["family_order"] or ()
+        )
+
+    if section_type is FGDApproxConfig and "certify_family_functional_lrs" in values:
+        values["certify_family_functional_lrs"] = tuple(
+            float(value)
+            for value in values["certify_family_functional_lrs"] or ()
         )
 
     if section_type in (ParametricGDConfig, ParametricDescentConfig):
@@ -4111,21 +4117,32 @@ def run_pipeline(
                             if config.fgd_approx.certify_family_ladder:
                                 _fp = fgd_train_probe
 
+                                # One eta_f, or a swept list of them. The sweep
+                                # certifies each candidate independently on
+                                # this same probe against the same
+                                # min(rel_error_threshold, 1/2), and stops at
+                                # the first certificate -- more search at an
+                                # unchanged bar, which is the shape of the
+                                # measured gap: on N=1024 the four seeds
+                                # certify the family 12/2/5/8 times and their
+                                # capped accuracies rank 0.941/0.830/0.904/
+                                # 0.925 in exactly that order. An eta_f that
+                                # fails says the clone could not realise THAT
+                                # distance, not that the family is unavailable.
                                 def _family_step(candidate_model):
-                                    return certify_parametric_step(
+                                    return certify_parametric_step_swept(
                                         candidate_model,
                                         _fp[0],
                                         _fp[1],
                                         config.fgd_approx,
-                                        functional_learning_rate=(
-                                            config.fgd_approx.certify_family_functional_lr
-                                        ),
+                                        config.fgd_approx.certify_family_functional_lrs,
                                         inner_steps=(
                                             config.fgd_approx.certify_family_inner_steps
                                         ),
                                         inner_learning_rate=(
                                             config.fgd_approx.certify_family_inner_learning_rate
                                         ),
+                                        progress=progress,
                                     ).model
                             model, certify_result = grow_until_certified(
                                 model=model,
