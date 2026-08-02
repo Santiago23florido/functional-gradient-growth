@@ -57,14 +57,15 @@ from fgdlib.rkhs import (
     KernelDictionaryModel,
 )
 from fgdlib.gromo_setup import ensure_gromo_importable
-from fgdlib.profile import increment
-from fgdlib.search.certify import grow_until_certified
+from fgdlib.profile import fallback, increment
+from fgdlib.search.certify import exact_relative_error, grow_until_certified
 from fgdlib.search.families import certify_parametric_step
 from fgdlib.search.depth import insert_identity_layer
 from fgdlib.search.unified import (
     Candidate,
     bottleneck_relief_target,
     rank_candidates,
+    rank_candidates_by_certified_gain,
     rank_limiting_locations,
 )
 from fgdlib.search.damping import select_projection_damping
@@ -5704,6 +5705,14 @@ def run_pipeline(
                             model, config.data.in_features
                         )
                         base_parameters = count_parameters(model)
+                        # "rank_ceiling" is the shipped path, byte-identical.
+                        # "certified_gain" replaces the levelling, the
+                        # bottleneck filter AND the pace in one go -- see the
+                        # field's comment in tangent.py for why replacing only
+                        # one of the three stalled growth at 53 parameters.
+                        where_mode = getattr(
+                            config.fgd_approx, "growth_where", "rank_ceiling"
+                        )
                         # rank J <= min_l w_l: while a location sits at the
                         # minimum, no purchase elsewhere can raise what the
                         # structure is able to express.
@@ -5731,7 +5740,7 @@ def run_pipeline(
                         )
                         bottlenecks = (
                             set()
-                            if free_shape
+                            if free_shape or where_mode == "certified_gain"
                             else set(rank_limiting_locations(widths))
                         )
                         ceiling_binds_precheck = (
@@ -5747,7 +5756,9 @@ def run_pipeline(
                         # buying one neuron per event merely made each
                         # purchase wait for R1 again.
                         relief = (
-                            None if free_shape else bottleneck_relief_target(widths)
+                            None
+                            if free_shape or where_mode == "certified_gain"
+                            else bottleneck_relief_target(widths)
                         )
                         if (
                             relief is not None
@@ -5833,6 +5844,35 @@ def run_pipeline(
                             )
                             return measured.relative_error
 
+                        # The TRAIN-probe eps, i.e. the same quantity the grow
+                        # loop chases and Lemma 3.5's interval is built from.
+                        # Scoring candidates on validation while the flow
+                        # certifies on train is two certificates driving one
+                        # decision; on the train probe function-preserving
+                        # growth strictly enlarges range(J), so the gain is
+                        # non-negative by certify.py's theorem, whereas on
+                        # validation it is not -- which is exactly what
+                        # expansion_value's max(..., 0) was clamping away.
+                        # Kept as a single seam so the exact block-Schur fast
+                        # path can be adopted here later behind its own flag.
+                        def _train_epsilon(trial: GrowingMLP) -> float | None:
+                            if fgd_train_probe is None:
+                                return None
+                            try:
+                                return exact_relative_error(
+                                    trial,
+                                    fgd_train_probe[0],
+                                    fgd_train_probe[1],
+                                    config.fgd_approx,
+                                )
+                            except RuntimeError:
+                                return None
+
+                        def _score_for(trial: GrowingMLP) -> float | None:
+                            if where_mode == "certified_gain":
+                                return _train_epsilon(trial)
+                            return _certificate_for(trial)
+
                         for candidate_layer in growable:
                             trial = copy.deepcopy(model)
                             try:
@@ -5878,7 +5918,7 @@ def run_pipeline(
                                         - base_parameters,
                                         1,
                                     ),
-                                    relative_error_after=_certificate_for(trial),
+                                    relative_error_after=_score_for(trial),
                                     relieves_rank_ceiling=(
                                         candidate_layer in bottlenecks
                                     ),
@@ -5903,23 +5943,77 @@ def run_pipeline(
                                         - base_parameters,
                                         1,
                                     ),
-                                    relative_error_after=_certificate_for(trial),
+                                    relative_error_after=_score_for(trial),
                                 )
                             )
 
-                        ranked = rank_candidates(
-                            candidates,
-                            relative_error_before=(
-                                validation_certificate.relative_error
-                            ),
-                            gradient_sq_norm=(
-                                validation_certificate.gradient_sq_norm
-                            ),
-                            statistical_threshold=(
-                                config.fgd_approx.tiny_statistical_threshold
-                            ),
-                            rank_ceiling_binds=ceiling_binds,
-                        )
+                        if where_mode == "certified_gain":
+                            # The base eps must come from the SAME probe the
+                            # candidates were scored on, or the gain is a
+                            # difference between two different certificates.
+                            base_train_eps = _train_epsilon(model)
+                            if base_train_eps is None or not math.isfinite(
+                                base_train_eps
+                            ):
+                                # Degenerate base: fall through to the shipped
+                                # rule for THIS event rather than rank on a
+                                # quantity that does not exist.
+                                fallback(
+                                    "growth_where_base_unavailable",
+                                    "train_epsilon_unavailable",
+                                )
+                                ranked = rank_candidates(
+                                    candidates,
+                                    relative_error_before=(
+                                        validation_certificate.relative_error
+                                    ),
+                                    gradient_sq_norm=(
+                                        validation_certificate.gradient_sq_norm
+                                    ),
+                                    statistical_threshold=(
+                                        config.fgd_approx.tiny_statistical_threshold
+                                    ),
+                                    rank_ceiling_binds=ceiling_binds,
+                                )
+                            else:
+                                ranked = rank_candidates_by_certified_gain(
+                                    candidates,
+                                    relative_error_before=base_train_eps,
+                                    gradient_sq_norm=(
+                                        validation_certificate.gradient_sq_norm
+                                    ),
+                                    cost_exponent=(
+                                        config.fgd_approx.growth_where_cost_exponent
+                                    ),
+                                    min_gain_fraction=(
+                                        config.fgd_approx.growth_where_min_gain_fraction
+                                    ),
+                                    # The clamped form, honoured at this new
+                                    # site too. Numerically identical here
+                                    # (threshold is 0.5) so it cannot perturb
+                                    # the reference.
+                                    certificate_binds=(
+                                        base_train_eps
+                                        >= min(
+                                            config.fgd_approx.rel_error_threshold,
+                                            0.5,
+                                        )
+                                    ),
+                                )
+                        else:
+                            ranked = rank_candidates(
+                                candidates,
+                                relative_error_before=(
+                                    validation_certificate.relative_error
+                                ),
+                                gradient_sq_norm=(
+                                    validation_certificate.gradient_sq_norm
+                                ),
+                                statistical_threshold=(
+                                    config.fgd_approx.tiny_statistical_threshold
+                                ),
+                                rank_ceiling_binds=ceiling_binds,
+                            )
                         if ranked:
                             # R3: buy the best proposal. Re-measuring after
                             # each purchase would be ideal but doubles the
@@ -5945,6 +6039,15 @@ def run_pipeline(
                                     f"{validation_certificate.relative_error:.3f}"
                                     f" -> {chosen.relative_error_after:.3f}); "
                                     f"{len(candidates)} candidates considered"
+                                    + (
+                                        "; widths "
+                                        + "-".join(
+                                            str(int(layer.in_features))
+                                            for layer in model._growable_layers
+                                        )
+                                        if where_mode == "certified_gain"
+                                        else ""
+                                    )
                                 )
                             # ADAPTIVE COUNT: the "re-measuring after each
                             # purchase" ideal the note above defers. While the
@@ -5958,12 +6061,29 @@ def run_pipeline(
                             # certificate condition are preserved; the COUNT is
                             # chosen by the criterion, not fixed. Off by default
                             # (one purchase per event, byte-identical).
-                            if (
+                            # Under certified_gain this block is ALSO the
+                            # pace replacement: the levelling loop it replaces
+                            # bought several neurons per event, and without a
+                            # burst the branch buys exactly one per epoch --
+                            # arithmetically short of the 40 neurons the
+                            # reference reaches in 25 epochs.
+                            _burst_on = (
                                 getattr(
                                     config.fgd_approx,
                                     "certify_adaptive_growth",
                                     False,
                                 )
+                                or (
+                                    where_mode == "certified_gain"
+                                    and getattr(
+                                        config.fgd_approx,
+                                        "growth_where_burst",
+                                        True,
+                                    )
+                                )
+                            )
+                            if (
+                                _burst_on
                                 and chosen.kind == "width"
                                 and ceiling_binds
                             ):
@@ -5998,7 +6118,7 @@ def run_pipeline(
                                         )
                                     except RuntimeError:
                                         break
-                                    _trial_eps = _certificate_for(_trial)
+                                    _trial_eps = _score_for(_trial)
                                     if _trial_eps is None:
                                         break
                                     _gain = _eps_now - _trial_eps

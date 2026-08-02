@@ -70,6 +70,7 @@ PROFILE_FIELDS = (
     "certify_force_suppressed_nonfinite",
     "certify_family_deferral_refused",
     "certify_growth_not_warranted",
+    "growth_where_base_unavailable",
     # certify_growth_target discriminators: how often the best available growth
     # failed the certify_growth_min_gain floor (the loop was chasing a target it
     # cannot reach at a price worth paying), how often max_total_parameters
@@ -153,6 +154,7 @@ _COUNTER_FIELDS = {
     "certify_force_suppressed_nonfinite",
     "certify_family_deferral_refused",
     "certify_growth_not_warranted",
+    "growth_where_base_unavailable",
     "certify_growth_target_stalls",
     "certify_budget_stops",
     "certify_budget_rejected_candidates",
