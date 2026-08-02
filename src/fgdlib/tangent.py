@@ -581,6 +581,21 @@ class FGDApproxConfig:
     # 0.9250 with 551 parameters where the grown 4-16-17-17-1 reaches 0.9135
     # with 693.
     growth_where_joint: bool = False
+    # WHICH PROBE ranks the locations. The certificate, the families and the
+    # ladder are untouched by this: it only decides WHERE capacity goes.
+    #
+    # eps = ||r - g|| / ||r|| on the TRAIN probe asks "which layer lets me
+    # represent the TRAINING gradient best per parameter". That is not the
+    # quantity that decides test accuracy, and MEASURED they diverge: the
+    # shape this criterion grows, 4-16-17-17-1, is the WORST of six under a
+    # per-shape lr grid (0.9135), while 4-19-13-13-1 reaches 0.9250 with 551
+    # parameters. A criterion minimising training-probe representation error
+    # favours the shapes that interpolate soonest, not the ones that
+    # generalise -- and this method is already known to certify by
+    # interpolating the train probe.
+    #
+    # "validation" ranks on the held-out probe, "both" on the mean of the two.
+    growth_where_probe: str = "train"
     # Let capacity MOVE, not just accumulate. A unit whose removal shifts f by
     # less than growth_preservation_tolerance is as function-preserving to drop
     # as it was to add, so no new constant is needed: the config already says

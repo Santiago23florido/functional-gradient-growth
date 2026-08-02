@@ -6118,6 +6118,21 @@ def run_pipeline(
                             )
                             if scale > 0.0:
                                 _wake_dormant_outgoing_weights(trial, scale)
+                            _probe_mode = str(
+                                getattr(
+                                    config.fgd_approx,
+                                    "growth_where_probe",
+                                    "train",
+                                )
+                            )
+                            if _probe_mode == "validation":
+                                return _certificate_for(trial)
+                            if _probe_mode == "both":
+                                _tr = _train_epsilon(trial)
+                                _va = _certificate_for(trial)
+                                if _tr is None or _va is None:
+                                    return _tr if _va is None else _va
+                                return 0.5 * (_tr + _va)
                             return _train_epsilon(trial)
 
                         def _rank_score(trial: GrowingMLP) -> float | None:
