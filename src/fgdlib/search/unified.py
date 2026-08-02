@@ -44,10 +44,15 @@ decides when to start.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
-
-__all__ = ["Candidate", "expansion_value", "rank_candidates"]
+__all__ = [
+    "Candidate",
+    "expansion_value",
+    "rank_candidates",
+    "rank_candidates_by_certified_gain",
+]
 
 
 def rank_limiting_locations(widths: list[int]) -> list[int]:
@@ -224,3 +229,97 @@ def rank_candidates(
     admitted = [item for item in scored if item[0] >= reference]
     admitted.sort(key=lambda item: (-item[0], item[1].kind, item[1].index))
     return [candidate for _, candidate in admitted]
+
+
+def rank_candidates_by_certified_gain(
+    candidates: list[Candidate],
+    *,
+    relative_error_before: float,
+    gradient_sq_norm: float | None,
+    cost_exponent: float = 1.0,
+    min_gain_fraction: float = 0.25,
+    certificate_binds: bool,
+) -> list[Candidate]:
+    """Rank by measured eps reduction per parameter -- no width mandate.
+
+    ``rank_candidates`` above levels the widths: its caller relieves the
+    narrowest location first, its filter keeps only bottleneck candidates
+    while the ceiling binds, and its fallback picks the cheapest of those.
+    Every run therefore lands on ``h, h, h+1``. That rests on
+    ``rank J <= min_l w_l`` (:53), which is FALSE on the exact Jacobian --
+    MEASURED at NK=200, widths (20,3,20) and (30,4,30) both reach rank 200
+    and (2,2,2) reaches 25 = P. The expressivity argument behind it is real
+    (``f`` factors through the narrowest activation), but that is a claim
+    about what widening the narrow layer BUYS, and buying is what the exact
+    scan measures. So the narrowest layer earns preference here rather than
+    receiving it a priori.
+
+    ``relative_error_*`` must come from the TRAIN probe, the same one the
+    grow loop chases and Lemma 3.5's interval is built from. There
+    function-preserving growth strictly enlarges ``range(J)``, so the gain is
+    non-negative by the theorem in ``certify.py``; on the validation probe it
+    is not, which is why the caller used to see it clamped to zero.
+
+    Two guards, in this order, and the order matters:
+
+    * the RAW gain must reach ``min_gain_fraction`` of the best gain on
+      offer, checked BEFORE dividing by cost. Cheap-and-nearly-useless is
+      eliminated before ``1/cost`` can rescue it. MEASURED without it, 11 of
+      12 consecutive purchases went to the last growable location, whose cost
+      ``h2 + 2`` does not grow with its own width and which contributes a
+      single tangent direction.
+    * only then does ``value / cost**cost_exponent`` decide, so the cheaper of
+      two genuinely comparable buys still wins. ``cost_exponent = 0`` collapses
+      this to a pure argmin over eps.
+
+    When nothing gains, the fallback returns the single candidate with the
+    LOWEST measured eps (cost only as a tie-break) provided the certificate
+    still binds -- growth is mandatory there, no step exists at any damping.
+    It cannot return empty while a finite candidate exists, which is the
+    property whose absence stalled the earlier free-shape attempt at 53
+    parameters.
+    """
+    priced = [
+        candidate
+        for candidate in candidates
+        if candidate.relative_error_after is not None
+        and math.isfinite(candidate.relative_error_after)
+    ]
+    if not priced:
+        return []
+
+    gains = {
+        id(candidate): relative_error_before - candidate.relative_error_after
+        for candidate in priced
+    }
+    best_gain = max(gains.values())
+
+    if best_gain <= 0.0:
+        if not certificate_binds:
+            return []
+        return [
+            min(
+                priced,
+                key=lambda c: (c.relative_error_after, c.cost, c.index),
+            )
+        ]
+
+    floor = min_gain_fraction * best_gain
+    admitted = [c for c in priced if gains[id(c)] > 0.0 and gains[id(c)] >= floor]
+    if not admitted:
+        admitted = [c for c in priced if gains[id(c)] == best_gain]
+
+    def _score(candidate: Candidate) -> float:
+        value = expansion_value(
+            relative_error_before=relative_error_before,
+            relative_error_after=candidate.relative_error_after,
+            gradient_sq_norm=gradient_sq_norm,
+        )
+        if value <= 0.0:
+            # gradient_sq_norm is a common positive factor, so falling back to
+            # the raw gain preserves the order when it is unavailable.
+            value = gains[id(candidate)]
+        return value / max(float(candidate.cost), 1.0) ** cost_exponent
+
+    admitted.sort(key=lambda c: (-_score(c), c.kind, c.index))
+    return admitted

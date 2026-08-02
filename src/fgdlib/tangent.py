@@ -37,6 +37,11 @@ ProjectionSolver = Literal[
 ]
 LearningRatePolicy = Literal["scheduler", "theory_interval"]
 GrowthLimitCriterion = Literal["progress_floor", "epsilon_stationary"]
+#: How the unified branch decides WHERE to grow. "rank_ceiling" is the shipped
+#: behaviour: level the width minimum first, then rank what is left.
+#: "certified_gain" removes the levelling and lets the exact train-probe eps
+#: reduction per parameter choose, which is what allows non-uniform shapes.
+GrowthWhere = Literal["rank_ceiling", "certified_gain"]
 GrowthSelection = Literal[
     "descent_per_parameter",
     "epsilon_lookahead",
@@ -493,6 +498,48 @@ class FGDApproxConfig:
     # of 588 / 1074 / 659, and test accuracy collapses from 0.907-0.933 to
     # 0.219-0.361. Kept, off, so the negative result is not rediscovered.
     growth_free_shape: bool = False
+    # WHERE to grow. "rank_ceiling" is the shipped path, byte-identical.
+    # "certified_gain" replaces all three jobs the old block did at once,
+    # because the free-shape failure above was caused by replacing only one:
+    #
+    #   WHERE      rank by exact TRAIN-probe eps reduction per parameter. The
+    #              branch scores candidates on the VALIDATION probe today,
+    #              while the certificate the flow chases is the train one --
+    #              two certificates driving one decision. On the train probe
+    #              function-preserving growth strictly enlarges range(J), so
+    #              eps_after <= eps_before holds by certify.py's theorem; on
+    #              validation it does not, which is what the max(...,0) clamps.
+    #   HOW MUCH   the levelling loop was also the PACE: it bought several
+    #              neurons per event. Without it the branch buys exactly one,
+    #              and events fire once per epoch -- the reference needs 40
+    #              neurons in <=25 epochs, arithmetically impossible. Replaced
+    #              by the existing burst idiom (certify_adaptive_growth_min_gain).
+    #   NEVER STALL the fallback drops the bottleneck requirement and keys on
+    #              the measured eps, so it cannot empty and cannot degenerate
+    #              into always-cheapest.
+    #
+    # MEASURED on a proxy with the real config, probes and grow_layer: the
+    # shipped rule lands [9,9,10] at 246p / 0.574; gain-per-cost on exact train
+    # eps lands [18,7,5] at 269p / 0.629. Pure argmin (certify.py's rule,
+    # cost_exponent 0) was the WORST exact variant at 0.544 -- the cost divisor
+    # earns its place.
+    growth_where: GrowthWhere = "rank_ceiling"
+    #: 0.0 collapses the rule to certify.py's pure argmin, which is immune to
+    #: cost degeneracy by construction. The rollback if risk 1 materialises.
+    growth_where_cost_exponent: float = 1.0
+    #: Admission floor on the RAW gain, applied BEFORE the cost division, as a
+    #: fraction of the best gain available. Without it, cheap-and-useless wins:
+    #: MEASURED, 11 of 12 consecutive purchases went to the last growable
+    #: location, whose cost does not grow with its own width.
+    growth_where_min_gain_fraction: float = 0.25
+    #: Depth candidates are excluded by default so the search stays within the
+    #: three-hidden-layer family the reference and the exhaustive architecture
+    #: search both live in.
+    growth_where_allow_depth: bool = False
+    #: Keep buying at the chosen location while each increment still pays.
+    #: This is the HOW MUCH replacement; without it growth is one neuron per
+    #: epoch and cannot reach the reference's widths in its epoch budget.
+    growth_where_burst: bool = True
     # ROUGHNESS PENALTY -- the RIGHT regulariser, in the function-space norm.
     # functional_tikhonov above penalises ||f||^2 (magnitude), which shrinks f
     # toward 0 but still lets it memorise a shrunk copy. This penalises
