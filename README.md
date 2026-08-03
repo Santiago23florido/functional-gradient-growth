@@ -17,21 +17,71 @@ Answer, measured: **yes — when the data is dense enough that the exact
 empirical optimum coincides with the true function, growth is
 function-preserving, and a ladder of certified families keeps growth cheap.**
 
-### Headline run — `configs/fgd/family_ladder_N1024.yaml` (the default)
+### Headline result — `configs/fgd/family_ladder_N1024.yaml` (the default)
 
 Synthetic regression task (`smooth_sin`, 4 inputs / 1 output), **1024
-training points**, evaluated on **8192 fresh points**:
+training points**, evaluated on **8192 fresh points**, under a **600-parameter
+budget**. Four seeds (`model_seed` 0-3, `train_seed` fixed at 0), 70 epochs:
 
-| metric | value |
-|---|---|
-| **test accuracy** (8192 unseen points) | **0.928** |
-| train / validation / test | 1.000 / 0.923 / 0.928 — small gap |
-| function-preserving growths | 17 |
-| certified family steps | 3 |
-| certified FGD steps | 200 |
+| seed | test accuracy | architecture | parameters |
+|---|---|---|---|
+| 0 | 0.949 | 11-19-16 | 620 |
+| 1 | 0.940 | 12-17-18 | 624 |
+| 2 | 0.927 | 13-19-14 | 626 |
+| 3 | 0.958 | 9-16-22 | 602 |
+| **mean** | **0.9435** | | |
+
+**Every seed clears 0.925 individually**, and the four architectures are
+**different from each other** (width ratios 1.46-2.44) rather than four copies
+of one shape. Reproduced exactly — accuracy *and* architecture to the neuron —
+on a re-run; the pipeline is deterministic.
 
 Train, validation and test rise **together** — the exact certified method
 converges to the underlying function, it does not memorise the sample.
+
+### What decides *where* to grow
+
+The growth location is the layer with the largest **expressivity
+bottleneck**, `activation_gradient · Σ(eigenvalues_extension²)` — TINY's
+extension term: the mass of the desired functional change that falls *outside*
+what the current width can express. It is deliberately **not** TINY's
+`select_best_update`, which adds `parameter_update_decrease` — how much
+re-fitting the *existing* weights would gain, a statement about training
+rather than about width. Under function-preserving growth that decrease is not
+even realised at the instant of growth, so it is used only as a measure of the
+gap between what is wanted and what is reachable, comparing layers at the same
+instant.
+
+Measured against the previous rule at **equal compute** (the control saturates
+at 25 epochs and does not improve by 70):
+
+| growth criterion | mean | architectures |
+|---|---|---|
+| gain-per-parameter of a *step* (`certified_gain`) | 0.9230 | `15-16-15` in 3 of 4 seeds |
+| **expressivity bottleneck** | **0.9435** | 4 distinct, ratios 1.46-2.44 |
+
+The old rule read the *step's* relative error, which **diverges** (0.64 → 114
+on the easy synthetic function, 229 on the hard one) as the damped projection
+recovers less of the residual — while the growth loop's own well-conditioned
+`eps` said 0.15-0.39, i.e. *the structure is more than adequate*. Growth was
+chasing a quantity that had stopped meaning anything: on the easiest
+constructible target the method reached test 1.000 at **74 parameters** and
+grew to **872** anyway, 25 growth events in 25 epochs.
+
+Across data variants at free budget the bottleneck criterion is better *and*
+cheaper on tasks of opposite difficulty: the easy function drops 872 → **460**
+parameters at the same 1.000 accuracy, and the hard one 1123 → **953** while
+accuracy rises 0.313 → **0.424**.
+
+### The family's functional step is swept, upward
+
+The certified family tries several functional step sizes `η_f` instead of one,
+each certified independently by its own `RelErr(Δ, r) < min(threshold, 1/2)`
+on the same probe, stopping at the first certificate — more search at an
+unchanged bar. Direction matters: ascending `[1, 2, 4, 8]` gives **0.9230**
+against **0.9000** for a single `η_f = 1`, while descending `[1, .5, .25,
+.125]` *loses* (0.8823), because a small `η_f` certifies a small step and a
+certified family step defers growth without progress.
 
 ### How the result was reached (each measured)
 
