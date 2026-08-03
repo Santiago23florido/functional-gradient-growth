@@ -575,6 +575,7 @@ def grow_until_certified(
     progress=None,
     family_step=None,
     growth_warranted=None,
+    layer_bottlenecks=None,
 ):
     """Grow until ``eps < certify_growth_target``; return the grown model.
 
@@ -795,6 +796,16 @@ def grow_until_certified(
         # candidate may still sit above the current eps; accepting it is what
         # lets the rank keep climbing, and the loop then relies on the measured
         # trajectory rather than the monotonicity theorem.
+        # NOT replaceable by the expressivity bottleneck. MEASURED: swapping
+        # this exhaustive eps argmin for the bottleneck argmax collapsed seed 1
+        # to 46 parameters -- the 2-2-2 start -- after 70 epochs with the
+        # budget untouched, mean 0.9285 -> 0.7380. The two answer different
+        # questions: the bottleneck says WHERE WIDTH IS MISSING, this says
+        # WHICH GROWTH UNSTICKS THE CERTIFICATE, and only the second guarantees
+        # eps goes down, which is what the loop needs to terminate and what a
+        # step needs in order to exist at all. They disagree in practice --
+        # with the adaptive count gated on "is this layer still the argmax
+        # bottleneck?" it fired ZERO times in four seeds.
         best_model, best_epsilon, best_location, best_system, budget_exhausted = (
             _select_growth_candidate(
                 model,
@@ -911,7 +922,55 @@ def grow_until_certified(
         # its OWN projection, so the certificate conditions are unchanged. This
         # cuts the number of full location scans on a hard task (CIFAR) without
         # weakening any certificate.
-        if getattr(config.fgd_approx, "certify_adaptive_growth", False):
+        # BY THE SAME CRITERION THAT CHOSE THE LOCATION, when one is supplied.
+        # The gap rule below asks "did this neuron close 10% of what is left to
+        # certify?", which is a question about eps and says nothing about
+        # whether this layer is still the place to buy. It therefore keeps
+        # buying HERE without re-asking WHERE -- MEASURED, that is exactly what
+        # it did on seed 3: eps sat at 1.0310, twice the threshold, and it
+        # bought a second neuron at location 0 anyway, which is the blind
+        # purchase the expressivity criterion exists to avoid.
+        #
+        # With layer_bottlenecks the same question that picked the location
+        # decides how many: keep buying while THIS layer is still the argmax
+        # bottleneck, re-measured after every purchase. It is self-limiting --
+        # widening a layer lowers its own bottleneck -- so it stops on its own
+        # the moment another layer becomes the one that cannot express what is
+        # asked of it, with no gap, no fraction and no constant.
+        _adaptive_on = getattr(config.fgd_approx, "certify_adaptive_growth", False)
+        if _adaptive_on and layer_bottlenecks is not None:
+            while epsilon >= threshold and growths < max_growths:
+                measured = layer_bottlenecks(model)
+                if not measured or max(measured) <= 0.0:
+                    break
+                if measured.index(max(measured)) != best_location:
+                    break  # another layer is the bottleneck now; re-scan
+                bigger = _grow_clone(
+                    model,
+                    train_loader,
+                    best_location,
+                    device,
+                    config,
+                    function_preserving,
+                )
+                if bigger is None:
+                    break
+                bigger_epsilon, bigger_system = _relative_error_and_system(
+                    bigger, x, y, config.fgd_approx
+                )
+                model = bigger
+                epsilon = bigger_epsilon
+                tangent_system = bigger_system
+                growths += 1
+                trajectory.append(epsilon)
+                if progress is not None:
+                    progress(
+                        f"[CERTIFY] adaptive +growth {growths} at location "
+                        f"{best_location} [by=expressivity_bottleneck]: eps -> "
+                        f"{epsilon:.4f}"
+                        + ("  (certified)" if epsilon < threshold else "")
+                    )
+        elif _adaptive_on:
             min_gain = float(
                 getattr(config.fgd_approx, "certify_adaptive_growth_min_gain", 0.1)
             )

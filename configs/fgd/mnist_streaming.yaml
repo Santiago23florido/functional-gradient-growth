@@ -92,12 +92,17 @@ fgd_approx:
   # a ratio of 0.0045 against the certify_growth_min_gain floor of 0.1 -- 22x
   # below, so the cut is not a close call. (N1024, for contrast, gains 0.00707
   # on a gap of 0.0267, ratio 0.265, and keeps growing.)
-  certify_growth_target: 0.3
+  # UNIFICADO con los otros dos configs: el bucle persigue el mismo
+  # certificado que certifica el paso, min(rel_error_threshold, 0.5).
+  # Antes 0.3 solo aqui. SIN RE-MEDIR en MNIST.
+  certify_growth_target:
   # 0 disables the eps-fraction refusal: on MNIST every growth buys
   # ~1e-3 of eps, so any fraction of the gap rejects all of them and
   # nothing ever grows. The cost is bounded by max_total_parameters
   # instead, which is the quantity actually at stake.
-  certify_growth_min_gain: 0.0
+  # UNIFICADO: 0.1 por defecto, como los otros dos. Antes 0.0 solo aqui.
+  # SIN RE-MEDIR en MNIST.
+  certify_growth_min_gain: 0.1
   rel_error_mode: tangent_projection
   layer_selection: certifying
   projection_solver: exact
@@ -209,11 +214,6 @@ fgd_approx:
   # exact certification, whatever it costs, delivers the best accuracy.
   certify_function_preserving: true
   certify_max_growths: 200
-  # Buy neurons at the chosen location while each still pays, then
-  # stop by itself -- the repo's own 'reach far without excess'
-  # mechanism, off until now.
-  certify_adaptive_growth: true
-  certify_adaptive_growth_min_gain: 0.02
   # PAPER-PURE STEP. Lemma 3.5 does not offer descent as a condition to
   # verify -- it PROVES it: eps < 1/2 implies every eta in (0, eta_bar(eps))
   # descends. So the flow keeps the rate the certificate licenses (the same
@@ -308,23 +308,39 @@ fgd_approx:
   certify_family_inner_steps: 400
   certify_family_inner_learning_rate: 0.01
   certify_family_functional_lr: 1.0
-  certify_family_plateau_stop: true
+  # Barrido ASCENDENTE de la distancia funcional de la familia. Cada eta_f
+  # certifica por su propio RelErr(Delta,r) < min(threshold, 0.5) sobre la
+  # misma sonda; eta_f=1 va primero, asi que una corrida que certifica ahi es
+  # identica a antes y al mismo coste. MEDIDO: descendente pierde (0.8823),
+  # ascendente gana (0.9230 contra 0.9000 del baseline).
+  certify_family_functional_lrs: [1.0, 2.0, 4.0, 8.0]
+  # UNIFICADO a false: la corrida que valido el criterio (media 0.9435) no
+  # lo llevaba, y estos ficheros deben ser esa corrida.
+  certify_family_plateau_stop: false
   # Commit the family step at its OWN Lemma 3.5 rate, not whole.
   # MEASURED: eps 0.292 allows eta_bar 0.263 at L_s = 2, so a full
   # step overshoots the descent bound by 3.8x. Certifying the
   # direction never licensed the distance.
-  certify_family_lemma35_rate: true
+  # UNIFICADO a false. MEDIDO en smooth_sin: true SIN min_gain colapsa la
+  # corrida (25 certificaciones, 0 crecimientos, acc 0.15). Antes true
+  # solo aqui, apoyado en certify_family_min_gain. SIN RE-MEDIR en MNIST.
+  certify_family_lemma35_rate: false
   # Let the ladder work in the band between the growth target and the
   # certificate, where growth alone buys 0.0007 of eps per 800 params
   # while the clone reaches 22 degrees against a 30 degree bar. Safe
   # only because the step above is now bounded by its own Lemma 3.5
   # rate; unbounded it diverged held-out loss 9.37 -> 44.53.
-  certify_family_in_target_band: true
+  # UNIFICADO a false. Su propio comentario dice que solo es seguro junto
+  # a certify_family_lemma35_rate, que ahora esta en false.
+  certify_family_in_target_band: false
   # The ladder DEFERS growth, so it must earn the deferral: close this
   # fraction of the gap to the target or hand the turn to growth.
   # MEASURED at 0.0 the ladder certified 20/20 epochs and the net never
   # grew (GRO=0), plateauing at 0.113 from epoch 9.
-  certify_family_min_gain: 0.02
+  # UNIFICADO a 0.0. Vigilaba el aplazamiento del crecimiento por pasos de
+  # familia que certifican sin progresar; con lemma35_rate en false el paso
+  # se compromete entero y ese fallo no aparece. SIN RE-MEDIR en MNIST.
+  certify_family_min_gain: 0.0
   certify_realize_max_iterations: 40
   certify_realize_tolerance: 0.05
   # Freeze the Gauss-Newton Gram across the inner realise iterations (modified-
@@ -337,6 +353,39 @@ fgd_approx:
   # faster per epoch on CIFAR (realise ~42 -> ~8 jacrev-equivalents/epoch).
   certify_realize_freeze_gram: true
   tangent_measured_descent: false
+  # ===================== CRITERIO DE CRECIMIENTO =====================
+  # DONDE crecer: la capa con el mayor CUELLO DE BOTELLA DE EXPRESIVIDAD,
+  # es decir el argmax de activation_gradient * sum(eigenvalues_extension^2)
+  # -- el termino de extension de TINY, la masa del cambio funcional deseado
+  # que cae FUERA de lo que el ancho actual puede expresar. NO es el
+  # select_best_update de TINY: ese suma parameter_update_decrease, que mide
+  # cuanto ganaria reajustar los pesos EXISTENTES y por tanto habla de
+  # entrenamiento, no de ancho. Una neurona por evento, en esa capa.
+  #
+  # MEDIDO en N=1024, 4 semillas, 600 parametros, a igualdad de computo:
+  #   certified_gain          0.9230   formas 15-16-15 en 3 de 4 semillas
+  #   expressivity_bottleneck 0.9435   4 formas distintas, ratios 1.46-2.44
+  # Las cuatro semillas superan 0.925 individualmente.
+  growth_where: expressivity_bottleneck
+  # NO INERTE, verificado por medicion: quitarla movio s0 y s3 (s3 de 0.958 a
+  # 0.896). Se lee en DOS sitios y solo uno depende del modo:
+  #   pipeline.py  la rafaga del bloque de crecimiento por epoch -- APAGADA
+  #                bajo expressivity_bottleneck (una neurona por evento)
+  #   certify.py   la rafaga dentro de grow_until_certified, que compra en la
+  #                ubicacion ya elegida mientras cada incremento siga pagando
+  #                en eps -- NO depende del modo, y es la que actua aqui
+  certify_adaptive_growth: true
+  certify_adaptive_growth_min_gain: 0.1
+  # NO INERTES bajo expressivity_bottleneck, verificado por medicion: quitarlas
+  # movio s0 y s3 (s3 de 0.958 a 0.896, perdiendo la forma 9-16-22). No pasan
+  # por el ranking del cuello de botella, actuan ANTES:
+  #   growth_select_by_descent  decide si el crecimiento se dispara siquiera
+  #                             (pipeline.py, fgd_growth_probe_improved)
+  #   growth_prefer_lower_error elige entre sondas en _select_growth_probe,
+  #                             antes de que existan los candidatos
+  growth_select_by_descent: true
+  growth_prefer_lower_error: true
+  # ===================================================================
   growth_selection: unified_expansion
   # Generalised R1: eps < 1/2 is Lemma 3.5 step-admissibility, not structural
   # adequacy. Before stopping, check whether growing the bottleneck reaches a
@@ -396,13 +445,7 @@ fgd_approx:
   # never mistaken for a non-FP run (the previous `false` here was an inert,
   # misleading inheritance).
   growth_function_preserving: true
-  growth_prefer_lower_error: true
-  growth_select_by_descent: true
   growth_requires_admissibility_failure: true
-  # Inert here: growth_selection: natural_expansion is checked first and
-  # brings its own allocation loop. Left false so the config cannot be
-  # misread as running both.
-  growth_uniform: false
   max_total_parameters: 30000
   growth_preservation_tolerance: 1.0e-6
   # Ordered ladder of approximation families, evaluated top to bottom.

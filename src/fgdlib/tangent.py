@@ -41,7 +41,7 @@ GrowthLimitCriterion = Literal["progress_floor", "epsilon_stationary"]
 #: behaviour: level the width minimum first, then rank what is left.
 #: "certified_gain" removes the levelling and lets the exact train-probe eps
 #: reduction per parameter choose, which is what allows non-uniform shapes.
-GrowthWhere = Literal["rank_ceiling", "certified_gain"]
+GrowthWhere = Literal["rank_ceiling", "certified_gain", "expressivity_bottleneck"]
 GrowthSelection = Literal[
     "descent_per_parameter",
     "epsilon_lookahead",
@@ -473,6 +473,33 @@ class FGDApproxConfig:
     # certifies there is bit-identical to today, at today's cost; the ladder
     # escalates ONLY where the single-eta call would have grown instead.
     certify_family_functional_lrs: tuple[float, ...] = ()
+    # STOP GROWING WHEN THE BOTTLENECK IS NOT SIGNIFICANT. Only meaningful
+    # with growth_where: expressivity_bottleneck. A parameter cap is a number
+    # nobody knows in advance -- it has to be guessed per dataset, and MEASURED
+    # here it is what actually ends every run: all four N=1024 seeds stop by
+    # exhausting 600 parameters, never by deciding they are done, and one of
+    # them then sits frozen for 35 of its 70 epochs, unable to grow and unable
+    # to certify. This replaces the cap with a question the DATA answers:
+    # are the extension's singular values distinguishable from what pure
+    # sampling noise would have produced? Marchenko-Pastur's edge settles it
+    # from the two dimensions and the spectrum's own bulk -- see
+    # marchenko_pastur_significant_count. Nothing is predetermined, nothing is
+    # fitted per dataset, and magnitude cancels, so the same rule transfers
+    # unchanged between bases. Off by default: it changes when growth ends.
+    growth_bottleneck_significance: bool = False
+    # UN SOLO CRITERIO en todo el crecimiento. La cuenta adaptativa de
+    # grow_until_certified decide CUANTAS neuronas comprar en la ubicacion ya
+    # elegida, y su regla es de HUECO: "cerro esta neurona el 10% de lo que
+    # falta para certificar?". Eso habla de eps y no dice nada sobre si esa
+    # capa sigue siendo el sitio, asi que compra sin volver a preguntar DONDE
+    # -- MEDIDO en la semilla 3, con eps en 1.0310, el doble del umbral,
+    # compro una segunda neurona en la capa 0 a ciegas. Con esto activo, la
+    # misma medida que eligio la ubicacion decide cuantas: sigue comprando
+    # mientras ESA capa siga siendo el argmax del cuello de botella,
+    # re-medido tras cada compra. Es autolimitante (ensanchar una capa baja su
+    # propio cuello) y no introduce ni hueco, ni fraccion, ni constante.
+    # Solo surte efecto con growth_where: expressivity_bottleneck.
+    certify_adaptive_growth_by_bottleneck: bool = False
     # Cheapen the family clone WITHOUT changing the step it produces: stop the
     # inner training once its alignment with the residual (cos(Delta, r)) has
     # genuinely PLATEAUED -- no improvement above plateau_tol for a few checks.
@@ -572,6 +599,25 @@ class FGDApproxConfig:
     # eps lands [18,7,5] at 269p / 0.629. Pure argmin (certify.py's rule,
     # cost_exponent 0) was the WORST exact variant at 0.544 -- the cost divisor
     # earns its place.
+    #
+    # "expressivity_bottleneck" asks the question growth is actually for:
+    # WHICH LAYER CANNOT EXPRESS WHAT IS BEING ASKED OF IT. One neuron goes
+    # into the argmax of tangent.compute_expressivity_bottlenecks, i.e. of
+    # activation_gradient * sum(eigenvalues_extension ** 2) -- TINY's
+    # extension term, the mass of the desired functional change lying outside
+    # the current width. NOT TINY's select_best_update, which adds
+    # parameter_update_decrease and so mixes in "where would re-fitting the
+    # existing weights help", a statement about training rather than width.
+    #
+    # It exists because the other two rules answer a different question and
+    # MEASURED runaway growth for it: with certified_gain the growth trigger
+    # reads the STEP's rel_err, which diverges (0.64 -> 114 on the easy
+    # synthetic function, 229 on the hard one) as the damped projection
+    # recovers less of the residual, while the growth loop's own eps says
+    # 0.15-0.39 -- adequate. The easy function reaches test 1.000 at 74
+    # parameters and is grown to 872 anyway, 25 growth events in 25 epochs.
+    # A bottleneck measured on what the STRUCTURE can represent cannot run
+    # away like that: it goes to zero when the width suffices.
     growth_where: GrowthWhere = "rank_ceiling"
     #: 0.0 collapses the rule to certify.py's pure argmin, which is immune to
     #: cost degeneracy by construction. The rollback if risk 1 materialises.
@@ -3687,6 +3733,141 @@ def _layer_functional_error(
         target_sq_norm=target_sq_norm,
         config=config,
     )
+
+
+def marchenko_pastur_significant_count(
+    singular_values: torch.Tensor,
+    sample_count: int,
+) -> int:
+    """How many extension directions stand above the NOISE, by RMT alone.
+
+    The stopping question -- "is this bottleneck real, or is it what an
+    all-noise extension would have produced anyway?" -- answered without a
+    threshold anyone has to choose. The extension's singular values come from
+    ``S^{-1/2} N``, i.e. an ALREADY WHITENED matrix estimated from a finite
+    probe, which is exactly the setting Marchenko-Pastur describes: if there
+    is no signal, the squared singular values fill a bulk whose upper edge is
+    ``sigma^2 (1 + sqrt(gamma))^2`` with ``gamma = r / n``, ``r`` the
+    extension's dimension and ``n`` the probe's sample count. Anything above
+    that edge cannot be explained by sampling noise.
+
+    Nothing here is predetermined and nothing is fitted to a dataset: the
+    edge's shape comes from random-matrix theory, ``gamma`` from the two
+    dimensions, and ``sigma^2`` from the spectrum's OWN bulk -- the mean of
+    the lower half of the squared values, which the top (signal) directions
+    cannot contaminate. Magnitude cancels, because the edge scales with the
+    same ``sigma^2`` the spectrum does. The identical rule therefore applies
+    to smooth_sin and MNIST with no re-tuning.
+
+    LIMIT, stated because it bites here: MP is an asymptotic statement, and a
+    layer of width 3 gives r = 3, where "the lower half" is a single number
+    and the bulk estimate is worth little. Read the count as a strong signal
+    when ``r`` is large and as a weak one when it is tiny.
+    """
+    if singular_values is None or singular_values.numel() == 0:
+        return 0
+    squared = (singular_values.detach().double() ** 2).reshape(-1)
+    rank = int(squared.numel())
+    if rank == 0 or sample_count <= 0:
+        return 0
+    gamma = rank / float(sample_count)
+    bulk_size = max(1, rank // 2)
+    bulk = torch.sort(squared).values[:bulk_size]
+    sigma_squared = float(bulk.mean())
+    if not (sigma_squared > 0.0 and math.isfinite(sigma_squared)):
+        return 0
+    edge = sigma_squared * (1.0 + math.sqrt(gamma)) ** 2
+    return int(torch.sum(squared > edge).item())
+
+
+def compute_expressivity_bottlenecks(
+    model: GrowingMLP,
+    train_loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    config: FGDApproxConfig,
+) -> list[float]:
+    """Per-layer EXPRESSIVITY BOTTLENECK: what the layer's width cannot reach.
+
+    TINY's quantity, and only the part of it that is about expressivity. GroMo
+    computes ``first_order_improvement = parameter_update_decrease +
+    activation_gradient * sum(eigenvalues_extension ** 2)``, and its
+    ``select_best_update`` takes the argmax of that SUM. The first term is the
+    first-order gain from re-fitting the weights the layer ALREADY has -- a
+    statement about training, not about width -- so including it answers
+    "where would a step help most", which is not the question growth asks.
+
+    The second term is the bottleneck itself: ``eigenvalues_extension`` are the
+    singular values of the extension problem, i.e. the mass of the desired
+    functional change that lies OUTSIDE what the current width can express and
+    that new neurons would capture. Weighted by ``activation_gradient``, it is
+    the first-order loss decrease attributable to ADDING capacity there.
+
+    Returned per growable layer, in layer order, so the caller can put its
+    neuron where the number is largest. ``0.0`` where GroMo declines to build
+    an extension (no bottleneck it can name), which the caller must read as
+    "nothing to gain here", not as a missing measurement.
+    """
+    bottlenecks: list[float] = []
+    update_kwargs = tiny_optimal_update_kwargs(
+        config,
+        compute_delta=config.rel_error_compute_delta,
+    )
+    # The FULL spectrum, for the significance test only. The shipped kwargs
+    # truncate to maximum_added_neurons (1 here) and to statistical_threshold,
+    # both of which discard exactly the bulk that Marchenko-Pastur needs in
+    # order to estimate the noise level from the data itself. Asking for the
+    # untruncated SVD costs nothing extra -- it is the same decomposition,
+    # simply not cut -- and the neuron actually added is still one.
+    significance = bool(
+        getattr(config, "growth_bottleneck_significance", False)
+    )
+    if significance:
+        update_kwargs = dict(update_kwargs)
+        update_kwargs["maximum_added_neurons"] = None
+        update_kwargs["statistical_threshold"] = 0.0
+    sample_count = 0
+    if significance:
+        for _batch in train_loader:
+            _inputs = _batch[0] if isinstance(_batch, (tuple, list)) else _batch
+            sample_count += int(_inputs.shape[0])
+
+    for layer_index in range(len(model._growable_layers)):
+        model.set_growing_layers(index=layer_index)
+        try:
+            compute_statistics(
+                model,
+                train_loader,
+                loss_function=batch_functional_mse_loss,
+                device=device,
+            )
+            model.compute_optimal_updates(**update_kwargs)
+            model.reset_computation()
+            model.dummy_select_update()
+            layer = model.currently_updated_layer
+            eigenvalues = getattr(layer, "eigenvalues_extension", None)
+            if eigenvalues is None or eigenvalues.numel() == 0:
+                bottlenecks.append(0.0)
+                continue
+            if significance:
+                # NOT SIGNIFICANT -> NOT A BOTTLENECK. Zero here is a
+                # measurement ("this layer's extension is indistinguishable
+                # from noise"), which is what lets the caller stop without a
+                # parameter cap: a cap is a number nobody knows in advance,
+                # while this is a statement the data makes about itself.
+                kept = marchenko_pastur_significant_count(
+                    eigenvalues, sample_count
+                )
+                if kept == 0:
+                    bottlenecks.append(0.0)
+                    continue
+                eigenvalues = eigenvalues[:kept]
+            gradient = float(layer.activation_gradient)
+            value = gradient * float(torch.sum(eigenvalues.double() ** 2))
+            bottlenecks.append(value if math.isfinite(value) else 0.0)
+        finally:
+            _cleanup_tiny_update(model)
+
+    return bottlenecks
 
 
 def compute_tiny_layer_relative_errors(

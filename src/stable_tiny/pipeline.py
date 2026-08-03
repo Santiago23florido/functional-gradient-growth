@@ -36,6 +36,7 @@ from fgdlib.tangent import (
     build_projection_probe,
     FUNCTIONAL_HAS_PL_CONSTANT,
     certificate_from_projection_stats,
+    compute_expressivity_bottlenecks,
     evaluate_fgd_validation_certificate,
     evaluate_secant_validation_certificate,
     measure_direction_projection,
@@ -4167,6 +4168,28 @@ def run_pipeline(
                                     if config.fgd_approx.certify_growth_lookahead
                                     else None
                                 ),
+                                # ONE criterion for the whole of growth. Passed
+                                # as a callable for the same reason family_step
+                                # is: this module imports certify, so the
+                                # dependency cannot run back. Supplied only
+                                # under expressivity_bottleneck -- under the
+                                # other rules the adaptive count keeps its own
+                                # gap test, so their results are untouched.
+                                layer_bottlenecks=(
+                                    (
+                                        lambda m: compute_expressivity_bottlenecks(
+                                            m, train_loader, device,
+                                            config.fgd_approx,
+                                        )
+                                    )
+                                    if (
+                                        config.fgd_approx.growth_where
+                                        == "expressivity_bottleneck"
+                                        and config.fgd_approx
+                                        .certify_adaptive_growth_by_bottleneck
+                                    )
+                                    else None
+                                ),
                                 # A step that did not commit while eps was
                                 # already certified means the structure, not
                                 # the step size, is what has to change --
@@ -5909,9 +5932,22 @@ def run_pipeline(
                         # in one event is what the inequality already says;
                         # buying one neuron per event merely made each
                         # purchase wait for R1 again.
+                        # Also off under expressivity_bottleneck, and for the
+                        # same reason it is off under certified_gain: this
+                        # loop LEVELS min_l w_l on the "rank J <= min_l w_l"
+                        # argument, so leaving it on hands the shape to a
+                        # mandate that never consults the criterion. MEASURED
+                        # with it left on by mistake: on the easy synthetic
+                        # function the bottleneck had collapsed to 1e-10..1e-12
+                        # by epoch 10 -- ten orders below its epoch-1 value of
+                        # 4.9e-02, i.e. the criterion was saying "no width is
+                        # missing" -- and the net still grew from 77 to 460
+                        # parameters, every event a "rank cap relieved"
+                        # levelling that widened whichever layer was narrowest.
                         relief = (
                             None
-                            if free_shape or where_mode == "certified_gain"
+                            if free_shape
+                            or where_mode in ("certified_gain", "expressivity_bottleneck")
                             else bottleneck_relief_target(widths)
                         )
                         if (
@@ -6158,6 +6194,15 @@ def run_pipeline(
                             Identical to _score_for unless the ladder score is
                             switched on, so the default path is unchanged.
                             """
+                            if where_mode == "expressivity_bottleneck":
+                                # Not consulted: that mode ranks by the
+                                # per-layer expressivity bottleneck, so this
+                                # would build the exact tangent system and its
+                                # SVD once PER CANDIDATE for a number nothing
+                                # reads. The candidate clones themselves are
+                                # still built -- the winner is committed --
+                                # but the exhaustive exact scoring is not.
+                                return None
                             if where_mode == "certified_gain" and getattr(
                                 config.fgd_approx,
                                 "growth_where_ladder_score",
@@ -6489,6 +6534,55 @@ def run_pipeline(
                                 ),
                                 rank_ceiling_binds=ceiling_binds,
                             )
+                        if where_mode == "expressivity_bottleneck":
+                            # ONE neuron, into the layer that cannot express
+                            # what is being asked of it. The ranking above
+                            # scored candidates by what a step would gain;
+                            # this replaces it with a measurement of the
+                            # STRUCTURE -- TINY's extension term, without its
+                            # parameter_update_decrease. See
+                            # FGDApproxConfig.growth_where for why the other
+                            # two rules run away on a solved task.
+                            _bottlenecks = compute_expressivity_bottlenecks(
+                                model, train_loader, device, config.fgd_approx
+                            )
+                            _width_only = [
+                                c for c in candidates
+                                if c.kind == "width"
+                                and not c.indices
+                                and 0 <= c.index < len(_bottlenecks)
+                            ]
+                            if progress is not None and _bottlenecks:
+                                progress(
+                                    f"[BOTTLENECK] Epoch {epoch} widths="
+                                    f"{widths} "
+                                    + " ".join(
+                                        f"L{i}={v:.4e}"
+                                        for i, v in enumerate(_bottlenecks)
+                                    )
+                                )
+                            if _width_only and max(_bottlenecks) > 0.0:
+                                ranked = sorted(
+                                    _width_only,
+                                    key=lambda c: _bottlenecks[c.index],
+                                    reverse=True,
+                                )
+                            elif _width_only:
+                                # Every layer expresses what is asked of it.
+                                # That is the answer, not a missing one: no
+                                # width is the bottleneck, so buy nothing.
+                                fallback(
+                                    "growth_where_no_bottleneck",
+                                    "expressivity_bottleneck_all_zero",
+                                )
+                                if progress is not None:
+                                    progress(
+                                        f"[BOTTLENECK] Epoch {epoch}: no layer "
+                                        "has an expressivity bottleneck; no "
+                                        "growth"
+                                    )
+                                ranked = []
+
                         if ranked:
                             # R3: buy the best proposal. Re-measuring after
                             # each purchase would be ideal but doubles the
@@ -6508,11 +6602,17 @@ def run_pipeline(
                             )
                             if progress is not None:
                                 progress(
-                                    f"[GRO] Unified growth at epoch {epoch}: "
+                                    f"[GRO] Unified growth at epoch {epoch} "
+                                    f"[where={where_mode}]: "
                                     f"{chosen.kind} at index {chosen.index} "
                                     f"(+{chosen.cost} params, eps "
                                     f"{validation_certificate.relative_error:.3f}"
-                                    f" -> {chosen.relative_error_after:.3f}); "
+                                    + (
+                                        " -> not scored"
+                                        if chosen.relative_error_after is None
+                                        else f" -> {chosen.relative_error_after:.3f}"
+                                    )
+                                    + "); "
                                     f"{len(candidates)} candidates considered"
                                     + (
                                         "; widths "
@@ -6542,7 +6642,16 @@ def run_pipeline(
                             # burst the branch buys exactly one per epoch --
                             # arithmetically short of the 40 neurons the
                             # reference reaches in 25 epochs.
-                            _burst_on = (
+                            # ONE neuron per event under
+                            # expressivity_bottleneck: the criterion names the
+                            # layer that cannot express what is asked of it,
+                            # and a single neuron changes that measurement, so
+                            # buying more without re-measuring would spend on
+                            # a bottleneck that may no longer be there. The
+                            # burst's own stopping rule is the gain-per-
+                            # parameter of the STEP, which is the quantity
+                            # this mode exists to stop listening to.
+                            _burst_on = where_mode != "expressivity_bottleneck" and (
                                 getattr(
                                     config.fgd_approx,
                                     "certify_adaptive_growth",

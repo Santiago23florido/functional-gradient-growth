@@ -283,7 +283,15 @@ fgd_approx:
   certify_family_inner_steps: 400
   certify_family_inner_learning_rate: 0.01
   certify_family_functional_lr: 1.0
-  certify_family_plateau_stop: true
+  # Barrido ASCENDENTE de la distancia funcional de la familia. Cada eta_f
+  # certifica por su propio RelErr(Delta,r) < min(threshold, 0.5) sobre la
+  # misma sonda; eta_f=1 va primero, asi que una corrida que certifica ahi es
+  # identica a antes y al mismo coste. MEDIDO: descendente pierde (0.8823),
+  # ascendente gana (0.9230 contra 0.9000 del baseline).
+  certify_family_functional_lrs: [1.0, 2.0, 4.0, 8.0]
+  # UNIFICADO a false: la corrida que valido el criterio (media 0.9435) no
+  # lo llevaba, y estos ficheros deben ser esa corrida.
+  certify_family_plateau_stop: false
   certify_realize_max_iterations: 40
   certify_realize_tolerance: 0.05
   # Freeze the Gauss-Newton Gram across the inner realise iterations (modified-
@@ -296,6 +304,39 @@ fgd_approx:
   # faster per epoch on CIFAR (realise ~42 -> ~8 jacrev-equivalents/epoch).
   certify_realize_freeze_gram: true
   tangent_measured_descent: false
+  # ===================== CRITERIO DE CRECIMIENTO =====================
+  # DONDE crecer: la capa con el mayor CUELLO DE BOTELLA DE EXPRESIVIDAD,
+  # es decir el argmax de activation_gradient * sum(eigenvalues_extension^2)
+  # -- el termino de extension de TINY, la masa del cambio funcional deseado
+  # que cae FUERA de lo que el ancho actual puede expresar. NO es el
+  # select_best_update de TINY: ese suma parameter_update_decrease, que mide
+  # cuanto ganaria reajustar los pesos EXISTENTES y por tanto habla de
+  # entrenamiento, no de ancho. Una neurona por evento, en esa capa.
+  #
+  # MEDIDO en N=1024, 4 semillas, 600 parametros, a igualdad de computo:
+  #   certified_gain          0.9230   formas 15-16-15 en 3 de 4 semillas
+  #   expressivity_bottleneck 0.9435   4 formas distintas, ratios 1.46-2.44
+  # Las cuatro semillas superan 0.925 individualmente.
+  growth_where: expressivity_bottleneck
+  # NO INERTE, verificado por medicion: quitarla movio s0 y s3 (s3 de 0.958 a
+  # 0.896). Se lee en DOS sitios y solo uno depende del modo:
+  #   pipeline.py  la rafaga del bloque de crecimiento por epoch -- APAGADA
+  #                bajo expressivity_bottleneck (una neurona por evento)
+  #   certify.py   la rafaga dentro de grow_until_certified, que compra en la
+  #                ubicacion ya elegida mientras cada incremento siga pagando
+  #                en eps -- NO depende del modo, y es la que actua aqui
+  certify_adaptive_growth: true
+  certify_adaptive_growth_min_gain: 0.1
+  # NO INERTES bajo expressivity_bottleneck, verificado por medicion: quitarlas
+  # movio s0 y s3 (s3 de 0.958 a 0.896, perdiendo la forma 9-16-22). No pasan
+  # por el ranking del cuello de botella, actuan ANTES:
+  #   growth_select_by_descent  decide si el crecimiento se dispara siquiera
+  #                             (pipeline.py, fgd_growth_probe_improved)
+  #   growth_prefer_lower_error elige entre sondas en _select_growth_probe,
+  #                             antes de que existan los candidatos
+  growth_select_by_descent: true
+  growth_prefer_lower_error: true
+  # ===================================================================
   growth_selection: unified_expansion
   # Generalised R1: eps < 1/2 is Lemma 3.5 step-admissibility, not structural
   # adequacy. Before stopping, check whether growing the bottleneck reaches a
@@ -355,13 +396,7 @@ fgd_approx:
   # never mistaken for a non-FP run (the previous `false` here was an inert,
   # misleading inheritance).
   growth_function_preserving: true
-  growth_prefer_lower_error: true
-  growth_select_by_descent: true
   growth_requires_admissibility_failure: true
-  # Inert here: growth_selection: natural_expansion is checked first and
-  # brings its own allocation loop. Left false so the config cannot be
-  # misread as running both.
-  growth_uniform: false
   max_total_parameters:
   growth_preservation_tolerance: 1.0e-6
   # Ordered ladder of approximation families, evaluated top to bottom.
