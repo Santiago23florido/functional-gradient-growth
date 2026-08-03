@@ -36,6 +36,7 @@ from fgdlib.tangent import (
     build_projection_probe,
     FUNCTIONAL_HAS_PL_CONSTANT,
     certificate_from_projection_stats,
+    compute_expressivity_bottlenecks,
     evaluate_fgd_validation_certificate,
     evaluate_secant_validation_certificate,
     measure_direction_projection,
@@ -57,14 +58,18 @@ from fgdlib.rkhs import (
     KernelDictionaryModel,
 )
 from fgdlib.gromo_setup import ensure_gromo_importable
-from fgdlib.profile import increment
-from fgdlib.search.certify import grow_until_certified
-from fgdlib.search.families import certify_parametric_step
+from fgdlib.profile import fallback, increment
+from fgdlib.search.certify import (
+    exact_relative_error,
+    grow_until_certified,
+)
+from fgdlib.search.families import certify_parametric_step_swept
 from fgdlib.search.depth import insert_identity_layer
 from fgdlib.search.unified import (
     Candidate,
     bottleneck_relief_target,
     rank_candidates,
+    rank_candidates_by_certified_gain,
     rank_limiting_locations,
 )
 from fgdlib.search.damping import select_projection_damping
@@ -358,6 +363,12 @@ def _section_dataclass(
     if section_type is FGDApproxConfig and "family_order" in values:
         values["family_order"] = tuple(
             str(value) for value in values["family_order"] or ()
+        )
+
+    if section_type is FGDApproxConfig and "certify_family_functional_lrs" in values:
+        values["certify_family_functional_lrs"] = tuple(
+            float(value)
+            for value in values["certify_family_functional_lrs"] or ()
         )
 
     if section_type in (ParametricGDConfig, ParametricDescentConfig):
@@ -2146,6 +2157,129 @@ def _measure_secant_projection(
     cosine = dot / math.sqrt(delta_sq * target_sq)
     eta_star = dot / target_sq
     return cosine, eta_star
+
+
+
+def _wake_dormant_outgoing_weights(model: GrowingMLP, scale: float) -> None:
+    """Break the w = 0 degeneracy on a DISPOSABLE scoring clone.
+
+    A function-preserving neuron enters with its outgoing weight at zero, so
+    df/d(its incoming weights) = 0 and those Jacobian columns are identically
+    zero. Scoring there measures the neuron at its most useless moment, and
+    unevenly: the closer the layer sits to a narrow output, the fewer live
+    columns it has. Nudging the exactly-zero outgoing weights to `scale`
+    activates the latent columns while leaving f, and therefore the residual,
+    essentially unchanged.
+
+    Only ever called on a clone that is thrown away after scoring.
+    """
+    with torch.no_grad():
+        for layer in getattr(model, "layers", []):
+            inner = getattr(layer, "layer", None)
+            weight = getattr(inner, "weight", None)
+            if weight is None or weight.ndim != 2:
+                continue
+            dormant = weight.abs().sum(dim=0) == 0
+            if bool(dormant.any()):
+                # Distinct directions, not one shared value. Assigning the
+                # SAME scalar to every dormant column makes the new neurons'
+                # outgoing weights identical, so their Jacobian columns are
+                # collinear: that trades the "all zero" degeneracy for an
+                # "all equal" one of rank 1. It is why a k-block lookahead
+                # measured barely more than a single block -- the horizon it
+                # probed spanned one direction, not k.
+                generator = torch.Generator(device="cpu").manual_seed(
+                    int(dormant.sum()) * 1000 + int(weight.shape[0])
+                )
+                noise = torch.randn(
+                    (weight.shape[0], int(dormant.sum())),
+                    generator=generator,
+                ).to(weight.device, weight.dtype)
+                noise = noise / noise.norm(dim=0, keepdim=True).clamp_min(1e-12)
+                weight[:, dormant] = scale * noise
+
+
+def _prune_negligible_units(
+    model: GrowingMLP,
+    probe: tuple[torch.Tensor, torch.Tensor],
+    tolerance: float,
+) -> int:
+    """Drop hidden units whose removal moves f by less than `tolerance`.
+
+    Growth is only allowed to change f by `growth_preservation_tolerance`;
+    removing a unit that moves f by less than that same tolerance is
+    function-preserving by exactly the same standard, so the certificate and
+    the family ladder see the same function either way.
+
+    This is the only mechanism here that lets capacity MOVE. Growth is
+    otherwise greedy and monotone from 2-2-2: whatever the first events decide
+    is sunk, and the reachable architectures at a given size are one path
+    through the space rather than the space. Freeing a unit that stopped
+    earning its place lets a later event buy it back somewhere it is worth
+    more.
+
+    MEASURED AND REFUTED as a source of improvement, but the negative is the
+    informative part: across three N=1024 seeds this fired ZERO times, and the
+    runs came out bit-identical to lookahead alone (0.921/0.899/0.903 at
+    875/875/451). The helper is not broken -- given a unit with an
+    exactly-zero outgoing column it removes it and leaves f untouched -- there
+    simply is no dead capacity: after training, every unit earns more than the
+    tolerance.
+
+    That makes the tension explicit. Function preservation is WHY the search is
+    monotone; moving capacity between layers requires changing f by more than
+    the tolerance, which is precisely what the method forbids. So within the
+    fixed constraints the search cannot be made non-monotone, and the only
+    remaining lever is the quality of the measurement at the moment of an
+    irreversible decision -- which is what lookahead improves.
+
+    Returns the number of units removed.
+    """
+    layers = getattr(model, "layers", [])
+    if len(layers) < 2:
+        return 0
+    x = probe[0]
+    removed = 0
+    with torch.no_grad():
+        reference = model(x)
+        for index in range(len(layers) - 1):
+            inner = getattr(layers[index], "layer", None)
+            nxt = getattr(layers[index + 1], "layer", None)
+            if inner is None or nxt is None:
+                continue
+            width = inner.weight.shape[0]
+            # Never prune a layer down to nothing: a width-zero layer is not a
+            # narrower model, it is a disconnected one.
+            keep = list(range(width))
+            for unit in range(width):
+                if len(keep) <= 1:
+                    break
+                saved = nxt.weight[:, unit].clone()
+                nxt.weight[:, unit] = 0.0
+                drift = float(torch.max(torch.abs(model(x) - reference)))
+                if drift <= tolerance:
+                    keep.remove(unit)
+                else:
+                    nxt.weight[:, unit] = saved
+            if len(keep) == width:
+                continue
+            idx = torch.tensor(keep, device=inner.weight.device)
+            new_in = torch.nn.Linear(
+                inner.weight.shape[1], len(keep)
+            ).to(inner.weight.device)
+            new_in.weight.copy_(inner.weight[idx])
+            if inner.bias is not None and new_in.bias is not None:
+                new_in.bias.copy_(inner.bias[idx])
+            new_out = torch.nn.Linear(
+                len(keep), nxt.weight.shape[0]
+            ).to(nxt.weight.device)
+            new_out.weight.copy_(nxt.weight[:, idx])
+            if nxt.bias is not None and new_out.bias is not None:
+                new_out.bias.copy_(nxt.bias)
+            layers[index].layer = new_in
+            layers[index + 1].layer = new_out
+            removed += width - len(keep)
+    return removed
 
 
 def _train_parametric_gd_candidate(
@@ -3960,25 +4094,56 @@ def run_pipeline(
                             # certifies. It certifies at a far smaller
                             # structure than the linear tangent, so it defers
                             # growth (MEASURED 57 -> 6 FP growths).
+                            # "Grow now, or train now?" -- the organic turn
+                            # question. Generalised R1 already implements it
+                            # (train a grown clone and a stay clone the same
+                            # number of steps, compare the eps they reach); it
+                            # was only ever reachable from the fallback-family
+                            # loop, which is dead under family_order:
+                            # [tangent]. Bound here so the grow-to-certify
+                            # loop can use it, which is where the front-loading
+                            # actually happens.
+                            def _growth_warranted_now(candidate_model):
+                                return _growth_reduces_lookahead_epsilon(
+                                    model=candidate_model,
+                                    train_batches=frozen_train_batches,
+                                    train_loader=train_loader,
+                                    validation_loader=validation_loader,
+                                    probe=fgd_validation_probe,
+                                    device=device,
+                                    config=config,
+                                )
+
                             _family_step = None
                             if config.fgd_approx.certify_family_ladder:
                                 _fp = fgd_train_probe
 
+                                # One eta_f, or a swept list of them. The sweep
+                                # certifies each candidate independently on
+                                # this same probe against the same
+                                # min(rel_error_threshold, 1/2), and stops at
+                                # the first certificate -- more search at an
+                                # unchanged bar, which is the shape of the
+                                # measured gap: on N=1024 the four seeds
+                                # certify the family 12/2/5/8 times and their
+                                # capped accuracies rank 0.941/0.830/0.904/
+                                # 0.925 in exactly that order. An eta_f that
+                                # fails says the clone could not realise THAT
+                                # distance, not that the family is unavailable.
                                 def _family_step(candidate_model):
-                                    return certify_parametric_step(
+                                    return certify_parametric_step_swept(
                                         candidate_model,
                                         _fp[0],
                                         _fp[1],
                                         config.fgd_approx,
-                                        functional_learning_rate=(
-                                            config.fgd_approx.certify_family_functional_lr
-                                        ),
+                                        config.fgd_approx.certify_family_functional_lrs,
                                         inner_steps=(
                                             config.fgd_approx.certify_family_inner_steps
                                         ),
                                         inner_learning_rate=(
                                             config.fgd_approx.certify_family_inner_learning_rate
                                         ),
+                                        progress=progress,
                                     ).model
                             model, certify_result = grow_until_certified(
                                 model=model,
@@ -3994,6 +4159,37 @@ def run_pipeline(
                                     config.fgd_approx.certify_function_preserving
                                 ),
                                 family_step=_family_step,
+                                # "Is it growth's turn?", asked once per outer
+                                # step. Passed as a callable for the same
+                                # reason family_step is: this module imports
+                                # certify, so the dependency cannot run back.
+                                growth_warranted=(
+                                    _growth_warranted_now
+                                    if config.fgd_approx.certify_growth_lookahead
+                                    else None
+                                ),
+                                # ONE criterion for the whole of growth. Passed
+                                # as a callable for the same reason family_step
+                                # is: this module imports certify, so the
+                                # dependency cannot run back. Supplied only
+                                # under expressivity_bottleneck -- under the
+                                # other rules the adaptive count keeps its own
+                                # gap test, so their results are untouched.
+                                layer_bottlenecks=(
+                                    (
+                                        lambda m: compute_expressivity_bottlenecks(
+                                            m, train_loader, device,
+                                            config.fgd_approx,
+                                        )
+                                    )
+                                    if (
+                                        config.fgd_approx.growth_where
+                                        == "expressivity_bottleneck"
+                                        and config.fgd_approx
+                                        .certify_adaptive_growth_by_bottleneck
+                                    )
+                                    else None
+                                ),
                                 # A step that did not commit while eps was
                                 # already certified means the structure, not
                                 # the step size, is what has to change --
@@ -4066,11 +4262,37 @@ def run_pipeline(
                                         f"in {certify_result.growths} growths"
                                     )
                             if progress is not None and not certify_result.certified:
+                                # TWO lines are in play, and only one of them
+                                # can kill the step: the growth TARGET the loop
+                                # chases, and the step CERTIFICATE Lemma 3.5
+                                # needs (eps < min(rel_error_threshold, 1/2),
+                                # the same expression damping.py and
+                                # lemma35_learning_rate use). Missing the
+                                # target while clearing the certificate is a
+                                # normal stop -- the step still commits, which
+                                # is the whole point of separating them.
+                                # Missing the certificate means no damping and
+                                # no rate exist at all. The old single line read
+                                # "could NOT reach eps < 0.3" for both, which is
+                                # how the MNIST run with a dead tangent step
+                                # looked exactly like a run doing fine.
+                                step_certificate = min(
+                                    config.fgd_approx.rel_error_threshold, 0.5
+                                )
                                 progress(
-                                    f"[CERTIFY] Epoch {epoch}: could NOT reach "
-                                    f"eps < {config.fgd_approx.rel_error_threshold} "
-                                    f"(stopped at {certify_result.relative_error:.4f} "
-                                    f"after {certify_result.growths} growths)"
+                                    f"[CERTIFY] Epoch {epoch}: growth target "
+                                    f"eps < {certify_result.growth_target} NOT "
+                                    f"reached (stopped at "
+                                    f"{certify_result.relative_error:.4f} after "
+                                    f"{certify_result.growths} growths, reason: "
+                                    f"{certify_result.stop_reason}); step "
+                                    f"certificate eps < {step_certificate} "
+                                    + (
+                                        "HOLDS, so a step can still commit"
+                                        if certify_result.relative_error
+                                        < step_certificate
+                                        else "FAILS, so no rate is admissible"
+                                    )
                                 )
                         damping_choice = (
                             select_projection_damping(
@@ -5649,6 +5871,14 @@ def run_pipeline(
                             model, config.data.in_features
                         )
                         base_parameters = count_parameters(model)
+                        # "rank_ceiling" is the shipped path, byte-identical.
+                        # "certified_gain" replaces the levelling, the
+                        # bottleneck filter AND the pace in one go -- see the
+                        # field's comment in tangent.py for why replacing only
+                        # one of the three stalled growth at 53 parameters.
+                        where_mode = getattr(
+                            config.fgd_approx, "growth_where", "rank_ceiling"
+                        )
                         # rank J <= min_l w_l: while a location sits at the
                         # minimum, no purchase elsewhere can raise what the
                         # structure is able to express.
@@ -5656,7 +5886,40 @@ def run_pipeline(
                             int(layer.in_features)
                             for layer in model._growable_layers
                         ]
-                        bottlenecks = set(rank_limiting_locations(widths))
+                        # The rank cap both FILTERS candidates to the width
+                        # minimum and MANDATES levelling it. Both rest on
+                        # "rank J <= min_l w_l" (unified.py:53), which is
+                        # FALSE as measured on the exact Jacobian: at NK=200,
+                        # widths (20,3,20) reach rank 200, (30,4,30) reach
+                        # 200, and even (2,2,2) reaches 25 = P, not 2. What
+                        # bounds the rank is min(NK, P), not the narrowest
+                        # layer. So the mandate levels the widths -- every
+                        # seed lands on h,h,h+1 -- and bars the search from
+                        # non-uniform shapes, for a reason that does not
+                        # hold. Disabling it leaves the exact per-candidate
+                        # eps ranking (unified.expansion_value) as the sole
+                        # criterion, which measures what each location
+                        # actually buys instead of assuming the minimum caps
+                        # it. No certificate is touched.
+                        free_shape = getattr(
+                            config.fgd_approx, "growth_free_shape", False
+                        )
+                        # The filter and the levelling are separable, and
+                        # they do different jobs. The filter protects the
+                        # location a pure value ranking STARVES -- MEASURED,
+                        # free shape drives the last hidden layer to width 2-4
+                        # because a neuron there costs h2+2 and adds a single
+                        # tangent direction, so it never wins on price even
+                        # though the structure needs it. Its benefit is
+                        # indirect: it raises the ceiling for later purchases
+                        # elsewhere, which immediate eps cannot see. The
+                        # levelling is what forces h,h,h+1. Keep the first,
+                        # drop the second.
+                        bottlenecks = (
+                            set()
+                            if free_shape
+                            else set(rank_limiting_locations(widths))
+                        )
                         ceiling_binds_precheck = (
                             validation_certificate.relative_error is not None
                             and validation_certificate.relative_error
@@ -5669,7 +5932,24 @@ def run_pipeline(
                         # in one event is what the inequality already says;
                         # buying one neuron per event merely made each
                         # purchase wait for R1 again.
-                        relief = bottleneck_relief_target(widths)
+                        # Also off under expressivity_bottleneck, and for the
+                        # same reason it is off under certified_gain: this
+                        # loop LEVELS min_l w_l on the "rank J <= min_l w_l"
+                        # argument, so leaving it on hands the shape to a
+                        # mandate that never consults the criterion. MEASURED
+                        # with it left on by mistake: on the easy synthetic
+                        # function the bottleneck had collapsed to 1e-10..1e-12
+                        # by epoch 10 -- ten orders below its epoch-1 value of
+                        # 4.9e-02, i.e. the criterion was saying "no width is
+                        # missing" -- and the net still grew from 77 to 460
+                        # parameters, every event a "rank cap relieved"
+                        # levelling that widened whichever layer was narrowest.
+                        relief = (
+                            None
+                            if free_shape
+                            or where_mode in ("certified_gain", "expressivity_bottleneck")
+                            else bottleneck_relief_target(widths)
+                        )
                         if (
                             relief is not None
                             and ceiling_binds_precheck
@@ -5754,6 +6034,199 @@ def run_pipeline(
                             )
                             return measured.relative_error
 
+                        # The TRAIN-probe eps, i.e. the same quantity the grow
+                        # loop chases and Lemma 3.5's interval is built from.
+                        # Scoring candidates on validation while the flow
+                        # certifies on train is two certificates driving one
+                        # decision; on the train probe function-preserving
+                        # growth strictly enlarges range(J), so the gain is
+                        # non-negative by certify.py's theorem, whereas on
+                        # validation it is not -- which is exactly what
+                        # expansion_value's max(..., 0) was clamping away.
+                        # Kept as a single seam so the exact block-Schur fast
+                        # path can be adopted here later behind its own flag.
+                        def _train_epsilon(trial: GrowingMLP) -> float | None:
+                            if fgd_train_probe is None:
+                                return None
+                            try:
+                                return exact_relative_error(
+                                    trial,
+                                    fgd_train_probe[0],
+                                    fgd_train_probe[1],
+                                    config.fgd_approx,
+                                )
+                            except RuntimeError:
+                                return None
+
+                        def _ladder_residual(
+                            trial: GrowingMLP,
+                        ) -> float | None:
+                            """How close the LADDER can bring this candidate
+                            to the functional target it is already chasing.
+
+                            Growth is function-preserving, so f -- and with it
+                            the target f - eta * r -- is the same for the base
+                            and for every candidate. All candidates therefore
+                            aim at one fixed blank, which is what makes the
+                            scores comparable without training a separate
+                            control.
+                            """
+                            if fgd_train_probe is None:
+                                return None
+                            _pd = config.parametric_descent
+                            try:
+                                _rate = float(
+                                    _pd.functional_learning_rates[0]
+                                )
+                            except (AttributeError, IndexError, TypeError):
+                                return None
+                            _batches = [
+                                (
+                                    fgd_train_probe[0].to(device),
+                                    fgd_train_probe[1].to(device),
+                                )
+                            ]
+                            _trained = _train_parametric_gd_candidate(
+                                base_model=trial,
+                                train_batches=_batches,
+                                device=device,
+                                functional_learning_rate=_rate,
+                                steps=max(
+                                    1,
+                                    int(
+                                        getattr(
+                                            config.fgd_approx,
+                                            "growth_where_ladder_steps",
+                                            1,
+                                        )
+                                    ),
+                                ),
+                                config=_pd,
+                                functional_loss=(
+                                    config.fgd_approx.functional_loss
+                                ),
+                            )
+                            if _trained is None:
+                                return None
+                            _x, _y = _batches[0]
+                            with torch.no_grad():
+                                _f = trial(_x)
+                                _target = _f - _rate * functional_gradient(
+                                    _f, _y, config.fgd_approx.functional_loss
+                                )
+                                # Report the FRACTION of the wanted functional
+                                # move the ladder could not achieve. Since
+                                # f - target = eta * g, this is
+                                # ||trained - target|| / ||f - target||, which
+                                # is eps's own meaning and eps's own scale --
+                                # a raw MSE is not, and feeding one to a ranker
+                                # and a threshold that both speak eps is what
+                                # made this score produce 0-2 growth events.
+                                _num = float(
+                                    torch.linalg.vector_norm(
+                                        _trained(_x) - _target
+                                    )
+                                )
+                                _den = float(
+                                    torch.linalg.vector_norm(_f - _target)
+                                )
+                            if _den <= 0.0:
+                                return None
+                            _res = _num / _den
+                            return _res if math.isfinite(_res) else None
+
+                        def _score_for(trial: GrowingMLP) -> float | None:
+                            if where_mode != "certified_gain":
+                                return _certificate_for(trial)
+                            # Score the candidate AWAKE, not dormant, WITHOUT
+                            # moving the target. Function-preserving growth
+                            # enters the neuron with outgoing weight w = 0,
+                            # which zeroes the derivative of ALL its incoming
+                            # weights: the columns exist but are identically
+                            # zero, so at insertion the neuron contributes one
+                            # direction instead of fan_in + 1 + fan_out.
+                            # MEASURED, rank(J) goes 211 -> 600 once w leaves
+                            # zero. The bias is UNEVEN -- a neuron next to the
+                            # 1-d output adds a single dormant direction and can
+                            # never win on price, which is what drove the last
+                            # hidden layer to width 2-4 -- so the rank cap was
+                            # patching a measurement defect, not an
+                            # architectural fact.
+                            #
+                            # Training the clone to wake it does NOT isolate
+                            # this: it moves f, hence r, so eps is compared
+                            # against a different target and every gain comes
+                            # out negative (MEASURED: the ladder's own step
+                            # raises eps 0.4497 -> 0.4806, and scoring that way
+                            # produced zero growth events). Perturbing w
+                            # instead breaks the degeneracy while leaving the
+                            # residual essentially fixed, and the clone is
+                            # discarded either way -- no certificate sees it.
+                            scale = float(
+                                getattr(
+                                    config.fgd_approx,
+                                    "growth_where_wake_scale",
+                                    1e-3,
+                                )
+                            )
+                            if scale > 0.0:
+                                _wake_dormant_outgoing_weights(trial, scale)
+                            _probe_mode = str(
+                                getattr(
+                                    config.fgd_approx,
+                                    "growth_where_probe",
+                                    "train",
+                                )
+                            )
+                            if _probe_mode == "validation":
+                                return _certificate_for(trial)
+                            if _probe_mode == "both":
+                                _tr = _train_epsilon(trial)
+                                _va = _certificate_for(trial)
+                                if _tr is None or _va is None:
+                                    return _tr if _va is None else _va
+                                return 0.5 * (_tr + _va)
+                            return _train_epsilon(trial)
+
+                        def _rank_score(trial: GrowingMLP) -> float | None:
+                            """Score used to RANK where to grow.
+
+                            Identical to _score_for unless the ladder score is
+                            switched on, so the default path is unchanged.
+                            """
+                            if where_mode == "expressivity_bottleneck":
+                                # Not consulted: that mode ranks by the
+                                # per-layer expressivity bottleneck, so this
+                                # would build the exact tangent system and its
+                                # SVD once PER CANDIDATE for a number nothing
+                                # reads. The candidate clones themselves are
+                                # still built -- the winner is committed --
+                                # but the exhaustive exact scoring is not.
+                                return None
+                            if where_mode == "certified_gain" and getattr(
+                                config.fgd_approx,
+                                "growth_where_ladder_score",
+                                False,
+                            ):
+                                return _ladder_residual(trial)
+                            return _score_for(trial)
+                        if where_mode == "certified_gain" and getattr(
+                            config.fgd_approx, "growth_where_prune", False
+                        ) and fgd_train_probe is not None:
+                            _freed = _prune_negligible_units(
+                                model,
+                                fgd_train_probe,
+                                float(
+                                    config.fgd_approx
+                                    .growth_preservation_tolerance
+                                ),
+                            )
+                            if _freed and progress is not None:
+                                progress(
+                                    f"[GRO] Epoch {epoch}: freed {_freed} "
+                                    "unit(s) whose removal left f inside the "
+                                    "growth tolerance"
+                                )
                         for candidate_layer in growable:
                             trial = copy.deepcopy(model)
                             try:
@@ -5789,24 +6262,151 @@ def run_pipeline(
                                         f"could not be built: {error}"
                                     )
                                 continue
+                            # Lookahead: measure this location over a
+                            # HORIZON, not at a single block. The extra blocks
+                            # go in the same way -- function-preserving, same
+                            # tolerance -- so the trial stays a legal model,
+                            # and it is this same trial that gets committed if
+                            # the location wins, so the investment that was
+                            # measured is the investment that is made.
+                            _look = int(
+                                getattr(
+                                    config.fgd_approx,
+                                    "growth_where_lookahead",
+                                    1,
+                                )
+                            )
+                            # SEE the horizon, BUY one block. Committing the
+                            # whole horizon triples the spend for a worse mean
+                            # (MEASURED: 0.925/0.908/0.874 at 1697/1348/1733,
+                            # against 0.947/0.929/0.854 at 693/819/392), so
+                            # the horizon informs WHERE while the pace stays
+                            # exactly as it was. The scored model is a
+                            # throwaway; `trial` -- one block -- is what gets
+                            # committed if this location wins.
+                            _probe = trial
+                            if where_mode == "certified_gain" and _look > 1:
+                                _probe = copy.deepcopy(trial)
+                                for _ in range(_look - 1):
+                                    try:
+                                        grow_layer(
+                                            model=_probe,
+                                            train_loader=train_loader,
+                                            layer_index=candidate_layer,
+                                            device=device,
+                                            line_search_config=(
+                                                config.scaling_line_search
+                                            ),
+                                            optimal_update_kwargs=(
+                                                unified_kwargs
+                                            ),
+                                            progress=None,
+                                            function_preserving=True,
+                                            preservation_tolerance=(
+                                                config.fgd_approx
+                                                .growth_preservation_tolerance
+                                            ),
+                                        )
+                                    except RuntimeError:
+                                        break
                             trials[("width", candidate_layer)] = trial
                             candidates.append(
                                 Candidate(
                                     kind="width",
                                     index=candidate_layer,
                                     cost=max(
-                                        count_parameters(trial)
+                                        count_parameters(_probe)
                                         - base_parameters,
                                         1,
                                     ),
-                                    relative_error_after=_certificate_for(trial),
+                                    relative_error_after=_rank_score(_probe),
                                     relieves_rank_ceiling=(
                                         candidate_layer in bottlenecks
                                     ),
                                 )
                             )
 
-                        for position in range(1, len(model.layers)):
+                        # JOINT moves: widen a layer AND the next one in the
+                        # same event, priced as ONE purchase. A new feature
+                        # upstream is worth only what the downstream can carry,
+                        # so the value of widening layer l is conditional on
+                        # widening l+1 -- a dependency no single-layer probe can
+                        # express, and the reason a funnel is unreachable by
+                        # one-layer-at-a-time growth (see Candidate.indices).
+                        # The pair is carried in `indices`; `index` stays a real
+                        # layer so every consumer that reads it keeps working.
+                        if where_mode == "certified_gain" and getattr(
+                            config.fgd_approx, "growth_where_joint", False
+                        ):
+                            for _first in growable:
+                                _second = _first + 1
+                                if _second not in growable:
+                                    continue
+                                _joint = copy.deepcopy(model)
+                                _built = True
+                                for _at in (_first, _second):
+                                    try:
+                                        grow_layer(
+                                            model=_joint,
+                                            train_loader=train_loader,
+                                            layer_index=_at,
+                                            device=device,
+                                            line_search_config=(
+                                                config.scaling_line_search
+                                            ),
+                                            optimal_update_kwargs=(
+                                                unified_kwargs
+                                            ),
+                                            progress=None,
+                                            function_preserving=True,
+                                            preservation_tolerance=(
+                                                config.fgd_approx
+                                                .growth_preservation_tolerance
+                                            ),
+                                        )
+                                    except RuntimeError as error:
+                                        if progress is not None:
+                                            progress(
+                                                f"[GRO-WARN] Epoch {epoch}: "
+                                                f"joint candidate "
+                                                f"({_first},{_second}) could "
+                                                f"not be built: {error}"
+                                            )
+                                        _built = False
+                                        break
+                                if not _built:
+                                    continue
+                                trials[("joint", _first)] = _joint
+                                candidates.append(
+                                    Candidate(
+                                        kind="joint",
+                                        index=_first,
+                                        cost=max(
+                                            count_parameters(_joint)
+                                            - base_parameters,
+                                            1,
+                                        ),
+                                        relative_error_after=(
+                                            _rank_score(_joint)
+                                        ),
+                                        relieves_rank_ceiling=(
+                                            _first in bottlenecks
+                                            or _second in bottlenecks
+                                        ),
+                                        indices=(_first, _second),
+                                    )
+                                )
+
+                        # Depth is excluded under certified_gain by default:
+                        # the reference and the exhaustive 316-architecture
+                        # search both live in the three-hidden-layer family, so
+                        # letting the net deepen would compare against neither.
+                        _allow_depth = where_mode != "certified_gain" or getattr(
+                            config.fgd_approx, "growth_where_allow_depth", False
+                        )
+                        for position in (
+                            range(1, len(model.layers)) if _allow_depth else ()
+                        ):
                             trial = copy.deepcopy(model)
                             try:
                                 insert_identity_layer(
@@ -5824,23 +6424,165 @@ def run_pipeline(
                                         - base_parameters,
                                         1,
                                     ),
-                                    relative_error_after=_certificate_for(trial),
+                                    relative_error_after=_score_for(trial),
                                 )
                             )
 
-                        ranked = rank_candidates(
-                            candidates,
-                            relative_error_before=(
-                                validation_certificate.relative_error
-                            ),
-                            gradient_sq_norm=(
-                                validation_certificate.gradient_sq_norm
-                            ),
-                            statistical_threshold=(
-                                config.fgd_approx.tiny_statistical_threshold
-                            ),
-                            rank_ceiling_binds=ceiling_binds,
-                        )
+                        if where_mode == "certified_gain" and (
+                            progress is not None
+                        ):
+                            # Per-candidate ledger. Without it there is no way
+                            # to tell "the joint move does not win" from "the
+                            # joint move was never evaluated" -- a distinction
+                            # an earlier attempt got wrong.
+                            _base_log = _rank_score(model)
+                            if _base_log is not None:
+                                _cols = []
+                                for _cand in candidates:
+                                    if _cand.relative_error_after is None:
+                                        continue
+                                    _gn = _base_log - _cand.relative_error_after
+                                    _tag = (
+                                        "+".join(str(i) for i in _cand.indices)
+                                        if _cand.indices
+                                        else str(_cand.index)
+                                    )
+                                    _cols.append(
+                                        f"{_cand.kind[0].upper()}{_tag}"
+                                        f":c={_cand.cost}"
+                                        f",g={_gn:+.4f}"
+                                        f",g/c={_gn / max(_cand.cost, 1):+.6f}"
+                                    )
+                                progress(
+                                    f"[WHY] Epoch {epoch} widths={widths} "
+                                    f"base={_base_log:.3f} " + " ".join(_cols)
+                                )
+
+                        if where_mode == "certified_gain":
+                            # The base eps must come from the SAME probe the
+                            # candidates were scored on, or the gain is a
+                            # difference between two different certificates.
+                            base_train_eps = _rank_score(model)
+                            if base_train_eps is None or not math.isfinite(
+                                base_train_eps
+                            ):
+                                # Degenerate base: fall through to the shipped
+                                # rule for THIS event rather than rank on a
+                                # quantity that does not exist.
+                                fallback(
+                                    "growth_where_base_unavailable",
+                                    "train_epsilon_unavailable",
+                                )
+                                ranked = rank_candidates(
+                                    candidates,
+                                    relative_error_before=(
+                                        validation_certificate.relative_error
+                                    ),
+                                    gradient_sq_norm=(
+                                        validation_certificate.gradient_sq_norm
+                                    ),
+                                    statistical_threshold=(
+                                        config.fgd_approx.tiny_statistical_threshold
+                                    ),
+                                    rank_ceiling_binds=ceiling_binds,
+                                )
+                            else:
+                                _pool = candidates
+                                if ceiling_binds:
+                                    _binding = [
+                                        c
+                                        for c in candidates
+                                        if c.relieves_rank_ceiling
+                                    ]
+                                    if _binding:
+                                        _pool = _binding
+                                ranked = rank_candidates_by_certified_gain(
+                                    _pool,
+                                    relative_error_before=base_train_eps,
+                                    gradient_sq_norm=(
+                                        validation_certificate.gradient_sq_norm
+                                    ),
+                                    cost_exponent=(
+                                        config.fgd_approx.growth_where_cost_exponent
+                                    ),
+                                    min_gain_fraction=(
+                                        config.fgd_approx.growth_where_min_gain_fraction
+                                    ),
+                                    # The clamped form, honoured at this new
+                                    # site too. Numerically identical here
+                                    # (threshold is 0.5) so it cannot perturb
+                                    # the reference.
+                                    certificate_binds=(
+                                        base_train_eps
+                                        >= min(
+                                            config.fgd_approx.rel_error_threshold,
+                                            0.5,
+                                        )
+                                    ),
+                                )
+                        else:
+                            ranked = rank_candidates(
+                                candidates,
+                                relative_error_before=(
+                                    validation_certificate.relative_error
+                                ),
+                                gradient_sq_norm=(
+                                    validation_certificate.gradient_sq_norm
+                                ),
+                                statistical_threshold=(
+                                    config.fgd_approx.tiny_statistical_threshold
+                                ),
+                                rank_ceiling_binds=ceiling_binds,
+                            )
+                        if where_mode == "expressivity_bottleneck":
+                            # ONE neuron, into the layer that cannot express
+                            # what is being asked of it. The ranking above
+                            # scored candidates by what a step would gain;
+                            # this replaces it with a measurement of the
+                            # STRUCTURE -- TINY's extension term, without its
+                            # parameter_update_decrease. See
+                            # FGDApproxConfig.growth_where for why the other
+                            # two rules run away on a solved task.
+                            _bottlenecks = compute_expressivity_bottlenecks(
+                                model, train_loader, device, config.fgd_approx
+                            )
+                            _width_only = [
+                                c for c in candidates
+                                if c.kind == "width"
+                                and not c.indices
+                                and 0 <= c.index < len(_bottlenecks)
+                            ]
+                            if progress is not None and _bottlenecks:
+                                progress(
+                                    f"[BOTTLENECK] Epoch {epoch} widths="
+                                    f"{widths} "
+                                    + " ".join(
+                                        f"L{i}={v:.4e}"
+                                        for i, v in enumerate(_bottlenecks)
+                                    )
+                                )
+                            if _width_only and max(_bottlenecks) > 0.0:
+                                ranked = sorted(
+                                    _width_only,
+                                    key=lambda c: _bottlenecks[c.index],
+                                    reverse=True,
+                                )
+                            elif _width_only:
+                                # Every layer expresses what is asked of it.
+                                # That is the answer, not a missing one: no
+                                # width is the bottleneck, so buy nothing.
+                                fallback(
+                                    "growth_where_no_bottleneck",
+                                    "expressivity_bottleneck_all_zero",
+                                )
+                                if progress is not None:
+                                    progress(
+                                        f"[BOTTLENECK] Epoch {epoch}: no layer "
+                                        "has an expressivity bottleneck; no "
+                                        "growth"
+                                    )
+                                ranked = []
+
                         if ranked:
                             # R3: buy the best proposal. Re-measuring after
                             # each purchase would be ideal but doubles the
@@ -5860,12 +6602,27 @@ def run_pipeline(
                             )
                             if progress is not None:
                                 progress(
-                                    f"[GRO] Unified growth at epoch {epoch}: "
+                                    f"[GRO] Unified growth at epoch {epoch} "
+                                    f"[where={where_mode}]: "
                                     f"{chosen.kind} at index {chosen.index} "
                                     f"(+{chosen.cost} params, eps "
                                     f"{validation_certificate.relative_error:.3f}"
-                                    f" -> {chosen.relative_error_after:.3f}); "
+                                    + (
+                                        " -> not scored"
+                                        if chosen.relative_error_after is None
+                                        else f" -> {chosen.relative_error_after:.3f}"
+                                    )
+                                    + "); "
                                     f"{len(candidates)} candidates considered"
+                                    + (
+                                        "; widths "
+                                        + "-".join(
+                                            str(int(layer.in_features))
+                                            for layer in model._growable_layers
+                                        )
+                                        if where_mode == "certified_gain"
+                                        else ""
+                                    )
                                 )
                             # ADAPTIVE COUNT: the "re-measuring after each
                             # purchase" ideal the note above defers. While the
@@ -5879,15 +6636,63 @@ def run_pipeline(
                             # certificate condition are preserved; the COUNT is
                             # chosen by the criterion, not fixed. Off by default
                             # (one purchase per event, byte-identical).
-                            if (
+                            # Under certified_gain this block is ALSO the
+                            # pace replacement: the levelling loop it replaces
+                            # bought several neurons per event, and without a
+                            # burst the branch buys exactly one per epoch --
+                            # arithmetically short of the 40 neurons the
+                            # reference reaches in 25 epochs.
+                            # ONE neuron per event under
+                            # expressivity_bottleneck: the criterion names the
+                            # layer that cannot express what is asked of it,
+                            # and a single neuron changes that measurement, so
+                            # buying more without re-measuring would spend on
+                            # a bottleneck that may no longer be there. The
+                            # burst's own stopping rule is the gain-per-
+                            # parameter of the STEP, which is the quantity
+                            # this mode exists to stop listening to.
+                            _burst_on = where_mode != "expressivity_bottleneck" and (
                                 getattr(
                                     config.fgd_approx,
                                     "certify_adaptive_growth",
                                     False,
                                 )
+                                or (
+                                    where_mode == "certified_gain"
+                                    and getattr(
+                                        config.fgd_approx,
+                                        "growth_where_burst",
+                                        True,
+                                    )
+                                )
+                            )
+                            # ceiling_binds reads the VALIDATION certificate,
+                            # which is the right signal for WHETHER to grow but
+                            # not for how far: MEASURED, it left seed 2 at 1.0
+                            # neurons per event and 241 parameters while seed 0
+                            # got 1.9 and 611. Once the event has decided to
+                            # buy, the burst's own marginal criterion is the
+                            # brake. (Gating it on the TRAIN eps instead was
+                            # tried and is worse: train certifies easily here,
+                            # so growth never fired at all -- 0 events, 25
+                            # parameters, accuracy 0.08-0.36.)
+                            if (
+                                _burst_on
                                 and chosen.kind == "width"
-                                and ceiling_binds
+                                and (
+                                    ceiling_binds
+                                    or where_mode == "certified_gain"
+                                )
                             ):
+                                # The burst buys while the target is unmet.
+                                # Under certified_gain that target is
+                                # certify_growth_target when set, so the
+                                # aspiration -- not the certificate -- sets the
+                                # pace. MEASURED without it, a seed whose first
+                                # purchase already lands under 0.5 never bursts
+                                # at all (seed 2: 0 bursts, 241 parameters,
+                                # 0.611) while a seed landing above it bursts 6
+                                # times (seed 1: 602 parameters, 0.900).
                                 _thr = config.fgd_approx.rel_error_threshold
                                 _min_gain = float(
                                     getattr(
@@ -5896,9 +6701,63 @@ def run_pipeline(
                                         0.1,
                                     )
                                 )
+                                # HOW MUCH, without a target and without a
+                                # constant. "Keep buying here while HERE is
+                                # still the best place to spend": the runner-up
+                                # of this event's own ranking is the reference,
+                                # so the scale is the problem's own and
+                                # recalibrates every event. A target instead
+                                # (certify_growth_target driving the burst) was
+                                # tried and rejected -- it works only if you
+                                # already know where the problem ends, and it
+                                # tuned this dataset rather than solving the
+                                # rule. MEASURED at target 0.30: 0.893 mean at
+                                # 761 parameters, i.e. the reference's budget
+                                # for less accuracy.
+                                # MEASURED AND REFUTED: buying at EVERY
+                                # location whose gain clears the ranker's
+                                # admission floor, to raise the pace. It does
+                                # raise it -- seed 2 goes 392 -> 1143
+                                # parameters -- but accuracy only moves 0.854
+                                # -> 0.878 while the two good seeds DEGRADE
+                                # (0.947 -> 0.925, 0.929 -> 0.895) and mean
+                                # parameters reach 1190 against the
+                                # reference's 774. It also refutes the
+                                # "seed 2 is merely undersized" reading: at
+                                # nearly double the reference's parameters it
+                                # still trails the reference's 0.933 at 659,
+                                # and 0.878 is about what an AdamW grid gives
+                                # at that size, i.e. on that seed the
+                                # certified step stops contributing the ~5
+                                # points it contributes on the others. That is
+                                # a separate pathology; more capacity does not
+                                # buy it back.
+                                _rival_rate = None
+                                if where_mode == "certified_gain" and (
+                                    len(ranked) > 1
+                                ):
+                                    _rival = ranked[1]
+                                    _rival_gain = (
+                                        base_train_eps - _rival.relative_error_after
+                                    )
+                                    _rival_rate = _rival_gain / max(
+                                        float(_rival.cost), 1.0
+                                    )
                                 _eps_now = chosen.relative_error_after
                                 _added = 0
-                                while _eps_now is not None and _eps_now >= _thr:
+                                # MEASURED AND REFUTED: letting the burst
+                                # RELOCATE to whichever location currently
+                                # rates best (instead of ending the event) and
+                                # stopping on decay relative to the event's
+                                # opening rate. A relocation commits nothing --
+                                # it discards the trial and re-loops -- so
+                                # events cost more and buy less: 0.915/0.392/
+                                # 0.917 at 631/102/1220 parameters, against
+                                # 0.947/0.929/0.854 at 693/819/392 for ending
+                                # the event and re-ranking at the next one.
+                                while _eps_now is not None and (
+                                    _eps_now >= _thr or _rival_rate is not None
+                                ):
                                     _trial = copy.deepcopy(model)
                                     try:
                                         grow_layer(
@@ -5919,11 +6778,67 @@ def run_pipeline(
                                         )
                                     except RuntimeError:
                                         break
-                                    _trial_eps = _certificate_for(_trial)
+                                    _trial_eps = _score_for(_trial)
                                     if _trial_eps is None:
                                         break
                                     _gain = _eps_now - _trial_eps
-                                    if not (
+                                    if _rival_rate is not None:
+                                        # Keep buying here while HERE is still
+                                        # the best place to spend, re-measuring
+                                        # the alternatives after every
+                                        # increment. Comparing against the
+                                        # runner-up's rate from BEFORE the
+                                        # purchase is stale: MEASURED, a seed
+                                        # whose single purchases are very
+                                        # effective (eps 1.072 -> 0.477) stops
+                                        # after one and ends at 31 neurons
+                                        # where the others reach 51.
+                                        _rate = _gain / max(
+                                            float(chosen.cost), 1.0
+                                        )
+                                        _still_best = True
+                                        for _other in growable:
+                                            if _other == chosen.index:
+                                                continue
+                                            _alt = copy.deepcopy(model)
+                                            try:
+                                                grow_layer(
+                                                    model=_alt,
+                                                    train_loader=train_loader,
+                                                    layer_index=_other,
+                                                    device=device,
+                                                    line_search_config=(
+                                                        config.scaling_line_search
+                                                    ),
+                                                    optimal_update_kwargs=(
+                                                        unified_kwargs
+                                                    ),
+                                                    progress=None,
+                                                    function_preserving=True,
+                                                    preservation_tolerance=(
+                                                        config.fgd_approx
+                                                        .growth_preservation_tolerance
+                                                    ),
+                                                )
+                                            except RuntimeError:
+                                                continue
+                                            _alt_eps = _score_for(_alt)
+                                            if _alt_eps is None:
+                                                continue
+                                            _alt_cost = max(
+                                                count_parameters(_alt)
+                                                - count_parameters(model),
+                                                1,
+                                            )
+                                            _alt_rate = (
+                                                _eps_now - _alt_eps
+                                            ) / float(_alt_cost)
+                                            if _alt_rate >= _rate:
+                                                _still_best = False
+                                                break
+                                        if not _still_best:
+                                            break
+                                    elif not (
                                         _gain
                                         > _min_gain * max(_eps_now - _thr, 1e-6)
                                     ):

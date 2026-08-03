@@ -37,6 +37,11 @@ ProjectionSolver = Literal[
 ]
 LearningRatePolicy = Literal["scheduler", "theory_interval"]
 GrowthLimitCriterion = Literal["progress_floor", "epsilon_stationary"]
+#: How the unified branch decides WHERE to grow. "rank_ceiling" is the shipped
+#: behaviour: level the width minimum first, then rank what is left.
+#: "certified_gain" removes the levelling and lets the exact train-probe eps
+#: reduction per parameter choose, which is what allows non-uniform shapes.
+GrowthWhere = Literal["rank_ceiling", "certified_gain", "expressivity_bottleneck"]
 GrowthSelection = Literal[
     "descent_per_parameter",
     "epsilon_lookahead",
@@ -419,6 +424,82 @@ class FGDApproxConfig:
     certify_family_inner_steps: int = 400
     certify_family_inner_learning_rate: float = 0.01
     certify_family_functional_lr: float = 1.0
+    # SWEEP the family's functional step instead of trying one eta_f. The
+    # tangent family is the only one in family_order, and its ladder call site
+    # passed certify_family_functional_lr as a single value -- unlike
+    # parametric_gd, which declares functional_learning_rates and walks them.
+    # One eta_f is one attempt at a target the clone may simply be unable to
+    # realise, and a failure there is recorded as "the family cannot certify
+    # here" when it only means "not at that distance".
+    #
+    # The search is bounded from BOTH ends by the method itself, which is why
+    # it is a search and not a knob. Too large and the target f - eta_f r sits
+    # off the reachable manifold, so the realised Delta misaligns and the
+    # cosine bar sqrt(3)/2 fails. Too small and Delta collapses onto the
+    # first-order term, i.e. onto the tangent projection, whose eps is >= 1/2
+    # -- that is why the ladder was reached at all -- so it fails too. The
+    # ladder cannot degenerate into "certify everything with a tiny step".
+    #
+    # First certificate wins. NOTHING is weakened -- every candidate faces the
+    # same RelErr(Delta, r) < min(rel_error_threshold, 1/2) on the same probe.
+    # Empty () keeps the single-eta behaviour bit-identical.
+    #
+    # THE DIRECTION MATTERS, and it is UP. MEASURED on N=1024, 4 seeds, capped
+    # at 600 parameters:
+    #
+    #   baseline (eta_f = 1 alone)     0.941 0.830 0.904 0.925  mean 0.9000
+    #   descending [1, .5, .25, .125]  0.893 0.807 0.904 0.925  mean 0.8823
+    #   ascending  [1, 2, 4, 8]        0.941 0.887 0.931 0.933  mean 0.9230
+    #
+    # Descending LOSES, and structurally rather than by noise: a small eta_f
+    # certifies a SMALL step, and a certified family step returns from
+    # grow_until_certified at once, so it buys a growth deferral without
+    # progress -- exactly what certify_family_min_gain is for, and it is 0
+    # here. It is also self-limiting in the other direction: as eta_f -> 0 the
+    # realised Delta collapses onto the first-order term, i.e. onto the
+    # tangent projection, whose eps is >= 1/2 -- which is why the ladder was
+    # reached at all. MEASURED cos(Delta, r) at one call: 0.7871 / 0.7955 /
+    # 0.7594 / 0.7481 for eta_f 1 / 0.5 / 0.25 / 0.125, decaying toward the
+    # tangent's own.
+    #
+    # Ascending asks the clone for MORE curvature, and it pays. Note how
+    # little of it is needed: across all four seeds only 4 steps certified
+    # above eta_f = 1 (eta_f = 2 three times, eta_f = 4 once, eta_f = 8
+    # never). The gain compounds instead -- one early rescue changes the whole
+    # trajectory, and the seed that was stuck goes from 2 family
+    # certifications to 6, of which only one came from eta_f > 1.
+    #
+    # Head first, so eta_f = 1 stays the preferred distance and a run that
+    # certifies there is bit-identical to today, at today's cost; the ladder
+    # escalates ONLY where the single-eta call would have grown instead.
+    certify_family_functional_lrs: tuple[float, ...] = ()
+    # STOP GROWING WHEN THE BOTTLENECK IS NOT SIGNIFICANT. Only meaningful
+    # with growth_where: expressivity_bottleneck. A parameter cap is a number
+    # nobody knows in advance -- it has to be guessed per dataset, and MEASURED
+    # here it is what actually ends every run: all four N=1024 seeds stop by
+    # exhausting 600 parameters, never by deciding they are done, and one of
+    # them then sits frozen for 35 of its 70 epochs, unable to grow and unable
+    # to certify. This replaces the cap with a question the DATA answers:
+    # are the extension's singular values distinguishable from what pure
+    # sampling noise would have produced? Marchenko-Pastur's edge settles it
+    # from the two dimensions and the spectrum's own bulk -- see
+    # marchenko_pastur_significant_count. Nothing is predetermined, nothing is
+    # fitted per dataset, and magnitude cancels, so the same rule transfers
+    # unchanged between bases. Off by default: it changes when growth ends.
+    growth_bottleneck_significance: bool = False
+    # UN SOLO CRITERIO en todo el crecimiento. La cuenta adaptativa de
+    # grow_until_certified decide CUANTAS neuronas comprar en la ubicacion ya
+    # elegida, y su regla es de HUECO: "cerro esta neurona el 10% de lo que
+    # falta para certificar?". Eso habla de eps y no dice nada sobre si esa
+    # capa sigue siendo el sitio, asi que compra sin volver a preguntar DONDE
+    # -- MEDIDO en la semilla 3, con eps en 1.0310, el doble del umbral,
+    # compro una segunda neurona en la capa 0 a ciegas. Con esto activo, la
+    # misma medida que eligio la ubicacion decide cuantas: sigue comprando
+    # mientras ESA capa siga siendo el argmax del cuello de botella,
+    # re-medido tras cada compra. Es autolimitante (ensanchar una capa baja su
+    # propio cuello) y no introduce ni hueco, ni fraccion, ni constante.
+    # Solo surte efecto con growth_where: expressivity_bottleneck.
+    certify_adaptive_growth_by_bottleneck: bool = False
     # Cheapen the family clone WITHOUT changing the step it produces: stop the
     # inner training once its alignment with the residual (cos(Delta, r)) has
     # genuinely PLATEAUED -- no improvement above plateau_tol for a few checks.
@@ -431,6 +512,191 @@ class FGDApproxConfig:
     # criterion (RelErr < 1/2) is never touched.
     certify_family_plateau_stop: bool = False
     certify_family_plateau_tol: float = 0.002
+    # Commit the family step at ITS OWN Lemma 3.5 rate instead of whole.
+    # The family certifies a DIRECTION -- cos(Delta, r) > sqrt(1 - eps^2) --
+    # and then commits the trained clone outright, which is a functional step
+    # of size 1. The lemma applied to that same eps allows far less: MEASURED
+    # on MNIST, eps 0.292 gives eta_bar = 0.263 at L_s = 2, so a full step
+    # overshoots the descent bound by 3.8x (9x at eps 0.400). The direction
+    # was certified; the distance never was, and that is what made the run
+    # oscillate with its loss flat. Off by default so every existing result
+    # is byte-identical -- the acceptance criterion is never touched, only
+    # how far the accepted direction is followed.
+    certify_family_lemma35_rate: bool = False
+    # Try the ladder throughout the band it can help in, not only where no
+    # step certifies. Default false = the ladder runs while eps is above the
+    # step CERTIFICATE, i.e. only as the remedy for "nothing certifies".
+    # True runs it while eps is above the GROWTH TARGET, where the tangent
+    # already certifies but an aspiration is still being chased -- the band
+    # where growth would otherwise be the only tool and, on MNIST, buys 0.0007
+    # of eps for 800 parameters while the clone reaches 22 degrees against a
+    # 30 degree bar. Only safe together with certify_family_lemma35_rate:
+    # MEASURED without it, the unbounded family step diverged held-out loss
+    # 9.37 -> 44.53 in two epochs because it pre-empted the tangent path that
+    # produces the very bound it was missing.
+    certify_family_in_target_band: bool = False
+    # A certified family step DEFERS growth, so it must earn the deferral by
+    # the same marginal-return rule growth answers to: it has to close this
+    # fraction of the remaining gap to the growth target, or growth takes the
+    # turn instead. MEASURED on MNIST without it, the ladder certified on all
+    # 20 epochs, the structure never grew (GRO=0), and accuracy plateaued at
+    # 0.113 from epoch 9 -- worse than the 0.164 the growing path reached by
+    # epoch 13. Certifying is not the same as progressing. 0.0 disables it,
+    # which is the previous behaviour exactly.
+    certify_family_min_gain: float = 0.0
+    # Ask ONCE per outer step whether it is growth's turn, by training a grown
+    # clone and a stay clone the same number of steps and comparing the eps
+    # they reach. Organic where a threshold is not: it never compares eps to a
+    # constant, so it transfers across datasets -- on MNIST every growth moves
+    # eps ~1e-3 and any fraction of any gap refuses them all equally, while a
+    # parameter cap is just another invented number. A "no" returns at once,
+    # so the step commits and training happens before the question is asked
+    # again, which is what stops the loop front-loading every growth into the
+    # first outer step. Off by default; reuses growth_lookahead_steps and
+    # tiny_statistical_threshold, so it introduces no new constant.
+    certify_growth_lookahead: bool = False
+    # Let the exact per-candidate eps ranking choose the SHAPE, not just the
+    # size. The rank cap filters candidates to the width minimum and mandates
+    # levelling it, both justified by "rank J <= min_l w_l" -- which is FALSE
+    # on the exact Jacobian: MEASURED at NK=200, widths (20,3,20) and
+    # (30,4,30) both reach rank 200, and (2,2,2) reaches 25 = P, not 2. The
+    # bound is min(NK, P). So the mandate levels every run onto h,h,h+1 and
+    # bars non-uniform shapes for a reason that does not hold. With this on,
+    # unified.expansion_value decides alone -- it already scores all six
+    # candidates by their EXACT resulting eps. No certificate changes.
+    #
+    # MEASURED AND REFUTED -- do not enable. The bound really is false (see
+    # above), but the machinery built on it is load-bearing for growth to
+    # happen AT ALL: rank_candidates filters by the rank ceiling and
+    # unified.py:207-217 returns the bottleneck relief as the FALLBACK when
+    # that ceiling binds. Removing both empties the candidate list. On
+    # N=1024 the three seeds then stop at 53 / 60 / 119 parameters instead
+    # of 588 / 1074 / 659, and test accuracy collapses from 0.907-0.933 to
+    # 0.219-0.361. Kept, off, so the negative result is not rediscovered.
+    growth_free_shape: bool = False
+    # WHERE to grow. "rank_ceiling" is the shipped path, byte-identical.
+    # "certified_gain" replaces all three jobs the old block did at once,
+    # because the free-shape failure above was caused by replacing only one:
+    #
+    #   WHERE      rank by exact TRAIN-probe eps reduction per parameter. The
+    #              branch scores candidates on the VALIDATION probe today,
+    #              while the certificate the flow chases is the train one --
+    #              two certificates driving one decision. On the train probe
+    #              function-preserving growth strictly enlarges range(J), so
+    #              eps_after <= eps_before holds by certify.py's theorem; on
+    #              validation it does not, which is what the max(...,0) clamps.
+    #   HOW MUCH   the levelling loop was also the PACE: it bought several
+    #              neurons per event. Without it the branch buys exactly one,
+    #              and events fire once per epoch -- the reference needs 40
+    #              neurons in <=25 epochs, arithmetically impossible. Replaced
+    #              by the existing burst idiom (certify_adaptive_growth_min_gain).
+    #   NEVER STALL the fallback drops the bottleneck requirement and keys on
+    #              the measured eps, so it cannot empty and cannot degenerate
+    #              into always-cheapest.
+    #
+    # MEASURED on a proxy with the real config, probes and grow_layer: the
+    # shipped rule lands [9,9,10] at 246p / 0.574; gain-per-cost on exact train
+    # eps lands [18,7,5] at 269p / 0.629. Pure argmin (certify.py's rule,
+    # cost_exponent 0) was the WORST exact variant at 0.544 -- the cost divisor
+    # earns its place.
+    #
+    # "expressivity_bottleneck" asks the question growth is actually for:
+    # WHICH LAYER CANNOT EXPRESS WHAT IS BEING ASKED OF IT. One neuron goes
+    # into the argmax of tangent.compute_expressivity_bottlenecks, i.e. of
+    # activation_gradient * sum(eigenvalues_extension ** 2) -- TINY's
+    # extension term, the mass of the desired functional change lying outside
+    # the current width. NOT TINY's select_best_update, which adds
+    # parameter_update_decrease and so mixes in "where would re-fitting the
+    # existing weights help", a statement about training rather than width.
+    #
+    # It exists because the other two rules answer a different question and
+    # MEASURED runaway growth for it: with certified_gain the growth trigger
+    # reads the STEP's rel_err, which diverges (0.64 -> 114 on the easy
+    # synthetic function, 229 on the hard one) as the damped projection
+    # recovers less of the residual, while the growth loop's own eps says
+    # 0.15-0.39 -- adequate. The easy function reaches test 1.000 at 74
+    # parameters and is grown to 872 anyway, 25 growth events in 25 epochs.
+    # A bottleneck measured on what the STRUCTURE can represent cannot run
+    # away like that: it goes to zero when the width suffices.
+    growth_where: GrowthWhere = "rank_ceiling"
+    #: 0.0 collapses the rule to certify.py's pure argmin, which is immune to
+    #: cost degeneracy by construction. The rollback if risk 1 materialises.
+    growth_where_cost_exponent: float = 1.0
+    #: Admission floor on the RAW gain, applied BEFORE the cost division, as a
+    #: fraction of the best gain available. Without it, cheap-and-useless wins:
+    #: MEASURED, 11 of 12 consecutive purchases went to the last growable
+    #: location, whose cost does not grow with its own width.
+    growth_where_min_gain_fraction: float = 0.25
+    #: Depth candidates are excluded by default so the search stays within the
+    #: three-hidden-layer family the reference and the exhaustive architecture
+    #: search both live in.
+    growth_where_allow_depth: bool = False
+    #: Keep buying at the chosen location while each increment still pays.
+    #: This is the HOW MUCH replacement; without it growth is one neuron per
+    #: epoch and cannot reach the reference's widths in its epoch budget.
+    growth_where_burst: bool = True
+    #: Magnitude used to break the w = 0 degeneracy when SCORING a candidate.
+    #: Only ever applied to a disposable clone, never to the committed model,
+    #: so function preservation and every certificate are untouched. 0
+    #: disables it and restores dormant scoring.
+    growth_where_wake_scale: float = 1e-3
+    # Score a candidate by what the LADDER can do with it, not by what it does
+    # at insertion. The ladder fits a disposable clone toward the functional
+    # target f - eta * r, and because growth is function-preserving that target
+    # is IDENTICAL whether it is computed from the base or from any grown
+    # candidate -- so every candidate chases the same fixed blank and the
+    # comparison needs no separately trained control. (An earlier attempt
+    # compared a TRAINED clone against an UNTRAINED base, which is why every
+    # gain came out negative: the ladder's own step raises eps 0.4497 ->
+    # 0.4806.)
+    growth_where_ladder_score: bool = False
+    growth_where_ladder_steps: int = 1
+    # How many neuron-blocks to put in when SCORING a location, and -- when the
+    # location wins -- to actually buy. Scoring one block is myopic: a layer
+    # that is a poor buy for one neuron can be the best buy for three, and that
+    # is invisible to a one-block probe. Because the winner is committed with
+    # the same horizon it was measured over, the WHERE and the HOW MUCH stop
+    # being two separate rules measured on two different quantities.
+    # MEASURED AND REFUTED as a better WHERE. It looked like a win at free
+    # budget -- it lifted the worst seed 0.854 -> 0.903 and collapsed the
+    # spread -- but that was a difference in SPEND, not in placement. Capped at
+    # 460 parameters so both rules get the same money, it loses on all four
+    # seeds: 0.830 mean against 0.872 for the shipped rank_ceiling rule. Left
+    # off by default; the knob stays because the horizon probe is the only way
+    # measured so far to see a location's value beyond one block.
+    growth_where_lookahead: int = 1
+    # Score JOINT proposals too: widen a layer and the one after it in a
+    # single event, priced as one purchase. Without this the first hidden
+    # layer never gets its moment -- MEASURED at widths [5, 6, 2] it gains
+    # +0.0080 against +0.0220 downstream because nothing reaches the output
+    # through a width-2 layer, and once the downstream is wide enough to use
+    # its features it costs 5 + h2 and is no longer cheap. Funnels are
+    # therefore unreachable one layer at a time, and the exhaustive per-shape
+    # lr grid says funnels are exactly what wins here: 4-19-13-13-1 reaches
+    # 0.9250 with 551 parameters where the grown 4-16-17-17-1 reaches 0.9135
+    # with 693.
+    growth_where_joint: bool = False
+    # WHICH PROBE ranks the locations. The certificate, the families and the
+    # ladder are untouched by this: it only decides WHERE capacity goes.
+    #
+    # eps = ||r - g|| / ||r|| on the TRAIN probe asks "which layer lets me
+    # represent the TRAINING gradient best per parameter". That is not the
+    # quantity that decides test accuracy, and MEASURED they diverge: the
+    # shape this criterion grows, 4-16-17-17-1, is the WORST of six under a
+    # per-shape lr grid (0.9135), while 4-19-13-13-1 reaches 0.9250 with 551
+    # parameters. A criterion minimising training-probe representation error
+    # favours the shapes that interpolate soonest, not the ones that
+    # generalise -- and this method is already known to certify by
+    # interpolating the train probe.
+    #
+    # "validation" ranks on the held-out probe, "both" on the mean of the two.
+    growth_where_probe: str = "train"
+    # Let capacity MOVE, not just accumulate. A unit whose removal shifts f by
+    # less than growth_preservation_tolerance is as function-preserving to drop
+    # as it was to add, so no new constant is needed: the config already says
+    # what "does not change f" means, it was just never used in this
+    # direction.
+    growth_where_prune: bool = False
     # ROUGHNESS PENALTY -- the RIGHT regulariser, in the function-space norm.
     # functional_tikhonov above penalises ||f||^2 (magnitude), which shrinks f
     # toward 0 but still lets it memorise a shrunk copy. This penalises
@@ -602,6 +868,53 @@ class FGDApproxConfig:
     # while (eps_before - eps_after) > this fraction of (eps - threshold). Higher
     # = fewer neurons per growth (stops sooner); lower = grows more aggressively.
     certify_adaptive_growth_min_gain: float = 0.1
+    # The eps the grow-to-certify loop CHASES, as distinct from the eps at which
+    # a step is CERTIFIED. rel_error_threshold does both jobs, and they are
+    # incompatible: every step site reads Lemma 3.5 as eps <
+    # min(rel_error_threshold, 1/2) (damping.py's bisection, lemma35_learning_
+    # rate), so lowering the threshold to make the loop aspire higher DISABLES
+    # the step. MEASURED on MNIST at rel_error_threshold 0.3: eps sat at 0.457,
+    # no damping and no rate ever certified, lr was 0 in every epoch, and the
+    # only thing still moving the model was the family ladder -- applied at
+    # functional_lr 1.0 WITHOUT the Lemma 3.5 bound, because that bound is
+    # produced on the tangent route the threshold had killed. Accuracy
+    # oscillated between 0.33 and 0.74 while the functional loss barely moved
+    # (0.2393 -> 0.2382) and growth ran away to P ~ 31000 without finishing one
+    # outer step in 39 minutes.
+    #
+    # Splitting them lets the loop aspire to 0.3 while a step still commits at
+    # eps 0.457 under a threshold of 0.5. Never laxer than the certificate: the
+    # loop uses min(this, rel_error_threshold), so this field can only ask for
+    # MORE structure, never license a step the lemma forbids. None means "chase
+    # the certificate" -- today's behaviour, and by construction rather than by
+    # a flag: with target == rel_error_threshold the loop invariant eps >=
+    # target already implies eps >= the certificate, the regime in which growth
+    # is unconditional.
+    certify_growth_target: float | None = None
+    # Marginal-value floor for chasing certify_growth_target BELOW the
+    # certificate. Once eps < min(rel_error_threshold, 1/2) a step exists, so
+    # every further growth is VOLUNTARY and has to earn its parameters: it must
+    # close at least this fraction of the gap that is left (eps - target). Above
+    # the certificate no step exists at any damping, growth is the only move the
+    # method has, and this floor is not applied at all -- which is why it cannot
+    # deadlock the loop.
+    #
+    # The discriminant is the dimensionless ratio gain/gap, so nothing about the
+    # dataset enters. MEASURED, at certificate 0.5 and target 0.3: MNIST eps
+    # 0.457, gap 0.157, gain per growth 0.0007 -> ratio 0.0045; N1024 eps 0.3267,
+    # gap 0.0267, gain per growth 0.00707 -> ratio 0.265. Two orders of magnitude
+    # apart, and 0.1 falls between them with 22x and 2.6x of margin. 0.0 disables
+    # the stop (every growth pays), which is the refutation experiment for a run
+    # this criterion is suspected of cutting short.
+    certify_growth_min_gain: float = 0.1
+    # How many CONSECUTIVE growths may fail the min_gain floor before the loop
+    # stops chasing the target. 1 stops at the first refusal, so not one
+    # parameter is spent on a growth that did not pay. Raise it if a bootstrap
+    # ladder appears -- the first growths of a very narrow net can under-deliver
+    # because the widths themselves are tiny -- which does not arise with
+    # tiny_maximum_added_neurons: 1 and certify_grow_all_width: false, where the
+    # count added per event is constant.
+    certify_growth_min_gain_patience: int = 1
     # Grow EVERY growable width location per event, not just the single best.
     # GroMo caps the neurons added to a layer at min(fan-in, fan-out) -- on a net
     # whose hidden layers all start at width 2, that is ~2 per event, and the
@@ -689,6 +1002,22 @@ class FGDApproxConfig:
     # parameters, structural growth is suppressed and the flow keeps
     # training the fixed structure through the certified families. None
     # means no cap. Keeps a grow-and-train run inside a target budget.
+    # MEASURED on N=1024 (4 model seeds, train_seed fixed): free growth
+    # OVERSHOOTS. The accuracy/parameter frontier of the shipped rule is
+    #
+    #   cap 460 -> 0.872 at 467p     cap 650 -> 0.911 at 641p
+    #   cap 550 -> 0.897 at 564p     cap 750 -> 0.918 at 671p
+    #   free    -> 0.920 at 774p
+    #
+    # so 750 buys the same accuracy as free growth for 13% fewer parameters.
+    # The cap does not even bind on most seeds (588p and 659p runs are
+    # untouched); it only stops the one seed that would run to 1074p for 0.907,
+    # which lands at 756p for 0.903 instead.
+    #
+    # It also locates where this method is worth using: against conventional
+    # AdamW it is +3.5 points at ~670p (0.918 vs ~0.88) but only TIED at ~450p
+    # (0.872 vs 0.876). Below roughly 550 parameters the certified step buys
+    # nothing over ordinary training.
     max_total_parameters: int | None = None
     # Structure-burst patience: the growth probe runs only after this many
     # CONSECUTIVE epochs in which no family committed a step. With a value
@@ -3404,6 +3733,141 @@ def _layer_functional_error(
         target_sq_norm=target_sq_norm,
         config=config,
     )
+
+
+def marchenko_pastur_significant_count(
+    singular_values: torch.Tensor,
+    sample_count: int,
+) -> int:
+    """How many extension directions stand above the NOISE, by RMT alone.
+
+    The stopping question -- "is this bottleneck real, or is it what an
+    all-noise extension would have produced anyway?" -- answered without a
+    threshold anyone has to choose. The extension's singular values come from
+    ``S^{-1/2} N``, i.e. an ALREADY WHITENED matrix estimated from a finite
+    probe, which is exactly the setting Marchenko-Pastur describes: if there
+    is no signal, the squared singular values fill a bulk whose upper edge is
+    ``sigma^2 (1 + sqrt(gamma))^2`` with ``gamma = r / n``, ``r`` the
+    extension's dimension and ``n`` the probe's sample count. Anything above
+    that edge cannot be explained by sampling noise.
+
+    Nothing here is predetermined and nothing is fitted to a dataset: the
+    edge's shape comes from random-matrix theory, ``gamma`` from the two
+    dimensions, and ``sigma^2`` from the spectrum's OWN bulk -- the mean of
+    the lower half of the squared values, which the top (signal) directions
+    cannot contaminate. Magnitude cancels, because the edge scales with the
+    same ``sigma^2`` the spectrum does. The identical rule therefore applies
+    to smooth_sin and MNIST with no re-tuning.
+
+    LIMIT, stated because it bites here: MP is an asymptotic statement, and a
+    layer of width 3 gives r = 3, where "the lower half" is a single number
+    and the bulk estimate is worth little. Read the count as a strong signal
+    when ``r`` is large and as a weak one when it is tiny.
+    """
+    if singular_values is None or singular_values.numel() == 0:
+        return 0
+    squared = (singular_values.detach().double() ** 2).reshape(-1)
+    rank = int(squared.numel())
+    if rank == 0 or sample_count <= 0:
+        return 0
+    gamma = rank / float(sample_count)
+    bulk_size = max(1, rank // 2)
+    bulk = torch.sort(squared).values[:bulk_size]
+    sigma_squared = float(bulk.mean())
+    if not (sigma_squared > 0.0 and math.isfinite(sigma_squared)):
+        return 0
+    edge = sigma_squared * (1.0 + math.sqrt(gamma)) ** 2
+    return int(torch.sum(squared > edge).item())
+
+
+def compute_expressivity_bottlenecks(
+    model: GrowingMLP,
+    train_loader: torch.utils.data.DataLoader,
+    device: torch.device,
+    config: FGDApproxConfig,
+) -> list[float]:
+    """Per-layer EXPRESSIVITY BOTTLENECK: what the layer's width cannot reach.
+
+    TINY's quantity, and only the part of it that is about expressivity. GroMo
+    computes ``first_order_improvement = parameter_update_decrease +
+    activation_gradient * sum(eigenvalues_extension ** 2)``, and its
+    ``select_best_update`` takes the argmax of that SUM. The first term is the
+    first-order gain from re-fitting the weights the layer ALREADY has -- a
+    statement about training, not about width -- so including it answers
+    "where would a step help most", which is not the question growth asks.
+
+    The second term is the bottleneck itself: ``eigenvalues_extension`` are the
+    singular values of the extension problem, i.e. the mass of the desired
+    functional change that lies OUTSIDE what the current width can express and
+    that new neurons would capture. Weighted by ``activation_gradient``, it is
+    the first-order loss decrease attributable to ADDING capacity there.
+
+    Returned per growable layer, in layer order, so the caller can put its
+    neuron where the number is largest. ``0.0`` where GroMo declines to build
+    an extension (no bottleneck it can name), which the caller must read as
+    "nothing to gain here", not as a missing measurement.
+    """
+    bottlenecks: list[float] = []
+    update_kwargs = tiny_optimal_update_kwargs(
+        config,
+        compute_delta=config.rel_error_compute_delta,
+    )
+    # The FULL spectrum, for the significance test only. The shipped kwargs
+    # truncate to maximum_added_neurons (1 here) and to statistical_threshold,
+    # both of which discard exactly the bulk that Marchenko-Pastur needs in
+    # order to estimate the noise level from the data itself. Asking for the
+    # untruncated SVD costs nothing extra -- it is the same decomposition,
+    # simply not cut -- and the neuron actually added is still one.
+    significance = bool(
+        getattr(config, "growth_bottleneck_significance", False)
+    )
+    if significance:
+        update_kwargs = dict(update_kwargs)
+        update_kwargs["maximum_added_neurons"] = None
+        update_kwargs["statistical_threshold"] = 0.0
+    sample_count = 0
+    if significance:
+        for _batch in train_loader:
+            _inputs = _batch[0] if isinstance(_batch, (tuple, list)) else _batch
+            sample_count += int(_inputs.shape[0])
+
+    for layer_index in range(len(model._growable_layers)):
+        model.set_growing_layers(index=layer_index)
+        try:
+            compute_statistics(
+                model,
+                train_loader,
+                loss_function=batch_functional_mse_loss,
+                device=device,
+            )
+            model.compute_optimal_updates(**update_kwargs)
+            model.reset_computation()
+            model.dummy_select_update()
+            layer = model.currently_updated_layer
+            eigenvalues = getattr(layer, "eigenvalues_extension", None)
+            if eigenvalues is None or eigenvalues.numel() == 0:
+                bottlenecks.append(0.0)
+                continue
+            if significance:
+                # NOT SIGNIFICANT -> NOT A BOTTLENECK. Zero here is a
+                # measurement ("this layer's extension is indistinguishable
+                # from noise"), which is what lets the caller stop without a
+                # parameter cap: a cap is a number nobody knows in advance,
+                # while this is a statement the data makes about itself.
+                kept = marchenko_pastur_significant_count(
+                    eigenvalues, sample_count
+                )
+                if kept == 0:
+                    bottlenecks.append(0.0)
+                    continue
+                eigenvalues = eigenvalues[:kept]
+            gradient = float(layer.activation_gradient)
+            value = gradient * float(torch.sum(eigenvalues.double() ** 2))
+            bottlenecks.append(value if math.isfinite(value) else 0.0)
+        finally:
+            _cleanup_tiny_update(model)
+
+    return bottlenecks
 
 
 def compute_tiny_layer_relative_errors(
