@@ -112,6 +112,68 @@ más alta, no más baja). Es independiente del *dónde*: su arquitectura es casi
 idéntica a la de s0 con el mismo presupuesto. Las otras tres semillas promedian
 0.93, así que **todo el déficit contra el objetivo es esta semilla**.
 
+
+## LO QUE FUNCIONA HOY (`fe4c88d`) — leer esto primero
+
+`growth_where: expressivity_bottleneck` en los tres configs de `configs/fgd/`.
+UNA neurona en el argmax de `activation_gradient * sum(eigenvalues_extension^2)`
+— el termino de extension de TINY, sin su `parameter_update_decrease`.
+
+**N=1024, 4 semillas, <=600 params, 70 epochs, a igualdad de computo:**
+
+| | media | formas |
+|---|---|---|
+| `certified_gain` (anterior) | 0.9230 | 15-16-15 en 3 de 4 |
+| **`expressivity_bottleneck`** | **0.9435** | 4 distintas, ratios 1.46-2.44 |
+
+Las 4 superan 0.925 individualmente. Reproducido exacto en las 4. **El pipeline
+es determinista** (verificado: re-ejecutar da el mismo resultado bit a bit), asi
+que cualquier diferencia entre corridas es causal, nunca ruido.
+
+### LA UNICA PREGUNTA ABIERTA: como parar sin presupuesto
+
+Nada de esto se detiene solo. Las 4 semillas paran al agotar los 600
+parametros; s1 llego al tope en la epoch 35 y paso las 35 restantes congelada
+(34 de 35 epochs con `model update rejected`, no entrenando). El tope es
+delicado porque **nunca se sabe cuanto es** de antemano.
+
+La senal EXISTE y es limpia: el cuello de botella colapsa **diez ordenes de
+magnitud** (4.9e-02 -> 1e-10..1e-12) justo cuando la tarea queda resuelta.
+Lo que falta es leerla como orden de parar.
+
+**Descartado con medicion:**
+- Umbral absoluto sobre los valores propios (`tiny_statistical_threshold`):
+  depende de la escala de cada base. Vetado.
+- Marchenko-Pastur: a `gamma = r/n ~ 0.015` (r = ancho de capa 2-32, n = 1024)
+  el borde queda en **1.26x el bulk** y no filtra nada. MP necesita `r/n`
+  apreciable; aqui el regimen asintotico no aplica. Sin tope la forma degenera
+  a `20-32-2` y el crecimiento revienta su tolerancia numerica.
+- Criterio de primer orden (comparar contra `parameter_update_decrease`):
+  **invalido bajo function-preserving**, porque al crecer `f` no se mueve y no
+  se cobra ningun decremento.
+
+**Candidato vivo: validacion cruzada en K pliegues.** Ajustar la direccion de
+extension en K-1 pliegues de la sonda y medir su cuello de botella en el
+retenido. Una direccion real da valor positivo fuera de muestra; el ruido
+fluctua alrededor de cero. `t = media(b_k) / (desv(b_k)/sqrt(K))`, crecer solo
+si `t > 1`. **No depende de que `r/n` sea grande**, que es lo que mato a MP, y
+el "umbral" es estadistico y no una magnitud, asi que transfiere entre bases.
+Cuesta K pasadas de estadisticos por capa y por evento.
+
+### Las dos vias de crecimiento (no confundirlas)
+
+| | pregunta | criterio | % de neuronas |
+|---|---|---|---|
+| via 1 `grow_until_certified` | que crecimiento hace que EXISTA un paso | argmin exacto de eps | 12-36% |
+| via 2 bloque por epoch | donde falta expresividad | **cuello de botella** | 64-88% |
+
+La via 1 **NO es sustituible**: su argmin de eps es lo que garantiza que eps
+baje, que es lo que hace terminar su bucle (tiene teorema) y lo que un paso
+necesita para existir. Sustituirla por el cuello de botella dio media 0.7380
+con s1 paralizada en 46 params. Y las dos **discrepan** sobre donde falta
+capacidad: ratear el conteo adaptativo por cuello de botella dio CERO disparos
+en 4 semillas.
+
 ## El barrido de η: hecho, medido, y FUNCIONA hacia arriba (`d843873`)
 
 Implementado como `certify_family_functional_lrs` (lista; `()` = comportamiento
