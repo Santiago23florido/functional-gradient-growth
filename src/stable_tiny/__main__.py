@@ -10,6 +10,7 @@ from stable_tiny.pipeline import (
     run_pipeline,
     with_fgd_overrides,
     with_growth_overrides,
+    with_model_overrides,
     with_run_overrides,
     with_wandb_overrides,
     write_outputs,
