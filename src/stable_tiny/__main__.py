@@ -29,6 +29,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--results-dir", type=Path)
     parser.add_argument("--run-name")
+    parser.add_argument(
+        "--model-seed",
+        type=int,
+        help="Override model.model_seed without changing the YAML file.",
+    )
     parser.add_argument("--no-plot", action="store_true", help="Disable plot output.")
     parser.add_argument("--show-plot", action="store_true", help="Show plot window.")
     parser.add_argument(
