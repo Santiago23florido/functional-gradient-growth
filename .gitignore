@@ -7,6 +7,7 @@ venv/
 results/*.json
 results/*.png
 results/wandb/
+results/grid_search_*/
 wandb/
 !results/.gitkeep
 

@@ -62,14 +62,19 @@ def test_build_places_regularizers_exactly_where_asked() -> None:
     assert len(model._growable_layers) == 2
 
 
-def test_mixed_starting_widths_are_rejected_for_now() -> None:
-    with pytest.raises(ValueError, match="same"):
-        build_stack_model(
-            stack=[{"mlp": [2, 1]}, {"mlp": [4, 1]}],
-            in_features=8,
-            out_features=2,
-            device=torch.device("cpu"),
-        )
+def test_mixed_starting_widths_build_the_requested_chain() -> None:
+    model = build_stack_model(
+        stack=[{"mlp": [2, 1]}, {"mlp": [4, 1]}],
+        in_features=8,
+        out_features=2,
+        device=torch.device("cpu"),
+    )
+    assert [(layer.in_features, layer.out_features) for layer in model.layers] == [
+        (8, 2),
+        (2, 4),
+        (4, 2),
+    ]
+    assert model(torch.randn(3, 8)).shape == (3, 2)
 
 
 def test_stack_config_builds_through_build_model() -> None:
@@ -121,4 +126,4 @@ def test_stack_grows_and_forwards() -> None:
         function_preserving=True,
         preservation_tolerance=config.fgd_approx.growth_preservation_tolerance,
     )
-    model(torch.randn(4, config.data.in_features))     # no dimension error
+    model(torch.randn(4, config.data.in_features))  # no dimension error
