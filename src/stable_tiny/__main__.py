@@ -49,9 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--global-bound-action",
         choices=("lr_then_growth", "grow", "ignore"),
-        help=(
-            "Override what to do when only the FGD global-convergence bound fails."
-        ),
+        help=("Override what to do when only the FGD global-convergence bound fails."),
     )
     wandb_toggle = parser.add_mutually_exclusive_group()
     wandb_toggle.add_argument(
@@ -79,6 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     config = load_pipeline_config(args.config)
+    config = with_model_overrides(config, model_seed=args.model_seed)
     config = with_run_overrides(
         config,
         name=args.run_name,
