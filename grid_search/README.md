@@ -29,3 +29,20 @@ PYTHONPATH=src python -m grid_search.run run --shard-index 0 --num-shards 8
 Completed trials are skipped automatically, so rerunning the same command is
 safe. Individual records go to `results/grid_search_fixed_architectures/trials`,
 full histories to `.../histories`, and `summarize` writes `summary.json`.
+
+## Stage 2: follow the boundary
+
+The completed first search put every architecture's best validation epoch at
+61-69 of 70 and every winner on AdamW's largest searched learning rate, 0.01.
+`fixed_architectures_stage2.yaml` follows both boundaries: 400 epochs, AdamW
+rates from 0.003 through 0.03, and a fresh results directory. It contains 384
+trials (indices 0-383):
+
+```bash
+PYTHONPATH=src python -m grid_search.run list \
+  --config grid_search/fixed_architectures_stage2.yaml
+PYTHONPATH=src python -m grid_search.run run \
+  --config grid_search/fixed_architectures_stage2.yaml --trial-index 0
+PYTHONPATH=src python -m grid_search.run summarize \
+  --config grid_search/fixed_architectures_stage2.yaml
+```

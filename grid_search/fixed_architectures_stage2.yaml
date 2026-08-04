@@ -1,0 +1,33 @@
+# Stage 2 follows the evidence from the completed 672-trial search:
+#   * every architecture selected AdamW;
+#   * every winner used learning_rate=0.01, the largest AdamW rate searched;
+#   * the winning epochs were 61-69 of 70, so the runs had not plateaued;
+#   * validation and test remained close, with no sign that overfitting was
+#     the limiting factor.
+#
+# Search beyond both boundaries and train long enough to distinguish slow
+# convergence from an advantage of FGD's function-preserving trajectory.
+base_config: configs/fgd/family_ladder_N1024.yaml
+results_dir: results/grid_search_fixed_architectures_stage2
+
+architectures:
+  - [11, 19, 16]
+  - [12, 17, 18]
+  - [13, 19, 14]
+  - [9, 16, 22]
+
+model_seeds: [0, 1, 2, 3]
+
+# 4 architectures x 4 seeds x 24 combinations = 384 trials.
+search_spaces:
+  - optimizer.name: [adamw]
+    optimizer.learning_rate: [0.003, 0.01, 0.02, 0.03]
+    optimizer.weight_decay: [0.0, 0.001, 0.01]
+    lr_scheduler.name: [none, cosineannealing]
+
+fixed_overrides:
+  training.epochs: 400
+  training.gradient_clip_norm: null
+  lr_scheduler.t_max: 400
+  lr_scheduler.eta_min: 0.0
+  lr_scheduler.restart_on_growth: false

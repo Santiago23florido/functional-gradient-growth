@@ -80,3 +80,24 @@ def test_default_grid_preserves_the_headline_data_protocol() -> None:
     assert config.training.method == "normal"
     assert config.growth_schedule.enabled is False
     assert config.wandb.enabled is False
+
+
+def test_stage2_follows_epoch_and_learning_rate_boundaries() -> None:
+    grid = load_grid(Path("grid_search/fixed_architectures_stage2.yaml"))
+    trials = enumerate_trials(grid)
+
+    assert len(trials) == 384
+    assert {trial.overrides["optimizer.name"] for trial in trials} == {"adamw"}
+    assert {trial.overrides["optimizer.learning_rate"] for trial in trials} == {
+        0.003,
+        0.01,
+        0.02,
+        0.03,
+    }
+    assert grid["results_dir"].endswith("_stage2")
+
+    config = build_trial_config(grid, trials[0])
+    assert config.training.epochs == 400
+    assert config.lr_scheduler.t_max == 400
+    assert config.data.train_batches * config.data.batch_size == 1024
+    assert config.data.test_batches * config.data.batch_size == 8192
