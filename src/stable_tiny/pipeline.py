@@ -4933,7 +4933,190 @@ def run_pipeline(
                 )
                 step_type: StepType = "SGD"
             elif config.training.method == "fgd_approx":
-                if use_fgd_theory_learning_rate:
+                if nonlinear_mode:
+                    theory_state = _FGDTheoryState(
+                        epoch_count=fgd_epoch_count,
+                        min_gradient_sq_norm=fgd_min_gradient_sq_norm,
+                        min_positive_learning_rate=(
+                            fgd_min_positive_learning_rate
+                        ),
+                        min_descent_coefficient=fgd_min_descent_coefficient,
+                        global_contraction_product=(
+                            fgd_global_contraction_product
+                        ),
+                        previous_validation_functional_loss=(
+                            previous_validation_functional_loss
+                        ),
+                    )
+                    nonlinear_result = _search_nonlinear_primary_candidate(
+                        base_model=model,
+                        train_loader=train_loader,
+                        validation_loader=validation_loader,
+                        test_loader=test_loader,
+                        loss_function=loss_function,
+                        device=device,
+                        accuracy_tolerance=(
+                            config.training.accuracy_tolerance
+                        ),
+                        config=config,
+                        classification=classification,
+                        theory_state=theory_state,
+                        initial_functional_gap=initial_functional_gap,
+                        theory_loss_star=theory_loss_star,
+                        progress=progress,
+                    )
+                    validation_certificate = nonlinear_result.certificate
+                    validation_certificate_for_next_epoch = None
+                    diagnostic_trial = nonlinear_result.last_trial
+                    fgd_lr_search_trials = nonlinear_result.attempts
+                    fgd_update_norm = nonlinear_result.update_norm
+                    fgd_trial_sensor_failure = (
+                        not nonlinear_result.certificate.sensor_valid
+                    )
+                    certify_step_failure_non_finite = fgd_trial_sensor_failure
+                    nonlinear_candidate_training_seconds = (
+                        nonlinear_result.candidate_training_seconds
+                    )
+                    nonlinear_certification_seconds = (
+                        nonlinear_result.certification_seconds
+                    )
+                    if nonlinear_result.candidate is not None:
+                        nonlinear_functional_learning_rate = (
+                            nonlinear_result.candidate.functional_learning_rate
+                        )
+                        nonlinear_inner_steps = (
+                            nonlinear_result.candidate.inner_steps
+                        )
+                    if nonlinear_result.stats is not None:
+                        nonlinear_cosine = nonlinear_result.stats.cosine
+
+                    accepted_trial = nonlinear_result.accepted
+                    nonlinear_certificate_valid = accepted_trial is not None
+                    if accepted_trial is not None:
+                        model = accepted_trial.model
+                        epoch_result = accepted_trial.epoch_result
+                        optimizer = build_optimizer(model, config.optimizer)
+                        committed_rate = epoch_result.learning_rate or 0.0
+                        apply_learning_rate(optimizer, committed_rate)
+                        current_fgd_learning_rate = committed_rate
+                        entry_learning_rate = committed_rate
+                        nonlinear_committed_rate = committed_rate
+                        fgd_candidate_accepted = True
+                        fgd_growth_requested = False
+                        fgd_accepted_outer_steps += 1
+                        accepted_state = accepted_trial.theory_state
+                        fgd_epoch_count = accepted_state.epoch_count
+                        fgd_min_gradient_sq_norm = (
+                            accepted_state.min_gradient_sq_norm
+                        )
+                        fgd_min_positive_learning_rate = (
+                            accepted_state.min_positive_learning_rate
+                        )
+                        fgd_min_descent_coefficient = (
+                            accepted_state.min_descent_coefficient
+                        )
+                        fgd_global_contraction_product = (
+                            accepted_state.global_contraction_product
+                        )
+                        previous_validation_functional_loss = (
+                            accepted_state.previous_validation_functional_loss
+                        )
+                        fgd_loss_descent_valid = (
+                            accepted_trial.loss_descent_valid
+                        )
+                        fgd_stationary_bound = accepted_trial.stationary_bound
+                        fgd_stationary_bound_valid = (
+                            accepted_trial.stationary_bound_valid
+                        )
+                        fgd_global_bound = accepted_trial.global_bound
+                        fgd_global_bound_valid = (
+                            accepted_trial.global_bound_valid
+                        )
+                        fgd_global_contraction = (
+                            accepted_trial.global_contraction
+                        )
+                    else:
+                        base_train_metrics = evaluate_regression_metrics(
+                            model,
+                            train_loader,
+                            loss_function,
+                            device=device,
+                            accuracy_tolerance=(
+                                config.training.accuracy_tolerance
+                            ),
+                            classification=classification,
+                        )
+                        base_test_metrics = evaluate_regression_metrics(
+                            model,
+                            test_loader,
+                            loss_function,
+                            device=device,
+                            accuracy_tolerance=(
+                                config.training.accuracy_tolerance
+                            ),
+                            classification=classification,
+                        )
+                        epoch_result = FGDApproxEpochResult(
+                            train_loss=base_train_metrics.loss,
+                            train_accuracy=base_train_metrics.accuracy,
+                            test_loss=base_test_metrics.loss,
+                            test_accuracy=base_test_metrics.accuracy,
+                            learning_rate=0.0,
+                            next_learning_rate=None,
+                            learning_rate_upper_bound=None,
+                            learning_rate_interval_valid=None,
+                            learning_rate_clipped_batches=0,
+                            skipped_batches=0,
+                            relative_error_condition_valid=None,
+                            loss_descent_valid=None,
+                            loss_non_descent_batches=0,
+                            gradient_sq_norm=None,
+                            theory_descent_coefficient=None,
+                            min_positive_learning_rate=None,
+                            relative_error=(
+                                nonlinear_result.stats.relative_error
+                                if nonlinear_result.stats is not None
+                                else None
+                            ),
+                            selected_layer_index=None,
+                            layer_relative_errors=[],
+                            output_relative_error=(
+                                validation_certificate.output_relative_error
+                            ),
+                            sensor_valid=validation_certificate.sensor_valid,
+                            sensor_invalid_batches=(
+                                validation_certificate.sensor_invalid_batches
+                            ),
+                        )
+                        entry_learning_rate = 0.0
+                        fgd_candidate_accepted = False
+                        fgd_growth_requested = True
+                        nonlinear_growth_requested = True
+                        if diagnostic_trial is not None:
+                            fgd_loss_descent_valid = (
+                                diagnostic_trial.loss_descent_valid
+                            )
+                            fgd_stationary_bound = (
+                                diagnostic_trial.stationary_bound
+                            )
+                            fgd_stationary_bound_valid = (
+                                diagnostic_trial.stationary_bound_valid
+                            )
+                            fgd_global_bound = diagnostic_trial.global_bound
+                            fgd_global_bound_valid = (
+                                diagnostic_trial.global_bound_valid
+                            )
+                            fgd_global_contraction = (
+                                diagnostic_trial.global_contraction
+                            )
+                        if progress is not None:
+                            progress(
+                                f"[NONLINEAR] Epoch {epoch}: all "
+                                f"{nonlinear_result.attempts} nonlinear "
+                                "candidates failed mandatory certificates; "
+                                "requesting growth"
+                            )
+                elif use_fgd_theory_learning_rate:
                     max_outer_steps = max(
                         1,
                         config.fgd_approx.outer_steps_per_epoch,
