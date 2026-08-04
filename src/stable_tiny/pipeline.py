@@ -3018,6 +3018,464 @@ def _search_parametric_gd_candidate(
     )
 
 
+def _invalid_nonlinear_certificate() -> _NonlinearDirectionalCertificate:
+    return _NonlinearDirectionalCertificate(
+        learning_rate_upper_bound=None,
+        max_valid_learning_rate=None,
+        learning_rate_interval_valid=None,
+        skipped_batches=0,
+        relative_error_condition_valid=None,
+        gradient_sq_norm=None,
+        theory_descent_coefficient=None,
+        relative_error=None,
+        sensor_valid=False,
+        sensor_invalid_batches=1,
+        non_finite_quantities=("nonlinear_candidate",),
+    )
+
+
+def _nonlinear_directional_certificate(
+    *,
+    stats: NonlinearCertificateStats,
+    learning_rate: float | None,
+    config: FGDApproxConfig,
+) -> _NonlinearDirectionalCertificate:
+    """Build the nonlinear certificate directly from streaming scalars."""
+    if not stats.sensor_valid or stats.relative_error is None or stats.cosine is None:
+        return _invalid_nonlinear_certificate()
+
+    upper_bound = theoretical_learning_rate_upper_bound(
+        stats.relative_error,
+        config,
+    )
+    safe_upper_bound = (
+        config.theory_lr_safety * upper_bound if upper_bound is not None else None
+    )
+    interval_valid = bool(
+        learning_rate is not None
+        and safe_upper_bound is not None
+        and safe_upper_bound > config.theory_lr_min + config.eps
+        and learning_rate > config.theory_lr_min
+        and learning_rate < safe_upper_bound + config.eps
+    )
+    descent_coefficient = (
+        theoretical_descent_coefficient(
+            stats.relative_error,
+            learning_rate,
+            config,
+        )
+        if interval_valid and learning_rate is not None
+        else None
+    )
+    return _NonlinearDirectionalCertificate(
+        learning_rate_upper_bound=upper_bound,
+        max_valid_learning_rate=(safe_upper_bound if interval_valid else None),
+        learning_rate_interval_valid=interval_valid,
+        skipped_batches=int(not interval_valid),
+        relative_error_condition_valid=stats.certified,
+        gradient_sq_norm=stats.gradient_sq_norm,
+        theory_descent_coefficient=descent_coefficient,
+        relative_error=stats.relative_error,
+        sensor_valid=True,
+        sensor_invalid_batches=0,
+    )
+
+
+def _parameter_displacement_norm(
+    base_model: torch.nn.Module,
+    moved_model: torch.nn.Module,
+) -> float:
+    squared = 0.0
+    with torch.no_grad():
+        for base, moved in zip(base_model.parameters(), moved_model.parameters()):
+            squared += float(torch.sum((moved - base).double().square()))
+    return math.sqrt(squared)
+
+
+def _search_nonlinear_primary_candidate(
+    *,
+    base_model: GrowingMLP,
+    train_loader,
+    validation_loader,
+    test_loader,
+    loss_function: torch.nn.Module,
+    device: torch.device,
+    accuracy_tolerance: float,
+    config: PipelineConfig,
+    classification: bool,
+    theory_state: _FGDTheoryState,
+    initial_functional_gap: float,
+    theory_loss_star: float,
+    progress: ProgressFn | None,
+) -> _NonlinearPrimaryResult:
+    """Try only the configured AdamW nonlinear ladder at ``theta_t``."""
+    attempts = 0
+    training_seconds = 0.0
+    certification_seconds = 0.0
+    last_stats: NonlinearCertificateStats | None = None
+    last_candidate: NonlinearCandidate | None = None
+    last_trial: _FGDTrial | None = None
+    last_certificate = _invalid_nonlinear_certificate()
+    last_update_norm: float | None = None
+
+    with timed("nonlinear_total_seconds"):
+        for functional_learning_rate in config.parametric_gd.functional_learning_rates:
+            for inner_steps in config.parametric_gd.inner_steps:
+                attempts += 1
+                generated = train_nonlinear_candidate(
+                    base_model=base_model,
+                    train_loader=train_loader,
+                    device=device,
+                    functional_learning_rate=functional_learning_rate,
+                    inner_steps=inner_steps,
+                    config=config.parametric_gd,
+                    fgd_config=config.fgd_approx,
+                )
+                last_candidate = generated
+                training_seconds += generated.training_seconds
+                if generated.model is None or not generated.sensor_valid:
+                    last_certificate = _invalid_nonlinear_certificate()
+                    if progress is not None:
+                        progress(
+                            f"[NONLINEAR] eta_f={functional_learning_rate:g}, "
+                            f"inner_steps={inner_steps}: non-finite candidate; "
+                            "rejected"
+                        )
+                    continue
+
+                stats = stream_nonlinear_certificate(
+                    base_model=base_model,
+                    candidate_model=generated.model,
+                    certification_loader=validation_loader,
+                    device=device,
+                    config=config.fgd_approx,
+                    max_batches=config.parametric_gd.certification_batches,
+                )
+                last_stats = stats
+                certification_seconds += stats.certification_seconds
+                rate = (
+                    family_lemma35_rate(
+                        stats.relative_error,
+                        config.fgd_approx,
+                    )
+                    if stats.certified and stats.relative_error is not None
+                    else None
+                )
+                last_certificate = _nonlinear_directional_certificate(
+                    stats=stats,
+                    learning_rate=rate,
+                    config=config.fgd_approx,
+                )
+                if progress is not None:
+                    cosine = (
+                        f"{stats.cosine:.4f}" if stats.cosine is not None else "n/a"
+                    )
+                    epsilon = (
+                        f"{stats.relative_error:.4f}"
+                        if stats.relative_error is not None
+                        else "n/a"
+                    )
+                    progress(
+                        f"[NONLINEAR] eta_f={functional_learning_rate:g}, "
+                        f"inner_steps={inner_steps}, cos={cosine}, "
+                        f"eps={epsilon}, direction_certified={stats.certified}, "
+                        f"rate={rate if rate is not None else 'n/a'}"
+                    )
+                if not stats.certified or rate is None:
+                    continue
+
+                scaled_model = scale_parameter_displacement(
+                    base_model=base_model,
+                    candidate_model=generated.model,
+                    rate=rate,
+                )
+                last_update_norm = _parameter_displacement_norm(
+                    base_model,
+                    scaled_model,
+                )
+                train_metrics = evaluate_regression_metrics(
+                    scaled_model,
+                    train_loader,
+                    loss_function,
+                    device=device,
+                    accuracy_tolerance=accuracy_tolerance,
+                    classification=classification,
+                )
+                test_metrics = evaluate_regression_metrics(
+                    scaled_model,
+                    test_loader,
+                    loss_function,
+                    device=device,
+                    accuracy_tolerance=accuracy_tolerance,
+                    classification=classification,
+                )
+                epoch_result = FGDApproxEpochResult(
+                    train_loss=train_metrics.loss,
+                    train_accuracy=train_metrics.accuracy,
+                    test_loss=test_metrics.loss,
+                    test_accuracy=test_metrics.accuracy,
+                    learning_rate=rate,
+                    next_learning_rate=rate,
+                    learning_rate_upper_bound=(
+                        last_certificate.learning_rate_upper_bound
+                    ),
+                    learning_rate_interval_valid=(
+                        last_certificate.learning_rate_interval_valid
+                    ),
+                    learning_rate_clipped_batches=0,
+                    skipped_batches=last_certificate.skipped_batches,
+                    relative_error_condition_valid=(
+                        last_certificate.relative_error_condition_valid
+                    ),
+                    loss_descent_valid=None,
+                    loss_non_descent_batches=0,
+                    gradient_sq_norm=last_certificate.gradient_sq_norm,
+                    theory_descent_coefficient=(
+                        last_certificate.theory_descent_coefficient
+                    ),
+                    min_positive_learning_rate=rate,
+                    relative_error=stats.relative_error,
+                    selected_layer_index=None,
+                    layer_relative_errors=[],
+                    output_relative_error=None,
+                    sensor_valid=last_certificate.sensor_valid,
+                    sensor_invalid_batches=(last_certificate.sensor_invalid_batches),
+                )
+                trial = _certify_fgd_candidate(
+                    candidate_model=scaled_model,
+                    epoch_result=epoch_result,
+                    certificate=last_certificate,
+                    validation_loader=validation_loader,
+                    device=device,
+                    config=config,
+                    theory_state=theory_state,
+                    initial_functional_gap=initial_functional_gap,
+                    theory_loss_star=theory_loss_star,
+                )
+                last_trial = trial
+                if not trial.all_conditions_valid:
+                    if progress is not None:
+                        progress(
+                            "[NONLINEAR] direction certified but transactional "
+                            "validation conditions rejected the scaled step"
+                        )
+                    continue
+
+                increment("nonlinear_accepted_steps")
+                return _NonlinearPrimaryResult(
+                    accepted=trial,
+                    last_trial=trial,
+                    certificate=last_certificate,
+                    stats=stats,
+                    candidate=generated,
+                    attempts=attempts,
+                    candidate_training_seconds=training_seconds,
+                    certification_seconds=certification_seconds,
+                    update_norm=last_update_norm,
+                )
+
+    increment("nonlinear_failed_ladders")
+    return _NonlinearPrimaryResult(
+        accepted=None,
+        last_trial=last_trial,
+        certificate=last_certificate,
+        stats=last_stats,
+        candidate=last_candidate,
+        attempts=attempts,
+        candidate_training_seconds=training_seconds,
+        certification_seconds=certification_seconds,
+        update_norm=last_update_norm,
+    )
+
+
+def _architecture_widths(model: GrowingMLP) -> tuple[int, ...]:
+    return tuple(
+        int(layer.in_features) for layer in getattr(model, "_growable_layers", [])
+    )
+
+
+@torch.no_grad()
+def _stream_max_function_drift(
+    *,
+    base_model: GrowingMLP,
+    grown_model: GrowingMLP,
+    loader: torch.utils.data.DataLoader,
+    device: torch.device,
+) -> float | None:
+    """Measure maximum output drift over a loader without retaining outputs."""
+    base_was_training = base_model.training
+    grown_was_training = grown_model.training
+    base_model.eval()
+    grown_model.eval()
+    maximum = 0.0
+    batches_seen = 0
+    try:
+        for x, _ in loader:
+            batches_seen += 1
+            x = x.to(device)
+            before = base_model(x)
+            after = grown_model(x)
+            if not torch.isfinite(before).all() or not torch.isfinite(after).all():
+                return None
+            drift = float(torch.max(torch.abs(after - before)))
+            if not math.isfinite(drift):
+                return None
+            maximum = max(maximum, drift)
+    finally:
+        base_model.train(base_was_training)
+        grown_model.train(grown_was_training)
+    return maximum if batches_seen else None
+
+
+def _apply_nonlinear_primary_growth(
+    *,
+    model: GrowingMLP,
+    train_loader,
+    preservation_loader=None,
+    device: torch.device,
+    config: PipelineConfig,
+    epoch: int,
+    progress: ProgressFn | None,
+) -> _NonlinearGrowthOutcome:
+    """Select and transactionally apply one non-tangent structural growth."""
+    if (
+        config.fgd_approx.growth_where != "expressivity_bottleneck"
+        or config.fgd_approx.growth_selection != "unified_expansion"
+    ):
+        raise ValueError(
+            "Nonlinear primary growth requires growth_where="
+            "'expressivity_bottleneck' and growth_selection='unified_expansion'."
+        )
+    if not getattr(model, "_growable_layers", None):
+        return _NonlinearGrowthOutcome(None, None, None, 0.0, 0.0)
+
+    started = time.perf_counter()
+    with timed("nonlinear_growth_statistics_seconds"):
+        bottlenecks = compute_expressivity_bottlenecks(
+            model,
+            train_loader,
+            device,
+            config.fgd_approx,
+        )
+        if progress is not None:
+            progress(
+                f"[NONLINEAR-BOTTLENECK] Epoch {epoch}, widths="
+                f"{_architecture_widths(model)} "
+                + " ".join(
+                    f"L{index}={value:.4e}" for index, value in enumerate(bottlenecks)
+                )
+            )
+        layer_index = (
+            max(range(len(bottlenecks)), key=bottlenecks.__getitem__)
+            if bottlenecks and max(bottlenecks) > 0.0
+            else None
+        )
+    statistics_seconds = time.perf_counter() - started
+    if layer_index is None:
+        if progress is not None:
+            progress(
+                f"[NONLINEAR-GRO] Epoch {epoch}: no valid growth location; "
+                "model unchanged"
+            )
+        return _NonlinearGrowthOutcome(
+            None,
+            None,
+            None,
+            statistics_seconds,
+            0.0,
+        )
+
+    maximum_parameters = config.fgd_approx.max_total_parameters
+    neuron_costs = growable_neuron_costs(model, config.data.in_features)
+    projected_parameters = count_parameters(model) + neuron_costs[layer_index]
+    if maximum_parameters is not None and projected_parameters > maximum_parameters:
+        if progress is not None:
+            progress(
+                f"[NONLINEAR-GRO] Epoch {epoch}: layer {layer_index} growth "
+                f"would exceed parameter budget ({projected_parameters} > "
+                f"{maximum_parameters}); model unchanged"
+            )
+        return _NonlinearGrowthOutcome(
+            None,
+            None,
+            layer_index,
+            statistics_seconds,
+            0.0,
+        )
+
+    before = _architecture_widths(model)
+    grown_model = copy.deepcopy(model)
+    started = time.perf_counter()
+    try:
+        with timed("nonlinear_growth_application_seconds"):
+            result = grow_layer(
+                model=grown_model,
+                train_loader=train_loader,
+                layer_index=layer_index,
+                device=device,
+                line_search_config=config.scaling_line_search,
+                optimal_update_kwargs=tiny_optimal_update_kwargs(
+                    config.fgd_approx,
+                    compute_delta=False,
+                ),
+                progress=progress,
+                function_preserving=True,
+                preservation_tolerance=(
+                    config.fgd_approx.growth_preservation_tolerance
+                ),
+            )
+            maximum_drift = _stream_max_function_drift(
+                base_model=model,
+                grown_model=grown_model,
+                loader=(
+                    preservation_loader
+                    if preservation_loader is not None
+                    else train_loader
+                ),
+                device=device,
+            )
+            if (
+                maximum_drift is None
+                or maximum_drift > config.fgd_approx.growth_preservation_tolerance
+            ):
+                raise RuntimeError(
+                    "Nonlinear growth failed its full-loader preservation "
+                    f"check: drift={maximum_drift!r}, tolerance="
+                    f"{config.fgd_approx.growth_preservation_tolerance:.3e}."
+                )
+    except (RuntimeError, ValueError) as error:
+        application_seconds = time.perf_counter() - started
+        if progress is not None:
+            progress(
+                f"[NONLINEAR-GRO] Epoch {epoch}: rejected transactional "
+                f"growth at layer {layer_index}: {error}"
+            )
+        return _NonlinearGrowthOutcome(
+            None,
+            None,
+            layer_index,
+            statistics_seconds,
+            application_seconds,
+            False,
+        )
+    application_seconds = time.perf_counter() - started
+    increment("nonlinear_growth_events")
+    if progress is not None:
+        progress(
+            f"[NONLINEAR-GRO] Epoch {epoch}: layer={layer_index}, "
+            f"widths {before} -> {_architecture_widths(grown_model)}, "
+            f"max_drift={maximum_drift:.3e}"
+        )
+    return _NonlinearGrowthOutcome(
+        grown_model,
+        result,
+        layer_index,
+        statistics_seconds,
+        application_seconds,
+        True,
+    )
+
+
 def _json_safe(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
