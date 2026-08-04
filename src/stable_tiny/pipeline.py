@@ -4618,6 +4618,11 @@ def run_pipeline(
     if progress is not None:
         progress(f"Using device: {device}")
         progress(f"Training method: {config.training.method}")
+        if nonlinear_mode:
+            progress(
+                "Primary approximation family: nonlinear "
+                "(AdamW minibatches; tangent operations disabled)"
+            )
         if wandb_logger.enabled:
             progress(
                 f"W&B logging enabled: project={config.wandb.project}, "
