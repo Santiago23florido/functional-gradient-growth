@@ -4733,6 +4733,7 @@ def run_pipeline(
         validation_certificate_for_next_epoch = None
         if (
             config.training.method == "fgd_approx"
+            and not nonlinear_mode
             and config.fgd_approx.learning_rate_policy == "theory_interval"
             and config.fgd_approx.projection_solver != "gromo_layer"
         ):
