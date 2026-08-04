@@ -8641,6 +8641,37 @@ def run_pipeline(
                     fgd_rkhs_phase_accepted=fgd_rkhs_phase_accepted,
                     fgd_rkhs_phase_steps=fgd_rkhs_phase_steps,
                     fgd_growth_probe_improved=fgd_growth_probe_improved,
+                    nonlinear_functional_learning_rate=(
+                        nonlinear_functional_learning_rate
+                    ),
+                    nonlinear_inner_steps=nonlinear_inner_steps,
+                    nonlinear_adamw_learning_rate=(
+                        config.parametric_gd.inner_learning_rate
+                        if nonlinear_mode
+                        else None
+                    ),
+                    nonlinear_weight_decay=(
+                        config.parametric_gd.weight_decay
+                        if nonlinear_mode
+                        else None
+                    ),
+                    nonlinear_cosine=nonlinear_cosine,
+                    nonlinear_certificate_valid=nonlinear_certificate_valid,
+                    nonlinear_committed_rate=nonlinear_committed_rate,
+                    nonlinear_growth_requested=nonlinear_growth_requested,
+                    nonlinear_candidate_training_seconds=(
+                        nonlinear_candidate_training_seconds
+                    ),
+                    nonlinear_certification_seconds=(
+                        nonlinear_certification_seconds
+                    ),
+                    nonlinear_growth_statistics_seconds=(
+                        nonlinear_growth_statistics_seconds
+                    ),
+                    nonlinear_growth_application_seconds=(
+                        nonlinear_growth_application_seconds
+                    ),
+                    architecture_widths=_architecture_widths(model),
                 )
                 history.append(growth_entry)
                 wandb_logger.log_history_entry(growth_entry)
