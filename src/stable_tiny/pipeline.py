@@ -163,8 +163,9 @@ class ModelConfig:
     # component from this list instead of the uniform hidden_size /
     # number_hidden_layers + use_batchnorm / dropout_rate shorthand, so batch-
     # norm and dropout can be placed exactly where wanted. Each `mlp` is a
-    # block (width, num_layers); `batchnorm` / `dropout` attach to the mlp
-    # above. Every mlp layer is growable. See fgdlib/models/stack.py. Example:
+    # block (width, num_layers); widths may differ between blocks, and
+    # `batchnorm` / `dropout` attach to the mlp above. Every mlp layer is
+    # growable. See fgdlib/models/stack.py. Example:
     #   stack:
     #     - {mlp: [2, 1]}
     #     - batchnorm
