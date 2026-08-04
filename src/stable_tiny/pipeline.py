@@ -4805,6 +4805,7 @@ def run_pipeline(
         for epoch in range(1, config.training.epochs + 1):
             use_fgd_theory_learning_rate = (
                 config.training.method == "fgd_approx"
+                and not nonlinear_mode
                 and config.fgd_approx.learning_rate_policy == "theory_interval"
             )
             learning_rate_clipped_by_validation = False
