@@ -4549,6 +4549,23 @@ def run_pipeline(
     device = select_device(config.training.device)
     train_loader, validation_loader, test_loader = build_dataloaders(config, device)
     classification = is_classification_task(config)
+    if nonlinear_selected:
+        try:
+            result = _run_nonlinear_pipeline(
+                config=config,
+                device=device,
+                train_loader=train_loader,
+                validation_loader=validation_loader,
+                test_loader=test_loader,
+                classification=classification,
+                wandb_logger=wandb_logger,
+                progress=progress,
+            )
+        except Exception:
+            wandb_logger.abort()
+            raise
+        wandb_logger.finish(history=result.history)
+        return result
     if config.training.method in ("fgd_rkhs", "fgd_rkhs_grow"):
         runner = (
             _run_fgd_rkhs_pipeline
