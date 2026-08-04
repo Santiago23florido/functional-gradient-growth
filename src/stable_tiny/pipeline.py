@@ -359,6 +359,31 @@ class _FGDSearchResult:
 
 
 @dataclass(frozen=True)
+class _NonlinearPrimaryResult:
+    """One nonlinear-only ladder outcome at the current structure."""
+
+    accepted: _FGDTrial | None
+    last_trial: _FGDTrial | None
+    certificate: _NonlinearDirectionalCertificate
+    stats: NonlinearCertificateStats | None
+    candidate: NonlinearCandidate | None
+    attempts: int
+    candidate_training_seconds: float
+    certification_seconds: float
+    update_norm: float | None
+
+
+@dataclass(frozen=True)
+class _NonlinearGrowthOutcome:
+    model: GrowingMLP | None
+    result: GrowthResult | None
+    layer_index: int | None
+    statistics_seconds: float
+    application_seconds: float
+    preservation_valid: bool | None = None
+
+
+@dataclass(frozen=True)
 class _GrowthProbe:
     model: GrowingMLP
     result: GrowthResult
