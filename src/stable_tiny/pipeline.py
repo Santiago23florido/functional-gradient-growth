@@ -8498,7 +8498,11 @@ def run_pipeline(
                     family_rejection_step.clear()
                     fgd_epochs_without_commit = 0
                     reset_fgd_certificate()
-                    if config.fgd_approx.learning_rate_policy == "theory_interval":
+                    if (
+                        not nonlinear_mode
+                        and config.fgd_approx.learning_rate_policy
+                        == "theory_interval"
+                    ):
                         validation_certificate_for_next_epoch = (
                             evaluate_fgd_validation_certificate(
                                 model=model,
