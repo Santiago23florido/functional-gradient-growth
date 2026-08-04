@@ -8550,7 +8550,9 @@ def run_pipeline(
                         )
                 optimizer = build_optimizer(model, config.optimizer)
                 post_growth_learning_rate = (
-                    current_fgd_learning_rate
+                    0.0
+                    if nonlinear_mode
+                    else current_fgd_learning_rate
                     if (
                         config.training.method == "fgd_approx"
                         and config.fgd_approx.learning_rate_policy
