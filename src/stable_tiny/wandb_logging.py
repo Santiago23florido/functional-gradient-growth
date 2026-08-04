@@ -150,7 +150,11 @@ class WandbRunLogger:
         step_committed = candidate_accepted is True
         approximation_kind = getattr(entry, "fgd_approximation_kind", None)
 
-        if entry.step_type == "FGD" and entry.rel_error is not None:
+        if (
+            entry.step_type == "FGD"
+            and approximation_kind == "tangent"
+            and entry.rel_error is not None
+        ):
             payload["fgd/tangent_relative_error"] = entry.rel_error
 
         if step_committed and entry.rel_error is not None:
@@ -245,7 +249,8 @@ class WandbRunLogger:
             False,
         )
         if fgd_payload_active := (
-            getattr(entry, "rel_error", None) is not None
+            approximation_kind is not None
+            or getattr(entry, "rel_error", None) is not None
             or learning_rate_interval_valid is not None
             or relative_error_condition_valid is not None
             or loss_descent_valid is not None
@@ -253,9 +258,7 @@ class WandbRunLogger:
             or global_bound_valid is not None
             or getattr(entry, "fgd_sensor_valid", None) is not None
         ):
-            payload["fgd/theory_learning_rate_adjusted"] = (
-                theory_learning_rate_adjusted
-            )
+            payload["fgd/theory_learning_rate_adjusted"] = theory_learning_rate_adjusted
 
         if fgd_payload_active:
             payload["fgd/learning_rate_clipped_by_validation"] = bool(
