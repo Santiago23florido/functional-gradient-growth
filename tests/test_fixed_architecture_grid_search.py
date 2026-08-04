@@ -11,7 +11,7 @@ from grid_search.run import (
     load_grid,
     parameter_count,
 )
-from stable_tiny.pipeline import PipelineConfig
+from stable_tiny.pipeline import PipelineConfig, build_model
 
 
 def test_heterogeneous_stack_builds_exact_headline_architecture() -> None:
@@ -101,8 +101,8 @@ def test_stage2_follows_epoch_and_learning_rate_boundaries() -> None:
         0.04,
     }
     assert grid["results_dir"].endswith("_stage2_lr_sweep")
-    assert grid["paired_evaluation"] == {
-        "protocol": "leave_one_seed_out",
+    assert grid["paired_same_seed_evaluation"] == {
+        "protocol": "same_seed_retraining",
         "growth_runs": {
             0: {"architecture": [11, 19, 16], "test_accuracy": 0.949},
             1: {"architecture": [12, 17, 18], "test_accuracy": 0.940},
@@ -116,3 +116,27 @@ def test_stage2_follows_epoch_and_learning_rate_boundaries() -> None:
     assert config.lr_scheduler.t_max == 400
     assert config.data.train_batches * config.data.batch_size == 1024
     assert config.data.test_batches * config.data.batch_size == 8192
+
+
+def test_retraining_builds_a_fresh_deterministic_model_without_growth() -> None:
+    grid = load_grid(Path("grid_search/fixed_architectures_stage2.yaml"))
+    trial = enumerate_trials(grid)[0]
+    config = build_trial_config(grid, trial)
+
+    first = build_model(config, torch.device("cpu"))
+    initial_state = {
+        name: value.detach().clone() for name, value in first.state_dict().items()
+    }
+    with torch.no_grad():
+        next(first.parameters()).add_(1.0)
+
+    second = build_model(config, torch.device("cpu"))
+
+    assert first is not second
+    assert config.model.model_seed == trial.model_seed
+    assert config.training.method == "normal"
+    assert config.growth_schedule.enabled is False
+    assert tuple(item["mlp"] for item in config.model.stack) == trial.architecture
+    for name, value in second.state_dict().items():
+        assert value.data_ptr() != first.state_dict()[name].data_ptr()
+        assert torch.equal(value, initial_state[name])
