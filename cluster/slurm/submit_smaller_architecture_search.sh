@@ -36,11 +36,17 @@ python -m grid_search.budget_search prepare-stage1 \
   --max-concurrent "$MAX_CONCURRENT"
 
 if command -v scontrol >/dev/null 2>&1; then
-  max_array_size="$(scontrol show config 2>/dev/null | awk -F= '/MaxArraySize/ {gsub(/[[:space:]]/, "", $2); print $2; exit}')"
+  max_array_size="$(
+    timeout "${SCONTROL_TIMEOUT_SECONDS:-10}" scontrol show config 2>/dev/null \
+      | awk -F= '/MaxArraySize/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' \
+      || true
+  )"
   if [[ -n "$max_array_size" ]] && (( STAGE1_NUM_SHARDS > max_array_size || STAGE2_NUM_SHARDS > max_array_size )); then
     echo "Configured shards exceed Slurm MaxArraySize=$max_array_size." >&2
     echo "Lower STAGE1_NUM_SHARDS/STAGE2_NUM_SHARDS or ask the administrator." >&2
     exit 2
+  elif [[ -z "$max_array_size" ]]; then
+    echo "WARNING: could not read MaxArraySize within ${SCONTROL_TIMEOUT_SECONDS:-10}s; continuing." >&2
   fi
 fi
 
