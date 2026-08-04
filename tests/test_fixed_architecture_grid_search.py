@@ -86,15 +86,21 @@ def test_stage2_follows_epoch_and_learning_rate_boundaries() -> None:
     grid = load_grid(Path("grid_search/fixed_architectures_stage2.yaml"))
     trials = enumerate_trials(grid)
 
-    assert len(trials) == 384
+    assert len(trials) == 960
     assert {trial.overrides["optimizer.name"] for trial in trials} == {"adamw"}
     assert {trial.overrides["optimizer.learning_rate"] for trial in trials} == {
+        0.001,
+        0.002,
         0.003,
+        0.005,
+        0.0075,
         0.01,
+        0.015,
         0.02,
         0.03,
+        0.04,
     }
-    assert grid["results_dir"].endswith("_stage2")
+    assert grid["results_dir"].endswith("_stage2_lr_sweep")
 
     config = build_trial_config(grid, trials[0])
     assert config.training.epochs == 400

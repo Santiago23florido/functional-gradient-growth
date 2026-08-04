@@ -35,8 +35,8 @@ full histories to `.../histories`, and `summarize` writes `summary.json`.
 The completed first search put every architecture's best validation epoch at
 61-69 of 70 and every winner on AdamW's largest searched learning rate, 0.01.
 `fixed_architectures_stage2.yaml` follows both boundaries: 400 epochs, AdamW
-rates from 0.003 through 0.03, and a fresh results directory. It contains 384
-trials (indices 0-383):
+rates from 0.001 through 0.04 with extra resolution around 0.01, and a fresh
+`stage2_lr_sweep` results directory. It contains 960 trials (indices 0-959):
 
 ```bash
 PYTHONPATH=src python -m grid_search.run list \
