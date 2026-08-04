@@ -994,7 +994,7 @@ def _certify_fgd_candidate(
     *,
     candidate_model: GrowingMLP,
     epoch_result: FGDApproxEpochResult,
-    certificate: FGDValidationCertificate,
+    certificate: FGDValidationCertificate | _NonlinearDirectionalCertificate,
     validation_loader: torch.utils.data.DataLoader,
     device: torch.device,
     config: PipelineConfig,
