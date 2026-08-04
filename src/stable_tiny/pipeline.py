@@ -8455,10 +8455,37 @@ def run_pipeline(
                     )
                 growth_events.append(growth_result)
                 growth_count += 1
+                if nonlinear_mode and history:
+                    history[-1] = replace(
+                        history[-1],
+                        num_params=count_parameters(model),
+                        layer_index=selected_layer_index,
+                        selected_layer_index=selected_layer_index,
+                        nonlinear_growth_statistics_seconds=(
+                            nonlinear_growth_statistics_seconds
+                        ),
+                        nonlinear_growth_application_seconds=(
+                            nonlinear_growth_application_seconds
+                        ),
+                        architecture_widths=_architecture_widths(model),
+                    )
                 wandb_logger.log_growth_event(
                     event=growth_result,
                     epoch=epoch,
                     growth_count=growth_count,
+                    architecture_widths=(
+                        _architecture_widths(model) if nonlinear_mode else ()
+                    ),
+                    statistics_seconds=(
+                        nonlinear_growth_statistics_seconds
+                        if nonlinear_mode
+                        else None
+                    ),
+                    application_seconds=(
+                        nonlinear_growth_application_seconds
+                        if nonlinear_mode
+                        else None
+                    ),
                 )
                 last_growth_epoch = epoch
                 lr_cycle_start_epoch = epoch
