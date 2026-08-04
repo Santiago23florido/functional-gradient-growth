@@ -46,7 +46,7 @@ ensure_gromo_importable()
 from gromo.containers.growing_mlp import GrowingMLP
 from gromo.modules.linear_growing_module import LinearGrowingModule
 
-__all__ = ["LayerSpec", "parse_stack", "build_stack_model"]
+__all__ = ["LayerSpec", "build_stack_model", "parse_stack"]
 
 
 @dataclass(frozen=True)
@@ -90,9 +90,7 @@ def parse_stack(stack: list[Any]) -> list[LayerSpec]:
         elif key == "batchnorm":
             if not specs:
                 raise ValueError("batchnorm must follow an mlp")
-            specs[-1] = LayerSpec(
-                specs[-1].width, True, specs[-1].dropout_rate
-            )
+            specs[-1] = LayerSpec(specs[-1].width, True, specs[-1].dropout_rate)
         elif key == "dropout":
             if not specs:
                 raise ValueError("dropout must follow an mlp")
@@ -116,7 +114,7 @@ def _component(item: Any) -> tuple[str, Any]:
                 if flag in item:
                     return flag, item[flag]
             raise ValueError(f"a stack item needs exactly one component: {item!r}")
-        (name, value), = item.items()
+        ((name, value),) = item.items()
         return str(name).strip().lower(), value
     raise ValueError(f"cannot read a stack component from {item!r}")
 
@@ -130,23 +128,14 @@ def build_stack_model(
 ) -> GrowingMLP:
     """Build a ``GrowingMLP`` whose hidden layers follow ``stack``.
 
-    The mlp blocks must share a common starting width (the certified search
-    widens them apart from there, so a uniform start is the natural one, and
-    it is what every example uses). This builds through GroMo's own
-    ``GrowingMLP`` constructor and then sets each hidden layer's post-function
-    from its spec, so it reuses the exact construction path the uniform
-    ``use_batchnorm`` shorthand uses -- no manual layer surgery, and no
-    interaction with the functorch tangent projection. The output layer is
-    never regularized.
+    The blocks may have different widths.  We first use GroMo's constructor
+    to initialise the container and then rebuild its linear chain with the
+    requested dimensions.  The resulting modules are still native
+    ``LinearGrowingModule`` instances, so downstream training and growth code
+    sees the same graph it would see after a search had widened the layers.
+    The output layer is never regularized.
     """
     specs = parse_stack(stack)
-    widths = {spec.width for spec in specs}
-    if len(widths) != 1:
-        raise ValueError(
-            "model.stack currently requires every mlp block to share the same "
-            f"starting width (growth widens them from there); got widths "
-            f"{sorted(widths)}. Use one width across the blocks."
-        )
     width = specs[0].width
 
     model = GrowingMLP(
@@ -157,19 +146,59 @@ def build_stack_model(
         device=device,
     )
 
-    # Set each hidden layer's post-function from its spec. GroMo's GrowingMLP
-    # puts the hidden layers at indices [0 .. len(specs)-1]; the last layer is
-    # the output and is left untouched.
-    for spec, layer in zip(specs, list(model.layers)[:-1]):
-        if spec.batchnorm:
-            layer.post_layer_function = make_hidden_post_function(
-                num_features=width,
-                activation=activation_factory(),
-                dropout_rate=spec.dropout_rate,
+    if len({spec.width for spec in specs}) > 1:
+        layers: list[LinearGrowingModule] = []
+        previous: LinearGrowingModule | None = None
+        input_width = in_features
+        for index, spec in enumerate(specs):
+            post_function = (
+                make_hidden_post_function(
+                    num_features=spec.width,
+                    activation=activation_factory(),
+                    dropout_rate=spec.dropout_rate,
+                    device=device,
+                )
+                if spec.batchnorm
+                else make_post_layer_function(activation_factory(), spec.dropout_rate)
+            )
+            layer = LinearGrowingModule(
+                input_width,
+                spec.width,
+                post_layer_function=post_function,
+                previous_module=previous,
+                use_bias=True,
+                name=f"Layer {index}",
                 device=device,
             )
-        else:
-            layer.post_layer_function = make_post_layer_function(
-                activation_factory(), spec.dropout_rate
+            layers.append(layer)
+            previous = layer
+            input_width = spec.width
+        layers.append(
+            LinearGrowingModule(
+                input_width,
+                out_features,
+                previous_module=previous,
+                use_bias=True,
+                name=f"Layer {len(specs)}",
+                device=device,
             )
+        )
+        model.layers = nn.ModuleList(layers)
+        model._growable_layers = list(model.layers[1:])
+        model.set_growing_layers(scheduling_method="all")
+    else:
+        # Preserve the original constructor path byte-for-byte for existing
+        # uniform stacks.
+        for spec, layer in zip(specs, list(model.layers)[:-1]):
+            if spec.batchnorm:
+                layer.post_layer_function = make_hidden_post_function(
+                    num_features=width,
+                    activation=activation_factory(),
+                    dropout_rate=spec.dropout_rate,
+                    device=device,
+                )
+            else:
+                layer.post_layer_function = make_post_layer_function(
+                    activation_factory(), spec.dropout_rate
+                )
     return model
