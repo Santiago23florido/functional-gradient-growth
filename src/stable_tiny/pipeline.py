@@ -318,10 +318,27 @@ class _FGDTheoryState:
 
 
 @dataclass(frozen=True)
+class _NonlinearDirectionalCertificate:
+    """Lemma 3.5 conditions derived only from a streamed nonlinear secant."""
+
+    learning_rate_upper_bound: float | None
+    max_valid_learning_rate: float | None
+    learning_rate_interval_valid: bool | None
+    skipped_batches: int
+    relative_error_condition_valid: bool | None
+    gradient_sq_norm: float | None
+    theory_descent_coefficient: float | None
+    relative_error: float | None
+    sensor_valid: bool
+    sensor_invalid_batches: int
+    non_finite_quantities: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class _FGDTrial:
     model: GrowingMLP
     epoch_result: FGDApproxEpochResult
-    certificate: FGDValidationCertificate
+    certificate: FGDValidationCertificate | _NonlinearDirectionalCertificate
     theory_state: _FGDTheoryState
     validation_functional_loss: float
     loss_descent_valid: bool
