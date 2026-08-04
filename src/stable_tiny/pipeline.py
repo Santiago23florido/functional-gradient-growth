@@ -7048,7 +7048,35 @@ def run_pipeline(
                             _attempt_rkhs_head_stage(in_ladder=False)
 
             if growth_triggered:
-                if config.training.method == "fgd_approx":
+                if nonlinear_mode:
+                    nonlinear_growth = _apply_nonlinear_primary_growth(
+                        model=model,
+                        train_loader=train_loader,
+                        device=device,
+                        config=config,
+                        epoch=epoch,
+                        progress=progress,
+                    )
+                    nonlinear_growth_statistics_seconds = (
+                        nonlinear_growth.statistics_seconds
+                    )
+                    nonlinear_growth_application_seconds = (
+                        nonlinear_growth.application_seconds
+                    )
+                    if nonlinear_growth.result is None:
+                        # The failed nonlinear ladder requested growth, but a
+                        # configured safety guard or the structural criterion
+                        # declined it. The model remains transactional.
+                        continue
+                    if nonlinear_growth.model is None:
+                        raise RuntimeError(
+                            "Successful nonlinear growth did not return a model."
+                        )
+                    model = nonlinear_growth.model
+                    growth_result = nonlinear_growth.result
+                    layer_index = nonlinear_growth.layer_index
+                    selected_layer_index = nonlinear_growth.layer_index
+                elif config.training.method == "fgd_approx":
                     if (
                         config.fgd_approx.growth_selection
                         == "unified_expansion"
