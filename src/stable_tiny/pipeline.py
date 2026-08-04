@@ -4896,12 +4896,28 @@ def run_pipeline(
             fgd_candidate_accepted: bool | None = None
             fgd_lr_search_trials = 0
             fgd_approximation_kind: str | None = (
-                "tangent" if config.training.method == "fgd_approx" else None
+                (
+                    "nonlinear"
+                    if nonlinear_mode
+                    else "tangent"
+                )
+                if config.training.method == "fgd_approx"
+                else None
             )
             fgd_rkhs_phase_attempted = False
             fgd_rkhs_phase_accepted: bool | None = None
             fgd_rkhs_phase_steps = 0
             fgd_growth_probe_improved: bool | None = None
+            nonlinear_functional_learning_rate: float | None = None
+            nonlinear_inner_steps: int | None = None
+            nonlinear_cosine: float | None = None
+            nonlinear_certificate_valid: bool | None = None
+            nonlinear_committed_rate: float | None = None
+            nonlinear_growth_requested = False
+            nonlinear_candidate_training_seconds = 0.0
+            nonlinear_certification_seconds = 0.0
+            nonlinear_growth_statistics_seconds = 0.0
+            nonlinear_growth_application_seconds = 0.0
             entry_learning_rate = current_learning_rate(optimizer)
             if config.training.method == "normal":
                 epoch_result = train_one_epoch(
