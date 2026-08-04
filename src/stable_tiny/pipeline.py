@@ -6302,10 +6302,14 @@ def run_pipeline(
             # handle "the tangent could not move", growth handles "the
             # reachable set cannot represent r".
             tangent_needs_fallback = (
+                not nonlinear_mode
+                and
                 config.fgd_approx.families_available_without_growth
                 and fgd_candidate_accepted is False
             )
             if (
+                not nonlinear_mode
+                and
                 (growth_triggered or tangent_needs_fallback)
                 and config.training.method == "fgd_approx"
                 and config.fgd_approx.projection_solver != "gromo_layer"
