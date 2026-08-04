@@ -68,6 +68,22 @@ seed under `paired_same_seed_evaluation`. For seed `s`, the comparison:
 5. reads test only after selection and compares it with train-and-grow seed
    `s`.
 
+### Same-seed results
+
+The table reports test metrics only; LR, weight decay and scheduler were
+selected by validation before test was read.
+
+| seed | architecture | LR | weight decay | scheduler | fixed test | growth test | fixed - growth |
+|---:|:---:|---:|---:|:---|---:|---:|---:|
+| 0 | `11-19-16` | 0.04 | 0.01 | cosine annealing | 0.9426 | 0.9490 | -0.0064 |
+| 1 | `12-17-18` | 0.015 | 0.0 | cosine annealing | 0.9332 | 0.9400 | -0.0068 |
+| 2 | `13-19-14` | 0.04 | 0.001 | cosine annealing | 0.9386 | 0.9270 | +0.0116 |
+| 3 | `9-16-22` | 0.04 | 0.001 | cosine annealing | 0.9253 | 0.9580 | -0.0327 |
+
+Across the four prescribed pairs, fixed retraining wins once and growth wins
+three times. Fixed retraining averages 0.9349 test accuracy versus 0.9435 for
+train-and-grow; the mean paired difference is -0.0086 (fixed minus growth).
+
 No favorable seed is selected per architecture. The epoch inside each run is
 still selected by maximum validation accuracy, and test never participates in
 either epoch or hyperparameter selection. `summarize` reuses the existing
