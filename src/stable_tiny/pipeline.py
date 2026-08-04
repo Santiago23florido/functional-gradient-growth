@@ -4589,6 +4589,10 @@ def run_pipeline(
         wandb_logger.finish(history=result.history)
         return result
     model = build_model(config, device)
+    nonlinear_mode = (
+        config.training.method == "fgd_approx"
+        and config.fgd_approx.family_order == ("nonlinear",)
+    )
     loss_function = torch.nn.MSELoss()
     optimizer = build_optimizer(model, config.optimizer)
     lr_cycle_start_epoch = 0
