@@ -1,0 +1,22 @@
+search_spaces:
+  - optimizer.name: [adamw]
+    optimizer.learning_rate:
+      - 0.001
+      - 0.002
+      - 0.003
+      - 0.005
+      - 0.0075
+      - 0.01
+      - 0.015
+      - 0.02
+      - 0.03
+      - 0.04
+    optimizer.weight_decay: [0.0, 0.001, 0.01]
+    lr_scheduler.name: [none, cosineannealing]
+
+fixed_overrides:
+  training.epochs: 400
+  training.gradient_clip_norm: null
+  lr_scheduler.t_max: 400
+  lr_scheduler.eta_min: 0.0
+  lr_scheduler.restart_on_growth: false

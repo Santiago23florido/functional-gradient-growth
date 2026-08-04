@@ -1,0 +1,40 @@
+base_config: configs/fgd/family_ladder_N1024.yaml
+stage2_config: grid_search/smaller_architectures_400_stage2.yaml
+
+architecture_budget_search:
+  protocol: same_seed_strictly_smaller
+  minimum_parameters: 400
+  # Width 2 is the current initial structure and the space reachable by growth.
+  minimum_width: 2
+  number_hidden_layers: 3
+  top_k_per_seed: 50
+  include_reference_control: true
+  search_mode: two_stage
+  growth_runs:
+    0:
+      architecture: [11, 19, 16]
+      expected_parameters: 620
+      test_accuracy: 0.949
+    1:
+      architecture: [12, 17, 18]
+      expected_parameters: 624
+      test_accuracy: 0.940
+    2:
+      architecture: [13, 19, 14]
+      expected_parameters: 626
+      test_accuracy: 0.927
+    3:
+      architecture: [9, 16, 22]
+      expected_parameters: 602
+      test_accuracy: 0.958
+
+screening_overrides:
+  optimizer.name: adamw
+  optimizer.learning_rate: 0.03
+  optimizer.weight_decay: 0.001
+  lr_scheduler.name: cosineannealing
+  training.epochs: 400
+  training.gradient_clip_norm: null
+  lr_scheduler.t_max: 400
+  lr_scheduler.eta_min: 0.0
+  lr_scheduler.restart_on_growth: false
