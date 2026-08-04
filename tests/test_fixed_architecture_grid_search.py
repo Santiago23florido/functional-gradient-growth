@@ -101,6 +101,15 @@ def test_stage2_follows_epoch_and_learning_rate_boundaries() -> None:
         0.04,
     }
     assert grid["results_dir"].endswith("_stage2_lr_sweep")
+    assert grid["paired_evaluation"] == {
+        "protocol": "leave_one_seed_out",
+        "growth_runs": {
+            0: {"architecture": [11, 19, 16], "test_accuracy": 0.949},
+            1: {"architecture": [12, 17, 18], "test_accuracy": 0.940},
+            2: {"architecture": [13, 19, 14], "test_accuracy": 0.927},
+            3: {"architecture": [9, 16, 22], "test_accuracy": 0.958},
+        },
+    }
 
     config = build_trial_config(grid, trials[0])
     assert config.training.epochs == 400
