@@ -549,6 +549,18 @@ def with_run_overrides(
     return replace(config, run=run_config)
 
 
+def with_model_overrides(
+    config: PipelineConfig,
+    *,
+    model_seed: int | None = None,
+) -> PipelineConfig:
+    """Return a config with command-line model overrides applied."""
+    model_config = config.model
+    if model_seed is not None:
+        model_config = replace(model_config, model_seed=int(model_seed))
+    return replace(config, model=model_config)
+
+
 def with_wandb_overrides(
     config: PipelineConfig,
     *,
