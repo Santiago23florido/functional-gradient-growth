@@ -79,6 +79,18 @@ PROFILE_FIELDS = (
     "certify_growth_target_stalls",
     "certify_budget_stops",
     "certify_budget_rejected_candidates",
+    # Nonlinear primary-family instrumentation. These fields stay independent
+    # of the tangent counters so a nonlinear smoke profile can prove both what
+    # it did and that no tangent construction occurred.
+    "nonlinear_total_seconds",
+    "nonlinear_candidate_training_seconds",
+    "nonlinear_certification_seconds",
+    "nonlinear_growth_statistics_seconds",
+    "nonlinear_growth_application_seconds",
+    "nonlinear_ladder_attempts",
+    "nonlinear_accepted_steps",
+    "nonlinear_failed_ladders",
+    "nonlinear_growth_events",
     # --- exact tangent-system construction instrumentation (Phase A) ---
     # Counters.
     "tangent_system_calls",
@@ -119,6 +131,7 @@ PROFILE_FIELDS = (
     "tangent_surrogate_seconds",
     "tangent_final_factorization_seconds",
     "tangent_projection_solve_seconds",
+    "tangent_projection_solve_calls",
     "tangent_sensor_seconds",
     # Max-gauges (written with set_max).
     "tangent_qr_input_rows",
@@ -158,7 +171,12 @@ _COUNTER_FIELDS = {
     "certify_growth_target_stalls",
     "certify_budget_stops",
     "certify_budget_rejected_candidates",
+    "nonlinear_ladder_attempts",
+    "nonlinear_accepted_steps",
+    "nonlinear_failed_ladders",
+    "nonlinear_growth_events",
     "tangent_system_calls",
+    "tangent_projection_solve_calls",
     "tangent_qr_calls",
     "tangent_sample_chunk_count",
     "tangent_backend_optimized_calls",

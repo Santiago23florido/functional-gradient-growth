@@ -131,12 +131,10 @@ class FGDApproxConfig:
     # the certified method's growth FP" -- that is always yes.
     growth_function_preserving: bool = False
     growth_preservation_tolerance: float = 1e-6
-    # Ordered ladder of approximation families. "tangent" must come first (it
-    # is the epoch's main transactional search); the remaining entries are
-    # tried in the listed order only after the previous family fails to
-    # certify, and structural growth is probed only after every listed family
-    # fails. Every family commits through the same full FGD certificate.
-    # Supported: "tangent", "rkhs_head", "parametric_gd".
+    # Ordered approximation families. The legacy ladder starts with "tangent"
+    # and retains its existing fallback semantics. The nonlinear primary mode
+    # is selected only by the standalone value ("nonlinear",); it bypasses all
+    # tangent construction and cannot be mixed with fallback families.
     family_order: tuple[str, ...] = ("tangent",)
     # Certify the tangent outer step by MEASURED validation descent
     # (Prop. 3.8) instead of the Lemma-3.5 relative-error interval. The
@@ -1051,6 +1049,7 @@ class FGDApproxConfig:
 
 SUPPORTED_FGD_FAMILIES = (
     "tangent",
+    "nonlinear",
     "rkhs_head",
     "parametric_gd",
     "parametric_descent",
@@ -1070,11 +1069,6 @@ def validate_family_order(family_order: tuple[str, ...]) -> None:
     """Reject malformed fgd_approx.family_order values early."""
     if not family_order:
         raise ValueError("fgd_approx.family_order cannot be empty.")
-    if family_order[0] != "tangent":
-        raise ValueError(
-            "fgd_approx.family_order must start with 'tangent' (the epoch's "
-            "main transactional search)."
-        )
     unknown = sorted(set(family_order) - set(SUPPORTED_FGD_FAMILIES))
     if unknown:
         raise ValueError(
@@ -1084,6 +1078,19 @@ def validate_family_order(family_order: tuple[str, ...]) -> None:
         )
     if len(set(family_order)) != len(family_order):
         raise ValueError("fgd_approx.family_order entries must be unique.")
+    if "nonlinear" in family_order:
+        if family_order != ("nonlinear",):
+            raise ValueError(
+                "fgd_approx.family_order selects 'nonlinear' as a standalone "
+                "primary family and therefore must be exactly ['nonlinear']; "
+                "it cannot coexist with tangent or fallback families."
+            )
+        return
+    if family_order[0] != "tangent":
+        raise ValueError(
+            "fgd_approx.family_order must start with 'tangent' in legacy mode, "
+            "or be exactly ['nonlinear'] for nonlinear primary mode."
+        )
 
 
 @dataclass(frozen=True)
@@ -1113,6 +1120,10 @@ class ParametricGDConfig:
     # displacement generalizes to validation (closing the train/val gap
     # that caps the certified acceptance).
     weight_decay: float = 0.0
+    # Nonlinear-primary certification streams this many validation minibatches.
+    # None means one complete loader pass. Legacy parametric fallback families
+    # do not read this field.
+    certification_batches: int | None = None
 
     def validate(self) -> None:
         if self.optimizer not in ("sgd", "adam", "adamw"):
@@ -1121,6 +1132,10 @@ class ParametricGDConfig:
             )
         if self.weight_decay < 0.0:
             raise ValueError("parametric_gd.weight_decay must be non-negative.")
+        if self.certification_batches is not None and self.certification_batches < 1:
+            raise ValueError(
+                "parametric_gd.certification_batches must be positive or null."
+            )
         if self.inner_learning_rate <= 0.0:
             raise ValueError("parametric_gd.inner_learning_rate must be positive.")
         if not self.inner_steps or any(v < 1 for v in self.inner_steps):
@@ -1923,6 +1938,7 @@ def _solve_tangent_projection(
     work_dtype: torch.dtype = torch.float64,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return parameter update and projected output gradient."""
+    increment("tangent_projection_solve_calls")
     if solver in {"exact", "exact_svd"}:
         return _solve_tangent_projection_svd(
             jacobian_matrix=jacobian_matrix,
