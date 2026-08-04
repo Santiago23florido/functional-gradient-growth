@@ -6,7 +6,6 @@ import os
 from dataclasses import dataclass
 from typing import Any, Literal
 
-
 WandbMode = Literal["online", "offline", "disabled"]
 
 # Numeric family identity for charting which family committed each epoch.
@@ -15,6 +14,7 @@ FAMILY_INDEX = {
     "rkhs_head": 1,
     "parametric_gd": 2,
     "parametric_descent": 3,
+    "nonlinear": 4,
 }
 
 
@@ -50,6 +50,9 @@ class NullWandbLogger:
         event: Any,
         epoch: int,
         growth_count: int,
+        architecture_widths: tuple[int, ...] = (),
+        statistics_seconds: float | None = None,
+        application_seconds: float | None = None,
     ) -> None:
         return None
 
