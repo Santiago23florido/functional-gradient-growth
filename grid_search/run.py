@@ -262,36 +262,42 @@ def _overrides_key(overrides: Mapping[str, Any]) -> str:
     return json.dumps(overrides, sort_keys=True, separators=(",", ":"))
 
 
-def paired_leave_one_seed_out_summary(
-    grid: Mapping[str, Any],
-    completed: Sequence[Mapping[str, Any]],
-) -> dict[str, Any]:
-    """Build the paired fixed-vs-growth comparison without seed selection.
+def _sample_std(values: Sequence[float]) -> float:
+    return statistics.stdev(values) if len(values) > 1 else 0.0
 
-    For fold ``s``, hyperparameters for growth architecture ``A_s`` are ranked
-    on every configured model seed except ``s``.  Only after that choice is
-    fixed do we read the held-out run's test accuracy.
+
+def paired_same_seed_retraining_summary(
+    grid: Mapping[str, Any],
+    trial_payloads: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Compare growth with fresh AdamW retraining on the corresponding seed.
+
+    For seed ``s``, candidates are restricted simultaneously to the
+    architecture produced by growth seed ``s`` and retraining seed ``s``.
+    Hyperparameters are selected by validation, then test is read once.
     """
-    paired = grid.get("paired_evaluation")
+    paired = grid.get("paired_same_seed_evaluation")
     if not isinstance(paired, Mapping):
-        raise TypeError("paired_evaluation must be a mapping")
-    if paired.get("protocol") != "leave_one_seed_out":
-        raise ValueError("paired_evaluation.protocol must be 'leave_one_seed_out'")
+        raise TypeError("paired_same_seed_evaluation must be a mapping")
+    if paired.get("protocol") != "same_seed_retraining":
+        raise ValueError(
+            "paired_same_seed_evaluation.protocol must be 'same_seed_retraining'"
+        )
 
     model_seeds = tuple(sorted(int(seed) for seed in grid["model_seeds"]))
-    if len(model_seeds) < 2 or len(set(model_seeds)) != len(model_seeds):
-        raise ValueError("paired evaluation needs at least two unique model_seeds")
+    if not model_seeds or len(set(model_seeds)) != len(model_seeds):
+        raise ValueError("paired evaluation needs unique model_seeds")
 
     raw_growth_runs = paired.get("growth_runs")
     if not isinstance(raw_growth_runs, Mapping):
-        raise TypeError("paired_evaluation.growth_runs must be a mapping")
+        raise TypeError("paired_same_seed_evaluation.growth_runs must be a mapping")
     growth_runs = {int(seed): value for seed, value in raw_growth_runs.items()}
     if set(growth_runs) != set(model_seeds):
         missing = sorted(set(model_seeds) - set(growth_runs))
         extra = sorted(set(growth_runs) - set(model_seeds))
         raise ValueError(
-            "paired_evaluation.growth_runs must contain exactly model_seeds; "
-            f"missing={missing}, extra={extra}"
+            "paired_same_seed_evaluation.growth_runs must contain exactly "
+            f"model_seeds; missing={missing}, extra={extra}"
         )
 
     grid_architectures = {
@@ -311,128 +317,113 @@ def paired_leave_one_seed_out_summary(
             )
         references[seed] = (architecture, float(reference["test_accuracy"]))
 
-    expected_overrides: dict[tuple[int, ...], dict[str, dict[str, Any]]] = {
-        architecture: {} for architecture in grid_architectures
+    expected_overrides: dict[int, dict[str, dict[str, Any]]] = {
+        seed: {} for seed in model_seeds
     }
     for trial in enumerate_trials(grid):
-        key = _overrides_key(trial.overrides)
-        expected_overrides[trial.architecture][key] = trial.overrides
+        reference_architecture, _ = references[trial.model_seed]
+        if trial.architecture == reference_architecture:
+            key = _overrides_key(trial.overrides)
+            expected_overrides[trial.model_seed][key] = trial.overrides
 
-    results: dict[tuple[tuple[int, ...], str, int], Mapping[str, Any]] = {}
-    for payload in completed:
+    results: dict[tuple[tuple[int, ...], int, str], Mapping[str, Any]] = {}
+    for payload in trial_payloads:
         trial = payload["trial"]
         architecture = tuple(int(width) for width in trial["architecture"])
         seed = int(trial["model_seed"])
         overrides_key = _overrides_key(trial["overrides"])
-        identity = (architecture, overrides_key, seed)
-        if (
-            architecture not in expected_overrides
-            or overrides_key not in expected_overrides[architecture]
-            or seed not in model_seeds
-        ):
+        identity = (architecture, seed, overrides_key)
+        if seed not in references:
+            continue
+        expected_architecture, _ = references[seed]
+        if architecture != expected_architecture:
+            continue
+        if overrides_key not in expected_overrides[seed]:
             continue
         if identity in results:
             raise RuntimeError(
-                "duplicate completed paired trial for "
-                f"architecture={list(architecture)}, seed={seed}, "
+                "duplicate same-seed retraining trial for "
+                f"seed={seed}, expected_architecture={list(architecture)}, "
                 f"overrides={overrides_key}"
             )
         results[identity] = payload
 
-    incomplete_folds: list[str] = []
-    for held_out_seed, (architecture, _) in references.items():
-        incomplete_configurations = []
-        for key, overrides in expected_overrides[architecture].items():
-            missing_seeds = [
-                seed for seed in model_seeds if (architecture, key, seed) not in results
-            ]
-            if missing_seeds:
-                incomplete_configurations.append(
-                    {
-                        "overrides": overrides,
-                        "missing_seeds": missing_seeds,
-                    }
-                )
-        if incomplete_configurations:
-            incomplete_folds.append(
-                f"architecture={list(architecture)}, "
-                f"held_out_seed={held_out_seed}, "
-                f"incomplete_configurations={incomplete_configurations}"
+    incomplete_pairs: list[str] = []
+    for seed, (architecture, _) in references.items():
+        missing_or_incomplete = []
+        complete_count = 0
+        for key, overrides in expected_overrides[seed].items():
+            payload = results.get((architecture, seed, key))
+            status = payload.get("status") if payload is not None else "missing"
+            if status == "complete":
+                complete_count += 1
+            else:
+                missing_or_incomplete.append({"overrides": overrides, "status": status})
+        if missing_or_incomplete or complete_count == 0:
+            incomplete_pairs.append(
+                f"seed={seed}, expected_architecture={list(architecture)}, "
+                f"complete_candidates={complete_count}/"
+                f"{len(expected_overrides[seed])}, "
+                f"missing_or_incomplete={missing_or_incomplete}"
             )
-    if incomplete_folds:
+    if incomplete_pairs:
         raise RuntimeError(
-            "paired leave-one-seed-out evaluation is incomplete:\n- "
-            + "\n- ".join(incomplete_folds)
+            "paired same-seed retraining evaluation is incomplete:\n- "
+            + "\n- ".join(incomplete_pairs)
         )
 
-    folds: list[dict[str, Any]] = []
-    for held_out_seed in model_seeds:
-        architecture, growth_test_accuracy = references[held_out_seed]
-        selection_seeds = [seed for seed in model_seeds if seed != held_out_seed]
-        candidates = []
-        for key, overrides in expected_overrides[architecture].items():
-            selection_results = [
-                results[(architecture, key, seed)] for seed in selection_seeds
-            ]
-            validation_accuracies = [
-                float(result["best"]["validation_accuracy"])
-                for result in selection_results
-            ]
-            validation_losses = [
-                float(result["best"]["validation_loss"]) for result in selection_results
-            ]
-            candidates.append(
-                {
-                    "overrides_key": key,
-                    "overrides": overrides,
-                    "mean_validation_accuracy": statistics.mean(validation_accuracies),
-                    "std_validation_accuracy": statistics.stdev(validation_accuracies),
-                    "mean_validation_loss": statistics.mean(validation_losses),
-                }
-            )
+    pairs: list[dict[str, Any]] = []
+    for seed in model_seeds:
+        architecture, growth_test_accuracy = references[seed]
+        candidates = [
+            results[(architecture, seed, key)] for key in expected_overrides[seed]
+        ]
         selected = min(
             candidates,
             key=lambda candidate: (
-                -candidate["mean_validation_accuracy"],
-                candidate["mean_validation_loss"],
-                candidate["overrides_key"],
+                -float(candidate["best"]["validation_accuracy"]),
+                float(candidate["best"]["validation_loss"]),
+                _overrides_key(candidate["trial"]["overrides"]),
             ),
         )
-        held_out = results[(architecture, selected["overrides_key"], held_out_seed)]
-        fixed_test_accuracy = float(held_out["best"]["test_accuracy"])
-        folds.append(
+        selected_trial = selected["trial"]
+        selected_architecture = tuple(selected_trial["architecture"])
+        selected_seed = int(selected_trial["model_seed"])
+        if selected_architecture != architecture or selected_seed != seed:
+            raise AssertionError(
+                "same-seed selection escaped its pair: "
+                f"seed={seed}, expected_architecture={list(architecture)}, "
+                f"selected_seed={selected_seed}, "
+                f"selected_architecture={list(selected_architecture)}"
+            )
+        fixed_test_accuracy = float(selected["best"]["test_accuracy"])
+        pairs.append(
             {
-                "held_out_seed": held_out_seed,
+                "seed": seed,
                 "architecture": list(architecture),
-                "selection_seeds": selection_seeds,
-                "selected_overrides": selected["overrides"],
-                "selection_mean_validation_accuracy": selected[
-                    "mean_validation_accuracy"
-                ],
-                "selection_std_validation_accuracy": selected[
-                    "std_validation_accuracy"
-                ],
-                "selection_mean_validation_loss": selected["mean_validation_loss"],
-                "held_out_best_epoch": int(held_out["best_validation_epoch"]),
-                "held_out_validation_accuracy": float(
-                    held_out["best"]["validation_accuracy"]
-                ),
+                "selected_overrides": selected_trial["overrides"],
+                "best_validation_epoch": int(selected["best_validation_epoch"]),
+                "validation_accuracy": float(selected["best"]["validation_accuracy"]),
+                "validation_loss": float(selected["best"]["validation_loss"]),
                 "fixed_test_accuracy": fixed_test_accuracy,
                 "growth_test_accuracy": growth_test_accuracy,
-                "fixed_minus_growth": (fixed_test_accuracy - growth_test_accuracy),
+                "fixed_minus_growth": fixed_test_accuracy - growth_test_accuracy,
+                "trial_id": selected_trial["trial_id"],
+                "parameters": int(selected["parameters"]),
+                "elapsed_seconds": float(selected["elapsed_seconds"]),
             }
         )
 
-    fixed_tests = [fold["fixed_test_accuracy"] for fold in folds]
-    growth_tests = [fold["growth_test_accuracy"] for fold in folds]
-    differences = [fold["fixed_minus_growth"] for fold in folds]
-    difference_std = statistics.stdev(differences)
+    fixed_tests = [pair["fixed_test_accuracy"] for pair in pairs]
+    growth_tests = [pair["growth_test_accuracy"] for pair in pairs]
+    differences = [pair["fixed_minus_growth"] for pair in pairs]
+    difference_std = _sample_std(differences)
     aggregate = {
-        "number_of_folds": len(folds),
+        "number_of_pairs": len(pairs),
         "fixed_mean_test_accuracy": statistics.mean(fixed_tests),
-        "fixed_std_test_accuracy": statistics.stdev(fixed_tests),
+        "fixed_std_test_accuracy": _sample_std(fixed_tests),
         "growth_mean_test_accuracy": statistics.mean(growth_tests),
-        "growth_std_test_accuracy": statistics.stdev(growth_tests),
+        "growth_std_test_accuracy": _sample_std(growth_tests),
         "mean_paired_difference": statistics.mean(differences),
         "std_paired_difference": difference_std,
         "standard_error_paired_difference": difference_std
@@ -442,29 +433,38 @@ def paired_leave_one_seed_out_summary(
         "ties": sum(difference == 0.0 for difference in differences),
     }
     return {
-        "protocol": "paired_leave_one_seed_out",
+        "protocol": "paired_same_seed_retraining",
         "selection": (
-            "hyperparameters selected by mean validation accuracy on all "
-            "non-held-out seeds; validation loss and canonical overrides "
-            "break ties; test is read only after selection"
+            "for each growth seed, restrict to its architecture and the same "
+            "retraining seed; select by validation accuracy, validation loss, "
+            "and canonical overrides; read test only after selection"
         ),
-        "folds": folds,
+        "pairs": pairs,
         "aggregate": aggregate,
     }
 
 
-def _print_paired_summary(summary: Mapping[str, Any]) -> None:
-    print("\nPaired leave-one-seed-out")
-    print("seed | architecture | selection seeds | fixed test | grow test | delta")
-    for fold in summary["folds"]:
-        architecture = "-".join(map(str, fold["architecture"]))
-        selection_seeds = ",".join(map(str, fold["selection_seeds"]))
+def _print_same_seed_summary(summary: Mapping[str, Any]) -> None:
+    print("\nPaired same-seed retraining")
+    print(
+        "Seed  Architecture  LR        WD        Scheduler          Val     "
+        "Fixed test  Grow test  Delta"
+    )
+    print("-" * 105)
+    for pair in summary["pairs"]:
+        architecture = "-".join(map(str, pair["architecture"]))
+        overrides = pair["selected_overrides"]
         print(
-            f"{fold['held_out_seed']:>4} | {architecture:<12} | "
-            f"{selection_seeds:<15} | {fold['fixed_test_accuracy']:.4f}     | "
-            f"{fold['growth_test_accuracy']:.4f}    | "
-            f"{fold['fixed_minus_growth']:+.4f}"
+            f"{pair['seed']:<5} {architecture:<13} "
+            f"{overrides.get('optimizer.learning_rate', 'n/a')!s:<9} "
+            f"{overrides.get('optimizer.weight_decay', 'n/a')!s:<9} "
+            f"{overrides.get('lr_scheduler.name', 'n/a')!s:<18} "
+            f"{pair['validation_accuracy']:.4f}  "
+            f"{pair['fixed_test_accuracy']:.4f}      "
+            f"{pair['growth_test_accuracy']:.4f}    "
+            f"{pair['fixed_minus_growth']:+.4f}"
         )
+    print("-" * 105)
     aggregate = summary["aggregate"]
     print(
         "Fixed mean +/- std: "
@@ -477,7 +477,7 @@ def _print_paired_summary(summary: Mapping[str, Any]) -> None:
         f"{aggregate['growth_std_test_accuracy']:.4f}"
     )
     print(
-        "Paired delta mean +/- std: "
+        "Paired difference mean +/- std: "
         f"{aggregate['mean_paired_difference']:+.4f} +/- "
         f"{aggregate['std_paired_difference']:.4f}"
     )
@@ -490,10 +490,12 @@ def _print_paired_summary(summary: Mapping[str, Any]) -> None:
 
 def summarize(grid: Mapping[str, Any]) -> Path:
     trial_dir = Path(grid["results_dir"]) / "trials"
+    trial_payloads = []
     completed = []
     failed = 0
     for path in sorted(trial_dir.glob("trial_*.json")):
         payload = json.loads(path.read_text(encoding="utf-8"))
+        trial_payloads.append(payload)
         if payload.get("status") == "complete":
             completed.append(payload)
         elif payload.get("status") == "failed":
@@ -542,13 +544,13 @@ def summarize(grid: Mapping[str, Any]) -> Path:
         f"test={best['mean_test_accuracy']:.4f} over {best['runs']} run(s)"
     )
     print(f"Saved {output}")
-    if grid.get("paired_evaluation") is not None:
-        paired_summary = paired_leave_one_seed_out_summary(grid, completed)
+    if grid.get("paired_same_seed_evaluation") is not None:
+        paired_summary = paired_same_seed_retraining_summary(grid, trial_payloads)
         paired_output = (
-            Path(grid["results_dir"]) / "paired_leave_one_seed_out_summary.json"
+            Path(grid["results_dir"]) / "paired_same_seed_retraining_summary.json"
         )
         _atomic_json(paired_output, paired_summary)
-        _print_paired_summary(paired_summary)
+        _print_same_seed_summary(paired_summary)
         print(f"Saved {paired_output}")
     return output
 

@@ -43,10 +43,10 @@ fixed_overrides:
   lr_scheduler.eta_min: 0.0
   lr_scheduler.restart_on_growth: false
 
-# Primary comparison. Hyperparameters for architecture A_s are selected on
-# the other three seeds; seed s is then used exactly once for evaluation.
-paired_evaluation:
-  protocol: leave_one_seed_out
+# Primary comparison. For growth seed s, select AdamW hyperparameters only
+# among fresh retrainings of architecture A_s initialized with the same seed s.
+paired_same_seed_evaluation:
+  protocol: same_seed_retraining
   growth_runs:
     0:
       architecture: [11, 19, 16]
