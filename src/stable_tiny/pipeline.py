@@ -4157,11 +4157,390 @@ def _run_rkhs_head_phase(
     )
 
 
+def _run_nonlinear_pipeline(
+    *,
+    config: PipelineConfig,
+    device: torch.device,
+    train_loader: torch.utils.data.DataLoader,
+    validation_loader: torch.utils.data.DataLoader,
+    test_loader: torch.utils.data.DataLoader,
+    classification: bool,
+    wandb_logger: Any,
+    progress: ProgressFn | None,
+) -> PipelineResult:
+    """Run nonlinear training without entering the tangent outer-step loop."""
+    model = build_model(config, device)
+    loss_function = torch.nn.MSELoss()
+    history: list[HistoryEntry] = []
+    growth_events: list[GrowthResult] = []
+    ladder_attempts = 0
+    accepted_steps = 0
+    failed_ladders = 0
+    growth_count = 0
+
+    def metrics(candidate: GrowingMLP, loader: torch.utils.data.DataLoader):
+        return evaluate_regression_metrics(
+            candidate,
+            loader,
+            loss_function,
+            device=device,
+            accuracy_tolerance=config.training.accuracy_tolerance,
+            classification=classification,
+        )
+
+    if progress is not None:
+        progress(f"Using device: {device}")
+        progress(f"Training method: {config.training.method}")
+        progress(
+            "Primary approximation family: nonlinear "
+            "(dedicated AdamW minibatch pipeline; tangent path unreachable)"
+        )
+        if wandb_logger.enabled:
+            progress(
+                f"W&B logging enabled: project={config.wandb.project}, "
+                f"run={config.wandb.run_name or config.run.name}"
+            )
+        progress("Original model:")
+        progress(str(model))
+
+    train_metrics = metrics(model, train_loader)
+    validation_metrics = metrics(model, validation_loader)
+    test_metrics = metrics(model, test_loader)
+    theory_loss_star = config.fgd_approx.theory_loss_star
+    initial_functional_loss = evaluate_functional_loss(
+        model,
+        validation_loader,
+        device,
+        config.fgd_approx.functional_loss,
+    )
+    initial_functional_gap = max(initial_functional_loss - theory_loss_star, 0.0)
+    theory_state = _FGDTheoryState(
+        epoch_count=0,
+        min_gradient_sq_norm=None,
+        min_positive_learning_rate=None,
+        min_descent_coefficient=None,
+        global_contraction_product=1.0,
+        previous_validation_functional_loss=initial_functional_loss,
+    )
+
+    init_entry = HistoryEntry(
+        step=0,
+        step_type="INIT",
+        train_loss=train_metrics.loss,
+        validation_loss=validation_metrics.loss,
+        test_loss=test_metrics.loss,
+        train_accuracy=train_metrics.accuracy,
+        validation_accuracy=validation_metrics.accuracy,
+        test_accuracy=test_metrics.accuracy,
+        learning_rate=0.0,
+        num_params=count_parameters(model),
+        fgd_approximation_kind="nonlinear",
+        nonlinear_adamw_learning_rate=config.parametric_gd.inner_learning_rate,
+        nonlinear_weight_decay=config.parametric_gd.weight_decay,
+        architecture_widths=_architecture_widths(model),
+    )
+    history.append(init_entry)
+    wandb_logger.log_history_entry(init_entry)
+    if progress is not None:
+        progress(
+            f"[INIT] Epoch 0, train_loss={train_metrics.loss:.4f}, "
+            f"validation_loss={validation_metrics.loss:.4f}, "
+            f"test_loss={test_metrics.loss:.4f}, "
+            f"train_acc={train_metrics.accuracy:.3f}, "
+            f"validation_acc={validation_metrics.accuracy:.3f}, "
+            f"test_acc={test_metrics.accuracy:.3f}"
+        )
+
+    last_test_loss = test_metrics.loss
+    for epoch in range(1, config.training.epochs + 1):
+        base_parameters = count_parameters(model)
+        base_widths = _architecture_widths(model)
+        nonlinear_result = _search_nonlinear_primary_candidate(
+            base_model=model,
+            train_loader=train_loader,
+            validation_loader=validation_loader,
+            test_loader=test_loader,
+            loss_function=loss_function,
+            device=device,
+            accuracy_tolerance=config.training.accuracy_tolerance,
+            config=config,
+            classification=classification,
+            theory_state=theory_state,
+            initial_functional_gap=initial_functional_gap,
+            theory_loss_star=theory_loss_star,
+            progress=progress,
+        )
+        ladder_attempts += nonlinear_result.attempts
+        accepted = nonlinear_result.accepted
+        if accepted is not None:
+            accepted_steps += 1
+            model = accepted.model
+            theory_state = accepted.theory_state
+        else:
+            failed_ladders += 1
+
+        candidate = nonlinear_result.candidate
+        stats = nonlinear_result.stats
+        last_trial = nonlinear_result.last_trial
+        committed_rate = (
+            accepted.epoch_result.learning_rate if accepted is not None else None
+        )
+        growth_outcome: _NonlinearGrowthOutcome | None = None
+        if accepted is None:
+            if growth_count >= config.fgd_approx.certify_max_growths:
+                if progress is not None:
+                    progress(
+                        f"[NONLINEAR-GRO] Epoch {epoch}: maximum growth events "
+                        f"reached ({config.fgd_approx.certify_max_growths}); "
+                        "model unchanged"
+                    )
+            else:
+                growth_outcome = _apply_nonlinear_primary_growth(
+                    model=model,
+                    train_loader=train_loader,
+                    preservation_loader=validation_loader,
+                    device=device,
+                    config=config,
+                    epoch=epoch,
+                    progress=progress,
+                )
+
+        step_metrics_model = accepted.model if accepted is not None else model
+        train_metrics = metrics(step_metrics_model, train_loader)
+        validation_metrics = metrics(step_metrics_model, validation_loader)
+        test_metrics = metrics(step_metrics_model, test_loader)
+        statistics_seconds = (
+            growth_outcome.statistics_seconds if growth_outcome is not None else 0.0
+        )
+        application_seconds = (
+            growth_outcome.application_seconds if growth_outcome is not None else 0.0
+        )
+        projected_growth_events = growth_count + int(
+            growth_outcome is not None and growth_outcome.result is not None
+        )
+        epoch_entry = HistoryEntry(
+            step=epoch,
+            step_type="FGD",
+            train_loss=train_metrics.loss,
+            validation_loss=validation_metrics.loss,
+            test_loss=test_metrics.loss,
+            train_accuracy=train_metrics.accuracy,
+            validation_accuracy=validation_metrics.accuracy,
+            test_accuracy=test_metrics.accuracy,
+            learning_rate=committed_rate or 0.0,
+            num_params=(
+                count_parameters(model) if accepted is not None else base_parameters
+            ),
+            fgd_learning_rate_upper_bound=(
+                nonlinear_result.certificate.learning_rate_upper_bound
+            ),
+            fgd_learning_rate_interval_valid=(
+                nonlinear_result.certificate.learning_rate_interval_valid
+            ),
+            fgd_relative_error_condition_valid=(
+                nonlinear_result.certificate.relative_error_condition_valid
+            ),
+            fgd_loss_descent_valid=(
+                last_trial.loss_descent_valid if last_trial is not None else None
+            ),
+            fgd_gradient_sq_norm=nonlinear_result.certificate.gradient_sq_norm,
+            fgd_theory_descent_coefficient=(
+                nonlinear_result.certificate.theory_descent_coefficient
+            ),
+            fgd_stationary_bound=(
+                accepted.stationary_bound if accepted is not None else None
+            ),
+            fgd_stationary_bound_valid=(
+                accepted.stationary_bound_valid if accepted is not None else None
+            ),
+            fgd_global_bound=(accepted.global_bound if accepted is not None else None),
+            fgd_global_bound_valid=(
+                accepted.global_bound_valid if accepted is not None else None
+            ),
+            fgd_global_contraction=(
+                accepted.global_contraction if accepted is not None else None
+            ),
+            fgd_sensor_valid=nonlinear_result.certificate.sensor_valid,
+            fgd_sensor_invalid_batches=(
+                nonlinear_result.certificate.sensor_invalid_batches
+            ),
+            fgd_update_norm=nonlinear_result.update_norm,
+            fgd_candidate_accepted=accepted is not None,
+            fgd_lr_search_trials=nonlinear_result.attempts,
+            fgd_approximation_kind="nonlinear",
+            nonlinear_functional_learning_rate=(
+                candidate.functional_learning_rate if candidate is not None else None
+            ),
+            nonlinear_inner_steps=(
+                candidate.inner_steps if candidate is not None else None
+            ),
+            nonlinear_adamw_learning_rate=config.parametric_gd.inner_learning_rate,
+            nonlinear_weight_decay=config.parametric_gd.weight_decay,
+            nonlinear_cosine=(stats.cosine if stats is not None else None),
+            nonlinear_relative_error=(
+                stats.relative_error if stats is not None else None
+            ),
+            nonlinear_certificate_valid=(
+                stats.certified if stats is not None else False
+            ),
+            nonlinear_validation_descent_valid=(
+                last_trial.loss_descent_valid if last_trial is not None else None
+            ),
+            nonlinear_committed_rate=committed_rate,
+            nonlinear_growth_requested=accepted is None,
+            nonlinear_candidate_training_seconds=(
+                nonlinear_result.candidate_training_seconds
+            ),
+            nonlinear_certification_seconds=nonlinear_result.certification_seconds,
+            nonlinear_growth_statistics_seconds=statistics_seconds,
+            nonlinear_growth_application_seconds=application_seconds,
+            nonlinear_ladder_attempts=ladder_attempts,
+            nonlinear_accepted_steps=accepted_steps,
+            nonlinear_failed_ladders=failed_ladders,
+            nonlinear_growth_events=projected_growth_events,
+            nonlinear_full_jacobian_calls=0,
+            nonlinear_tangent_system_calls=0,
+            nonlinear_tangent_projection_solves=0,
+            architecture_widths=base_widths,
+        )
+        history.append(epoch_entry)
+        wandb_logger.log_history_entry(epoch_entry)
+
+        if progress is not None and should_log_epoch(epoch, config):
+            epsilon = (
+                f"{stats.relative_error:.4f}"
+                if stats is not None and stats.relative_error is not None
+                else "n/a"
+            )
+            progress(
+                f"[NONLINEAR] Epoch {epoch}, accepted={accepted is not None}, "
+                f"eps={epsilon}, train_loss={train_metrics.loss:.4f}, "
+                f"validation_loss={validation_metrics.loss:.4f}, "
+                f"test_loss={test_metrics.loss:.4f} "
+                f"({test_metrics.loss - last_test_loss:+.4f}), widths={base_widths}"
+            )
+        last_test_loss = test_metrics.loss
+
+        if accepted is not None or growth_outcome is None:
+            continue
+        if growth_outcome.result is None or growth_outcome.model is None:
+            continue
+
+        model = growth_outcome.model
+        growth_result = growth_outcome.result
+        growth_events.append(growth_result)
+        growth_count += 1
+        # The clone passed the function-preservation check, so all metrics and
+        # the functional loss are identical. Reusing them avoids four complete
+        # loader passes after every structural event.
+        post_growth_loss = theory_state.previous_validation_functional_loss
+        initial_functional_gap = max(post_growth_loss - theory_loss_star, 0.0)
+        theory_state = _FGDTheoryState(
+            epoch_count=0,
+            min_gradient_sq_norm=None,
+            min_positive_learning_rate=None,
+            min_descent_coefficient=None,
+            global_contraction_product=1.0,
+            previous_validation_functional_loss=post_growth_loss,
+        )
+        growth_entry = HistoryEntry(
+            step=epoch,
+            step_type="GRO",
+            train_loss=train_metrics.loss,
+            validation_loss=validation_metrics.loss,
+            test_loss=test_metrics.loss,
+            train_accuracy=train_metrics.accuracy,
+            validation_accuracy=validation_metrics.accuracy,
+            test_accuracy=test_metrics.accuracy,
+            learning_rate=0.0,
+            num_params=count_parameters(model),
+            layer_index=growth_outcome.layer_index,
+            scaling_factor=growth_result.best_scaling_factor,
+            selected_layer_index=growth_outcome.layer_index,
+            fgd_candidate_accepted=False,
+            fgd_approximation_kind="nonlinear",
+            nonlinear_functional_learning_rate=(
+                candidate.functional_learning_rate if candidate is not None else None
+            ),
+            nonlinear_inner_steps=(
+                candidate.inner_steps if candidate is not None else None
+            ),
+            nonlinear_adamw_learning_rate=config.parametric_gd.inner_learning_rate,
+            nonlinear_weight_decay=config.parametric_gd.weight_decay,
+            nonlinear_cosine=(stats.cosine if stats is not None else None),
+            nonlinear_relative_error=(
+                stats.relative_error if stats is not None else None
+            ),
+            nonlinear_certificate_valid=(
+                stats.certified if stats is not None else False
+            ),
+            nonlinear_validation_descent_valid=(
+                last_trial.loss_descent_valid if last_trial is not None else None
+            ),
+            nonlinear_growth_requested=True,
+            nonlinear_candidate_training_seconds=(
+                nonlinear_result.candidate_training_seconds
+            ),
+            nonlinear_certification_seconds=nonlinear_result.certification_seconds,
+            nonlinear_growth_statistics_seconds=growth_outcome.statistics_seconds,
+            nonlinear_growth_application_seconds=growth_outcome.application_seconds,
+            nonlinear_ladder_attempts=ladder_attempts,
+            nonlinear_accepted_steps=accepted_steps,
+            nonlinear_failed_ladders=failed_ladders,
+            nonlinear_growth_events=growth_count,
+            nonlinear_full_jacobian_calls=0,
+            nonlinear_tangent_system_calls=0,
+            nonlinear_tangent_projection_solves=0,
+            architecture_widths=_architecture_widths(model),
+        )
+        history.append(growth_entry)
+        wandb_logger.log_growth_event(
+            event=growth_result,
+            epoch=epoch,
+            growth_count=growth_count,
+            architecture_widths=_architecture_widths(model),
+            statistics_seconds=growth_outcome.statistics_seconds,
+            application_seconds=growth_outcome.application_seconds,
+        )
+        wandb_logger.log_history_entry(growth_entry)
+        if progress is not None:
+            progress(
+                f"[GRO] Epoch {epoch}, layer={growth_outcome.layer_index}, "
+                f"widths={_architecture_widths(model)}, "
+                f"parameters={count_parameters(model)}"
+            )
+        last_test_loss = test_metrics.loss
+
+    return PipelineResult(
+        config=config,
+        history=history,
+        growth_events=growth_events,
+        model=model,
+        device=str(device),
+    )
+
+
 def run_pipeline(
     config: PipelineConfig,
     progress: ProgressFn | None = print,
 ) -> PipelineResult:
     """Run the train-grow loop from the GroMo tutorial."""
+    nonlinear_selected = (
+        config.training.method == "fgd_approx"
+        and config.fgd_approx.family_order == ("nonlinear",)
+    )
+    if nonlinear_selected and config.parametric_gd.optimizer != "adamw":
+        raise ValueError(
+            "The nonlinear primary family requires parametric_gd.optimizer='adamw'."
+        )
+    if nonlinear_selected and (
+        config.fgd_approx.growth_where != "expressivity_bottleneck"
+        or config.fgd_approx.growth_selection != "unified_expansion"
+    ):
+        raise ValueError(
+            "Nonlinear primary growth requires growth_where="
+            "'expressivity_bottleneck' and growth_selection='unified_expansion'."
+        )
     wandb_logger = build_wandb_logger(config.wandb)
     wandb_logger.start(
         run_name=config.run.name,
