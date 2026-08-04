@@ -4699,7 +4699,7 @@ def run_pipeline(
         certify_previous_failure_non_finite = False
         fgd_validation_probe: tuple[torch.Tensor, torch.Tensor] | None = None
         fgd_train_probe: tuple[torch.Tensor, torch.Tensor] | None = None
-        if config.training.method == "fgd_approx":
+        if config.training.method == "fgd_approx" and not nonlinear_mode:
             # Bounded certification probe: sized to kappa*rank(J) when enabled,
             # else the fixed probe_batches. Re-evaluated each outer step (rank
             # grows). ``_probe_batches`` tracks the current train-probe size so
