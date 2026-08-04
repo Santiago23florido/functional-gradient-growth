@@ -4601,6 +4601,7 @@ def run_pipeline(
         current_fgd_learning_rate
         if (
             config.training.method == "fgd_approx"
+            and not nonlinear_mode
             and config.fgd_approx.learning_rate_policy == "theory_interval"
         )
         else scheduled_learning_rate(
