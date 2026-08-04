@@ -6271,6 +6271,19 @@ def run_pipeline(
                             f"(parameter budget {max_parameters} reached: "
                             f"{count_parameters(model)} params)"
                         )
+                if (
+                    growth_triggered
+                    and nonlinear_mode
+                    and growth_count >= config.fgd_approx.certify_max_growths
+                ):
+                    growth_triggered = False
+                    if progress is not None:
+                        progress(
+                            f"[NONLINEAR-GRO] Epoch {epoch}: growth suppressed "
+                            "because the configured maximum of "
+                            f"{config.fgd_approx.certify_max_growths} events "
+                            "was reached"
+                        )
 
             if (
                 config.training.method == "fgd_approx"
