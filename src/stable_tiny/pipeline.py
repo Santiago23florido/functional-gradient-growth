@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, field, fields, replace
 from pathlib import Path
@@ -43,6 +44,7 @@ from fgdlib.tangent import (
     functional_gradient,
     select_tiny_growth_layer_index,
     should_trigger_fgd_growth,
+    theoretical_descent_coefficient,
     theoretical_learning_rate_upper_bound,
     tiny_optimal_update_kwargs,
     train_one_epoch_fgd_approx,
@@ -58,12 +60,22 @@ from fgdlib.rkhs import (
     KernelDictionaryModel,
 )
 from fgdlib.gromo_setup import ensure_gromo_importable
-from fgdlib.profile import fallback, increment
+from fgdlib.profile import fallback, increment, timed
 from fgdlib.search.certify import (
     exact_relative_error,
     grow_until_certified,
 )
-from fgdlib.search.families import certify_parametric_step_swept
+from fgdlib.search.families import (
+    certify_parametric_step_swept,
+    family_lemma35_rate,
+)
+from fgdlib.search.nonlinear import (
+    NonlinearCandidate,
+    NonlinearCertificateStats,
+    scale_parameter_displacement,
+    stream_nonlinear_certificate,
+    train_nonlinear_candidate,
+)
 from fgdlib.search.depth import insert_identity_layer
 from fgdlib.search.unified import (
     Candidate,
@@ -262,6 +274,28 @@ class HistoryEntry:
     fgd_rkhs_dictionary_size: int | None = None
     fgd_rkhs_functional_loss: float | None = None
     fgd_rkhs_loss_star: float | None = None
+    nonlinear_functional_learning_rate: float | None = None
+    nonlinear_inner_steps: int | None = None
+    nonlinear_adamw_learning_rate: float | None = None
+    nonlinear_weight_decay: float | None = None
+    nonlinear_cosine: float | None = None
+    nonlinear_relative_error: float | None = None
+    nonlinear_certificate_valid: bool | None = None
+    nonlinear_validation_descent_valid: bool | None = None
+    nonlinear_committed_rate: float | None = None
+    nonlinear_growth_requested: bool = False
+    nonlinear_candidate_training_seconds: float = 0.0
+    nonlinear_certification_seconds: float = 0.0
+    nonlinear_growth_statistics_seconds: float = 0.0
+    nonlinear_growth_application_seconds: float = 0.0
+    nonlinear_ladder_attempts: int = 0
+    nonlinear_accepted_steps: int = 0
+    nonlinear_failed_ladders: int = 0
+    nonlinear_growth_events: int = 0
+    nonlinear_full_jacobian_calls: int = 0
+    nonlinear_tangent_system_calls: int = 0
+    nonlinear_tangent_projection_solves: int = 0
+    architecture_widths: tuple[int, ...] = ()
 
 
 @dataclass
