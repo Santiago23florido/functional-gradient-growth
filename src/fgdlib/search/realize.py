@@ -306,7 +306,23 @@ def realize_functional_step(
                 if current_system is None:
                     break
                 solve_parameters = current_system.parameters
-                if freeze_gram:
+                if current_system.factors is not None:
+                    # Factored system: J = W V^T, so the damped solution lies
+                    # in span(V) and the normal equations collapse to a k x k
+                    # solve. Neither the O(P^2) Gram nor its factorisation is
+                    # built. Reached only by the matrix-free family.
+                    from fgdlib.search.mffactored import (
+                        factored_projection_solve,
+                    )
+
+                    with timed("realize_solve_seconds"):
+                        solved = factored_projection_solve(
+                            current_system, shortfall, absolute_damping
+                        )
+                    if solved is None:
+                        break
+                    flat_step = solved[0].to(shortfall.dtype)
+                elif freeze_gram:
                     # First inner iteration under freeze: build the Gram ONCE
                     # from the (streamed or full) Jacobian and factor-solve it;
                     # G = J^T J exactly in both cases (the streamed surrogate

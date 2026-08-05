@@ -131,3 +131,92 @@ def test_the_exact_system_carries_no_factors() -> None:
     config = load_pipeline_config(LADDER).fgd_approx
     _c, model, x, y = _probe(LADDER)
     assert exact_tangent_system(model, x, y, config).factors is None
+
+
+def _wide(width: int):
+    import dataclasses
+
+    base = load_pipeline_config(APPROX)
+    config = dataclasses.replace(
+        base, model=dataclasses.replace(base.model, hidden_size=width)
+    )
+    device = torch.device("cpu")
+    train_loader, _, _ = build_dataloaders(config, device)
+    model = build_model(config, device)
+    x, y = build_projection_probe(train_loader, config.fgd_approx.probe_batches)
+    return config, model, x, y
+
+
+def test_factored_gram_is_the_gram() -> None:
+    """``J^T J = V (W^T W) V^T`` -- O(P^2 k) compute instead of O(NK P^2)."""
+    from fgdlib.search.mffactored import factored_gram
+
+    config, model, x, y = _wide(16)
+    system = exact_tangent_system(model, x, y, config.fgd_approx)
+    jacobian = system.jacobian.double()
+    reference = jacobian.t() @ jacobian
+    produced = factored_gram(system)
+    gap = float(
+        torch.linalg.matrix_norm(produced - reference)
+        / torch.linalg.matrix_norm(reference)
+    )
+    assert gap < 1e-12, gap
+
+
+def test_factored_solve_matches_the_dense_normal_equations() -> None:
+    """The k x k solve returns the same direction as the P x P one.
+
+    ``J = W V^T`` puts the damped solution in ``span(V)``, so ``u = V c`` with
+    ``(W^T W + lam I) c = W^T t`` -- a k x k system. Neither the O(P^2) Gram
+    nor its factorisation is built, which at MNIST width is the difference
+    between running and not running at all.
+    """
+    from fgdlib.search.mffactored import factored_projection_solve
+
+    config, model, x, y = _wide(16)
+    system = exact_tangent_system(model, x, y, config.fgd_approx)
+    jacobian = system.jacobian.double()
+    target = system.target.reshape(-1).double()
+    size = jacobian.shape[1]
+    damping = 1e-6 * float(torch.linalg.matrix_norm(jacobian, 2)) ** 2
+
+    produced, _predicted = factored_projection_solve(system, target, damping)
+    reference = torch.linalg.solve(
+        jacobian.t() @ jacobian + damping * torch.eye(size, dtype=torch.float64),
+        jacobian.t() @ target,
+    )
+    cosine = float(
+        torch.dot(produced, reference) / (produced.norm() * reference.norm())
+    )
+    assert cosine == pytest.approx(1.0, abs=1e-6), cosine
+    residual = lambda v: float((jacobian @ v - target).norm())
+    assert residual(produced) == pytest.approx(residual(reference), rel=1e-6)
+
+
+def test_factored_damping_selection_agrees_on_eps_and_lambda() -> None:
+    """The factored selector must pick the SAME rung as the dense one.
+
+    eps and lambda agree tightly; the update does not, and that is recorded
+    rather than hidden. MEASURED at P=641: cos 0.979 with a 20% norm gap,
+    because the ladder's chosen damping is ~1e-12 relative and near-zero
+    damping puts the weight on the smallest singular values -- exactly where
+    a rank-k subspace is blind. The step is re-certified on what it applies.
+    """
+    from fgdlib.search.damping import (
+        select_projection_damping,
+        select_projection_damping_factored,
+    )
+
+    config, model, x, y = _wide(16)
+    system = exact_tangent_system(model, x, y, config.fgd_approx)
+    dense = select_projection_damping(model, x, y, config.fgd_approx, system=system)
+    factored = select_projection_damping_factored(
+        model, x, y, config.fgd_approx, system=system
+    )
+    assert dense is not None and factored is not None
+    assert factored.candidate.relative_damping == pytest.approx(
+        dense.candidate.relative_damping, rel=1e-9
+    )
+    assert factored.candidate.relative_error == pytest.approx(
+        dense.candidate.relative_error, rel=1e-3
+    )

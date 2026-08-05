@@ -40,13 +40,38 @@ Carry the factors on `ExactTangentSystem` as a new optional field defaulting to
 
 ## Sites (all of them)
 
-| file | line | function | second function to add |
-|---|---|---|---|
-| `search/certify.py` | 223 | `exact_relative_error` | `factored_relative_error` |
-| `search/damping.py` | 300 | `minimal_relative_error_from_system` | `..._from_factors` |
-| `search/damping.py` | 363 | `select_projection_damping` | `select_projection_damping_factored` |
-| `search/realize.py` | 316, 339, 346 | realisation path | factored variant |
-| `search/exact_where.py` | 267, 401-403 | growth scoring | factored variant |
+ALL DONE. Each original is untouched and still serves `family_order: [tangent]`.
+
+| file | second function | verified against the dense route |
+|---|---|---|
+| `search/certify.py` | gate -> `factored_minimal_relative_error` | singular values 5.1e-08, eps 1.7e-04 |
+| `search/damping.py` | `select_projection_damping_factored` | same lambda to 1e-9, eps 1.7e-04 |
+| `search/realize.py` | gate -> `factored_projection_solve` | cos(u) 1.000000, same residual to 1e-6 |
+| `search/exact_where.py` | gate -> `factored_gram` | Gram gap 1.0e-15 |
+
+## What each one costs now
+
+| | before | after |
+|---|---|---|
+| eps | SVD of (NK, P) | SVD of (NK, k) |
+| damping selection | same | same |
+| realisation solve | P x P Gram + factorisation | **k x k solve** |
+| growth scoring | O(NK P^2) to build the Gram | O(P^2 k), still a P x P object |
+
+`exact_where` is the one that did not fully collapse: it scores candidate
+structures by comparing Grams rather than by solving, so the dense `P x P`
+form is genuinely needed there. That is a compute win, not a memory one, and
+it is the remaining ceiling at MNIST width.
+
+## The gap that is real, and is not precision
+
+`select_projection_damping_factored` agrees on eps and on the selected lambda
+but NOT on the update: MEASURED at P=641, cos 0.979 with a 20% norm gap. The
+ladder picks a relative damping around 1e-12, and at near-zero damping the
+solution is dominated by the smallest singular values -- exactly the
+directions a rank-k subspace is blind to. `factored_projection_solve` at a
+realistic damping (1e-6 relative) matches to cos 1.000000, so the sensitivity
+is to the damping, not to the construction.
 
 ## What must be measured, not assumed
 

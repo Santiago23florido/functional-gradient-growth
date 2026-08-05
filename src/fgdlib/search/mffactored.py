@@ -50,9 +50,81 @@ from fgdlib.tangent import (
 )
 
 __all__ = [
+    "factored_gram",
     "factored_minimal_relative_error",
+    "factored_projection_solve",
     "factored_spectrum",
 ]
+
+
+def factored_projection_solve(
+    system: ExactTangentSystem,
+    target: torch.Tensor,
+    absolute_damping: float,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """``(J^T J + lam I) u = J^T t``, solved in the Krylov coordinates.
+
+    ``J = W V^T`` with ``V`` orthonormal columns, so ``J^T J = V (W^T W) V^T``
+    and the damped solution lies in ``span(V)``. Writing ``u = V c`` collapses
+    the normal equations to
+
+        (W^T W + lam I) c = W^T t
+
+    a ``k x k`` system. The ``O(P^2)`` Gram is never built and the ``P x P``
+    factorisation never happens -- at MNIST width that Gram alone is ~40 GB,
+    which is the entire reason this path exists.
+
+    Returns ``(u, J u)``, matching what ``_solve_tangent_projection`` returns,
+    so the caller's arithmetic is unchanged.
+
+    The restriction to ``span(V)`` is the approximation and it is real: the
+    exact solution has components along the directions the Krylov process did
+    not reach. MEASURED at P=641 with the damping the ladder picks, the two
+    updates agree to cos 0.979 but differ by 20% in norm -- near-zero damping
+    puts the weight on the smallest singular values, exactly where truncation
+    bites. The step is re-certified on what it applies, so this costs
+    efficiency rather than soundness.
+    """
+    if system.factors is None:
+        return None
+    left_factor, right_factor = system.factors
+    left_factor = left_factor.to(dtype=torch.float64)
+    right_factor = right_factor.to(dtype=torch.float64)
+    flat_target = target.reshape(-1).to(dtype=torch.float64)
+    if left_factor.shape[0] != flat_target.numel():
+        return None
+
+    columns = left_factor.shape[1]
+    small_gram = left_factor.t() @ left_factor
+    small_gram = small_gram + absolute_damping * torch.eye(
+        columns, dtype=torch.float64
+    )
+    try:
+        coefficients = torch.linalg.solve(
+            small_gram, left_factor.t() @ flat_target
+        )
+    except RuntimeError:
+        return None
+    if not torch.isfinite(coefficients).all():
+        return None
+    return right_factor @ coefficients, left_factor @ coefficients
+
+
+def factored_gram(system: ExactTangentSystem) -> torch.Tensor | None:
+    """``J^T J = V (W^T W) V^T``, at ``O(P^2 k)`` compute instead of ``O(NK P^2)``.
+
+    Still an ``O(P^2)`` OBJECT, so this is a compute win and not a memory one.
+    It is here because ``exact_where`` scores candidate structures against the
+    Gram itself rather than against a solve, so the ``P x P`` form is genuinely
+    needed there; the other consumers avoid it entirely via
+    ``factored_projection_solve``.
+    """
+    if system.factors is None:
+        return None
+    left_factor, right_factor = system.factors
+    left_factor = left_factor.to(dtype=torch.float64)
+    right_factor = right_factor.to(dtype=torch.float64)
+    return right_factor @ (left_factor.t() @ left_factor) @ right_factor.t()
 
 
 def factored_spectrum(
