@@ -322,8 +322,8 @@ def krylov_jacobian(
     target: torch.Tensor,
     iterations: int,
     eps: float,
-) -> torch.Tensor | None:
-    """``J`` reconstructed as ``U_{k+1} B_k V_k^T``, never forming the Gram.
+) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]] | None:
+    """``J`` reconstructed as ``W V^T``, never forming the Gram.
 
     The ladder consumes a dense ``(rows, P)`` Jacobian, so one is returned --
     but it is BUILT from ``2k+1`` matrix-vector products rather than from a
@@ -367,17 +367,31 @@ def krylov_jacobian(
     # V_k as (P, k), then J = (U B) V^T. U is regenerated from B and V rather
     # than stored: J v_i is one product each, and it keeps the peak memory at
     # the factors instead of at two dense copies.
+    # The TRUNCATED basis, deliberately. The dropped trailing vector had no
+    # beta computed, which means the process had not confirmed it carries
+    # anything -- MEASURED at P=25, including it moved eps from 1.5e-03 to
+    # 8.8e-03 away from the exact value, and downward, because a noise
+    # direction in V makes r look more representable than it is. Reach the
+    # full rank by asking for more ITERATIONS, never by keeping the offcut.
+    vectors = system.basis
     basis = torch.stack(
-        [
-            torch.cat([block.reshape(-1) for block in vector])
-            for vector in system.basis
-        ]
+        [torch.cat([block.reshape(-1) for block in vector]) for vector in vectors]
     )
     columns = [
         torch.cat([block.reshape(-1) for block in apply_j(vector)])
-        for vector in system.basis
+        for vector in vectors
     ]
-    return torch.stack(columns, dim=1) @ basis
+    # FLOAT64, and not as a precaution. eps is read at DAMPING_BRACKET[0] =
+    # 1e-16 * sigma_max^2, i.e. essentially none, so the smallest singular
+    # values dominate the solve and any noise in J is amplified by the
+    # condition number. The reconstruction accumulates k matmuls, so it
+    # carries more rounding than a jacrev-built J of the same dtype: MEASURED,
+    # the two agree to 1.2e-07 as matrices while their eps differed by 1.2e-03
+    # -- four orders of amplification. The exact path casts to float64 at the
+    # consumer for the same reason; this one has to be built that way.
+    left = torch.stack(columns, dim=1).double()   # W = J V, (rows, k)
+    right = basis.t().contiguous().double()       # V, (P, k), orthonormal cols
+    return left @ right.t(), (left, right)
 
 
 @dataclass(frozen=True)
@@ -398,6 +412,13 @@ class _Bidiagonalization:
     beta1: float
     #: Golub-Kahan steps actually run.
     steps: int
+    #: The basis BEFORE the trailing vector is dropped. That drop exists only
+    #: to keep ``J V = U B`` honest, and a caller that reconstructs ``J`` as
+    #: ``(J V) V^T`` never touches ``B`` -- so it wants every orthonormal
+    #: column the process produced. MEASURED at P=25: using the truncated
+    #: basis left k=24, one direction short, and eps came out 0.87634 against
+    #: the exact 0.87767 -- 1.5e-03 LOW, the optimistic side.
+    full_basis: list = None  # type: ignore[assignment]
 
 
 def _golub_kahan(
@@ -460,6 +481,7 @@ def _golub_kahan(
         basis.append(v)
         alphas.append(alpha)
 
+    untruncated = list(basis)
     if not exact:
         # Drop any trailing v whose beta was never computed: without it,
         # J v_last is not representable in the retained U and the identity
@@ -482,7 +504,11 @@ def _golub_kahan(
             bidiagonal[index + 1, index] = value
 
     return _Bidiagonalization(
-        basis=basis, bidiagonal=bidiagonal, beta1=beta1, steps=columns
+        basis=basis,
+        bidiagonal=bidiagonal,
+        beta1=beta1,
+        steps=columns,
+        full_basis=untruncated,
     )
 
 

@@ -2203,6 +2203,18 @@ class ExactTangentSystem:
     # statistics surrogate when ``certify_stream_gram`` is enabled; candidate
     # cross-statistics still need the original rows, but retaining this vector
     # is O(NK), not the forbidden O(NKP) second Jacobian.
+    #: ``(W, V)`` with ``J = W V^T``, ``W = J V`` of shape ``(rows, k)`` and
+    #: ``V`` of shape ``(P, k)`` with orthonormal columns. Present ONLY on the
+    #: matrix-free family; ``None`` on every exact system, which is what keeps
+    #: the default path constructing exactly what it constructs today.
+    #:
+    #: Carrying it is what lets the consumers skip ``J`` entirely: with
+    #: ``W = A S B^T``, ``J = A S (V B)^T`` and ``V B`` is orthonormal, so
+    #: ``svd(J) = (A, S, V B)`` EXACTLY -- from an SVD of a ``(rows, k)``
+    #: matrix. Memory ``O(NK k + P k)``, linear in ``P``.
+    factors: tuple[torch.Tensor, torch.Tensor] | None = field(
+        default=None, repr=False, compare=False
+    )
     full_target: torch.Tensor | None = field(default=None, repr=False, compare=False)
     owner_model: torch.nn.Module | None = field(default=None, repr=False, compare=False)
     parameter_names: tuple[str, ...] = field(default=(), repr=False)
@@ -3140,13 +3152,21 @@ def _matrix_free_tangent_system(
             loss = float(
                 torch.nn.functional.mse_loss(outputs.detach(), y).detach().item()
             )
-        jacobian_matrix = krylov_jacobian(
+        built = krylov_jacobian(
             outputs=outputs,
             parameters=parameters,
             target=target,
+            # P, which yields k = P - 1 usable columns after the trailing
+            # offcut is dropped. Asking for P + 1 to reach k = P is WORSE, not
+            # better: MEASURED at P=25 the extra direction is numerically
+            # unreachable and behaves as noise, moving eps from 1.5e-03 to
+            # 8.8e-03 away from exact, and downward. The Krylov subspace
+            # converges to a (P-1)-dimensional invariant subspace here, and
+            # that is the honest ceiling of this construction.
             iterations=sum(p.numel() for p in parameters),
             eps=config.eps,
         )
+        jacobian_matrix, factors = (None, None) if built is None else built
     finally:
         model.train(was_training)
     if jacobian_matrix is None:
@@ -3158,6 +3178,7 @@ def _matrix_free_tangent_system(
         target=target,
         parameters=parameters,
         loss=loss,
+        factors=factors,
         full_target=target,
         owner_model=model,
         parameter_names=parameter_names,
