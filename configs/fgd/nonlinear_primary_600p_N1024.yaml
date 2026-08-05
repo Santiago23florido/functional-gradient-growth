@@ -130,6 +130,20 @@ parametric_gd:
   # eps falls, so the Lemma 3.5 bound RISES, and eta_f = 0.5 becomes
   # admissible at eta* = 0.49 -- a step 10x longer than the eta* ~ 0.05 an
   # under-trained clone could justify. Most of the gain is in by 1600.
+  # A BUDGET LADDER, not a single budget. Tried in order for each eta_f, and
+  # the search returns on the first acceptance, so the larger budget is only
+  # paid on epochs where the cheap one failed.
+  #
+  # Needed because the fit-limit TIGHTENS as training succeeds: at train_loss
+  # 0.0040 the residual r is tiny, the clone's fit error e does not shrink with
+  # it, and cos(eta_f r - e, r) -> 0. MEASURED: after its third accepted step
+  # the 1600-step run sat 10 epochs at eps 0.97-0.99, growing every epoch and
+  # committing nothing. 6400 steps is what took eps from 0.15 to 0.10 at
+  # structure (6,7,13).
+  # ONE budget. MEASURED: a 1600-step full-batch candidate costs ~3.1 s and
+  # already certifies (eps 0.1493, eta* 0.4895 < bound 0.5131) at structure
+  # (6,7,13). The cost problem was never the candidate -- it was running six
+  # of them per epoch.
   inner_steps: [1600]
   inner_learning_rate: 0.01
   candidate_objective: sum
@@ -168,7 +182,11 @@ parametric_gd:
   # nearer 0.40 (bound 0.10) it had nothing short enough left to offer.
   # eta_f = 1 is never admissible even fully converged (eta* 0.98 vs bound
   # 0.62), so the sweep starts at 0.5 where the long certified steps live.
-  functional_learning_rates: [0.5, 0.25, 0.125]
+  # ONE pilot rate plus the adaptive retry below, i.e. two candidates per
+  # epoch (~6 s) against the tangent's ~7.4 s. A three-value sweep times two
+  # budgets was six candidates and ~45 s/epoch, which is the whole reason this
+  # family was slower than the Jacobian it exists to replace.
+  functional_learning_rates: [0.5]
 
   # ...and then STOP guessing. A fixed grid cannot be placed correctly in
   # advance, because the rate Lemma 3.5 admits depends on the eps the clone

@@ -68,6 +68,8 @@ class NonlinearCandidate:
     initial_objective: float | None = None
     #: Unit the configured ``inner_steps`` was interpreted in.
     step_unit: str = "minibatch"
+    #: Whether the clone was initialised from a previous candidate.
+    warm_started: bool = False
 
     @property
     def objective_reduction(self) -> float | None:
@@ -166,8 +168,17 @@ def train_nonlinear_candidate(
     config: ParametricGDConfig,
     fgd_config: FGDApproxConfig,
     probe: tuple[torch.Tensor, torch.Tensor] | None = None,
+    warm_start: dict | None = None,
 ) -> NonlinearCandidate:
     """Train one disposable AdamW clone toward ``f - eta_f r``.
+
+    ``warm_start`` is an optional ``state_dict`` to initialise the clone from
+    instead of ``base_model``. Between consecutive outer steps the base barely
+    moves, so the previous candidate is already close to the new target and
+    restarting from ``theta`` throws that work away -- which is most of why
+    this family costs more than the Jacobian it replaces. It changes only the
+    INITIALISATION: the certificate is measured on the final model either way,
+    so nothing about the guarantee depends on where the optimiser started.
 
     ``inner_steps`` is interpreted in ``config.inner_step_unit``:
 
@@ -201,6 +212,15 @@ def train_nonlinear_candidate(
     initial_objective: float | None = None
     sensor_valid = True
     candidate: torch.nn.Module | None = copy.deepcopy(base_model)
+    warm_started = False
+    if warm_start is not None:
+        try:
+            candidate.load_state_dict(warm_start)
+            warm_started = True
+        except (RuntimeError, KeyError):
+            # Shapes changed under us (the structure grew). Fall back to the
+            # base initialisation rather than guessing how to map the weights.
+            candidate = copy.deepcopy(base_model)
 
     base_was_training = base_model.training
     base_model.eval()
@@ -221,6 +241,26 @@ def train_nonlinear_candidate(
         weight_decay=config.weight_decay,
     )
     reduction = config.candidate_objective
+    base_lr = float(config.inner_learning_rate)
+    schedule = config.inner_lr_schedule
+
+    def _set_lr(step_index: int, total: int) -> None:
+        """Decay the inner rate toward zero over the candidate's budget.
+
+        AdamW at a constant rate converges only to a ball of radius ~lr, so the
+        fit residual e stops shrinking and cos(eta_f r - e, r) stops improving.
+        Decaying to zero is what actually converges the clone, and it is far
+        cheaper than buying the same accuracy with more constant-rate steps.
+        """
+        if schedule == "constant":
+            return
+        progress = min(1.0, max(0.0, step_index / max(1, total)))
+        if schedule == "cosine":
+            factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+        else:
+            factor = 1.0 - progress
+        for group in optimizer.param_groups:
+            group["lr"] = base_lr * factor
 
     def _apply_update(x: torch.Tensor, y: torch.Tensor, target=None):
         """One AdamW update. Returns the objective, or ``None`` if non-finite."""
@@ -294,7 +334,8 @@ def train_nonlinear_candidate(
                     ).detach()
                 if not torch.isfinite(probe_target).all():
                     sensor_valid = False
-                for _ in range(budget if sensor_valid else 0):
+                for step_index in range(budget if sensor_valid else 0):
+                    _set_lr(step_index, budget)
                     value = _apply_update(probe_x, probe_y, target=probe_target)
                     if value is None:
                         sensor_valid = False
@@ -380,6 +421,7 @@ def train_nonlinear_candidate(
         examples_seen=examples_seen,
         initial_objective=initial_objective,
         step_unit=config.inner_step_unit,
+        warm_started=warm_started,
     )
 
 

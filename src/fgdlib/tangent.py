@@ -1199,6 +1199,14 @@ class ParametricGDConfig:
     # admissible by construction, while committing a displacement whose real
     # eta* was never measured.
     acceptance_rule: str = "theory_interval"
+    # Inner-optimizer learning-rate schedule for the candidate.
+    #
+    # At a CONSTANT lr, AdamW settles into a noise ball of radius ~lr and stops
+    # converging, so the only way to improve the fit is more steps -- which is
+    # why 400 -> 1600 -> 6400 kept helping and why this family ended up costing
+    # more than the Jacobian it replaces. Decaying the rate to zero lets the
+    # same clone actually converge, in far fewer steps.
+    inner_lr_schedule: str = "constant"
 
     def validate(self) -> None:
         if self.optimizer not in ("sgd", "adam", "adamw"):
@@ -1243,6 +1251,11 @@ class ParametricGDConfig:
         if self.transactional_split not in ("train", "validation"):
             raise ValueError(
                 "parametric_gd.transactional_split must be 'train' or 'validation'."
+            )
+        if self.inner_lr_schedule not in ("constant", "cosine", "linear"):
+            raise ValueError(
+                "parametric_gd.inner_lr_schedule must be 'constant', "
+                "'cosine' or 'linear'."
             )
         if self.acceptance_rule not in (
             "theory_interval",

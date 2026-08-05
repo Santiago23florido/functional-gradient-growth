@@ -3155,6 +3155,7 @@ def _search_nonlinear_primary_candidate(
     theory_loss_star: float,
     progress: ProgressFn | None,
     train_probe: tuple[torch.Tensor, torch.Tensor] | None = None,
+    warm_start_cache: dict | None = None,
 ) -> _NonlinearPrimaryResult:
     """Try only the configured AdamW nonlinear ladder at ``theta_t``.
 
@@ -3207,6 +3208,12 @@ def _search_nonlinear_primary_candidate(
             tried_rates.add(functional_learning_rate)
             for inner_steps in parametric.inner_steps:
                 attempts += 1
+                # Reuse the clone this (structure, eta_f) produced last
+                # time. The base barely moves between outer steps, so the old
+                # solution is already close to the new target; restarting from
+                # theta every epoch is most of why this family costs more than
+                # the Jacobian it exists to replace.
+                cache_key = (_architecture_widths(base_model), functional_learning_rate)
                 generated = train_nonlinear_candidate(
                     base_model=base_model,
                     train_loader=train_loader,
@@ -3216,7 +3223,17 @@ def _search_nonlinear_primary_candidate(
                     config=parametric,
                     fgd_config=config.fgd_approx,
                     probe=train_probe,
+                    warm_start=(
+                        warm_start_cache.get(cache_key)
+                        if warm_start_cache is not None
+                        else None
+                    ),
                 )
+                if warm_start_cache is not None and generated.model is not None:
+                    warm_start_cache[cache_key] = {
+                        name: value.detach().clone()
+                        for name, value in generated.model.state_dict().items()
+                    }
                 last_candidate = generated
                 training_seconds += generated.training_seconds
                 if generated.model is None or not generated.sensor_valid:
@@ -3864,6 +3881,10 @@ def _run_fgd_rkhs_pipeline(
             f"validation_acc={validation_metrics.accuracy:.3f}, "
             f"test_acc={test_metrics.accuracy:.3f}"
         )
+
+    # Keyed by (structure widths, eta_f): a grown structure has different
+    # shapes and simply misses, falling back to the base initialisation.
+    nonlinear_warm_start_cache: dict = {}
 
     last_test_loss = test_metrics.loss
     for epoch in range(1, config.training.epochs + 1):
@@ -4520,6 +4541,10 @@ def _run_nonlinear_pipeline(
             f"({config.parametric_gd.alpha_policy})"
         )
 
+    # Keyed by (structure widths, eta_f): a grown structure has different
+    # shapes and simply misses, falling back to the base initialisation.
+    nonlinear_warm_start_cache: dict = {}
+
     last_test_loss = test_metrics.loss
     for epoch in range(1, config.training.epochs + 1):
         base_parameters = count_parameters(model)
@@ -4528,6 +4553,7 @@ def _run_nonlinear_pipeline(
             base_model=model,
             train_loader=train_loader,
             train_probe=nonlinear_train_probe,
+            warm_start_cache=nonlinear_warm_start_cache,
             validation_loader=validation_loader,
             test_loader=test_loader,
             loss_function=loss_function,
