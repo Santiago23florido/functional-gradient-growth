@@ -1207,6 +1207,22 @@ class ParametricGDConfig:
     # more than the Jacobian it replaces. Decaying the rate to zero lets the
     # same clone actually converge, in far fewer steps.
     inner_lr_schedule: str = "constant"
+    # Solve the OUTPUT layer against the functional target in closed form
+    # after the inner steps, instead of leaving it to the optimizer.
+    #
+    # The certified quantity is cos(Delta, r) with Delta = eta_f r - e, where e
+    # is the clone's fit residual. Iterative optimisation leaves an e that does
+    # NOT shrink as r does, so late in training cos collapses however long the
+    # clone trains -- MEASURED, eps sat at 0.58-0.99 for 28 consecutive epochs
+    # with the loss frozen. The network is exactly linear in its readout
+    # parameters, so fitting them is a least-squares solve with no
+    # approximation error, costing O(N H^2) in the last hidden width against
+    # O(N K P^2) for a tangent system over all P parameters. The hidden layers
+    # are still moved nonlinearly by AdamW first, so the family keeps reaching
+    # outside range(J); only the readout is exact.
+    candidate_readout_solve: bool = False
+    # Tikhonov term for that solve, for conditioning only.
+    candidate_readout_ridge: float = 1e-8
 
     def validate(self) -> None:
         if self.optimizer not in ("sgd", "adam", "adamw"):
@@ -1251,6 +1267,10 @@ class ParametricGDConfig:
         if self.transactional_split not in ("train", "validation"):
             raise ValueError(
                 "parametric_gd.transactional_split must be 'train' or 'validation'."
+            )
+        if self.candidate_readout_ridge < 0.0:
+            raise ValueError(
+                "parametric_gd.candidate_readout_ridge must be non-negative."
             )
         if self.inner_lr_schedule not in ("constant", "cosine", "linear"):
             raise ValueError(

@@ -29,6 +29,7 @@ __all__ = [
     "NonlinearCandidate",
     "NonlinearCertificateStats",
     "scale_parameter_displacement",
+    "solve_readout_least_squares",
     "search_interpolated_step",
     "stream_nonlinear_certificate",
     "train_nonlinear_candidate",
@@ -70,6 +71,8 @@ class NonlinearCandidate:
     step_unit: str = "minibatch"
     #: Whether the clone was initialised from a previous candidate.
     warm_started: bool = False
+    #: Whether the output layer was fitted in closed form.
+    readout_solved: bool = False
 
     @property
     def objective_reduction(self) -> float | None:
@@ -404,6 +407,25 @@ def train_nonlinear_candidate(
         finally:
             base_model.train(base_was_training)
 
+    # Exact readout fit, after the nonlinear hidden-layer movement. Only
+    # meaningful against a fixed target, i.e. under the "probe" unit.
+    readout_solved = False
+    if (
+        sensor_valid
+        and candidate is not None
+        and config.candidate_readout_solve
+        and config.inner_step_unit == "probe"
+        and probe is not None
+    ):
+        readout_solved = solve_readout_least_squares(
+            model=candidate,
+            probe_x=probe[0].to(device),
+            target=probe_target,
+            ridge=config.candidate_readout_ridge,
+        )
+        if readout_solved and not _parameters_are_finite(candidate):
+            sensor_valid = False
+
     _sync_cuda()
     elapsed = time.perf_counter() - started
     if not sensor_valid:
@@ -422,6 +444,7 @@ def train_nonlinear_candidate(
         initial_objective=initial_objective,
         step_unit=config.inner_step_unit,
         warm_started=warm_started,
+        readout_solved=readout_solved,
     )
 
 
@@ -686,3 +709,94 @@ def search_interpolated_step(
     else:
         selected = max(admissible, key=lambda trial: trial.alpha)
     return selected, tuple(trials)
+
+
+def _readout_and_features(
+    model: torch.nn.Module,
+    probe_x: torch.Tensor,
+) -> tuple[torch.nn.Linear | None, torch.Tensor | None]:
+    """Return the Linear that runs LAST, and the features fed to it.
+
+    Identified by EXECUTION order in a real forward pass, not by name or by
+    position in the module tree, so it does not depend on how a given model
+    wraps its layers. One forward pass yields both the identity of the readout
+    and its input, so nothing has to be run twice.
+    """
+    calls: list[tuple[torch.nn.Linear, torch.Tensor]] = []
+
+    def _record(module, inputs, output):  # noqa: ARG001
+        calls.append((module, inputs[0].detach()))
+
+    handles = [
+        module.register_forward_hook(_record)
+        for module in model.modules()
+        if isinstance(module, torch.nn.Linear)
+    ]
+    if not handles:
+        return None, None
+    try:
+        model(probe_x)
+    finally:
+        for handle in handles:
+            handle.remove()
+    if not calls:
+        return None, None
+    return calls[-1]
+
+
+@torch.no_grad()
+def solve_readout_least_squares(
+    *,
+    model: torch.nn.Module,
+    probe_x: torch.Tensor,
+    target: torch.Tensor,
+    ridge: float = 1e-8,
+) -> bool:
+    """Fit the OUTPUT layer to ``target`` in closed form. Returns success.
+
+    The network is EXACTLY linear in its output-layer parameters, so this is a
+    plain least-squares solve, not a linearization: there is no approximation
+    error to control and no Jacobian over the full parameter vector. It costs
+    ``O(N H^2)`` in the last hidden width ``H``, against ``O(N K P^2)`` for the
+    tangent system over all ``P`` parameters.
+
+    Why it matters here: the certified quantity is
+    ``cos(Delta, r)`` with ``Delta = eta_f r - e``, and ``e`` is the clone's
+    fit residual. Iterative optimisation leaves an ``e`` that does not shrink
+    as the residual ``r`` does, so late in training ``cos`` collapses however
+    long the clone trains -- MEASURED, eps sat at 0.58-0.99 for 28 consecutive
+    epochs. Solving the readout exactly removes the readout's contribution to
+    ``e`` outright.
+
+    The hidden layers are still moved nonlinearly by AdamW beforehand, so the
+    family keeps reaching outside ``range(J)``; only the final readout is
+    exact. The certificate is untouched: ``Delta`` is measured on the resulting
+    model exactly as for any other candidate.
+    """
+    layer, features = _readout_and_features(model, probe_x)
+    if layer is None or features is None or features.ndim != 2:
+        return False
+
+    design = torch.cat(
+        [features, torch.ones(features.shape[0], 1, dtype=features.dtype)],
+        dim=1,
+    ).to(torch.float64)
+    goal = target.reshape(features.shape[0], -1).to(torch.float64)
+    gram = design.T @ design
+    gram = gram + ridge * torch.eye(
+        gram.shape[0], dtype=gram.dtype, device=gram.device
+    )
+    try:
+        solution = torch.linalg.solve(gram, design.T @ goal)
+    except RuntimeError:
+        return False
+    if not torch.isfinite(solution).all():
+        return False
+
+    weight = solution[:-1].T.to(layer.weight.dtype)
+    bias = solution[-1].to(layer.weight.dtype)
+    if weight.shape != layer.weight.shape or bias.shape != layer.bias.shape:
+        return False
+    layer.weight.copy_(weight)
+    layer.bias.copy_(bias)
+    return True
