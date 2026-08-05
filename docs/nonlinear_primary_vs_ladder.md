@@ -250,30 +250,50 @@ needed and none was added.
 
 ## Results (N = 1024, 2-2-2, seed 0, 25 epochs)
 
-| | before | ladder parity | corrected |
-|---|---|---|---|
-| config | `nonlinear_family_ladder_N1024` | `nonlinear_primary_parity_N1024` | `nonlinear_primary_certified_N1024` |
-| accepted steps | 0 | 0 | **1** |
-| growths | 25 | 25 | 24 |
-| best cosine | 0.65 | 0.975 | 0.951 |
-| train loss | 0.1935 → 0.1935 | 0.1935 → 0.1935 | 0.1935 → **0.0691** |
-| test loss | 0.1930 → 0.1930 | 0.1930 → 0.1930 | 0.1930 → **0.0758** |
-| tangent calls | 0 | 0 | 0 |
+All four runs use the same data, seed, initial architecture and budget
+(400 full-batch probe steps per candidate). They differ only in the
+acceptance bar and the functional-rate sweep.
 
-The accepted step: `η_f = 0.2279` (adaptively derived), `cos = 0.9513`,
-`ε = 0.3081`, `η* = 0.2089`, `α = 1`, measured functional descent `+127.3`.
+| config | rule | sweep | accepted | train loss | stable |
+|---|---|---|---|---|---|
+| `nonlinear_family_ladder` (before) | interval, but faked | `[0.5]` | 0 | 0.1935 → 0.1935 | frozen |
+| `nonlinear_primary_parity` | theory_interval | `[1,2,4,8]` | 0 | 0.1935 → 0.1935 | frozen |
+| `nonlinear_primary_ladderrule` | **direction_only** | `[1,2,4,8]` | 12 | 0.1935 → **27.70 → 11.15** | **diverges** |
+| `nonlinear_primary_descent` | measured_descent | `[1,2,4,8]` | 0 | 0.1935 → 0.1935 | frozen |
+| `nonlinear_primary_certified` | theory_interval | descending + adaptive | 1 | 0.1935 → 0.0691 | yes |
+| `nonlinear_primary_practical` | measured_descent | descending + adaptive | **2** | 0.1935 → **0.0648** | yes |
+
+Tangent calls are 0 in every one of them.
+
+The two steps `practical` accepted, both at ADAPTIVELY derived rates rather
+than any value in the fixed sweep:
+
+```
+epoch 15   eta_f 0.0524   cos 0.8924   eps 0.4513   eta* 0.0403   descent  +30.3
+epoch 16   eta_f 0.2183   cos 0.9450   eps 0.3271   eta* 0.1927   descent +101.4
+```
+
+The ordering is the finding. Direction-only accepts the most and is the only
+one that destroys the model; the two bars that examine the step's actual effect
+accept far less and are the only ones that make progress. Test loss follows
+train: 0.1930 → 0.0718 for `practical`, 0.1930 → 0.0758 for `certified`.
 
 ## Remaining limitations
 
-* Only one step certifies in 25 epochs. After it, `ε` sits at 0.43–0.59 and no
-  admissible distance is found, so the run grows without further progress. The
-  binding constraint is the cosine the structure can reach, not the step rule.
-* The joint condition `ε < 1/2` **and** `η* < η̄(ε)` is strict: `η̄ → 0` as
-  `ε → 1/2`, so certification needs `cos ≳ 0.95`, well above the `√3/2` the
-  direction test alone requires.
-* `_growth_reduces_lookahead_epsilon` (grow-vs-train lookahead) is still not
-  wired into the nonlinear growth path; growth remains argmax-bottleneck.
-* Only seed 0 was run for the corrected config; the before-numbers come from
-  the existing three-seed results.
+* Progress is still sparse: 2 accepted steps in 25 epochs for `practical`, 1
+  for `certified`. The binding constraint is the cosine the STRUCTURE can
+  reach, not the step rule — certification needs `cos ≳ 0.95`, well above the
+  `√3/2 ≈ 0.866` the direction test alone requires, because `η̄ → 0` as
+  `ε → 1/2`.
+* Immediately after an accepted step `eps` degrades sharply (1.0000 at epochs
+  17–18 of the `practical` run) before recovering. Not investigated.
+* `_growth_reduces_lookahead_epsilon` (the grow-vs-train lookahead the ladder
+  uses) is still not wired into the nonlinear growth path; growth remains
+  unconditional argmax-bottleneck.
+* Only seed 0 was run for the new configurations. The "before" numbers come
+  from the existing three-seed results, where seed 2 behaved differently
+  (24 accepted steps) because it started from a higher loss.
+* `direction_only` is available but should not be used as a primary family
+  without the divergence caveat above.
 * Three failures in `tests/test_regularized_mlp.py` predate this work and are
   unrelated (verified on a clean checkout of the branch point).

@@ -1,0 +1,525 @@
+Using device: cuda
+Training method: fgd_approx
+Primary approximation family: nonlinear (dedicated AdamW minibatch pipeline; tangent path unreachable)
+Original model:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=4, out_features=2, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=2, out_features=2, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=2, out_features=2, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=2, out_features=1, use_bias=True)
+[INIT] Epoch 0, train_loss=0.1935, validation_loss=0.1862, test_loss=0.1930, train_acc=0.167, validation_acc=0.184, test_acc=0.192
+[NONLINEAR] certificate split=train, train probe=1024 examples, inner_step_unit=probe, eta_f sweep=[1.0, 0.5, 0.25], alpha grid=[1.0] (largest_certified)
+[NONLINEAR-CAND] eta_f=1, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 792.5172119140625 -> 405.9049072265625 (reduction 386.6123046875)
+[NONLINEAR] eta_f=1, inner_steps=400, cos=0.6992, eps=0.7149, eta_star=0.467, param_disp=4.116, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.6992, eps=0.7149, descent=+1.663205e+01, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR-CAND] eta_f=0.5, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 198.12930297851562 -> 103.592529296875 (reduction 94.53677368164062)
+[NONLINEAR] eta_f=0.5, inner_steps=400, cos=0.6908, eps=0.7230, eta_star=0.2413, param_disp=3.347, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.6908, eps=0.7230, descent=+9.454456e+01, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR-CAND] eta_f=0.25, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 49.532325744628906 -> 25.45640754699707 (reduction 24.075918197631836)
+[NONLINEAR] eta_f=0.25, inner_steps=400, cos=0.6972, eps=0.7169, eta_star=0.1254, param_disp=1.671, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.6972, eps=0.7169, descent=+7.373613e+01, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR] no candidate certified the step it would apply (best cos over 3 attempts: 0.6992)
+[NONLINEAR-BOTTLENECK] Epoch 1, widths=(2, 2, 2) L0=3.5725e-03 L1=1.9587e-04 L2=8.2398e-03
+  function-preserving growth: drift=0.000e+00, train_loss=0.1935
+[NONLINEAR-GRO] Epoch 1: layer=2, widths (2, 2, 2) -> (2, 2, 3), max_drift=0.000e+00
+[NONLINEAR] Epoch 1, accepted=False, eps=0.7169, train_loss=0.1935, validation_loss=0.1862, test_loss=0.1930 (+0.0000), widths=(2, 2, 2)
+[GRO] Epoch 1, layer=2, widths=(2, 2, 3), parameters=29
+[NONLINEAR-CAND] eta_f=1, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 792.5172119140625 -> 386.88482666015625 (reduction 405.63238525390625)
+[NONLINEAR] eta_f=1, inner_steps=400, cos=0.7171, eps=0.6969, eta_star=0.4795, param_disp=3.534, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.7171, eps=0.6969, descent=+2.567428e+01, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR-CAND] eta_f=0.5, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 198.12930297851562 -> 94.08979034423828 (reduction 104.03951263427734)
+[NONLINEAR] eta_f=0.5, inner_steps=400, cos=0.7250, eps=0.6888, eta_star=0.2562, param_disp=2.991, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.7250, eps=0.6888, descent=+1.040699e+02, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR-CAND] eta_f=0.25, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 49.532325744628906 -> 25.33664894104004 (reduction 24.195676803588867)
+[NONLINEAR] eta_f=0.25, inner_steps=400, cos=0.6992, eps=0.7149, eta_star=0.1259, param_disp=1.742, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.6992, eps=0.7149, descent=+7.408426e+01, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR] no candidate certified the step it would apply (best cos over 3 attempts: 0.7250)
+[NONLINEAR-BOTTLENECK] Epoch 2, widths=(2, 2, 3) L0=3.5725e-03 L1=1.9587e-04 L2=3.3376e-07
+  function-preserving growth: drift=0.000e+00, train_loss=0.1935
+[NONLINEAR-GRO] Epoch 2: layer=0, widths (2, 2, 3) -> (3, 2, 3), max_drift=0.000e+00
+[NONLINEAR] Epoch 2, accepted=False, eps=0.7149, train_loss=0.1935, validation_loss=0.1862, test_loss=0.1930 (+0.0000), widths=(2, 2, 3)
+[GRO] Epoch 2, layer=0, widths=(3, 2, 3), parameters=36
+[NONLINEAR-CAND] eta_f=1, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 792.5172119140625 -> 354.610107421875 (reduction 437.9071044921875)
+[NONLINEAR] eta_f=1, inner_steps=400, cos=0.7441, eps=0.6680, eta_star=0.5322, param_disp=4.354, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.7441, eps=0.6680, descent=+1.639074e+01, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR-CAND] eta_f=0.5, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 198.12930297851562 -> 83.26884460449219 (reduction 114.86045837402344)
+[NONLINEAR] eta_f=0.5, inner_steps=400, cos=0.7617, eps=0.6479, eta_star=0.2841, param_disp=3.767, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.7617, eps=0.6479, descent=+1.149083e+02, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR-CAND] eta_f=0.25, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 49.532325744628906 -> 19.748926162719727 (reduction 29.78339958190918)
+[NONLINEAR] eta_f=0.25, inner_steps=400, cos=0.7746, eps=0.6324, eta_star=0.1483, param_disp=2.346, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.7746, eps=0.6324, descent=+8.846487e+01, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR] no candidate certified the step it would apply (best cos over 3 attempts: 0.7746)
+[NONLINEAR-BOTTLENECK] Epoch 3, widths=(3, 2, 3) L0=5.7619e-05 L1=2.8468e-03 L2=3.3376e-07
+  function-preserving growth: drift=0.000e+00, train_loss=0.1935
+[NONLINEAR-GRO] Epoch 3: layer=1, widths (3, 2, 3) -> (3, 3, 3), max_drift=0.000e+00
+[NONLINEAR] Epoch 3, accepted=False, eps=0.6324, train_loss=0.1935, validation_loss=0.1862, test_loss=0.1930 (+0.0000), widths=(3, 2, 3)
+[GRO] Epoch 3, layer=1, widths=(3, 3, 3), parameters=43
+[NONLINEAR-CAND] eta_f=1, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 792.5172119140625 -> 226.81802368164062 (reduction 565.6991882324219)
+[NONLINEAR] eta_f=1, inner_steps=400, cos=0.8460, eps=0.5333, eta_star=0.6884, param_disp=4.818, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.8460, eps=0.5333, descent=+2.077201e+01, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR-CAND] eta_f=0.5, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 198.12930297851562 -> 68.64422607421875 (reduction 129.48507690429688)
+[NONLINEAR] eta_f=0.5, inner_steps=400, cos=0.8084, eps=0.5886, eta_star=0.327, param_disp=4.228, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.8084, eps=0.5886, descent=+1.294952e+02, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR-CAND] eta_f=0.25, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 49.532325744628906 -> 10.888152122497559 (reduction 38.64417362213135)
+[NONLINEAR] eta_f=0.25, inner_steps=400, cos=0.8836, eps=0.4683, eta_star=0.1913, param_disp=4.762, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.8836, eps=0.4683, descent=+1.144495e+02, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-ADAPT] latest eps=0.4683 admits eta <= 0.03277; retrying at eta_f=0.03113
+[NONLINEAR-CAND] eta_f=0.031127, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 0.7678599953651428 -> 0.46675536036491394 (reduction 0.3011046350002289)
+[NONLINEAR] eta_f=0.031127, inner_steps=400, cos=0.6263, eps=0.7796, eta_star=0.01234, param_disp=1.192, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.6263, eps=0.7796, descent=+9.470963e+00, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR] no candidate certified the step it would apply (best cos over 4 attempts: 0.8836)
+[NONLINEAR-BOTTLENECK] Epoch 4, widths=(3, 3, 3) L0=5.7619e-05 L1=3.2225e-04 L2=8.2762e-03
+  function-preserving growth: drift=0.000e+00, train_loss=0.1935
+[NONLINEAR-GRO] Epoch 4: layer=2, widths (3, 3, 3) -> (3, 3, 4), max_drift=0.000e+00
+[NONLINEAR] Epoch 4, accepted=False, eps=0.7796, train_loss=0.1935, validation_loss=0.1862, test_loss=0.1930 (+0.0000), widths=(3, 3, 3)
+[GRO] Epoch 4, layer=2, widths=(3, 3, 4), parameters=48
+[NONLINEAR-CAND] eta_f=1, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 792.5172119140625 -> 293.38287353515625 (reduction 499.13433837890625)
+[NONLINEAR] eta_f=1, inner_steps=400, cos=0.7939, eps=0.6081, eta_star=0.616, param_disp=3.896, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.7939, eps=0.6081, descent=+1.108614e+01, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR-CAND] eta_f=0.5, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 198.12930297851562 -> 54.72395324707031 (reduction 143.4053497314453)
+[NONLINEAR] eta_f=0.5, inner_steps=400, cos=0.8577, eps=0.5142, eta_star=0.3386, param_disp=4.591, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.8577, eps=0.5142, descent=+1.448181e+02, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR-CAND] eta_f=0.25, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 49.532325744628906 -> 14.738879203796387 (reduction 34.79344654083252)
+[NONLINEAR] eta_f=0.25, inner_steps=400, cos=0.8398, eps=0.5429, eta_star=0.1653, param_disp=3.225, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.8398, eps=0.5429, descent=+1.003173e+02, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR] no candidate certified the step it would apply (best cos over 3 attempts: 0.8577)
+[NONLINEAR-BOTTLENECK] Epoch 5, widths=(3, 3, 4) L0=5.7619e-05 L1=3.2225e-04 L2=4.1067e-07
+  function-preserving growth: drift=0.000e+00, train_loss=0.1935
+[NONLINEAR-GRO] Epoch 5: layer=1, widths (3, 3, 4) -> (3, 4, 4), max_drift=0.000e+00
+[NONLINEAR] Epoch 5, accepted=False, eps=0.5429, train_loss=0.1935, validation_loss=0.1862, test_loss=0.1930 (+0.0000), widths=(3, 3, 4)
+[GRO] Epoch 5, layer=1, widths=(3, 4, 4), parameters=56
+[NONLINEAR-CAND] eta_f=1, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 792.5172119140625 -> 275.1754150390625 (reduction 517.341796875)
+[NONLINEAR] eta_f=1, inner_steps=400, cos=0.8095, eps=0.5872, eta_star=0.6212, param_disp=4.615, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.8095, eps=0.5872, descent=+2.557364e+01, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR-CAND] eta_f=0.5, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 198.12930297851562 -> 64.02195739746094 (reduction 134.1073455810547)
+[NONLINEAR] eta_f=0.5, inner_steps=400, cos=0.8254, eps=0.5645, eta_star=0.3133, param_disp=3.776, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.8254, eps=0.5645, descent=+1.341229e+02, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR-CAND] eta_f=0.25, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 49.532325744628906 -> 13.269790649414062 (reduction 36.262535095214844)
+[NONLINEAR] eta_f=0.25, inner_steps=400, cos=0.8557, eps=0.5174, eta_star=0.1778, param_disp=3.338, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.8557, eps=0.5174, descent=+1.066810e+02, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR] no candidate certified the step it would apply (best cos over 3 attempts: 0.8557)
+[NONLINEAR-BOTTLENECK] Epoch 6, widths=(3, 4, 4) L0=5.7619e-05 L1=2.7081e-05 L2=3.8378e-02
+  function-preserving growth: drift=1.192e-07, train_loss=0.1935
+[NONLINEAR-GRO] Epoch 6: layer=2, widths (3, 4, 4) -> (3, 4, 5), max_drift=1.192e-07
+[NONLINEAR] Epoch 6, accepted=False, eps=0.5174, train_loss=0.1935, validation_loss=0.1862, test_loss=0.1930 (+0.0000), widths=(3, 4, 4)
+[GRO] Epoch 6, layer=2, widths=(3, 4, 5), parameters=62
+[NONLINEAR-CAND] eta_f=1, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 792.5172119140625 -> 179.031005859375 (reduction 613.4862060546875)
+[NONLINEAR] eta_f=1, inner_steps=400, cos=0.8803, eps=0.4744, eta_star=0.7446, param_disp=4.025, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.8803, eps=0.4744, descent=+2.313184e+01, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.5, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 198.12930297851562 -> 49.2901611328125 (reduction 148.83914184570312)
+[NONLINEAR] eta_f=0.5, inner_steps=400, cos=0.8669, eps=0.4984, eta_star=0.3703, param_disp=3.393, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.8669, eps=0.4984, descent=+1.488724e+02, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.25, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 49.532325744628906 -> 12.52106761932373 (reduction 37.011258125305176)
+[NONLINEAR] eta_f=0.25, inner_steps=400, cos=0.8632, eps=0.5048, eta_star=0.177, param_disp=2.322, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.8632, eps=0.5048, descent=+1.069458e+02, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR] no candidate certified the step it would apply (best cos over 3 attempts: 0.8803)
+[NONLINEAR-BOTTLENECK] Epoch 7, widths=(3, 4, 5) L0=5.7619e-05 L1=2.7081e-05 L2=1.5181e-05
+  function-preserving growth: drift=0.000e+00, train_loss=0.1935
+[NONLINEAR-GRO] Epoch 7: layer=0, widths (3, 4, 5) -> (4, 4, 5), max_drift=0.000e+00
+[NONLINEAR] Epoch 7, accepted=False, eps=0.5048, train_loss=0.1935, validation_loss=0.1862, test_loss=0.1930 (+0.0000), widths=(3, 4, 5)
+[GRO] Epoch 7, layer=0, widths=(4, 4, 5), parameters=71
+[NONLINEAR-CAND] eta_f=1, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 792.5172119140625 -> 215.21893310546875 (reduction 577.2982788085938)
+[NONLINEAR] eta_f=1, inner_steps=400, cos=0.8529, eps=0.5221, eta_star=0.7072, param_disp=2.723, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.8529, eps=0.5221, descent=+1.560704e+01, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR-CAND] eta_f=0.5, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 198.12930297851562 -> 48.77690124511719 (reduction 149.35240173339844)
+[NONLINEAR] eta_f=0.5, inner_steps=400, cos=0.8681, eps=0.4964, eta_star=0.3688, param_disp=2.909, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.8681, eps=0.4964, descent=+1.492356e+02, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.25, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 49.532325744628906 -> 10.805912971496582 (reduction 38.726412773132324)
+[NONLINEAR] eta_f=0.25, inner_steps=400, cos=0.8847, eps=0.4662, eta_star=0.1934, param_disp=2.532, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.8847, eps=0.4662, descent=+1.153870e+02, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-ADAPT] latest eps=0.4662 admits eta <= 0.03499; retrying at eta_f=0.03324
+[NONLINEAR-CAND] eta_f=0.033243, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 0.8758092522621155 -> 0.3677736520767212 (reduction 0.5080356001853943)
+[NONLINEAR] eta_f=0.033243, inner_steps=400, cos=0.7644, eps=0.6448, eta_star=0.02055, param_disp=1.47, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.7644, eps=0.6448, descent=+1.571209e+01, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR] no candidate certified the step it would apply (best cos over 4 attempts: 0.8847)
+[NONLINEAR-BOTTLENECK] Epoch 8, widths=(4, 4, 5) L0=1.1669e-05 L1=2.7087e-05 L2=1.5181e-05
+  function-preserving growth: drift=0.000e+00, train_loss=0.1935
+[NONLINEAR-GRO] Epoch 8: layer=1, widths (4, 4, 5) -> (4, 5, 5), max_drift=0.000e+00
+[NONLINEAR] Epoch 8, accepted=False, eps=0.6448, train_loss=0.1935, validation_loss=0.1862, test_loss=0.1930 (+0.0000), widths=(4, 4, 5)
+[GRO] Epoch 8, layer=1, widths=(4, 5, 5), parameters=81
+[NONLINEAR-CAND] eta_f=1, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 792.5172119140625 -> 131.4306640625 (reduction 661.0865478515625)
+[NONLINEAR] eta_f=1, inner_steps=400, cos=0.9129, eps=0.4082, eta_star=0.8308, param_disp=3.198, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9129, eps=0.4082, descent=+2.062461e+00, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.5, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 198.12930297851562 -> 25.65979766845703 (reduction 172.4695053100586)
+[NONLINEAR] eta_f=0.5, inner_steps=400, cos=0.9331, eps=0.3596, eta_star=0.4302, param_disp=3.509, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9331, eps=0.3596, descent=+1.724802e+02, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.25, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 49.532325744628906 -> 7.654292583465576 (reduction 41.87803316116333)
+[NONLINEAR] eta_f=0.25, inner_steps=400, cos=0.9181, eps=0.3965, eta_star=0.2037, param_disp=2.319, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9181, eps=0.3965, descent=+1.224280e+02, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-ADAPT] latest eps=0.3965 admits eta <= 0.1155; retrying at eta_f=0.1097
+[NONLINEAR-CAND] eta_f=0.109731, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 9.542591094970703 -> 3.771172523498535 (reduction 5.771418571472168)
+[NONLINEAR] eta_f=0.109731, inner_steps=400, cos=0.7781, eps=0.6282, eta_star=0.0659, param_disp=1.471, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.7781, eps=0.6282, descent=+4.654274e+01, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR] no candidate certified the step it would apply (best cos over 4 attempts: 0.9331)
+[NONLINEAR-BOTTLENECK] Epoch 9, widths=(4, 5, 5) L0=1.1669e-05 L1=3.4498e-05 L2=2.5872e-04
+  function-preserving growth: drift=0.000e+00, train_loss=0.1935
+[NONLINEAR-GRO] Epoch 9: layer=2, widths (4, 5, 5) -> (4, 5, 6), max_drift=0.000e+00
+[NONLINEAR] Epoch 9, accepted=False, eps=0.6282, train_loss=0.1935, validation_loss=0.1862, test_loss=0.1930 (+0.0000), widths=(4, 5, 5)
+[GRO] Epoch 9, layer=2, widths=(4, 5, 6), parameters=88
+[NONLINEAR-CAND] eta_f=1, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 792.5172119140625 -> 90.10713195800781 (reduction 702.4100799560547)
+[NONLINEAR] eta_f=1, inner_steps=400, cos=0.9409, eps=0.3386, eta_star=0.8575, param_disp=5.472, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9409, eps=0.3386, descent=+2.134152e+01, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.5, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 198.12930297851562 -> 41.71218490600586 (reduction 156.41711807250977)
+[NONLINEAR] eta_f=0.5, inner_steps=400, cos=0.8878, eps=0.4602, eta_star=0.3923, param_disp=3.742, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.8878, eps=0.4602, descent=+1.561679e+02, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.25, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 49.532325744628906 -> 7.187906265258789 (reduction 42.34441947937012)
+[NONLINEAR] eta_f=0.25, inner_steps=400, cos=0.9248, eps=0.3806, eta_star=0.2163, param_disp=2.317, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9248, eps=0.3806, descent=+1.280505e+02, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-ADAPT] latest eps=0.3806 admits eta <= 0.1356; retrying at eta_f=0.1289
+[NONLINEAR-CAND] eta_f=0.128866, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 13.160816192626953 -> 2.895350933074951 (reduction 10.265465259552002)
+[NONLINEAR] eta_f=0.128866, inner_steps=400, cos=0.8834, eps=0.4686, eta_star=0.09922, param_disp=2.617, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.8834, eps=0.4686, descent=+6.863449e+01, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-ADAPT] latest eps=0.4686 admits eta <= 0.03242; retrying at eta_f=0.0308
+[NONLINEAR-CAND] eta_f=0.0307951, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 0.7515733242034912 -> 0.2675228416919708 (reduction 0.4840504825115204)
+[NONLINEAR] eta_f=0.0307951, inner_steps=400, cos=0.8022, eps=0.5970, eta_star=0.01982, param_disp=1.733, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.8022, eps=0.5970, descent=+1.522750e+01, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR] no candidate certified the step it would apply (best cos over 5 attempts: 0.9409)
+[NONLINEAR-BOTTLENECK] Epoch 10, widths=(4, 5, 6) L0=1.1669e-05 L1=3.4498e-05 L2=3.2959e-05
+  function-preserving growth: drift=0.000e+00, train_loss=0.1935
+[NONLINEAR-GRO] Epoch 10: layer=1, widths (4, 5, 6) -> (4, 6, 6), max_drift=0.000e+00
+[NONLINEAR] Epoch 10, accepted=False, eps=0.5970, train_loss=0.1935, validation_loss=0.1862, test_loss=0.1930 (+0.0000), widths=(4, 5, 6)
+[GRO] Epoch 10, layer=1, widths=(4, 6, 6), parameters=99
+[NONLINEAR-CAND] eta_f=1, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 792.5172119140625 -> 113.69979095458984 (reduction 678.8174209594727)
+[NONLINEAR] eta_f=1, inner_steps=400, cos=0.9253, eps=0.3792, eta_star=0.8497, param_disp=5.108, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9253, eps=0.3792, descent=+5.145314e+00, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.5, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 198.12930297851562 -> 30.551612854003906 (reduction 167.57769012451172)
+[NONLINEAR] eta_f=0.5, inner_steps=400, cos=0.9176, eps=0.3976, eta_star=0.4194, param_disp=3.148, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9176, eps=0.3976, descent=+1.668025e+02, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.25, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 49.532325744628906 -> 7.925091743469238 (reduction 41.60723400115967)
+[NONLINEAR] eta_f=0.25, inner_steps=400, cos=0.9145, eps=0.4045, eta_star=0.2149, param_disp=2.428, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9145, eps=0.4045, descent=+1.265631e+02, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-ADAPT] latest eps=0.4045 admits eta <= 0.1056; retrying at eta_f=0.1003
+[NONLINEAR-CAND] eta_f=0.100301, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 7.97296142578125 -> 2.208616256713867 (reduction 5.764345169067383)
+[NONLINEAR] eta_f=0.100301, inner_steps=400, cos=0.8501, eps=0.5267, eta_star=0.07274, param_disp=2.329, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.8501, eps=0.5267, descent=+5.184185e+01, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR] no candidate certified the step it would apply (best cos over 4 attempts: 0.9253)
+[NONLINEAR-BOTTLENECK] Epoch 11, widths=(4, 6, 6) L0=1.1669e-05 L1=7.0225e-05 L2=2.9662e-04
+  function-preserving growth: drift=0.000e+00, train_loss=0.1935
+[NONLINEAR-GRO] Epoch 11: layer=2, widths (4, 6, 6) -> (4, 6, 7), max_drift=0.000e+00
+[NONLINEAR] Epoch 11, accepted=False, eps=0.5267, train_loss=0.1935, validation_loss=0.1862, test_loss=0.1930 (+0.0000), widths=(4, 6, 6)
+[GRO] Epoch 11, layer=2, widths=(4, 6, 7), parameters=107
+[NONLINEAR-CAND] eta_f=1, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 792.5172119140625 -> 84.43993377685547 (reduction 708.077278137207)
+[NONLINEAR] eta_f=1, inner_steps=400, cos=0.9453, eps=0.3261, eta_star=0.8819, param_disp=6.402, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9453, eps=0.3261, descent=+9.172510e+00, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.5, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 198.12930297851562 -> 20.134521484375 (reduction 177.99478149414062)
+[NONLINEAR] eta_f=0.5, inner_steps=400, cos=0.9479, eps=0.3184, eta_star=0.4451, param_disp=3.797, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9479, eps=0.3184, descent=+1.780242e+02, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.25, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 49.532325744628906 -> 7.202993392944336 (reduction 42.32933235168457)
+[NONLINEAR] eta_f=0.25, inner_steps=400, cos=0.9246, eps=0.3810, eta_star=0.2147, param_disp=2.593, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9246, eps=0.3810, descent=+1.274114e+02, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-ADAPT] latest eps=0.3810 admits eta <= 0.1351; retrying at eta_f=0.1283
+[NONLINEAR-CAND] eta_f=0.128342, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 13.054157257080078 -> 4.516406059265137 (reduction 8.537751197814941)
+[NONLINEAR] eta_f=0.128342, inner_steps=400, cos=0.8091, eps=0.5877, eta_star=0.08304, param_disp=2.144, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.8091, eps=0.5877, descent=+5.746431e+01, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR] no candidate certified the step it would apply (best cos over 4 attempts: 0.9479)
+[NONLINEAR-BOTTLENECK] Epoch 12, widths=(4, 6, 7) L0=1.1669e-05 L1=7.0225e-05 L2=3.4448e-05
+  function-preserving growth: drift=0.000e+00, train_loss=0.1935
+[NONLINEAR-GRO] Epoch 12: layer=1, widths (4, 6, 7) -> (4, 7, 7), max_drift=0.000e+00
+[NONLINEAR] Epoch 12, accepted=False, eps=0.5877, train_loss=0.1935, validation_loss=0.1862, test_loss=0.1930 (+0.0000), widths=(4, 6, 7)
+[GRO] Epoch 12, layer=1, widths=(4, 7, 7), parameters=119
+[NONLINEAR-CAND] eta_f=1, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 792.5172119140625 -> 101.30393981933594 (reduction 691.2132720947266)
+[NONLINEAR] eta_f=1, inner_steps=400, cos=0.9305, eps=0.3664, eta_star=0.8914, param_disp=6.993, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9305, eps=0.3664, descent=-2.091390e+01, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.5, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 198.12930297851562 -> 24.474407196044922 (reduction 173.6548957824707)
+[NONLINEAR] eta_f=0.5, inner_steps=400, cos=0.9355, eps=0.3534, eta_star=0.4339, param_disp=3.628, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9355, eps=0.3534, descent=+1.733738e+02, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.25, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 49.532325744628906 -> 8.42833137512207 (reduction 41.103994369506836)
+[NONLINEAR] eta_f=0.25, inner_steps=400, cos=0.9054, eps=0.4246, eta_star=0.2037, param_disp=2.768, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9054, eps=0.4246, descent=+1.213205e+02, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-ADAPT] latest eps=0.4246 admits eta <= 0.08159; retrying at eta_f=0.07751
+[NONLINEAR-CAND] eta_f=0.0775126, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 4.761601448059082 -> 1.617856740951538 (reduction 3.143744707107544)
+[NONLINEAR] eta_f=0.0775126, inner_steps=400, cos=0.8196, eps=0.5730, eta_star=0.05216, param_disp=1.988, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.8196, eps=0.5730, descent=+3.812622e+01, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR] no candidate certified the step it would apply (best cos over 4 attempts: 0.9355)
+[NONLINEAR-BOTTLENECK] Epoch 13, widths=(4, 7, 7) L0=1.1669e-05 L1=1.1630e-05 L2=3.3121e-03
+  function-preserving growth: drift=0.000e+00, train_loss=0.1935
+[NONLINEAR-GRO] Epoch 13: layer=2, widths (4, 7, 7) -> (4, 7, 8), max_drift=0.000e+00
+[NONLINEAR] Epoch 13, accepted=False, eps=0.5730, train_loss=0.1935, validation_loss=0.1862, test_loss=0.1930 (+0.0000), widths=(4, 7, 7)
+[GRO] Epoch 13, layer=2, widths=(4, 7, 8), parameters=128
+[NONLINEAR-CAND] eta_f=1, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 792.5172119140625 -> 126.77728271484375 (reduction 665.7399291992188)
+[NONLINEAR] eta_f=1, inner_steps=400, cos=0.9168, eps=0.3993, eta_star=0.8225, param_disp=4.876, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9168, eps=0.3993, descent=+1.401670e+01, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.5, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 198.12930297851562 -> 22.6046142578125 (reduction 175.52468872070312)
+[NONLINEAR] eta_f=0.5, inner_steps=400, cos=0.9408, eps=0.3390, eta_star=0.442, param_disp=3.184, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9408, eps=0.3390, descent=+1.753664e+02, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.25, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 49.532325744628906 -> 5.65617036819458 (reduction 43.876155376434326)
+[NONLINEAR] eta_f=0.25, inner_steps=400, cos=0.9420, eps=0.3357, eta_star=0.223, param_disp=2.873, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9420, eps=0.3357, descent=+1.323094e+02, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-ADAPT] latest eps=0.3357 admits eta <= 0.1965; retrying at eta_f=0.1867
+[NONLINEAR-CAND] eta_f=0.186704, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 27.625778198242188 -> 5.471973896026611 (reduction 22.153804302215576)
+[NONLINEAR] eta_f=0.186704, inner_steps=400, cos=0.8958, eps=0.4445, eta_star=0.1401, param_disp=3.309, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.8958, eps=0.4445, descent=+9.166431e+01, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-ADAPT] latest eps=0.4445 admits eta <= 0.05878; retrying at eta_f=0.05584
+[NONLINEAR-CAND] eta_f=0.0558374, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 2.4709184169769287 -> 0.8081552982330322 (reduction 1.6627631187438965)
+[NONLINEAR] eta_f=0.0558374, inner_steps=400, cos=0.8270, eps=0.5621, eta_star=0.03736, param_disp=1.885, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.8270, eps=0.5621, descent=+2.798943e+01, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR] no candidate certified the step it would apply (best cos over 5 attempts: 0.9420)
+[NONLINEAR-BOTTLENECK] Epoch 14, widths=(4, 7, 8) L0=1.1669e-05 L1=1.1630e-05 L2=3.8414e-05
+  function-preserving growth: drift=0.000e+00, train_loss=0.1935
+[NONLINEAR-GRO] Epoch 14: layer=2, widths (4, 7, 8) -> (4, 7, 9), max_drift=0.000e+00
+[NONLINEAR] Epoch 14, accepted=False, eps=0.5621, train_loss=0.1935, validation_loss=0.1862, test_loss=0.1930 (+0.0000), widths=(4, 7, 8)
+[GRO] Epoch 14, layer=2, widths=(4, 7, 9), parameters=137
+[NONLINEAR-CAND] eta_f=1, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 792.5172119140625 -> 83.32777404785156 (reduction 709.1894378662109)
+[NONLINEAR] eta_f=1, inner_steps=400, cos=0.9460, eps=0.3241, eta_star=0.8789, param_disp=5.822, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9460, eps=0.3241, descent=+1.248108e+01, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.5, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 198.12930297851562 -> 24.61046600341797 (reduction 173.51883697509766)
+[NONLINEAR] eta_f=0.5, inner_steps=400, cos=0.9397, eps=0.3420, eta_star=0.4456, param_disp=3.585, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9397, eps=0.3420, descent=+1.749356e+02, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.25, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 49.532325744628906 -> 6.666090965270996 (reduction 42.86623477935791)
+[NONLINEAR] eta_f=0.25, inner_steps=400, cos=0.9303, eps=0.3668, eta_star=0.2161, param_disp=3.062, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9303, eps=0.3668, descent=+1.284818e+02, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-ADAPT] latest eps=0.3668 admits eta <= 0.1536; retrying at eta_f=0.1459
+[NONLINEAR-CAND] eta_f=0.145949, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 16.881559371948242 -> 3.471038818359375 (reduction 13.410520553588867)
+[NONLINEAR] eta_f=0.145949, inner_steps=400, cos=0.8942, eps=0.4477, eta_star=0.113, param_disp=2.744, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.8942, eps=0.4477, descent=+7.691726e+01, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-ADAPT] latest eps=0.4477 admits eta <= 0.05514; retrying at eta_f=0.05238
+[NONLINEAR-CAND] eta_f=0.0523802, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 2.1744203567504883 -> 0.6620930433273315 (reduction 1.5123273134231567)
+[NONLINEAR] eta_f=0.0523802, inner_steps=400, cos=0.8924, eps=0.4513, eta_star=0.04029, param_disp=2.033, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.8924, eps=0.4513, descent=+3.031312e+01, certified=True, rejected=no
+[NONLINEAR-ACCEPT] alpha=1, eta_f=0.0523802, cos=0.8924, eps=0.4513, eta_star=0.04029, descent=+3.031312e+01, param_disp=2.033
+[NONLINEAR] Epoch 15, accepted=True, eps=0.4513, train_loss=0.1639, validation_loss=0.1599, test_loss=0.1656 (-0.0274), widths=(4, 7, 9)
+[NONLINEAR-CAND] eta_f=1, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 671.2647094726562 -> 156.93453979492188 (reduction 514.3301696777344)
+[NONLINEAR] eta_f=1, inner_steps=400, cos=0.8751, eps=0.4840, eta_star=0.7603, param_disp=4.492, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.8751, eps=0.4840, descent=+3.622792e+00, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.5, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 167.81617736816406 -> 22.807239532470703 (reduction 145.00893783569336)
+[NONLINEAR] eta_f=0.5, inner_steps=400, cos=0.9270, eps=0.3751, eta_star=0.4144, param_disp=3.355, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9270, eps=0.3751, descent=+1.440240e+02, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.25, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 41.954044342041016 -> 4.070989608764648 (reduction 37.88305473327637)
+[NONLINEAR] eta_f=0.25, inner_steps=400, cos=0.9497, eps=0.3131, eta_star=0.2291, param_disp=2.284, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9497, eps=0.3131, descent=+1.147193e+02, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-ADAPT] latest eps=0.3131 admits eta <= 0.2298; retrying at eta_f=0.2183
+[NONLINEAR-CAND] eta_f=0.21832, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 31.995033264160156 -> 3.3777337074279785 (reduction 28.617299556732178)
+[NONLINEAR] eta_f=0.21832, inner_steps=400, cos=0.9450, eps=0.3271, eta_star=0.1927, param_disp=2.125, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9450, eps=0.3271, descent=+1.014272e+02, certified=True, rejected=no
+[NONLINEAR-ACCEPT] alpha=1, eta_f=0.21832, cos=0.9450, eps=0.3271, eta_star=0.1927, descent=+1.014272e+02, param_disp=2.125
+[NONLINEAR] Epoch 16, accepted=True, eps=0.3271, train_loss=0.0648, validation_loss=0.0691, test_loss=0.0718 (-0.0938), widths=(4, 7, 9)
+[NONLINEAR-CAND] eta_f=1, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 265.5559997558594 -> 51.628536224365234 (reduction 213.92746353149414)
+[NONLINEAR] eta_f=1, inner_steps=400, cos=0.8990, eps=0.4379, eta_star=0.7751, param_disp=2.62, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.8990, eps=0.4379, descent=+8.439977e+00, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.5, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 66.38899230957031 -> 14.597006797790527 (reduction 51.791985511779785)
+[NONLINEAR] eta_f=0.5, inner_steps=400, cos=0.8814, eps=0.4725, eta_star=0.3836, param_disp=1.613, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.8814, eps=0.4725, descent=+5.156216e+01, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.25, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 16.597248077392578 -> 4.175249099731445 (reduction 12.421998977661133)
+[NONLINEAR] eta_f=0.25, inner_steps=400, cos=0.8662, eps=0.4998, eta_star=0.179, param_disp=1.17, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.8662, eps=0.4998, descent=+3.619971e+01, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-ADAPT] latest eps=0.4998 admits eta <= 0.00022; retrying at eta_f=0.000209
+[NONLINEAR-CAND] eta_f=0.000208996, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 1.1599386198213324e-05 -> 0.034581296145915985 (reduction -0.03456969675971777)
+[NONLINEAR] eta_f=0.000208996, inner_steps=400, cos=-0.4035, eps=1.0000, eta_star=-0.004566, param_disp=1.117, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=-0.4035, eps=1.0000, descent=-1.246489e+00, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR] no candidate certified the step it would apply (best cos over 4 attempts: 0.8990)
+[NONLINEAR-BOTTLENECK] Epoch 17, widths=(4, 7, 9) L0=3.2675e-02 L1=9.2021e-05 L2=1.2216e-03
+  function-preserving growth: drift=0.000e+00, train_loss=0.0648
+[NONLINEAR-GRO] Epoch 17: layer=0, widths (4, 7, 9) -> (5, 7, 9), max_drift=0.000e+00
+[NONLINEAR] Epoch 17, accepted=False, eps=1.0000, train_loss=0.0648, validation_loss=0.0691, test_loss=0.0718 (+0.0000), widths=(4, 7, 9)
+[GRO] Epoch 17, layer=0, widths=(5, 7, 9), parameters=149
+[NONLINEAR-CAND] eta_f=1, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 265.55596923828125 -> 49.94829559326172 (reduction 215.60767364501953)
+[NONLINEAR] eta_f=1, inner_steps=400, cos=0.9017, eps=0.4323, eta_star=0.7834, param_disp=2.538, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9017, eps=0.4323, descent=+7.605387e+00, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.5, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 66.38899230957031 -> 14.124098777770996 (reduction 52.264893531799316)
+[NONLINEAR] eta_f=0.5, inner_steps=400, cos=0.8881, eps=0.4597, eta_star=0.3904, param_disp=1.724, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.8881, eps=0.4597, descent=+5.235458e+01, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.25, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 16.597248077392578 -> 4.055598735809326 (reduction 12.541649341583252)
+[NONLINEAR] eta_f=0.25, inner_steps=400, cos=0.8702, eps=0.4928, eta_star=0.1816, param_disp=1.31, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.8702, eps=0.4928, descent=+3.665576e+01, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-ADAPT] latest eps=0.4928 admits eta <= 0.007279; retrying at eta_f=0.006916
+[NONLINEAR-CAND] eta_f=0.00691551, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 0.012700011022388935 -> 0.04525240510702133 (reduction -0.0325523940846324)
+[NONLINEAR] eta_f=0.00691551, inner_steps=400, cos=0.0057, eps=1.0000, eta_star=6.335e-05, param_disp=1.172, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.0057, eps=1.0000, descent=-1.588404e-02, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR] no candidate certified the step it would apply (best cos over 4 attempts: 0.9017)
+[NONLINEAR-BOTTLENECK] Epoch 18, widths=(5, 7, 9) L0=3.3947e-03 L1=5.4382e-03 L2=1.2216e-03
+  function-preserving growth: drift=0.000e+00, train_loss=0.0648
+[NONLINEAR-GRO] Epoch 18: layer=1, widths (5, 7, 9) -> (5, 8, 9), max_drift=0.000e+00
+[NONLINEAR] Epoch 18, accepted=False, eps=1.0000, train_loss=0.0648, validation_loss=0.0691, test_loss=0.0718 (+0.0000), widths=(5, 7, 9)
+[GRO] Epoch 18, layer=1, widths=(5, 8, 9), parameters=164
+[NONLINEAR-CAND] eta_f=1, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 265.55596923828125 -> 45.47675704956055 (reduction 220.0792121887207)
+[NONLINEAR] eta_f=1, inner_steps=400, cos=0.9104, eps=0.4137, eta_star=0.7949, param_disp=2.95, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9104, eps=0.4137, descent=+8.639211e+00, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.5, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 66.38899230957031 -> 13.52701473236084 (reduction 52.86197757720947)
+[NONLINEAR] eta_f=0.5, inner_steps=400, cos=0.8896, eps=0.4567, eta_star=0.3742, param_disp=1.97, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.8896, eps=0.4567, descent=+5.238715e+01, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.25, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 16.597248077392578 -> 4.005167007446289 (reduction 12.592081069946289)
+[NONLINEAR] eta_f=0.25, inner_steps=400, cos=0.8720, eps=0.4895, eta_star=0.1821, param_disp=1.4, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.8720, eps=0.4895, descent=+3.677896e+01, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-ADAPT] latest eps=0.4895 admits eta <= 0.01059; retrying at eta_f=0.01006
+[NONLINEAR-CAND] eta_f=0.0100559, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 0.02685316652059555 -> 0.05024828016757965 (reduction -0.0233951136469841)
+[NONLINEAR] eta_f=0.0100559, inner_steps=400, cos=0.2051, eps=0.9787, eta_star=0.002391, param_disp=1.198, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.2051, eps=0.9787, descent=+5.987963e-01, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR] no candidate certified the step it would apply (best cos over 4 attempts: 0.9104)
+[NONLINEAR-BOTTLENECK] Epoch 19, widths=(5, 8, 9) L0=3.3947e-03 L1=8.1980e-05 L2=3.9349e-03
+  function-preserving growth: drift=0.000e+00, train_loss=0.0648
+[NONLINEAR-GRO] Epoch 19: layer=2, widths (5, 8, 9) -> (5, 8, 10), max_drift=0.000e+00
+[NONLINEAR] Epoch 19, accepted=False, eps=0.9787, train_loss=0.0648, validation_loss=0.0691, test_loss=0.0718 (+0.0000), widths=(5, 8, 9)
+[GRO] Epoch 19, layer=2, widths=(5, 8, 10), parameters=174
+[NONLINEAR-CAND] eta_f=1, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 265.55596923828125 -> 49.52968215942383 (reduction 216.02628707885742)
+[NONLINEAR] eta_f=1, inner_steps=400, cos=0.9027, eps=0.4302, eta_star=0.7803, param_disp=2.546, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9027, eps=0.4302, descent=+8.819537e+00, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.5, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 66.38899230957031 -> 11.979104995727539 (reduction 54.40988731384277)
+[NONLINEAR] eta_f=0.5, inner_steps=400, cos=0.9059, eps=0.4234, eta_star=0.3955, param_disp=2.684, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9059, eps=0.4234, descent=+5.441571e+01, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.25, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 16.597248077392578 -> 3.750835418701172 (reduction 12.846412658691406)
+[NONLINEAR] eta_f=0.25, inner_steps=400, cos=0.8808, eps=0.4736, eta_star=0.1856, param_disp=1.876, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.8808, eps=0.4736, descent=+3.749131e+01, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-ADAPT] latest eps=0.4736 admits eta <= 0.02714; retrying at eta_f=0.02579
+[NONLINEAR-CAND] eta_f=0.0257877, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 0.17659595608711243 -> 0.11174961179494858 (reduction 0.06484634429216385)
+[NONLINEAR] eta_f=0.0257877, inner_steps=400, cos=0.6361, eps=0.7716, eta_star=0.01356, param_disp=1.465, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.6361, eps=0.7716, descent=+3.481200e+00, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR] no candidate certified the step it would apply (best cos over 4 attempts: 0.9059)
+[NONLINEAR-BOTTLENECK] Epoch 20, widths=(5, 8, 10) L0=3.3947e-03 L1=8.1982e-05 L2=1.9427e-04
+  function-preserving growth: drift=0.000e+00, train_loss=0.0648
+[NONLINEAR-GRO] Epoch 20: layer=0, widths (5, 8, 10) -> (6, 8, 10), max_drift=0.000e+00
+[NONLINEAR] Epoch 20, accepted=False, eps=0.7716, train_loss=0.0648, validation_loss=0.0691, test_loss=0.0718 (+0.0000), widths=(5, 8, 10)
+[GRO] Epoch 20, layer=0, widths=(6, 8, 10), parameters=187
+[NONLINEAR-CAND] eta_f=1, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 265.55596923828125 -> 51.79086685180664 (reduction 213.7651023864746)
+[NONLINEAR] eta_f=1, inner_steps=400, cos=0.8978, eps=0.4404, eta_star=0.7832, param_disp=2.524, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.8978, eps=0.4404, descent=+5.910009e+00, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.5, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 66.38899230957031 -> 9.645528793334961 (reduction 56.74346351623535)
+[NONLINEAR] eta_f=0.5, inner_steps=400, cos=0.9236, eps=0.3834, eta_star=0.4219, param_disp=2.838, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9236, eps=0.3834, descent=+5.662548e+01, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.25, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 16.597248077392578 -> 3.3513033390045166 (reduction 13.245944738388062)
+[NONLINEAR] eta_f=0.25, inner_steps=400, cos=0.8936, eps=0.4489, eta_star=0.1947, param_disp=1.88, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.8936, eps=0.4489, descent=+3.909246e+01, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-ADAPT] latest eps=0.4489 admits eta <= 0.05387; retrying at eta_f=0.05118
+[NONLINEAR-CAND] eta_f=0.0511766, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 0.6955037117004395 -> 0.25974103808403015 (reduction 0.4357626736164093)
+[NONLINEAR] eta_f=0.0511766, inner_steps=400, cos=0.7919, eps=0.6106, eta_star=0.03229, param_disp=1.508, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.7919, eps=0.6106, descent=+8.133841e+00, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR] no candidate certified the step it would apply (best cos over 4 attempts: 0.9236)
+[NONLINEAR-BOTTLENECK] Epoch 21, widths=(6, 8, 10) L0=2.1810e-03 L1=8.7880e-03 L2=1.9427e-04
+  function-preserving growth: drift=0.000e+00, train_loss=0.0648
+[NONLINEAR-GRO] Epoch 21: layer=1, widths (6, 8, 10) -> (6, 9, 10), max_drift=0.000e+00
+[NONLINEAR] Epoch 21, accepted=False, eps=0.6106, train_loss=0.0648, validation_loss=0.0691, test_loss=0.0718 (+0.0000), widths=(6, 8, 10)
+[GRO] Epoch 21, layer=1, widths=(6, 9, 10), parameters=204
+[NONLINEAR-CAND] eta_f=1, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 265.55596923828125 -> 35.36568832397461 (reduction 230.19028091430664)
+[NONLINEAR] eta_f=1, inner_steps=400, cos=0.9316, eps=0.3634, eta_star=0.8399, param_disp=3.462, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9316, eps=0.3634, descent=+7.195302e+00, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.5, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 66.38899230957031 -> 12.112127304077148 (reduction 54.276865005493164)
+[NONLINEAR] eta_f=0.5, inner_steps=400, cos=0.9043, eps=0.4269, eta_star=0.3982, param_disp=2.535, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9043, eps=0.4269, descent=+5.425378e+01, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.25, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 16.597248077392578 -> 3.5638608932495117 (reduction 13.033387184143066)
+[NONLINEAR] eta_f=0.25, inner_steps=400, cos=0.8868, eps=0.4622, eta_star=0.1903, param_disp=1.939, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.8868, eps=0.4622, descent=+3.829905e+01, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-ADAPT] latest eps=0.4622 admits eta <= 0.03925; retrying at eta_f=0.03729
+[NONLINEAR-CAND] eta_f=0.0372856, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 0.369179368019104 -> 0.17643523216247559 (reduction 0.19274413585662842)
+[NONLINEAR] eta_f=0.0372856, inner_steps=400, cos=0.7284, eps=0.6852, eta_star=0.02215, param_disp=1.644, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.7284, eps=0.6852, descent=+5.636035e+00, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR] no candidate certified the step it would apply (best cos over 4 attempts: 0.9316)
+[NONLINEAR-BOTTLENECK] Epoch 22, widths=(6, 9, 10) L0=2.1810e-03 L1=6.8873e-05 L2=2.5025e-04
+  function-preserving growth: drift=0.000e+00, train_loss=0.0648
+[NONLINEAR-GRO] Epoch 22: layer=0, widths (6, 9, 10) -> (7, 9, 10), max_drift=0.000e+00
+[NONLINEAR] Epoch 22, accepted=False, eps=0.6852, train_loss=0.0648, validation_loss=0.0691, test_loss=0.0718 (+0.0000), widths=(6, 9, 10)
+[GRO] Epoch 22, layer=0, widths=(7, 9, 10), parameters=218
+[NONLINEAR-CAND] eta_f=1, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 265.55596923828125 -> 39.71295928955078 (reduction 225.84300994873047)
+[NONLINEAR] eta_f=1, inner_steps=400, cos=0.9219, eps=0.3873, eta_star=0.829, param_disp=3.107, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9219, eps=0.3873, descent=+5.421594e+00, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.5, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 66.38899230957031 -> 11.992645263671875 (reduction 54.39634704589844)
+[NONLINEAR] eta_f=0.5, inner_steps=400, cos=0.9030, eps=0.4297, eta_star=0.4111, param_disp=2.405, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9030, eps=0.4297, descent=+5.412659e+01, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.25, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 16.597248077392578 -> 3.493894100189209 (reduction 13.10335397720337)
+[NONLINEAR] eta_f=0.25, inner_steps=400, cos=0.8889, eps=0.4581, eta_star=0.1926, param_disp=1.85, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.8889, eps=0.4581, descent=+3.867291e+01, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-ADAPT] latest eps=0.4581 admits eta <= 0.04376; retrying at eta_f=0.04158
+[NONLINEAR-CAND] eta_f=0.0415753, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 0.4590138792991638 -> 0.18323417007923126 (reduction 0.27577970921993256)
+[NONLINEAR] eta_f=0.0415753, inner_steps=400, cos=0.7767, eps=0.6298, eta_star=0.02641, param_disp=1.669, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.7767, eps=0.6298, descent=+6.707501e+00, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR] no candidate certified the step it would apply (best cos over 4 attempts: 0.9219)
+[NONLINEAR-BOTTLENECK] Epoch 23, widths=(7, 9, 10) L0=2.1890e-03 L1=3.5264e-03 L2=2.5025e-04
+  function-preserving growth: drift=0.000e+00, train_loss=0.0648
+[NONLINEAR-GRO] Epoch 23: layer=1, widths (7, 9, 10) -> (7, 10, 10), max_drift=0.000e+00
+[NONLINEAR] Epoch 23, accepted=False, eps=0.6298, train_loss=0.0648, validation_loss=0.0691, test_loss=0.0718 (+0.0000), widths=(7, 9, 10)
+[GRO] Epoch 23, layer=1, widths=(7, 10, 10), parameters=236
+[NONLINEAR-CAND] eta_f=1, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 265.55596923828125 -> 45.5469856262207 (reduction 220.00898361206055)
+[NONLINEAR] eta_f=1, inner_steps=400, cos=0.9159, eps=0.4013, eta_star=0.7983, param_disp=3.195, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9159, eps=0.4013, descent=+1.026772e+01, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.5, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 66.38899230957031 -> 9.462868690490723 (reduction 56.92612361907959)
+[NONLINEAR] eta_f=0.5, inner_steps=400, cos=0.9265, eps=0.3762, eta_star=0.4088, param_disp=2.908, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9265, eps=0.3762, descent=+5.686410e+01, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.25, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 16.597248077392578 -> 3.049929618835449 (reduction 13.547318458557129)
+[NONLINEAR] eta_f=0.25, inner_steps=400, cos=0.9040, eps=0.4275, eta_star=0.1985, param_disp=2.775, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9040, eps=0.4275, descent=+3.990395e+01, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-ADAPT] latest eps=0.4275 admits eta <= 0.07811; retrying at eta_f=0.0742
+[NONLINEAR-CAND] eta_f=0.074204, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 1.4622151851654053 -> 0.39174163341522217 (reduction 1.070473551750183)
+[NONLINEAR] eta_f=0.074204, inner_steps=400, cos=0.8558, eps=0.5173, eta_star=0.05435, param_disp=2.428, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.8558, eps=0.5173, descent=+1.336289e+01, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR] no candidate certified the step it would apply (best cos over 4 attempts: 0.9265)
+[NONLINEAR-BOTTLENECK] Epoch 24, widths=(7, 10, 10) L0=2.1890e-03 L1=1.0519e-04 L2=2.5736e-04
+  function-preserving growth: drift=0.000e+00, train_loss=0.0648
+[NONLINEAR-GRO] Epoch 24: layer=0, widths (7, 10, 10) -> (8, 10, 10), max_drift=0.000e+00
+[NONLINEAR] Epoch 24, accepted=False, eps=0.5173, train_loss=0.0648, validation_loss=0.0691, test_loss=0.0718 (+0.0000), widths=(7, 10, 10)
+[GRO] Epoch 24, layer=0, widths=(8, 10, 10), parameters=251
+[NONLINEAR-CAND] eta_f=1, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 265.55596923828125 -> 35.55223083496094 (reduction 230.0037384033203)
+[NONLINEAR] eta_f=1, inner_steps=400, cos=0.9335, eps=0.3586, eta_star=0.84, param_disp=3.231, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9335, eps=0.3586, descent=+8.044646e+00, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.5, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 66.38899230957031 -> 7.956660747528076 (reduction 58.432331562042236)
+[NONLINEAR] eta_f=0.5, inner_steps=400, cos=0.9386, eps=0.3451, eta_star=0.43, param_disp=2.882, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9386, eps=0.3451, descent=+5.844771e+01, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-CAND] eta_f=0.25, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 16.597248077392578 -> 2.7562155723571777 (reduction 13.8410325050354)
+[NONLINEAR] eta_f=0.25, inner_steps=400, cos=0.9126, eps=0.4088, eta_star=0.2083, param_disp=2.592, full_candidate_certified=True
+[NONLINEAR-ALPHA] alpha=1, cos=0.9126, eps=0.4088, descent=+4.147707e+01, certified=True, rejected=no
+[NONLINEAR-ALPHA] alpha=1 certified but the transactional conditions rejected it
+[NONLINEAR-ADAPT] latest eps=0.4088 admits eta <= 0.1003; retrying at eta_f=0.09533
+[NONLINEAR-CAND] eta_f=0.0953252, inner_steps=400 (probe), optimizer_steps=400, epochs=400, batches=400, examples=409600, objective 2.413081169128418 -> 0.6491446495056152 (reduction 1.7639365196228027)
+[NONLINEAR] eta_f=0.0953252, inner_steps=400, cos=0.8555, eps=0.5179, eta_star=0.0679, param_disp=2.444, full_candidate_certified=False
+[NONLINEAR-ALPHA] alpha=1, cos=0.8555, eps=0.5179, descent=+1.635744e+01, certified=False, rejected=relative_error_above_threshold
+[NONLINEAR] no candidate certified the step it would apply (best cos over 4 attempts: 0.9386)
+[NONLINEAR-BOTTLENECK] Epoch 25, widths=(8, 10, 10) L0=2.1937e-03 L1=9.5165e-05 L2=2.5736e-04
+  function-preserving growth: drift=0.000e+00, train_loss=0.0648
+[NONLINEAR-GRO] Epoch 25: layer=0, widths (8, 10, 10) -> (9, 10, 10), max_drift=0.000e+00
+[NONLINEAR] Epoch 25, accepted=False, eps=0.5179, train_loss=0.0648, validation_loss=0.0691, test_loss=0.0718 (+0.0000), widths=(8, 10, 10)
+[GRO] Epoch 25, layer=0, widths=(9, 10, 10), parameters=266
+Saved history: results/nonlinear_primary_practical_N1024_2x2x2_history.json
