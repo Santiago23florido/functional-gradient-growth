@@ -290,6 +290,7 @@ def matrix_free_tangent_step(
     config: FGDApproxConfig,
     iterations: int = 200,
     damping: float = 1e-2,
+    damping_grid: tuple[float, ...] | None = None,
     tolerance: float = 1e-10,
     max_batches: int | None = None,
 ) -> tuple[dict | None, MatrixFreeCertificate]:
@@ -352,6 +353,42 @@ def matrix_free_tangent_step(
                 )
 
             b = _jt(residuals)
+
+            def _solve(lam: float):
+                """CG at one damping, reusing the retained batch graphs."""
+                u_l = [torch.zeros_like(p) for p in parameters]
+                r_l = [value.clone() for value in b]
+                p_l = [value.clone() for value in r_l]
+                rs = _dot(r_l, r_l)
+                done = 0
+                for _ in range(max(1, iterations)):
+                    ap = _axpy(_jt(_j(p_l)), lam, p_l)
+                    den = _dot(p_l, ap)
+                    if not torch.isfinite(den) or float(den) <= 0.0:
+                        break
+                    a = rs / den
+                    u_l = _axpy(u_l, a, p_l)
+                    r_l = _axpy(r_l, -a, ap)
+                    rs_n = _dot(r_l, r_l)
+                    done += 1
+                    if float(torch.sqrt(rs_n)) <= tolerance * b_norm:
+                        break
+                    p_l = _axpy(r_l, rs_n / rs, p_l)
+                    rs = rs_n
+                return u_l, done
+
+            def _epsilon(u_l):
+                pred = _j(u_l)
+                psq = sum(float(torch.sum(a * a)) for a in pred)
+                if not psq > config.eps**2:
+                    return float("inf"), None, 0.0, pred
+                gap = sum(
+                    float(torch.sum((a - r) ** 2)) for a, r in zip(pred, residuals)
+                )
+                dt = sum(float(torch.sum(a * r)) for a, r in zip(pred, residuals))
+                pn = math.sqrt(psq)
+                return math.sqrt(gap) / pn, dt / (pn * residual_norm), pn, pred
+
             u = [torch.zeros_like(p) for p in parameters]
             r_cg = [value.clone() for value in b]
             p_cg = [value.clone() for value in r_cg]
@@ -362,21 +399,23 @@ def matrix_free_tangent_step(
                     float("inf"), None, 0.0, residual_norm, 0, passes, False
                 )
 
+            # projection_damping_auto, matrix-free: eps depends on lambda and
+            # the ladder picks the lambda that MINIMISES it per step. That is
+            # not a detail -- at the fixed 1e-2 this solver reports eps 1.1-1.5
+            # and never certifies, which is why a fixed-damping version looked
+            # like the tangent could not step. It can; it just steps at a
+            # different lambda.
+            grid = damping_grid or (damping,)
             performed = 0
-            for _ in range(max(1, iterations)):
-                ap = _axpy(_jt(_j(p_cg)), damping, p_cg)
-                denominator = _dot(p_cg, ap)
-                if not torch.isfinite(denominator) or float(denominator) <= 0.0:
-                    break
-                alpha = rs_old / denominator
-                u = _axpy(u, alpha, p_cg)
-                r_cg = _axpy(r_cg, -alpha, ap)
-                rs_new = _dot(r_cg, r_cg)
-                performed += 1
-                if float(torch.sqrt(rs_new)) <= tolerance * b_norm:
-                    break
-                p_cg = _axpy(r_cg, rs_new / rs_old, p_cg)
-                rs_old = rs_new
+            best = float("inf")
+            for lam in grid:
+                u_l, done = _solve(float(lam))
+                eps_l, _cos_l, _pn, _pred = _epsilon(u_l)
+                if eps_l < best:
+                    best = eps_l
+                    u = u_l
+                    performed = done
+                    chosen = float(lam)
 
             if not all(torch.isfinite(value).all() for value in u):
                 return None, MatrixFreeCertificate(
