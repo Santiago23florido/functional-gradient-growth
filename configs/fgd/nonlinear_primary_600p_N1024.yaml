@@ -1,0 +1,230 @@
+# Nonlinear-primary N = 1024, CORRECTED step rule.
+#
+# Derived from nonlinear_primary_parity_N1024.yaml, which mirrors the ladder's
+# nonlinear family exactly and is kept as the parity artifact. That parity run
+# certifies every candidate's direction and then rejects every one of them on
+# distance, which is the real finding: the ladder's functional-rate sweep does
+# not contain an admissible step size under a sound step rule, and the ladder
+# only appeared to work because it shortened the step in parameter space
+# without re-measuring what that did to the direction.
+#
+# This configuration changes exactly one thing -- the functional rate sweep --
+# and documents the measurement that motivates it inline below.
+
+run:
+  name: nonlinear_primary_600p_N1024
+  results_dir: results
+  save_plot: false
+  show_plot: false
+
+# Preserved exactly from family_ladder_N1024.yaml (N = 16 * 64 = 1024).
+data:
+  kind: smooth_sin
+  in_features: 4
+  out_features: 1
+  train_batches: 16
+  validation_batches: 16
+  test_batches: 128
+  batch_size: 64
+  train_seed: 0
+  validation_seed: 2
+  test_seed: 1
+  active_features: 3
+  frequency: 1.5
+  phase_shift: 0.5
+  interaction_strength: 0.25
+  linear_strength: 0.1
+
+# Required initial hidden architecture: 2-2-2.
+model:
+  hidden_size: 2
+  number_hidden_layers: 3
+  model_seed: 0
+
+training:
+  method: fgd_approx
+  epochs: 60
+  accuracy_tolerance: 0.1
+  gradient_clip_norm:
+  log_every: 1
+  device: auto
+
+# Rebuilt after structural growth. Candidate optimization is configured below
+# and always uses AdamW independently of this outer optimizer.
+optimizer:
+  name: sgd
+  learning_rate: 0.01
+  momentum: 0.0
+  weight_decay: 0.0
+  nesterov: false
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+lr_scheduler:
+  name: cosineannealing
+  t_max: 50
+  eta_min: 0.0
+  restart_on_growth: true
+
+fgd_approx:
+  family_order:
+    - nonlinear
+  functional_loss: mse
+  rel_error_threshold: 0.5
+  # The whole N=1024 training set, exactly as the ladder probes it.
+  probe_batches: 16
+  learning_rate_policy: theory_interval
+  theory_smoothness_constant: 2.0
+  theory_alpha: 1.0
+  theory_beta: 1.0
+  theory_mu: 2.0
+  theory_loss_star: 0.0
+  theory_lr_safety: 0.95
+  theory_lr_initial: 0.01
+  theory_lr_min: 1.0e-5
+  local_acceptance_conditions: true
+  eps: 1.0e-12
+
+  # A failed nonlinear ladder directly requests one bounded structural event.
+  certify_max_growths: 200
+  max_total_parameters: 600
+  growth_where: expressivity_bottleneck
+  growth_selection: unified_expansion
+  growth_function_preserving: true
+  growth_preservation_tolerance: 1.0e-6
+  growth_compute_delta: false
+  tiny_use_covariance: true
+  tiny_alpha_zero: false
+  tiny_omega_zero: false
+  tiny_use_projection: true
+  tiny_ignore_singular_values: false
+  tiny_use_fisher: false
+  tiny_maximum_added_neurons: 1
+  tiny_numerical_threshold: 1.0e-6
+  tiny_statistical_threshold: 1.0e-3
+
+  # Existing nonlinear plateau support; disabled to retain the full configured
+  # inner budget unless explicitly enabled in a follow-up experiment.
+  certify_family_plateau_stop: false
+  certify_family_plateau_tol: 0.002
+
+parametric_gd:
+  optimizer: adamw
+
+  # --- Ladder-parity candidate generation ---
+  # 400 FULL-BATCH AdamW steps on the 1024-example train probe. The original
+  # nonlinear-only config spent its budget on 64-example minibatch steps, so
+  # "256" bought 16k example-gradients where the ladder's "400" buys 409,600 --
+  # and the logged cosine was still climbing monotonically with the budget at
+  # the largest setting, i.e. every candidate was cut off mid-optimization.
+  inner_step_unit: probe
+  inner_steps: [400]
+  inner_learning_rate: 0.01
+  candidate_objective: sum
+  candidate_train_mode: true
+
+  # DESCENDING sweep, and the one place this configuration departs from the
+  # ladder. Justification, MEASURED on this task at parity settings:
+  #
+  # The ladder's [1, 2, 4, 8] all certify their DIRECTION comfortably
+  # (cos 0.96-0.97, eps 0.22-0.29) and all fail on DISTANCE: the realized
+  # secant rate eta* = <Delta, r>/|r|^2 comes out 0.93 / 1.86 / 3.74 / 7.25
+  # against a Lemma 3.5 bound of ~0.32 at those eps. The ladder never noticed
+  # because it shortened the step by scaling PARAMETERS -- and that is exactly
+  # what does not work: re-measuring the interpolations gives
+  #
+  #     alpha    1.0     0.5     0.25    0.125
+  #     cos      0.969   0.640   0.523   0.476
+  #
+  # so the direction is destroyed long before the distance is admissible.
+  #
+  # The functional target rate is the sound control. Sweeping eta_f down,
+  # eta* tracks it linearly (0.60 / 0.30 / 0.17 / 0.077 / 0.036 at
+  # eta_f = 1 / 0.5 / 0.25 / 0.125 / 0.0625) while the cosine stays flat --
+  # a clone ASKED for a short displacement realises a short one in the same
+  # direction, whereas a clone asked for a long one and then halved in
+  # parameter space realises something else entirely.
+  #
+  # Descending order keeps the ladder's intent: accept the LONGEST step that
+  # certifies, now measured on the step actually taken.
+  # Extended DOWNWARD. MEASURED at structure (4,5,11): eps has an interior
+  # optimum in eta_f -- 0.409 / 0.276 / 0.257 / 0.358 at eta_f 1 / 0.5 / 0.25 /
+  # 0.125 -- and the admissible steps live at the bottom of the grid:
+  #   eta_f 0.25   eps 0.2572  eta* 0.2283 < bound 0.3047   ADMISSIBLE
+  #   eta_f 0.125  eps 0.3583  eta* 0.1060 < bound 0.1568   ADMISSIBLE
+  # The previous grid stopped at 0.25, so on structures where eps came out
+  # nearer 0.40 (bound 0.10) it had nothing short enough left to offer.
+  functional_learning_rates: [1.0, 0.5, 0.25, 0.125, 0.0625]
+
+  # ...and then STOP guessing. A fixed grid cannot be placed correctly in
+  # advance, because the rate Lemma 3.5 admits depends on the eps the clone
+  # happens to reach, which is not known until it is trained. MEASURED here:
+  # eta_f 0.25 reaches eps 0.4045 (bound 0.1056) while eta_f 0.0625 reaches
+  # eps 0.4779 (bound 0.0215) -- the target moves as fast as the guess. Two
+  # retries train a candidate at theory_lr_safety * eta_bar(best eps) and
+  # certify it on its own terms; the second uses the eps the first achieved.
+  adaptive_rate_retries: 1
+
+  # torch's AdamW default; the ladder constructs AdamW(params, lr=...) and
+  # takes it. No parameter penalty and no clipping, also as the ladder does.
+  weight_decay: 0.01
+  parameter_penalty: 0.0
+  gradient_clip_norm:
+
+  min_cosine: 0.9
+
+  # --- Certificate and step ---
+  # Train and certify on the same probe, as the ladder does. Validation stays
+  # the transactional control, so a generalization failure still rejects the
+  # step -- but the DIRECTIONAL guarantee is not silently restated on a split
+  # the step was not defined on.
+  certificate_split: train
+  transactional_split: validation
+  certification_batches:
+
+  # The committed step is still re-certified -- that is the correctness
+  # property, not an optimization -- but the grid is just alpha = 1, because
+  # the measurement above shows interpolation never produces an admissible
+  # step here: it loses the direction faster than it loses the distance. The
+  # distance search lives in the eta_f sweep, where shortening the request
+  # keeps the direction. A longer grid only buys certification passes that
+  # are known to fail; it stays configurable for tasks where curvature is
+  # milder.
+  alpha_grid: [1.0]
+  alpha_policy: largest_certified
+
+  # Direction, plus REAL measured descent on the transactional split -- no
+  # theoretical length bound. MEASURED, this is the bar that separates the two
+  # failure modes:
+  #   direction_only   accepted eta* ~0.75 steps whose measured descent was
+  #                    -1477, -8866, -39742 and diverged 0.153 -> 27.70;
+  #   measured_descent rejects exactly those, and with the ladder's [1,2,4,8]
+  #                    sweep that leaves nothing, so it never steps at all.
+  # It needs the descending sweep BELOW to have short candidates to accept.
+  acceptance_rule: measured_descent
+
+scaling_line_search:
+  method: golden_section
+  min_value: 0.0
+  max_value: 1.0
+  iterations: 12
+  tolerance: 0.001
+
+growth_schedule:
+  enabled: true
+  every: 100
+  first_epoch: 50
+  layer_policy: round_robin
+
+wandb:
+  enabled: false
+  project: stable-tiny
+  entity:
+  run_name:
+  group: nonlinear-primary-certified-n1024-2x2x2
+  job_type: train
+  tags: [fgd_approx, nonlinear, parity, certified_growth, smooth_sin_tiny, from_2x2x2]
+  notes: Nonlinear primary, certified distance via the eta_f sweep
+  mode: disabled
+  dir: results
+  log_code: false
