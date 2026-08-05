@@ -477,6 +477,10 @@ def _section_dataclass(
             values["functional_learning_rates"] = tuple(
                 float(value) for value in values["functional_learning_rates"] or ()
             )
+        if "alpha_grid" in values:
+            values["alpha_grid"] = tuple(
+                float(value) for value in values["alpha_grid"] or ()
+            )
 
     return section_type(**values)
 
