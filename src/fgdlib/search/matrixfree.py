@@ -1,5 +1,27 @@
 """A matrix-free tangent direction, for use as a STALL fallback.
 
+READ THIS FIRST. This is an APPROXIMATION of the tangent family, not a
+cheaper route to the same answer, and the difference is not a rounding
+detail. The tangent decides on the full spectrum of ``J``; anything that
+does not form ``J`` sees a Krylov subspace of dimension ``k``, and while
+``k < rank(J)`` the reduced geometry cannot see the directions outside
+``span(U)``. The projection therefore looks BETTER than it is:
+
+    MEASURED at P=25, k=24:  reduced eps 0.8104  vs  true eps 0.8779
+
+7.7% low. The bias is one-sided and it is on the unsafe side -- an eps that
+is too small certifies a direction that does not deserve it. Two guards
+follow from that and are not optional: ``k`` is capped at ``P`` (past that
+the extra dimensions are pure noise and the same bias got much worse, 0.8097
+at k=48), and the direction this module returns is a PROPOSAL whose realised
+displacement the caller must re-certify. The certificate that gates a step is
+always measured on what was actually applied, never on ``eps`` from here.
+
+Equality with the tangent is reachable only at ``k = rank(J)``, which
+restores the cost this module exists to avoid. The trade is deliberate;
+do not describe the result as "the tangent, solved differently".
+
+
 The nonlinear primary family stalls in a characteristic way: after a few
 accepted steps the model fits well, the residual ``r`` becomes small, and the
 clone's fit residual ``e`` -- which does not shrink with it -- dominates
