@@ -150,10 +150,12 @@ parametric_gd:
   inner_steps: [1600]
 
   # --- Matrix-free tangent solver ---
-  # 50 iterations agree with the exact Jacobian to 2.2e-03 relative at
-  # damping 1e-2 -- far inside the margin that matters against a 0.5 bar --
-  # and cost a quarter of what 200 do.
-  cg_iterations: 50
+  # An UPPER BOUND on the Krylov dimension, not a cost. The
+  # bidiagonalization stops at the numerical rank of J as seen from r --
+  # MEASURED 41 at P=106 -- and iterations past that point are free, so
+  # there is nothing to buy by keeping this tight. Whatever k it reaches
+  # serves the entire damping grid at once.
+  cg_iterations: 200
   cg_tolerance: 1.0e-10
   step_backoff: [1.0, 0.5, 0.25, 0.125]
   inner_learning_rate: 0.01
