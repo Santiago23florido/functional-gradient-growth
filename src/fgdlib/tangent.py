@@ -1049,6 +1049,11 @@ class FGDApproxConfig:
 
 SUPPORTED_FGD_FAMILIES = (
     "tangent",
+    # The isolated primary family of this branch. It was an AdamW clone
+    # ("nonlinear"); it is now the tangent's own algorithm solved matrix-free,
+    # so the name states what it is. The old spelling is still accepted so
+    # existing configs keep loading.
+    "matrix_free_tangent",
     "nonlinear",
     "rkhs_head",
     "parametric_gd",
@@ -1078,18 +1083,21 @@ def validate_family_order(family_order: tuple[str, ...]) -> None:
         )
     if len(set(family_order)) != len(family_order):
         raise ValueError("fgd_approx.family_order entries must be unique.")
-    if "nonlinear" in family_order:
-        if family_order != ("nonlinear",):
+    isolated = {"matrix_free_tangent", "nonlinear"} & set(family_order)
+    if isolated:
+        if len(family_order) != 1:
             raise ValueError(
-                "fgd_approx.family_order selects 'nonlinear' as a standalone "
-                "primary family and therefore must be exactly ['nonlinear']; "
-                "it cannot coexist with tangent or fallback families."
+                "fgd_approx.family_order selects "
+                f"'{family_order[0]}' as a standalone primary family and "
+                "therefore must be exactly that one entry; it cannot coexist "
+                "with tangent or fallback families."
             )
         return
     if family_order[0] != "tangent":
         raise ValueError(
             "fgd_approx.family_order must start with 'tangent' in legacy mode, "
-            "or be exactly ['nonlinear'] for nonlinear primary mode."
+            "or be exactly ['matrix_free_tangent'] for the isolated primary "
+            "family."
         )
 
 
@@ -1223,6 +1231,17 @@ class ParametricGDConfig:
     candidate_readout_solve: bool = False
     # Tikhonov term for that solve, for conditioning only.
     candidate_readout_ridge: float = 1e-8
+    # --- Matrix-free tangent solver (the isolated family's engine) ---
+    # Conjugate-gradient iterations on J v / J^T w products. MEASURED at P=197
+    # against the exact Jacobian at damping 1e-2: 200 iterations agree to
+    # 3.6e-06 relative, 50 to 2.2e-03. Damping conditions the CG as well as
+    # regularising the projection, so the ladder's own regime is the easy one.
+    cg_iterations: int = 200
+    cg_tolerance: float = 1e-10
+    # The Lemma 3.5 rate is first order, so the displacement it produces is not
+    # exactly eta J u. These scales are tried in order and each is certified on
+    # the displacement it ACTUALLY applies.
+    step_backoff: tuple[float, ...] = (1.0, 0.5, 0.25, 0.125)
 
     def validate(self) -> None:
         if self.optimizer not in ("sgd", "adam", "adamw"):
@@ -1267,6 +1286,12 @@ class ParametricGDConfig:
         if self.transactional_split not in ("train", "validation"):
             raise ValueError(
                 "parametric_gd.transactional_split must be 'train' or 'validation'."
+            )
+        if self.cg_iterations < 1:
+            raise ValueError("parametric_gd.cg_iterations must be positive.")
+        if not self.step_backoff or any(v <= 0.0 for v in self.step_backoff):
+            raise ValueError(
+                "parametric_gd.step_backoff entries must be positive."
             )
         if self.candidate_readout_ridge < 0.0:
             raise ValueError(

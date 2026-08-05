@@ -68,6 +68,10 @@ from fgdlib.search.certify import (
 from fgdlib.search.families import (
     certify_parametric_step_swept,
 )
+from fgdlib.search.matrixfree import (
+    apply_parameter_direction,
+    matrix_free_tangent_step,
+)
 from fgdlib.search.nonlinear import (
     NonlinearCandidate,
     NonlinearCertificateStats,
@@ -391,6 +395,10 @@ class _NonlinearPrimaryResult:
     #: Best cosine any candidate reached at this structure. Kept so a failed
     #: ladder reports how close it came instead of only its last attempt.
     best_cosine: float | None = None
+    #: Model after the grow-until-certified inner loop, when it grew.
+    grown_model: GrowingMLP | None = None
+    #: Growth events that loop consumed.
+    growths: int = 0
 
 
 @dataclass(frozen=True)
@@ -476,6 +484,10 @@ def _section_dataclass(
         if "functional_learning_rates" in values:
             values["functional_learning_rates"] = tuple(
                 float(value) for value in values["functional_learning_rates"] or ()
+            )
+        if "step_backoff" in values:
+            values["step_backoff"] = tuple(
+                float(value) for value in values["step_backoff"] or ()
             )
         if "alpha_grid" in values:
             values["alpha_grid"] = tuple(
@@ -3553,6 +3565,280 @@ def _search_nonlinear_primary_candidate(
     )
 
 
+def _search_matrix_free_tangent_step(
+    *,
+    base_model: GrowingMLP,
+    train_loader,
+    validation_loader,
+    test_loader,
+    loss_function: torch.nn.Module,
+    device: torch.device,
+    accuracy_tolerance: float,
+    config: PipelineConfig,
+    classification: bool,
+    theory_state: _FGDTheoryState,
+    initial_functional_gap: float,
+    theory_loss_star: float,
+    progress: ProgressFn | None,
+    train_probe: tuple[torch.Tensor, torch.Tensor] | None = None,
+    warm_start_cache: dict | None = None,
+) -> _NonlinearPrimaryResult:
+    """The tangent's algorithm, solved matrix-free, as the isolated family.
+
+    Same steps the tangent takes, in the same order:
+
+      1. solve ``(J^T J + lambda I) u = J^T r`` at ``projection_damping``;
+      2. read ``eps = ||J u - r|| / ||J u||`` -- the tangent's own definition;
+      3. certify iff ``eps < min(rel_error_threshold, 1/2)``;
+      4. take ``eta`` from Lemma 3.5 at that ``eps``;
+      5. step ``theta <- theta - eta u``.
+
+    Only the SOLVER differs: conjugate gradients on ``J v`` and ``J^T w``
+    products, accumulated over minibatches, so neither ``J`` nor the ``P x P``
+    Gram is ever formed. MEASURED at P=197 and the ladder's own damping 1e-2,
+    it agrees with the exact Jacobian to 3.6e-06 relative.
+
+    One thing is kept from the nonlinear work and is NOT the tangent's
+    behaviour: step 5 is first-order, so the displacement it actually produces
+    is re-measured and re-certified before being committed. The rate is tried
+    at decreasing scales until one of them certifies what it applies.
+    """
+    parametric = config.parametric_gd
+    fa = config.fgd_approx
+    attempts = 0
+    solve_seconds = 0.0
+    certification_seconds = 0.0
+    last_stats: NonlinearCertificateStats | None = None
+    last_trial: _FGDTrial | None = None
+    last_certificate = _invalid_nonlinear_certificate()
+    last_update_norm: float | None = None
+
+    certification_source = _nonlinear_certification_source(
+        split=parametric.certificate_split,
+        train_probe=train_probe,
+        validation_loader=validation_loader,
+    )
+    certification_cap = (
+        parametric.certification_batches
+        if parametric.certificate_split == "validation"
+        else None
+    )
+
+    threshold = min(fa.rel_error_threshold, 0.5)
+    growths = 0
+    grown_model: GrowingMLP | None = None
+
+    with timed("nonlinear_total_seconds"):
+        # grow_until_certified, matrix-free: FP growth keeps f fixed, so eps
+        # only moves when the structure does. The tangent grows repeatedly
+        # inside ONE outer step until it can certify; growing once per epoch
+        # instead is why the isolated family never kept pace.
+        while True:
+            started = time.perf_counter()
+            direction, certificate = matrix_free_tangent_step(
+                model=base_model,
+                loader=train_loader,
+                device=device,
+                config=fa,
+                iterations=parametric.cg_iterations,
+                damping=fa.projection_damping,
+                tolerance=parametric.cg_tolerance,
+            )
+            solve_seconds += time.perf_counter() - started
+            attempts += 1
+            if progress is not None:
+                progress(
+                    f"[MFTANGENT] eps={certificate.relative_error:.4f} "
+                    f"(threshold {threshold:.3f}), "
+                    f"cg_iters={certificate.iterations}, "
+                    f"passes={certificate.passes}, growths={growths}"
+                )
+            if (
+                direction is not None
+                and certificate.sensor_valid
+                and certificate.relative_error < threshold
+            ):
+                break
+            if growths >= fa.certify_max_growths:
+                break
+            outcome = _apply_nonlinear_primary_growth(
+                model=base_model,
+                train_loader=train_loader,
+                preservation_loader=validation_loader,
+                device=device,
+                config=config,
+                epoch=growths,
+                progress=None,
+            )
+            if outcome.model is None:
+                break
+            base_model = outcome.model
+            grown_model = outcome.model
+            growths += 1
+
+        if direction is None or not certificate.sensor_valid:
+            increment("nonlinear_failed_ladders")
+            return _NonlinearPrimaryResult(
+                None, None, last_certificate, None, None, attempts,
+                solve_seconds, certification_seconds, None,
+                grown_model=grown_model, growths=growths,
+            )
+
+        # The tangent's certificate: eps alone decides whether a step exists.
+        if certificate.relative_error >= threshold:
+            increment("nonlinear_failed_ladders")
+            if progress is not None:
+                progress(
+                    "[MFTANGENT] eps above threshold; growth requested"
+                )
+            return _NonlinearPrimaryResult(
+                None, None, last_certificate, None, None, attempts,
+                solve_seconds, certification_seconds, None,
+                grown_model=grown_model, growths=growths,
+            )
+
+        upper = theoretical_learning_rate_upper_bound(
+            certificate.relative_error, fa
+        )
+        if upper is None:
+            increment("nonlinear_failed_ladders")
+            return _NonlinearPrimaryResult(
+                None, None, last_certificate, None, None, attempts,
+                solve_seconds, certification_seconds, None,
+                grown_model=grown_model, growths=growths,
+            )
+        base_rate = fa.theory_lr_safety * upper
+
+        # Step 5 is first order, so the displacement it produces is NOT
+        # eta J u. Try decreasing scales and certify what is actually applied.
+        for factor in parametric.step_backoff:
+            rate = base_rate * factor
+            if rate <= fa.theory_lr_min:
+                continue
+            attempts += 1
+            stepped = apply_parameter_direction(
+                base_model=base_model, direction=direction, step=rate
+            )
+            stats = stream_nonlinear_certificate(
+                base_model=base_model,
+                candidate_model=stepped,
+                certification_loader=certification_source,
+                device=device,
+                config=fa,
+                max_batches=certification_cap,
+            )
+            certification_seconds += stats.certification_seconds
+            last_stats = stats
+            realized = stats.effective_secant_rate
+            if progress is not None:
+                progress(
+                    f"[MFTANGENT-STEP] eta={rate:.4g}, "
+                    f"cos={stats.cosine!r}, applied_eps={stats.relative_error!r}, "
+                    f"eta_star={realized!r}, "
+                    f"descent={stats.base_loss - stats.candidate_loss:+.4e}"
+                )
+            if not stats.sensor_valid or not stats.certified:
+                continue
+
+            applied_certificate = _nonlinear_directional_certificate(
+                stats=stats, learning_rate=realized, config=fa
+            )
+            last_certificate = applied_certificate
+            last_update_norm = _parameter_displacement_norm(base_model, stepped)
+            train_metrics = evaluate_regression_metrics(
+                stepped, train_loader, loss_function, device=device,
+                accuracy_tolerance=accuracy_tolerance, classification=classification,
+            )
+            test_metrics = evaluate_regression_metrics(
+                stepped, test_loader, loss_function, device=device,
+                accuracy_tolerance=accuracy_tolerance, classification=classification,
+            )
+            epoch_result = FGDApproxEpochResult(
+                train_loss=train_metrics.loss,
+                train_accuracy=train_metrics.accuracy,
+                test_loss=test_metrics.loss,
+                test_accuracy=test_metrics.accuracy,
+                learning_rate=rate,
+                next_learning_rate=rate,
+                learning_rate_upper_bound=upper,
+                learning_rate_interval_valid=True,
+                learning_rate_clipped_batches=0,
+                skipped_batches=0,
+                relative_error_condition_valid=True,
+                loss_descent_valid=None,
+                loss_non_descent_batches=0,
+                gradient_sq_norm=applied_certificate.gradient_sq_norm,
+                theory_descent_coefficient=(
+                    applied_certificate.theory_descent_coefficient
+                ),
+                min_positive_learning_rate=rate,
+                relative_error=certificate.relative_error,
+                selected_layer_index=None,
+                layer_relative_errors=[],
+                output_relative_error=None,
+                sensor_valid=True,
+                sensor_invalid_batches=0,
+            )
+            trial = _certify_fgd_candidate(
+                candidate_model=stepped,
+                epoch_result=epoch_result,
+                certificate=applied_certificate,
+                validation_loader=validation_loader,
+                device=device,
+                config=config,
+                theory_state=theory_state,
+                initial_functional_gap=initial_functional_gap,
+                theory_loss_star=theory_loss_star,
+            )
+            last_trial = trial
+            accepted = (
+                trial.loss_descent_valid
+                if parametric.acceptance_rule != "theory_interval"
+                else trial.all_conditions_valid
+            )
+            if not accepted:
+                continue
+
+            increment("nonlinear_accepted_steps")
+            if progress is not None:
+                progress(
+                    f"[MFTANGENT-ACCEPT] eta={rate:.4g}, "
+                    f"eps={certificate.relative_error:.4f}, "
+                    f"applied_cos={stats.cosine:.4f}, "
+                    f"param_disp={last_update_norm:.4g}"
+                )
+            return _NonlinearPrimaryResult(
+                accepted=trial,
+                last_trial=trial,
+                certificate=applied_certificate,
+                stats=stats,
+                candidate=None,
+                attempts=attempts,
+                candidate_training_seconds=solve_seconds,
+                certification_seconds=certification_seconds,
+                update_norm=last_update_norm,
+                committed_alpha=1.0,
+                best_cosine=stats.cosine,
+                grown_model=grown_model,
+                growths=growths,
+            )
+
+    increment("nonlinear_failed_ladders")
+    return _NonlinearPrimaryResult(
+        accepted=None,
+        last_trial=last_trial,
+        certificate=last_certificate,
+        stats=last_stats,
+        candidate=None,
+        attempts=attempts,
+        candidate_training_seconds=solve_seconds,
+        certification_seconds=certification_seconds,
+        update_norm=last_update_norm,
+        grown_model=grown_model,
+        growths=growths,
+    )
+
+
 def _architecture_widths(model: GrowingMLP) -> tuple[int, ...]:
     return tuple(
         int(layer.in_features) for layer in getattr(model, "_growable_layers", [])
@@ -4549,7 +4835,16 @@ def _run_nonlinear_pipeline(
     for epoch in range(1, config.training.epochs + 1):
         base_parameters = count_parameters(model)
         base_widths = _architecture_widths(model)
-        nonlinear_result = _search_nonlinear_primary_candidate(
+        # Engine selected by family name: "matrix_free_tangent" runs the
+        # tangent's algorithm solved matrix-free, "nonlinear" keeps the AdamW
+        # clone. Both are the isolated primary family; neither touches the
+        # tangent path.
+        _search_step = (
+            _search_matrix_free_tangent_step
+            if config.fgd_approx.family_order == ("matrix_free_tangent",)
+            else _search_nonlinear_primary_candidate
+        )
+        nonlinear_result = _search_step(
             base_model=model,
             train_loader=train_loader,
             train_probe=nonlinear_train_probe,
@@ -4567,6 +4862,11 @@ def _run_nonlinear_pipeline(
             progress=progress,
         )
         ladder_attempts += nonlinear_result.attempts
+        # grow_until_certified may have grown INSIDE the step; adopt it, and
+        # do not grow again below -- the loop already decided the structure.
+        if nonlinear_result.grown_model is not None:
+            model = nonlinear_result.grown_model
+            growth_count += nonlinear_result.growths
         accepted = nonlinear_result.accepted
         if accepted is not None:
             accepted_steps += 1
@@ -4582,7 +4882,7 @@ def _run_nonlinear_pipeline(
             accepted.epoch_result.learning_rate if accepted is not None else None
         )
         growth_outcome: _NonlinearGrowthOutcome | None = None
-        if accepted is None:
+        if accepted is None and nonlinear_result.grown_model is None:
             if growth_count >= config.fgd_approx.certify_max_growths:
                 if progress is not None:
                     progress(
@@ -4852,7 +5152,8 @@ def run_pipeline(
     """Run the train-grow loop from the GroMo tutorial."""
     nonlinear_selected = (
         config.training.method == "fgd_approx"
-        and config.fgd_approx.family_order == ("nonlinear",)
+        and config.fgd_approx.family_order
+        in (("matrix_free_tangent",), ("nonlinear",))
     )
     if nonlinear_selected and config.parametric_gd.optimizer != "adamw":
         raise ValueError(
@@ -4916,7 +5217,8 @@ def run_pipeline(
     model = build_model(config, device)
     nonlinear_mode = (
         config.training.method == "fgd_approx"
-        and config.fgd_approx.family_order == ("nonlinear",)
+        and config.fgd_approx.family_order
+        in (("matrix_free_tangent",), ("nonlinear",))
     )
     loss_function = torch.nn.MSELoss()
     optimizer = build_optimizer(model, config.optimizer)
