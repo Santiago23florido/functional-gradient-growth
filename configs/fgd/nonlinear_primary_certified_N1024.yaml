@@ -147,7 +147,16 @@ parametric_gd:
   #
   # Descending order keeps the ladder's intent: accept the LONGEST step that
   # certifies, now measured on the step actually taken.
-  functional_learning_rates: [1.0, 0.5, 0.25, 0.125, 0.0625]
+  functional_learning_rates: [1.0, 0.5, 0.25]
+
+  # ...and then STOP guessing. A fixed grid cannot be placed correctly in
+  # advance, because the rate Lemma 3.5 admits depends on the eps the clone
+  # happens to reach, which is not known until it is trained. MEASURED here:
+  # eta_f 0.25 reaches eps 0.4045 (bound 0.1056) while eta_f 0.0625 reaches
+  # eps 0.4779 (bound 0.0215) -- the target moves as fast as the guess. Two
+  # retries train a candidate at theory_lr_safety * eta_bar(best eps) and
+  # certify it on its own terms; the second uses the eps the first achieved.
+  adaptive_rate_retries: 2
 
   # torch's AdamW default; the ladder constructs AdamW(params, lr=...) and
   # takes it. No parameter penalty and no clipping, also as the ladder does.

@@ -3179,6 +3179,12 @@ def _search_nonlinear_primary_candidate(
     last_certificate = _invalid_nonlinear_certificate()
     last_update_norm: float | None = None
     best_cosine = -2.0
+    # Best (smallest) relative error any candidate reached here. It determines
+    # the Lemma 3.5 bound, and therefore the functional rate worth asking for.
+    best_relative_error: float | None = None
+    pending_rates = [float(rate) for rate in parametric.functional_learning_rates]
+    tried_rates: set[float] = set()
+    adaptive_retries_left = int(parametric.adaptive_rate_retries)
 
     certification_source = _nonlinear_certification_source(
         split=parametric.certificate_split,
@@ -3194,7 +3200,11 @@ def _search_nonlinear_primary_candidate(
     )
 
     with timed("nonlinear_total_seconds"):
-        for functional_learning_rate in parametric.functional_learning_rates:
+        while pending_rates:
+            functional_learning_rate = pending_rates.pop(0)
+            if functional_learning_rate in tried_rates:
+                continue
+            tried_rates.add(functional_learning_rate)
             for inner_steps in parametric.inner_steps:
                 attempts += 1
                 generated = train_nonlinear_candidate(
@@ -3247,6 +3257,11 @@ def _search_nonlinear_primary_candidate(
                 last_stats = candidate_stats
                 if candidate_stats.cosine is not None:
                     best_cosine = max(best_cosine, candidate_stats.cosine)
+                if candidate_stats.relative_error is not None and (
+                    best_relative_error is None
+                    or candidate_stats.relative_error < best_relative_error
+                ):
+                    best_relative_error = candidate_stats.relative_error
                 if progress is not None:
                     cosine = (
                         "n/a"
@@ -3422,6 +3437,33 @@ def _search_nonlinear_primary_candidate(
                         committed_alpha=step.alpha,
                         best_cosine=(best_cosine if best_cosine > -2.0 else None),
                     )
+
+            # The fixed grid cannot be placed correctly in advance: the rate
+            # Lemma 3.5 admits depends on the eps the clone happens to reach,
+            # which is only known once it is trained. Having measured it, ask
+            # for exactly that distance instead of guessing again.
+            if not pending_rates and adaptive_retries_left > 0:
+                adaptive_retries_left -= 1
+                bound = (
+                    theoretical_learning_rate_upper_bound(
+                        best_relative_error,
+                        config.fgd_approx,
+                    )
+                    if best_relative_error is not None
+                    else None
+                )
+                if bound is not None:
+                    derived = config.fgd_approx.theory_lr_safety * bound
+                    if derived > config.fgd_approx.theory_lr_min and (
+                        derived not in tried_rates
+                    ):
+                        if progress is not None:
+                            progress(
+                                f"[NONLINEAR-ADAPT] best eps={best_relative_error:.4f} "
+                                f"admits eta <= {bound:.4g}; retrying at "
+                                f"eta_f={derived:.4g}"
+                            )
+                        pending_rates.append(derived)
 
     if progress is not None:
         progress(

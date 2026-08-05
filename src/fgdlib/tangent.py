@@ -1161,6 +1161,18 @@ class ParametricGDConfig:
     #                          functional-loss decrease
     #   "full_only"         -- only alpha = 1, and only when it certifies
     alpha_policy: str = "largest_certified"
+    # Extra candidates trained at a functional rate DERIVED from the best
+    # relative error the fixed sweep achieved, rather than guessed in advance.
+    #
+    # A well-fitted clone realises eta* ~ eta_f, while Lemma 3.5 admits only
+    # eta <= 2(1 - 2 eps)/(L_s(1 + 2 eps)) -- a bound that depends on the eps
+    # the clone happens to reach, which is not known until it has been trained.
+    # A fixed grid therefore cannot be placed correctly in advance: MEASURED on
+    # N=1024, eta_f = 0.25 reaches eps 0.4045 whose bound is 0.1056, and
+    # eta_f = 0.0625 reaches eps 0.4779 whose bound is 0.0215 -- the target
+    # moves as fast as the guess does. Each retry trains one more candidate at
+    # theory_lr_safety * eta_bar(best eps) and certifies it on its own terms.
+    adaptive_rate_retries: int = 0
 
     def validate(self) -> None:
         if self.optimizer not in ("sgd", "adam", "adamw"):
@@ -1205,6 +1217,10 @@ class ParametricGDConfig:
         if self.transactional_split not in ("train", "validation"):
             raise ValueError(
                 "parametric_gd.transactional_split must be 'train' or 'validation'."
+            )
+        if self.adaptive_rate_retries < 0:
+            raise ValueError(
+                "parametric_gd.adaptive_rate_retries must be non-negative."
             )
         if any(not 0.0 < value <= 1.0 for value in self.alpha_grid):
             raise ValueError("parametric_gd.alpha_grid entries must lie in (0, 1].")
