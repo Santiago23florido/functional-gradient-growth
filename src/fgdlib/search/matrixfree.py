@@ -81,6 +81,14 @@ def _axpy(a: list, alpha, b: list) -> list:
     return [x + alpha * y for x, y in zip(a, b)]
 
 
+def _norm(vectors: list) -> float:
+    return math.sqrt(sum(float(torch.sum(v * v)) for v in vectors))
+
+
+def _scaled(vectors: list, factor: float) -> list:
+    return [v * factor for v in vectors]
+
+
 def matrix_free_tangent_direction(
     *,
     model: torch.nn.Module,
@@ -251,6 +259,9 @@ class MatrixFreeCertificate:
     iterations: int
     passes: int
     sensor_valid: bool
+    #: The damping the sweep settled on. Free telemetry now that the whole
+    #: grid is evaluated on one shared subspace.
+    damping: float = 0.0
 
 
 def _batch_graphs(model, loader, device, config, max_batches):
@@ -282,6 +293,155 @@ def _batch_graphs(model, loader, device, config, max_batches):
     return graphs
 
 
+@dataclass(frozen=True)
+class _Bidiagonalization:
+    """``J V_k = U_{k+1} B_k`` with ``U_{k+1} e_1 = r / ||r||``.
+
+    The whole point of carrying this object instead of a single solution: the
+    Krylov subspace ``K_k(J^T J, J^T r)`` DOES NOT DEPEND ON LAMBDA. Adding
+    ``lambda I`` shifts the spectrum, it does not rotate the subspace, so one
+    bidiagonalization serves the entire damping grid.
+    """
+
+    #: Orthonormal parameter-space basis, ``k`` entries of shape ``P``.
+    basis: list
+    #: ``B_k``, shape ``(rows, k)``, lower bidiagonal. Tiny.
+    bidiagonal: torch.Tensor
+    #: ``beta_1 = ||r||``. The right-hand side is ``beta_1 e_1``, exactly.
+    beta1: float
+    #: Golub-Kahan steps actually run.
+    steps: int
+
+
+def _golub_kahan(
+    *,
+    apply_j,
+    apply_jt,
+    residuals: list,
+    iterations: int,
+    floor: float,
+) -> _Bidiagonalization | None:
+    """Golub-Kahan bidiagonalization of ``J`` started at ``r``.
+
+    Costs ``2k + 1`` products and NO ``lambda``. Full reorthogonalization is
+    done against the stored bases: it is ``O(k^2 (P + NK))`` flops but zero
+    extra passes over the data, and without it the Lanczos vectors lose
+    orthogonality well before ``k = 50`` -- which would silently corrupt the
+    ``eps`` identity below, since that identity is exactly what orthonormality
+    buys.
+
+    Memory is ``O(k (P + NK))``. Linear in ``P``, which is the entire reason
+    this route exists: the exact Gram is ``O(P^2)``.
+    """
+    beta1 = _norm(residuals)
+    if not beta1 > floor:
+        return None
+    u = _scaled(residuals, 1.0 / beta1)
+    left = [u]
+
+    v = apply_jt(u)
+    alpha = _norm(v)
+    if not alpha > floor:
+        return None
+    v = _scaled(v, 1.0 / alpha)
+    basis = [v]
+    alphas = [alpha]
+    betas: list[float] = []
+    exact = False
+
+    for _ in range(max(1, iterations) - 1):
+        w = _axpy(apply_j(v), -alpha, u)
+        for previous in left:
+            w = _axpy(w, -float(_dot(w, previous)), previous)
+        beta = _norm(w)
+        if not beta > floor:
+            # Happy breakdown: J v_i lies in span(U_i), so the projection on
+            # this subspace is EXACT and there is nothing left to capture.
+            exact = True
+            break
+        u = _scaled(w, 1.0 / beta)
+        left.append(u)
+        betas.append(beta)
+
+        z = _axpy(apply_jt(u), -beta, v)
+        for previous in basis:
+            z = _axpy(z, -float(_dot(z, previous)), previous)
+        alpha = _norm(z)
+        if not alpha > floor:
+            break
+        v = _scaled(z, 1.0 / alpha)
+        basis.append(v)
+        alphas.append(alpha)
+
+    if not exact:
+        # Drop any trailing v whose beta was never computed: without it,
+        # J v_last is not representable in the retained U and the identity
+        # J V = U B would be a lie in the last column.
+        keep = len(betas)
+        if keep == 0:
+            return None
+        basis = basis[:keep]
+        alphas = alphas[:keep]
+        rows = keep + 1
+    else:
+        rows = len(alphas)
+
+    columns = len(alphas)
+    bidiagonal = torch.zeros(rows, columns, dtype=torch.float64)
+    for index, value in enumerate(alphas):
+        bidiagonal[index, index] = value
+    for index, value in enumerate(betas[:columns]):
+        if index + 1 < rows:
+            bidiagonal[index + 1, index] = value
+
+    return _Bidiagonalization(
+        basis=basis, bidiagonal=bidiagonal, beta1=beta1, steps=columns
+    )
+
+
+def _shifted_epsilon(
+    system: _Bidiagonalization, lam: float
+) -> tuple[float, float | None, float, torch.Tensor]:
+    """``eps``, ``cos`` and ``|J u|`` at one damping -- with no passes at all.
+
+    ``u_lambda = V_k y_lambda`` and ``J u_lambda = U_{k+1} B_k y_lambda``, so
+    because ``U`` is ORTHONORMAL and the right-hand side is ``beta_1 e_1``:
+
+        ||J u - r||  = ||B y - beta_1 e_1||
+        ||J u||      = ||B y||
+        <J u, r>     = beta_1 (B y)_1
+
+    Every quantity the certificate needs collapses to the ``(k+1) x k``
+    factor. These are not approximations of the projected ``eps``; they are
+    that ``eps``, evaluated exactly for the ``u`` that gets returned.
+    """
+    bidiagonal = system.bidiagonal
+    rows, columns = bidiagonal.shape
+    rhs = torch.zeros(rows, dtype=torch.float64)
+    rhs[0] = system.beta1
+
+    if lam > 0.0:
+        stacked = torch.cat(
+            [bidiagonal, math.sqrt(lam) * torch.eye(columns, dtype=torch.float64)]
+        )
+        padded = torch.cat([rhs, torch.zeros(columns, dtype=torch.float64)])
+    else:
+        stacked, padded = bidiagonal, rhs
+
+    solution = torch.linalg.lstsq(stacked, padded.unsqueeze(1)).solution.squeeze(1)
+    if not torch.isfinite(solution).all():
+        return float("inf"), None, 0.0, solution
+
+    predicted = bidiagonal @ solution
+    predicted_norm = float(torch.linalg.vector_norm(predicted))
+    if not predicted_norm > 0.0:
+        return float("inf"), None, 0.0, solution
+    gap = float(torch.linalg.vector_norm(predicted - rhs))
+    # <J u, r> = beta_1 (B y)_1 and ||r|| = beta_1, so the beta_1 cancels.
+    cosine = float(predicted[0]) / predicted_norm
+    return gap / predicted_norm, cosine, predicted_norm, solution
+
+
 def matrix_free_tangent_step(
     *,
     model: torch.nn.Module,
@@ -297,16 +457,19 @@ def matrix_free_tangent_step(
     """The tangent projection and its ``eps``, without ever forming ``J``.
 
     Algorithmically this IS the tangent family: solve
-    ``(J^T J + lambda I) u = J^T r`` at the configured ``lambda`` and report
-    ``eps = ||J u - r|| / ||J u||``. Only the SOLVER differs -- conjugate
-    gradients on matrix-vector products instead of a materialised Gram.
+    ``(J^T J + lambda I) u = J^T r`` and report ``eps = ||J u - r|| / ||J u||``
+    at the ``lambda`` that minimises it. Only the SOLVER differs -- a Golub-Kahan
+    bidiagonalization of matrix-vector products instead of a materialised Gram.
 
     MEASURED at P=197 against the exact Jacobian, at the ladder's own
     ``projection_damping = 1e-2``: 200 iterations agree to 5.2e-06 relative,
     50 iterations to 5.4e-03 -- both far inside the margin that matters against
     a threshold of 1/2. Damping helps twice over: it is the tangent's own
-    regularisation AND it conditions the CG, so the regime the ladder already
-    operates in is the easy one for this solver.
+    regularisation AND it conditions the iteration, so the regime the ladder
+    already operates in is the easy one for this solver.
+
+    Cost is ``2k + 1`` passes REGARDLESS of how many dampings are tried, because
+    the shifted systems share one Krylov subspace. Memory is ``O(k(P + NK))``.
     """
     increment("matrix_free_tangent_calls")
     was_training = model.training
@@ -352,49 +515,14 @@ def matrix_free_tangent_step(
                     float("inf"), None, 0.0, residual_norm, 0, passes, False
                 )
 
-            b = _jt(residuals)
-
-            def _solve(lam: float):
-                """CG at one damping, reusing the retained batch graphs."""
-                u_l = [torch.zeros_like(p) for p in parameters]
-                r_l = [value.clone() for value in b]
-                p_l = [value.clone() for value in r_l]
-                rs = _dot(r_l, r_l)
-                done = 0
-                for _ in range(max(1, iterations)):
-                    ap = _axpy(_jt(_j(p_l)), lam, p_l)
-                    den = _dot(p_l, ap)
-                    if not torch.isfinite(den) or float(den) <= 0.0:
-                        break
-                    a = rs / den
-                    u_l = _axpy(u_l, a, p_l)
-                    r_l = _axpy(r_l, -a, ap)
-                    rs_n = _dot(r_l, r_l)
-                    done += 1
-                    if float(torch.sqrt(rs_n)) <= tolerance * b_norm:
-                        break
-                    p_l = _axpy(r_l, rs_n / rs, p_l)
-                    rs = rs_n
-                return u_l, done
-
-            def _epsilon(u_l):
-                pred = _j(u_l)
-                psq = sum(float(torch.sum(a * a)) for a in pred)
-                if not psq > config.eps**2:
-                    return float("inf"), None, 0.0, pred
-                gap = sum(
-                    float(torch.sum((a - r) ** 2)) for a, r in zip(pred, residuals)
-                )
-                dt = sum(float(torch.sum(a * r)) for a, r in zip(pred, residuals))
-                pn = math.sqrt(psq)
-                return math.sqrt(gap) / pn, dt / (pn * residual_norm), pn, pred
-
-            u = [torch.zeros_like(p) for p in parameters]
-            r_cg = [value.clone() for value in b]
-            p_cg = [value.clone() for value in r_cg]
-            rs_old = _dot(r_cg, r_cg)
-            b_norm = float(torch.sqrt(_dot(b, b)))
-            if not b_norm > 0.0:
+            system = _golub_kahan(
+                apply_j=_j,
+                apply_jt=_jt,
+                residuals=residuals,
+                iterations=iterations,
+                floor=max(config.eps, tolerance * residual_norm),
+            )
+            if system is None:
                 return None, MatrixFreeCertificate(
                     float("inf"), None, 0.0, residual_norm, 0, passes, False
                 )
@@ -405,37 +533,49 @@ def matrix_free_tangent_step(
             # and never certifies, which is why a fixed-damping version looked
             # like the tangent could not step. It can; it just steps at a
             # different lambda.
+            #
+            # Sweeping it used to cost one full CG run PER lambda. It does not
+            # have to: every shifted system shares the Krylov subspace above,
+            # so the sweep is now a grid of (k+1) x k least squares with ZERO
+            # further passes over the data. MEASURED: the pass count stops
+            # depending on the grid size entirely.
             grid = damping_grid or (damping,)
-            performed = 0
-            best = float("inf")
+            relative_error = float("inf")
+            cosine = None
+            predicted_norm = 0.0
+            chosen = float(damping)
+            coefficients = None
             for lam in grid:
-                u_l, done = _solve(float(lam))
-                eps_l, _cos_l, _pn, _pred = _epsilon(u_l)
-                if eps_l < best:
-                    best = eps_l
-                    u = u_l
-                    performed = done
+                eps_l, cos_l, norm_l, y_l = _shifted_epsilon(system, float(lam))
+                if eps_l < relative_error:
+                    relative_error = eps_l
+                    cosine = cos_l
+                    predicted_norm = norm_l
                     chosen = float(lam)
+                    coefficients = y_l
 
-            if not all(torch.isfinite(value).all() for value in u):
+            if coefficients is None or not math.isfinite(relative_error):
                 return None, MatrixFreeCertificate(
-                    float("inf"), None, 0.0, residual_norm, performed, passes, False
+                    float("inf"), None, 0.0, residual_norm,
+                    system.steps, passes, False,
                 )
-
-            predicted = _j(u)
-            predicted_sq = sum(float(torch.sum(a * a)) for a in predicted)
-            gap_sq = sum(
-                float(torch.sum((a - r) ** 2)) for a, r in zip(predicted, residuals)
-            )
-            dot = sum(float(torch.sum(a * r)) for a, r in zip(predicted, residuals))
-            predicted_norm = math.sqrt(predicted_sq)
             if not predicted_norm > config.eps:
                 return None, MatrixFreeCertificate(
                     float("inf"), None, predicted_norm, residual_norm,
-                    performed, passes, False,
+                    system.steps, passes, False,
                 )
-            relative_error = math.sqrt(gap_sq) / predicted_norm
-            cosine = dot / (predicted_norm * residual_norm)
+
+            # u = V_k y, assembled only for the lambda that won.
+            u = [torch.zeros_like(p) for p in parameters]
+            for weight, vector in zip(coefficients.tolist(), system.basis):
+                u = _axpy(u, weight, vector)
+            if not all(torch.isfinite(value).all() for value in u):
+                return None, MatrixFreeCertificate(
+                    float("inf"), None, 0.0, residual_norm,
+                    system.steps, passes, False,
+                )
+
+            performed = system.steps
             direction = {
                 name: value
                 for (name, _), value in zip(model.named_parameters(), u)
@@ -451,4 +591,5 @@ def matrix_free_tangent_step(
         iterations=performed,
         passes=passes,
         sensor_valid=math.isfinite(relative_error),
+        damping=chosen,
     )
