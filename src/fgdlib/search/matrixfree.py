@@ -515,11 +515,19 @@ def matrix_free_tangent_step(
                     float("inf"), None, 0.0, residual_norm, 0, passes, False
                 )
 
+            # HARD CAP AT P. The Krylov subspace cannot exceed the parameter
+            # count, so any step past it is numerical noise -- and the noise
+            # does not cancel: MEASURED at P=25 with a too-small breakdown
+            # floor, the process ran to k=48 and reported eps 0.8097 against
+            # the true 0.8779. That is eps too SMALL, i.e. certifying a
+            # direction that does not deserve it, which is the one direction
+            # of error a certificate must never make.
+            budget = sum(p.numel() for p in parameters)
             system = _golub_kahan(
                 apply_j=_j,
                 apply_jt=_jt,
                 residuals=residuals,
-                iterations=iterations,
+                iterations=min(iterations, budget),
                 floor=max(config.eps, tolerance * residual_norm),
             )
             if system is None:
