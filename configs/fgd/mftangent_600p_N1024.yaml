@@ -71,6 +71,9 @@ fgd_approx:
     - matrix_free_tangent
   functional_loss: mse
   rel_error_threshold: 0.5
+  # As the ladder does: pick the lambda that MINIMISES eps per step.
+  projection_damping: 0.01
+  projection_damping_auto: true
   # The whole N=1024 training set, exactly as the ladder probes it.
   probe_batches: 16
   learning_rate_policy: theory_interval

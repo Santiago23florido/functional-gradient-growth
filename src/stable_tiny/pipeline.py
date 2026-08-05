@@ -485,6 +485,10 @@ def _section_dataclass(
             values["functional_learning_rates"] = tuple(
                 float(value) for value in values["functional_learning_rates"] or ()
             )
+        if "damping_grid" in values:
+            values["damping_grid"] = tuple(
+                float(value) for value in values["damping_grid"] or ()
+            )
         if "step_backoff" in values:
             values["step_backoff"] = tuple(
                 float(value) for value in values["step_backoff"] or ()
@@ -3642,6 +3646,11 @@ def _search_matrix_free_tangent_step(
                 config=fa,
                 iterations=parametric.cg_iterations,
                 damping=fa.projection_damping,
+                damping_grid=(
+                    parametric.damping_grid
+                    if fa.projection_damping_auto
+                    else None
+                ),
                 tolerance=parametric.cg_tolerance,
             )
             solve_seconds += time.perf_counter() - started

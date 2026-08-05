@@ -1238,6 +1238,11 @@ class ParametricGDConfig:
     # regularising the projection, so the ladder's own regime is the easy one.
     cg_iterations: int = 200
     cg_tolerance: float = 1e-10
+    # projection_damping_auto, matrix-free: eps depends on lambda and the
+    # ladder picks the minimiser per step. Solving at the fixed 1e-2 instead
+    # reported eps 1.1-1.5 and never certified -- the wrong lambda, not a
+    # solver defect. The grid is swept reusing the retained batch graphs.
+    damping_grid: tuple[float, ...] = (1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1.0)
     # The Lemma 3.5 rate is first order, so the displacement it produces is not
     # exactly eta J u. These scales are tried in order and each is certified on
     # the displacement it ACTUALLY applies.
