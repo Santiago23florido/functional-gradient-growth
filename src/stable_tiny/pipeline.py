@@ -3330,7 +3330,10 @@ def _search_nonlinear_primary_candidate(
                         config=config.fgd_approx,
                     )
                     last_certificate = certificate
-                    if not certificate.learning_rate_interval_valid:
+                    if (
+                        parametric.acceptance_rule == "theory_interval"
+                        and not certificate.learning_rate_interval_valid
+                    ):
                         if progress is not None:
                             progress(
                                 f"[NONLINEAR-ALPHA] alpha={step.alpha:g} rejected: "
@@ -3405,7 +3408,14 @@ def _search_nonlinear_primary_candidate(
                     )
                     last_trial = trial
                     last_stats = step.stats
-                    if not trial.all_conditions_valid:
+                    # "direction_only" is the ladder's rule verbatim: it commits
+                    # the model its cosine test returned, with no transactional
+                    # gate. Kept so the two paths can be compared at the SAME
+                    # bar; it carries no statement about step length.
+                    if (
+                        parametric.acceptance_rule != "direction_only"
+                        and not trial.all_conditions_valid
+                    ):
                         if progress is not None:
                             progress(
                                 f"[NONLINEAR-ALPHA] alpha={step.alpha:g} certified "

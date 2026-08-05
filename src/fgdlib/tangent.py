@@ -1173,6 +1173,32 @@ class ParametricGDConfig:
     # moves as fast as the guess does. Each retry trains one more candidate at
     # theory_lr_safety * eta_bar(best eps) and certifies it on its own terms.
     adaptive_rate_retries: int = 0
+    # What a candidate must satisfy to be committed. The ladder and the
+    # nonlinear primary were never asking the same question, which is the whole
+    # reason the ladder certifies where the primary does not:
+    #
+    #   "direction_only"   -- eps < min(rel_error_threshold, 1/2), and nothing
+    #                         else. This is EXACTLY the ladder
+    #                         (certify_parametric_step returns on the cosine
+    #                         test alone, certify_family_lemma35_rate defaults
+    #                         off, and grow_until_certified commits the
+    #                         returned model without a transactional gate).
+    #                         There is no statement about step LENGTH.
+    #   "measured_descent" -- direction, plus the transactional conditions,
+    #                         which measure real descent on the transactional
+    #                         split. Prop 3.8 with a measured coefficient
+    #                         rather than one lower-bounded through eps.
+    #   "theory_interval"  -- the above, plus the realized secant rate
+    #                         eta* = <Delta, r>/|r|^2 must lie inside the
+    #                         Lemma 3.5 interval implied by its OWN eps.
+    #                         Strictest, and the only one that certifies the
+    #                         DISTANCE actually travelled.
+    #
+    # The previous nonlinear-only code appeared to enforce the last one but did
+    # not: it quoted family_lemma35_rate(eps) as the step's rate, a number
+    # admissible by construction, while committing a displacement whose real
+    # eta* was never measured.
+    acceptance_rule: str = "theory_interval"
 
     def validate(self) -> None:
         if self.optimizer not in ("sgd", "adam", "adamw"):
@@ -1217,6 +1243,15 @@ class ParametricGDConfig:
         if self.transactional_split not in ("train", "validation"):
             raise ValueError(
                 "parametric_gd.transactional_split must be 'train' or 'validation'."
+            )
+        if self.acceptance_rule not in (
+            "theory_interval",
+            "measured_descent",
+            "direction_only",
+        ):
+            raise ValueError(
+                "parametric_gd.acceptance_rule must be 'theory_interval', "
+                "'measured_descent' or 'direction_only'."
             )
         if self.adaptive_rate_retries < 0:
             raise ValueError(
