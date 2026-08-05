@@ -1,0 +1,163 @@
+wandb: [wandb.login()] Using explicit session credentials for https://api.wandb.ai.
+wandb: Appending key for api.wandb.ai to your netrc file: /home/santiago/.netrc
+wandb: Currently logged in as: santiago-florido (TAU-Frugal) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: setting up run x0f8bibb
+wandb: Tracking run with wandb version 0.28.0
+wandb: Run data is saved locally in results/wandb/run-20260804_145706-x0f8bibb
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run nonlinear-n1024-2x2x2-model-seed-2
+wandb: ⭐️ View project at https://wandb.ai/TAU-Frugal/stable-tiny
+wandb: 🚀 View run at https://wandb.ai/TAU-Frugal/stable-tiny/runs/x0f8bibb
+Using device: cuda
+Training method: fgd_approx
+Primary approximation family: nonlinear (dedicated AdamW minibatch pipeline; tangent path unreachable)
+W&B logging enabled: project=stable-tiny, run=nonlinear-n1024-2x2x2-model-seed-2
+Original model:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=4, out_features=2, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=2, out_features=2, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=2, out_features=2, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=2, out_features=1, use_bias=True)
+[INIT] Epoch 0, train_loss=0.8031, validation_loss=0.7807, test_loss=0.7687, train_acc=0.050, validation_acc=0.062, test_acc=0.057
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.8443, eps=0.5359, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.8478, eps=0.5303, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.8992, eps=0.4375, direction_certified=True, rate=0.06337511279811492
+[NONLINEAR] Epoch 1, accepted=True, eps=0.4375, train_loss=0.7244, validation_loss=0.7063, test_loss=0.6934 (-0.0753), widths=(2, 2, 2)
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.8282, eps=0.5604, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.8351, eps=0.5502, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.8886, eps=0.4588, direction_certified=True, rate=0.04086157881581332
+[NONLINEAR] Epoch 2, accepted=True, eps=0.4588, train_loss=0.6801, validation_loss=0.6645, test_loss=0.6511 (-0.0423), widths=(2, 2, 2)
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.8177, eps=0.5756, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.8278, eps=0.5611, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.8815, eps=0.4721, direction_certified=True, rate=0.027239200186703824
+[NONLINEAR] Epoch 3, accepted=True, eps=0.4721, train_loss=0.6531, validation_loss=0.6390, test_loss=0.6253 (-0.0258), widths=(2, 2, 2)
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.8108, eps=0.5853, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.8232, eps=0.5677, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.8766, eps=0.4812, direction_certified=True, rate=0.018216427613886366
+[NONLINEAR] Epoch 4, accepted=True, eps=0.4812, train_loss=0.6360, validation_loss=0.6229, test_loss=0.6091 (-0.0163), widths=(2, 2, 2)
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.8065, eps=0.5913, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.8203, eps=0.5719, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.8733, eps=0.4872, direction_certified=True, rate=0.012328949220789743
+[NONLINEAR] Epoch 5, accepted=True, eps=0.4872, train_loss=0.6249, validation_loss=0.6125, test_loss=0.5985 (-0.0106), widths=(2, 2, 2)
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.8037, eps=0.5950, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.8185, eps=0.5745, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.8711, eps=0.4910, direction_certified=True, rate=0.00858613298360922
+[NONLINEAR] Epoch 6, accepted=True, eps=0.4910, train_loss=0.6174, validation_loss=0.6054, test_loss=0.5913 (-0.0072), widths=(2, 2, 2)
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.8019, eps=0.5975, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.8173, eps=0.5763, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.8697, eps=0.4937, direction_certified=True, rate=0.006057123925478167
+[NONLINEAR] Epoch 7, accepted=True, eps=0.4937, train_loss=0.6122, validation_loss=0.6005, test_loss=0.5863 (-0.0050), widths=(2, 2, 2)
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.8006, eps=0.5991, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.8165, eps=0.5774, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.8686, eps=0.4955, direction_certified=True, rate=0.0043032888508350775
+[NONLINEAR] Epoch 8, accepted=True, eps=0.4955, train_loss=0.6085, validation_loss=0.5970, test_loss=0.5829 (-0.0035), widths=(2, 2, 2)
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.7998, eps=0.6002, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.8159, eps=0.5783, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.8679, eps=0.4968, direction_certified=True, rate=0.0030679302458272908
+[NONLINEAR] Epoch 9, accepted=True, eps=0.4968, train_loss=0.6059, validation_loss=0.5946, test_loss=0.5804 (-0.0025), widths=(2, 2, 2)
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.7992, eps=0.6010, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.8154, eps=0.5789, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.8674, eps=0.4977, direction_certified=True, rate=0.002212301336337358
+[NONLINEAR] Epoch 10, accepted=True, eps=0.4977, train_loss=0.6040, validation_loss=0.5928, test_loss=0.5786 (-0.0018), widths=(2, 2, 2)
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.7988, eps=0.6017, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.8150, eps=0.5795, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.8670, eps=0.4984, direction_certified=True, rate=0.0015322445944293604
+[NONLINEAR] Epoch 11, accepted=True, eps=0.4984, train_loss=0.6028, validation_loss=0.5916, test_loss=0.5774 (-0.0012), widths=(2, 2, 2)
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.7985, eps=0.6020, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.8148, eps=0.5797, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.8667, eps=0.4988, direction_certified=True, rate=0.0011766122390175601
+[NONLINEAR] Epoch 12, accepted=True, eps=0.4988, train_loss=0.6018, validation_loss=0.5907, test_loss=0.5765 (-0.0009), widths=(2, 2, 2)
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.7983, eps=0.6023, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.8147, eps=0.5798, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.8665, eps=0.4991, direction_certified=True, rate=0.0008179374763654722
+[NONLINEAR] Epoch 13, accepted=True, eps=0.4991, train_loss=0.6011, validation_loss=0.5901, test_loss=0.5758 (-0.0006), widths=(2, 2, 2)
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.7981, eps=0.6026, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.8146, eps=0.5800, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.8664, eps=0.4994, direction_certified=True, rate=0.0005513327706606046
+[NONLINEAR] Epoch 14, accepted=True, eps=0.4994, train_loss=0.6007, validation_loss=0.5896, test_loss=0.5754 (-0.0004), widths=(2, 2, 2)
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.7979, eps=0.6027, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.8145, eps=0.5802, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.8663, eps=0.4996, direction_certified=True, rate=0.00041324361073004356
+[NONLINEAR] Epoch 15, accepted=True, eps=0.4996, train_loss=0.6003, validation_loss=0.5893, test_loss=0.5751 (-0.0003), widths=(2, 2, 2)
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.7978, eps=0.6029, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.8145, eps=0.5802, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.8662, eps=0.4997, direction_certified=True, rate=0.0002478023692489045
+[NONLINEAR] Epoch 16, accepted=True, eps=0.4997, train_loss=0.6001, validation_loss=0.5891, test_loss=0.5749 (-0.0002), widths=(2, 2, 2)
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.7978, eps=0.6029, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.8144, eps=0.5803, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.8661, eps=0.4998, direction_certified=True, rate=0.00016631411109303276wandb: uploading data; updating run metadata; uploading artifact run-x0f8bibb-growthevents_table-gewZmA; uploading artifact run-x0f8bibb-growthline_search_table-dyXotg
+wandb: uploading data; uploading artifact run-x0f8bibb-growthevents_table-gewZmA; uploading artifact run-x0f8bibb-growthline_search_table-dyXotg
+wandb: uploading data; uploading artifact run-x0f8bibb-growthline_search_table-dyXotg
+wandb: uploading data; uploading media/table/growth/events_table_28_d110b850b15f04bf3559.table.json; uploading media/table/growth/line_search_table_29_7b92d749ef1c030d3b6a.table.json; uploading output.log; uploading wandb-summary.json (+ 1 more)
+wandb: uploading data
+wandb: uploading history steps 7-22, summary, console lines 36-98
+wandb: uploading history steps 23-29, summary, console lines 99-113
+wandb: 
+wandb: Run history:
+wandb:                                    epoch ▁▁▂▂▂▂▃▃▃▄▄▄▄▅▅▅▅▆▆▆▇▇▇▇██████
+wandb:                         fgd/family_index ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:                         fgd/global_bound █▄▃▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:                   fgd/global_contraction ▁▅▇▇████████████████████
+wandb:                     fgd/gradient_sq_norm █▅▄▃▂▂▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:            fgd/learning_rate_upper_bound █▆▄▃▂▂▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:                     fgd/lr_search_trials ▁█████████████████████████▁
+wandb:        fgd/nonlinear_adamw_learning_rate ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb: fgd/nonlinear_candidate_training_seconds ▁█▆▅▅▅▅▆▇▆▇▇▆▆▇▇▇▇▆▆▆▆▆▇▆▇▇
+wandb:      fgd/nonlinear_certification_seconds ▁▆▄▄▅▄▄▆▄▄▅▅▄▅▅▅▅▅▅▅▅▅▅█▄▅▅
+wandb:                                      +51 ...
+wandb: 
+wandb: Run summary:
+wandb:                                   epoch 25
+wandb:                         event/step_type GRO
+wandb:                  fgd/approximation_kind nonlinear
+wandb:                  fgd/candidate_accepted False
+wandb:                        fgd/family_index 4
+wandb:                        fgd/global_bound 795.32254
+wandb:                  fgd/global_bound_valid True
+wandb:                  fgd/global_contraction 1.0
+wandb:                    fgd/gradient_sq_norm 2411.38414
+wandb: fgd/learning_rate_clipped_by_validation False
+wandb:                                     +73 ...
+wandb: 
+wandb: 🚀 View run nonlinear-n1024-2x2x2-model-seed-2 at: https://wandb.ai/TAU-Frugal/stable-tiny/runs/x0f8bibb
+wandb: ⭐️ View project at: https://wandb.ai/TAU-Frugal/stable-tiny
+wandb: Synced 5 W&B file(s), 2 media file(s), 4 artifact file(s) and 0 other file(s)
+wandb: Find logs at: results/wandb/run-20260804_145706-x0f8bibb/logs
+
+[NONLINEAR] Epoch 17, accepted=True, eps=0.4998, train_loss=0.6000, validation_loss=0.5890, test_loss=0.5748 (-0.0001), widths=(2, 2, 2)
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.7977, eps=0.6030, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.8144, eps=0.5803, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.8661, eps=0.4999, direction_certified=True, rate=0.0001163786097889608
+[NONLINEAR] Epoch 18, accepted=True, eps=0.4999, train_loss=0.5999, validation_loss=0.5889, test_loss=0.5747 (-0.0001), widths=(2, 2, 2)
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.7977, eps=0.6030, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.8144, eps=0.5803, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.8661, eps=0.4999, direction_certified=True, rate=8.216645535095921e-05
+[NONLINEAR] Epoch 19, accepted=True, eps=0.4999, train_loss=0.5998, validation_loss=0.5888, test_loss=0.5746 (-0.0001), widths=(2, 2, 2)
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.7977, eps=0.6031, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.8144, eps=0.5804, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.8661, eps=0.4999, direction_certified=True, rate=5.838180393777125e-05
+[NONLINEAR] Epoch 20, accepted=True, eps=0.4999, train_loss=0.5998, validation_loss=0.5888, test_loss=0.5746 (-0.0000), widths=(2, 2, 2)
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.7977, eps=0.6031, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.8143, eps=0.5804, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.8660, eps=0.5000, direction_certified=True, rate=3.8491173554117713e-05
+[NONLINEAR] Epoch 21, accepted=True, eps=0.5000, train_loss=0.5997, validation_loss=0.5888, test_loss=0.5745 (-0.0000), widths=(2, 2, 2)
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.7977, eps=0.6031, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.8143, eps=0.5804, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.8660, eps=0.5000, direction_certified=True, rate=2.7703091948704807e-05
+[NONLINEAR] Epoch 22, accepted=True, eps=0.5000, train_loss=0.5997, validation_loss=0.5887, test_loss=0.5745 (-0.0000), widths=(2, 2, 2)
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.7977, eps=0.6031, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.8143, eps=0.5804, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.8660, eps=0.5000, direction_certified=True, rate=1.9519926894546373e-05
+[NONLINEAR] Epoch 23, accepted=True, eps=0.5000, train_loss=0.5997, validation_loss=0.5887, test_loss=0.5745 (-0.0000), widths=(2, 2, 2)
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.7977, eps=0.6031, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.8143, eps=0.5804, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.8660, eps=0.5000, direction_certified=True, rate=1.3741157936265218e-05
+[NONLINEAR] Epoch 24, accepted=True, eps=0.5000, train_loss=0.5997, validation_loss=0.5887, test_loss=0.5745 (-0.0000), widths=(2, 2, 2)
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.7977, eps=0.6031, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.8143, eps=0.5804, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.8660, eps=0.5000, direction_certified=True, rate=n/a
+[NONLINEAR-BOTTLENECK] Epoch 25, widths=(2, 2, 2) L0=3.6065e-02 L1=4.6674e-03 L2=6.3357e-05
+  function-preserving growth: drift=0.000e+00, train_loss=0.5997
+[NONLINEAR-GRO] Epoch 25: layer=0, widths (2, 2, 2) -> (3, 2, 2), max_drift=0.000e+00
+[NONLINEAR] Epoch 25, accepted=False, eps=0.5000, train_loss=0.5997, validation_loss=0.5887, test_loss=0.5745 (+0.0000), widths=(2, 2, 2)
+[GRO] Epoch 25, layer=0, widths=(3, 2, 2), parameters=32
+Saved history: /home/santiago/StageFrugal/stable-tiny-nonlinear/results/nonlinear_n1024_3seeds/seed_2/nonlinear-n1024-2x2x2-model-seed-2_history.json

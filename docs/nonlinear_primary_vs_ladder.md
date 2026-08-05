@@ -111,6 +111,87 @@ A well-fitted clone realises `η* ≈ η_f`, while Lemma 3.5 admits only
 admissible step size**; it only appeared to work because it shortened the step
 in parameter space without re-measuring what that did to the direction.
 
+## Why it certifies inside the ladder but not standalone
+
+This is the single largest difference, and it is not about the candidate at
+all — it is about the **bar**. The two paths were never asking the same
+question.
+
+**The ladder** (`certify_parametric_step`, families.py):
+
+```python
+certified = cosine > 0.0 and relative_error < threshold   # and nothing else
+```
+
+`certify_family_lemma35_rate` defaults to `False` and
+`configs/fgd/family_ladder_N1024.yaml` does not set it, so no rescale happens.
+`grow_until_certified` then does `model = stepped` directly — the family step
+never passes through `_certify_fgd_candidate`. The ladder's only additional
+gate is `certify_family_min_gain` on how far `eps` moved.
+
+So the ladder accepts on **one condition: `eps < 1/2`**. It makes no statement
+about the step's LENGTH.
+
+**The nonlinear primary** required `eps < 1/2`, *plus* the full transactional
+conditions on validation (this predates the branch), *plus* — after the fix —
+the Lemma 3.5 interval on the realized `eta*`.
+
+And the old code only *appeared* to enforce that last one:
+
+```python
+rate = family_lemma35_rate(stats.relative_error, config.fgd_approx)
+last_certificate = _nonlinear_directional_certificate(learning_rate=rate, ...)
+```
+
+`family_lemma35_rate(eps)` returns a rate **admissible by construction**, so
+`learning_rate_interval_valid` was always `True`. The check tested nothing,
+while the committed displacement had a real `eta*` that was never measured.
+Substituting the measured `eta*` turned a check that always passed into one
+that rejects — which is why parity first looked *worse*, not better.
+
+`acceptance_rule` now names the bar explicitly:
+
+| value | direction | measured descent | realized distance |
+|---|---|---|---|
+| `direction_only` | yes | no | no | ← the ladder verbatim |
+| `measured_descent` | yes | yes | no |
+| `theory_interval` | yes | yes | yes |
+
+The step-recertification fix is **independent of this choice** and stays on for
+all three: with `alpha = 1` the committed model *is* the certified one, so the
+ladder's bar is met without the unsound parameter rescale.
+
+### The ladder's rule diverges as a PRIMARY family
+
+Running `acceptance_rule: direction_only` — the ladder's rule verbatim — on
+N=1024 (`results/ladderrule_divergence_seed0.log`):
+
+```
+epoch 7   eps 0.4744   train_loss 0.1709   accepted
+epoch 8   eps 0.4274   train_loss 0.1532   accepted
+epoch 9   eps 0.4053   train_loss 27.6955  accepted   <-- x180
+epoch 13  eps 0.2383   train_loss 13.6936
+epoch 18  eps 0.0964   train_loss 11.1519
+```
+
+At epoch 9 it accepted a step with a *good* direction (`cos ≈ 0.91`) and the
+loss exploded by a factor of 180. It never recovers. Note the direction keeps
+IMPROVING as the loss stays wrecked — `eps` falls to 0.096 — which is exactly
+the signature of a well-aligned step that is far too long.
+
+`tangent.py` already documents this failure for the in-band case:
+
+> MEASURED without it, the unbounded family step diverged held-out loss
+> 9.37 -> 44.53 in two epochs because it pre-empted the tangent path that
+> produces the very bound it was missing.
+
+That is the whole answer. **The ladder's direction-only rule is safe only
+because the family is a FALLBACK**: the tangent path supplies the bounded steps
+and the family fires occasionally between them. Promoted to primary, nothing
+bounds the step length and it diverges. A nonlinear primary therefore needs a
+distance criterion the ladder never had — which is why `theory_interval`
+rejects so much, and why the honest middle option is `measured_descent`.
+
 ## The correction
 
 Four quantities that were previously conflated under `rate` are now distinct:
