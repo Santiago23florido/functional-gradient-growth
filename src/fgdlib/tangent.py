@@ -1237,6 +1237,16 @@ class ParametricGDConfig:
     # 3.6e-06 relative, 50 to 2.2e-03. Damping conditions the CG as well as
     # regularising the projection, so the ladder's own regime is the easy one.
     cg_iterations: int = 200
+    # How many examples the matrix-free solver accumulates per autograd call.
+    # NOT a hyperparameter: J and r are sums over examples, so the grouping is
+    # only how that sum is accumulated and cannot move the answer. MEASURED at
+    # N=1024, eps agreed to 6 significant figures across 64 / 128 / 256 / 512 /
+    # 1024 while the solve went 0.62s -> 0.06s. It is pure call overhead: each
+    # group is one torch.autograd.grad, Krylov is strictly sequential so the
+    # calls cannot be batched, and at these sizes the arithmetic inside one is
+    # negligible against the ~1ms dispatch around it. Larger is faster until
+    # the retained graphs stop fitting. 0 keeps the loader's own batching.
+    matrixfree_batch_size: int = 0
     cg_tolerance: float = 1e-10
     # projection_damping_auto, matrix-free: eps depends on lambda and the
     # ladder picks the minimiser per step. Solving at the fixed 1e-2 instead
