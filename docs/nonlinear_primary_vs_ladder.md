@@ -189,8 +189,29 @@ That is the whole answer. **The ladder's direction-only rule is safe only
 because the family is a FALLBACK**: the tangent path supplies the bounded steps
 and the family fires occasionally between them. Promoted to primary, nothing
 bounds the step length and it diverges. A nonlinear primary therefore needs a
-distance criterion the ladder never had — which is why `theory_interval`
-rejects so much, and why the honest middle option is `measured_descent`.
+distance criterion the ladder never had.
+
+### `measured_descent` rejects exactly those steps — and then has nothing left
+
+Running `acceptance_rule: measured_descent` with the ladder's `[1, 2, 4, 8]`
+sweep accepts **nothing** in 25 epochs, and the reason is visible in the
+measured descent of the candidates it refuses:
+
+```
+eta_f 2   cos 0.9639  eps 0.2661  eta* 1.861  descent  -1,477
+eta_f 4   cos 0.9677  eps 0.2521  eta* 3.739  descent  -8,866
+eta_f 8   cos 0.9573  eps 0.2892  eta* 7.253  descent -39,742
+```
+
+The direction is excellent (`eps` down to 0.224) and the step still *raises*
+the loss by four orders of magnitude, because `eta*` overshoots the admissible
+rate by 6–20x. These are precisely the steps `direction_only` accepted at epoch
+9. So `measured_descent` is doing its job — but the ladder's sweep contains
+nothing else for it to accept, which is the same conclusion the parity run
+reached from the theoretical side.
+
+The bar and the sweep have to change together: `measured_descent` needs the
+descending sweep and the adaptive retries to have short candidates available.
 
 ## The correction
 
