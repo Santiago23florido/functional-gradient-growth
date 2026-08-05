@@ -1125,6 +1125,43 @@ class ParametricGDConfig:
     # do not read this field.
     certification_batches: int | None = None
 
+    # --- Nonlinear-primary family: EXPLICIT optimization-budget semantics ---
+    # The ladder's nonlinear family (certify_parametric_step) spends
+    # ``certify_family_inner_steps`` FULL-BATCH AdamW steps on the fixed probe.
+    # The nonlinear primary originally spent the same integer on loader
+    # MINIBATCH steps, which on N=1024/batch-64 is 64x fewer example-gradients
+    # per candidate -- MEASURED as the dominant cause of its non-certification
+    # (cos still climbing monotonically with the budget at the largest setting).
+    # The unit is therefore named rather than implied:
+    #   "probe"     -- full-batch steps on the certification probe (ladder parity)
+    #   "epoch"     -- complete loader passes
+    #   "minibatch" -- individual optimizer steps on loader minibatches
+    inner_step_unit: str = "minibatch"
+    # Reduction of the candidate's parametric objective. The ladder uses the
+    # sum-MSE convention that matches the certified functional; "mean" rescales
+    # the gradient by 1/(batch * out_features), which AdamW largely but not
+    # exactly absorbs (it does not rescale weight_decay or parameter_penalty).
+    candidate_objective: str = "mean"
+    # Whether the disposable clone trains in train() mode (the ladder) or in
+    # eval() mode. Only observable when the model has dropout / batch norm.
+    candidate_train_mode: bool = False
+    # Split the DIRECTIONAL certificate is measured on. The ladder trains and
+    # certifies on the same train probe; certifying on validation silently
+    # converts a statement about the step's own empirical objective into a
+    # generalization claim.
+    certificate_split: str = "train"
+    # Split the transactional acceptance conditions are measured on.
+    transactional_split: str = "validation"
+    # Interpolation factors alpha searched for the COMMITTED step, in the order
+    # given. Empty means "commit the full candidate only" (alpha = 1).
+    alpha_grid: tuple[float, ...] = ()
+    # How the committed alpha is chosen among those that RE-certify:
+    #   "largest_certified" -- the largest certified alpha (longest step)
+    #   "max_descent"       -- the certified alpha with the largest measured
+    #                          functional-loss decrease
+    #   "full_only"         -- only alpha = 1, and only when it certifies
+    alpha_policy: str = "largest_certified"
+
     def validate(self) -> None:
         if self.optimizer not in ("sgd", "adam", "adamw"):
             raise ValueError(
@@ -1152,6 +1189,34 @@ class ParametricGDConfig:
             raise ValueError("parametric_gd.min_cosine must lie in (0, 1].")
         if self.parameter_penalty < 0.0:
             raise ValueError("parametric_gd.parameter_penalty must be non-negative.")
+        if self.inner_step_unit not in ("minibatch", "epoch", "probe"):
+            raise ValueError(
+                "parametric_gd.inner_step_unit must be 'minibatch', 'epoch' "
+                "or 'probe'."
+            )
+        if self.candidate_objective not in ("mean", "sum"):
+            raise ValueError(
+                "parametric_gd.candidate_objective must be 'mean' or 'sum'."
+            )
+        if self.certificate_split not in ("train", "validation"):
+            raise ValueError(
+                "parametric_gd.certificate_split must be 'train' or 'validation'."
+            )
+        if self.transactional_split not in ("train", "validation"):
+            raise ValueError(
+                "parametric_gd.transactional_split must be 'train' or 'validation'."
+            )
+        if any(not 0.0 < value <= 1.0 for value in self.alpha_grid):
+            raise ValueError("parametric_gd.alpha_grid entries must lie in (0, 1].")
+        if self.alpha_policy not in (
+            "largest_certified",
+            "max_descent",
+            "full_only",
+        ):
+            raise ValueError(
+                "parametric_gd.alpha_policy must be 'largest_certified', "
+                "'max_descent' or 'full_only'."
+            )
 
 
 @dataclass(frozen=True)
