@@ -88,14 +88,45 @@ fgd_approx:
   local_acceptance_conditions: true
   eps: 1.0e-12
 
-  # A failed nonlinear ladder directly requests one bounded structural event.
+  # More outer steps than epochs: the solve is the expensive part and it is
+  # already paid, so trying several rates per epoch is nearly free. The ladder
+  # runs 8; this ran 1, which is a large part of why it committed so little.
+  outer_steps_per_epoch: 8
+
+  # --- Growth governance, ported from configs/fgd/family_ladder_N1024.yaml ---
+  # MEASURED without these: 39 consecutive growths in epoch 0, the 600-parameter
+  # budget exhausted by epoch 2, and 68 epochs unable to either grow or step.
+  # Each of those growths re-solved the whole system to re-certify -- ~58,000
+  # passes against the ~2,500 a real step costs -- so the same omission was
+  # both the accuracy failure and the speed failure.
+  grow_to_certify: true
+  # Grow only when Lemma 3.5 genuinely fails on the committed state. Its own
+  # documentation is exact about the alternative: "ANY failed transaction
+  # requests growth ... and with no parameter budget the run grows without
+  # bound". With a budget it does not grow without bound, it just dies at it.
+  growth_requires_admissibility_failure: true
+  admissibility_failure_forces_growth: false
+  # Stop when eps stops moving, rather than when the budget runs out.
+  growth_limit_criterion: epsilon_stationary
+  growth_patience: 1
+  growth_lookahead_adequacy: true
+  growth_lookahead_steps: 10
+  growth_prefer_lower_error: true
+  growth_select_by_descent: true
+  # Add neurons at ONE chosen location while each increment still pays, instead
+  # of re-scanning and re-solving per neuron. This is the direct cost fix: the
+  # count follows the certificate, so the re-solves collapse.
+  certify_adaptive_growth: true
+  certify_adaptive_growth_min_gain: 0.1
+  families_available_without_growth: true
+
   certify_max_growths: 200
   max_total_parameters: 600
   growth_where: expressivity_bottleneck
   growth_selection: unified_expansion
   growth_function_preserving: true
   growth_preservation_tolerance: 1.0e-6
-  growth_compute_delta: false
+  growth_compute_delta: true
   tiny_use_covariance: true
   tiny_alpha_zero: false
   tiny_omega_zero: false

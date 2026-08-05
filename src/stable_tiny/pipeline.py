@@ -3569,6 +3569,12 @@ def _search_nonlinear_primary_candidate(
     )
 
 
+#: Ceiling on the adaptive burst. Bursts cut the number of SOLVES, but each
+#: neuron inside one is unmeasured until the next solve, so the ceiling bounds
+#: how much structure can be bought without a certificate looking at it.
+_MFTANGENT_MAX_BURST = 8
+
+
 def _search_matrix_free_tangent_step(
     *,
     base_model: GrowingMLP,
@@ -3631,6 +3637,8 @@ def _search_matrix_free_tangent_step(
     threshold = min(fa.rel_error_threshold, 0.5)
     growths = 0
     grown_model: GrowingMLP | None = None
+    previous_error: float | None = None
+    burst = 1
 
     with timed("nonlinear_total_seconds"):
         # grow_until_certified, matrix-free: FP growth keeps f fixed, so eps
@@ -3670,20 +3678,69 @@ def _search_matrix_free_tangent_step(
                 break
             if growths >= fa.certify_max_growths:
                 break
-            outcome = _apply_nonlinear_primary_growth(
-                model=base_model,
-                train_loader=train_loader,
-                preservation_loader=validation_loader,
-                device=device,
-                config=config,
-                epoch=growths,
-                progress=None,
-            )
-            if outcome.model is None:
+
+            # MARGINAL VALUE. One neuron per solve, bounded only by
+            # certify_max_growths, is what made this both wrong and slow:
+            # MEASURED at N=1024 it took 39 growths in epoch 0 -- each one a
+            # full re-solve, ~58,000 passes against the ~2,500 a real step
+            # costs -- exhausted the 600-parameter budget by epoch 2, and then
+            # sat 68 epochs unable to either grow or step.
+            #
+            # The ladder does not do this, and its rule is already in the
+            # config: keep adding while each increment still pays, measured as
+            # a fraction of the REMAINING gap to the threshold. Reuse it here
+            # rather than inventing a second one.
+            gap = certificate.relative_error - threshold
+            if previous_error is not None and math.isfinite(previous_error):
+                gain = previous_error - certificate.relative_error
+                required = fa.certify_adaptive_growth_min_gain * max(
+                    previous_error - threshold, 0.0
+                )
+                if fa.growth_limit_criterion == "epsilon_stationary" and (
+                    gain <= 0.0
+                ):
+                    # eps stopped moving: more of this structure cannot help,
+                    # and every further growth is a re-solve spent for nothing.
+                    if progress is not None:
+                        progress(
+                            f"[MFTANGENT] eps stationary at "
+                            f"{certificate.relative_error:.4f} after {growths} "
+                            f"growths; stopping the inner loop"
+                        )
+                    break
+                if fa.certify_adaptive_growth and gain < required:
+                    # Still paying, but slowly. Widen the burst so the number
+                    # of SOLVES grows logarithmically in neurons added instead
+                    # of one-for-one. Every intermediate structure is still
+                    # scored by its own projection.
+                    burst = min(burst * 2, _MFTANGENT_MAX_BURST)
+                elif fa.certify_adaptive_growth and gain > 2.0 * required:
+                    burst = 1
+            previous_error = certificate.relative_error
+
+            added = 0
+            for _ in range(burst):
+                outcome = _apply_nonlinear_primary_growth(
+                    model=base_model,
+                    train_loader=train_loader,
+                    preservation_loader=validation_loader,
+                    device=device,
+                    config=config,
+                    epoch=growths,
+                    progress=None,
+                )
+                if outcome.model is None:
+                    break
+                base_model = outcome.model
+                grown_model = outcome.model
+                growths += 1
+                added += 1
+                if growths >= fa.certify_max_growths:
+                    break
+            if added == 0:
+                # Budget reached, or growth declined. Nothing more to try at
+                # this structure; the caller decides what to do about it.
                 break
-            base_model = outcome.model
-            grown_model = outcome.model
-            growths += 1
 
         if direction is None or not certificate.sensor_valid:
             increment("nonlinear_failed_ladders")
