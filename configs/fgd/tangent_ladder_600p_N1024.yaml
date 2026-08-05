@@ -53,7 +53,7 @@ model:
 
 training:
   method: fgd_approx
-  epochs: 60
+  epochs: 70
   accuracy_tolerance: 0.1
   gradient_clip_norm:
   log_every: 1
@@ -509,7 +509,7 @@ scaling_line_search:
 # the proposal unnecessary. should_trigger_fgd_growth() opens with
 # `del epoch, last_growth_epoch`: no epoch, dwell or cap participates.
 growth_schedule:
-  enabled: false
+  enabled: true
   every: 100
   first_epoch: 50
   layer_policy: round_robin
