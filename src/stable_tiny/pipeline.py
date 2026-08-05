@@ -3442,14 +3442,25 @@ def _search_nonlinear_primary_candidate(
             # Lemma 3.5 admits depends on the eps the clone happens to reach,
             # which is only known once it is trained. Having measured it, ask
             # for exactly that distance instead of guessing again.
+            #
+            # This is a fixed-point iteration eta_{k+1} = safety * eta_bar(eps_k)
+            # driven by the eps of the MOST RECENT candidate, not the best one
+            # seen. eps generally degrades as eta_f shrinks, so seeding from the
+            # smallest eps -- which belongs to the LARGEST eta_f -- overstates
+            # the bound and the iteration never contracts. When the sequence
+            # walks away from admissibility instead of toward it, no admissible
+            # distance exists at this structure, which is the signal to grow.
             if not pending_rates and adaptive_retries_left > 0:
                 adaptive_retries_left -= 1
+                latest_relative_error = (
+                    last_stats.relative_error if last_stats is not None else None
+                )
                 bound = (
                     theoretical_learning_rate_upper_bound(
-                        best_relative_error,
+                        latest_relative_error,
                         config.fgd_approx,
                     )
-                    if best_relative_error is not None
+                    if latest_relative_error is not None
                     else None
                 )
                 if bound is not None:
@@ -3459,9 +3470,9 @@ def _search_nonlinear_primary_candidate(
                     ):
                         if progress is not None:
                             progress(
-                                f"[NONLINEAR-ADAPT] best eps={best_relative_error:.4f} "
-                                f"admits eta <= {bound:.4g}; retrying at "
-                                f"eta_f={derived:.4g}"
+                                f"[NONLINEAR-ADAPT] latest eps="
+                                f"{latest_relative_error:.4f} admits eta <= "
+                                f"{bound:.4g}; retrying at eta_f={derived:.4g}"
                             )
                         pending_rates.append(derived)
 
