@@ -102,7 +102,11 @@ def _run_with_rule(monkeypatch, rule: str, *, relative_error: float, descends: b
         "search_interpolated_step",
         lambda **k: ((step if step.rejection_reason is None else None), (step,)),
     )
-    # The transactional gate rejects unless the step really descends.
+    # all_conditions_valid ANDs in learning_rate_interval_valid, which for this
+    # over-long step (eta* = 5.0) is False. Modelling that faithfully is the
+    # whole point: a stub that returned all_conditions_valid=True whenever the
+    # step descended hid the fact that "measured_descent" was re-imposing the
+    # Lemma 3.5 interval through the shared gate.
     monkeypatch.setattr(
         pipeline,
         "_certify_fgd_candidate",
@@ -118,7 +122,9 @@ def _run_with_rule(monkeypatch, rule: str, *, relative_error: float, descends: b
             global_bound=None,
             global_bound_valid=None,
             global_contraction=None,
-            all_conditions_valid=descends,
+            # eta* = 5.0 sits outside the Lemma 3.5 interval, so the shared
+            # gate's conjunction is False EVEN WHEN the step descends.
+            all_conditions_valid=False,
         ),
     )
 

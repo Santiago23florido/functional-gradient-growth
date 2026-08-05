@@ -3408,18 +3408,46 @@ def _search_nonlinear_primary_candidate(
                     )
                     last_trial = trial
                     last_stats = step.stats
-                    # "direction_only" is the ladder's rule verbatim: it commits
-                    # the model its cosine test returned, with no transactional
-                    # gate. Kept so the two paths can be compared at the SAME
-                    # bar; it carries no statement about step length.
-                    if (
-                        parametric.acceptance_rule != "direction_only"
-                        and not trial.all_conditions_valid
-                    ):
+                    # _certify_fgd_candidate's all_conditions_valid ANDs four
+                    # things, one of which is learning_rate_interval_valid. It
+                    # is shared with the tangent path and is not modified here,
+                    # so the rule is applied to its COMPONENTS instead --
+                    # otherwise "measured_descent" would silently re-impose the
+                    # very Lemma 3.5 interval it is defined not to require, and
+                    # would be indistinguishable from "theory_interval".
+                    # NOT epoch_result.skipped_batches: the nonlinear
+                    # certificate sets it to int(not interval_valid), so
+                    # gating on it would smuggle the Lemma 3.5 interval back in
+                    # under a sensor-shaped name.
+                    sensors_valid = (
+                        epoch_result.sensor_valid and certificate.sensor_valid
+                    )
+                    direction_valid = (
+                        certificate.relative_error_condition_valid is True
+                    )
+                    if parametric.acceptance_rule == "direction_only":
+                        # The ladder's rule verbatim: the cosine test alone.
+                        step_accepted = True
+                        rejection = ""
+                    elif parametric.acceptance_rule == "measured_descent":
+                        step_accepted = bool(
+                            sensors_valid
+                            and direction_valid
+                            and trial.loss_descent_valid
+                        )
+                        rejection = (
+                            "no measured descent on the transactional split"
+                            if sensors_valid and direction_valid
+                            else "sensor or direction condition failed"
+                        )
+                    else:
+                        step_accepted = bool(trial.all_conditions_valid)
+                        rejection = "the transactional conditions rejected it"
+                    if not step_accepted:
                         if progress is not None:
                             progress(
                                 f"[NONLINEAR-ALPHA] alpha={step.alpha:g} certified "
-                                "but the transactional conditions rejected it"
+                                f"but {rejection}"
                             )
                         continue
 
