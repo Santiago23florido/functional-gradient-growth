@@ -315,6 +315,71 @@ def _batch_graphs(model, loader, device, config, max_batches):
     return graphs
 
 
+def krylov_jacobian(
+    *,
+    outputs: torch.Tensor,
+    parameters,
+    target: torch.Tensor,
+    iterations: int,
+    eps: float,
+) -> torch.Tensor | None:
+    """``J`` reconstructed as ``U_{k+1} B_k V_k^T``, never forming the Gram.
+
+    The ladder consumes a dense ``(rows, P)`` Jacobian, so one is returned --
+    but it is BUILT from ``2k+1`` matrix-vector products rather than from a
+    ``jacrev`` over every row, and the ``O(P^2)`` Gram is never materialised at
+    any point. That Gram is the object that makes the exact route impossible at
+    MNIST width; ``J`` itself is ``O(NK P)``, which is large but linear.
+
+    ``k`` runs to the numerical rank as seen from ``target`` and is capped at
+    ``P``. Both matter: below the rank the reconstruction is optimistic about
+    how much of ``r`` is representable, and above ``P`` the extra directions
+    are noise that is optimistic in the same direction.
+    """
+    parameters = list(parameters)
+    dummy = torch.zeros_like(outputs, requires_grad=True)
+    jt_dummy = torch.autograd.grad(
+        outputs, parameters, grad_outputs=dummy, create_graph=True
+    )
+
+    def apply_jt(weights: list) -> list:
+        grads = torch.autograd.grad(
+            outputs, parameters, grad_outputs=weights[0], retain_graph=True
+        )
+        return [g.detach() for g in grads]
+
+    def apply_j(vector: list) -> list:
+        paired = sum((g * value).sum() for g, value in zip(jt_dummy, vector))
+        (result,) = torch.autograd.grad(paired, dummy, retain_graph=True)
+        return [result.detach()]
+
+    residuals = [target.reshape(outputs.shape)]
+    system = _golub_kahan(
+        apply_j=apply_j,
+        apply_jt=apply_jt,
+        residuals=residuals,
+        iterations=max(1, iterations),
+        floor=max(eps, 1e-12),
+    )
+    if system is None:
+        return None
+
+    # V_k as (P, k), then J = (U B) V^T. U is regenerated from B and V rather
+    # than stored: J v_i is one product each, and it keeps the peak memory at
+    # the factors instead of at two dense copies.
+    basis = torch.stack(
+        [
+            torch.cat([block.reshape(-1) for block in vector])
+            for vector in system.basis
+        ]
+    )
+    columns = [
+        torch.cat([block.reshape(-1) for block in apply_j(vector)])
+        for vector in system.basis
+    ]
+    return torch.stack(columns, dim=1) @ basis
+
+
 @dataclass(frozen=True)
 class _Bidiagonalization:
     """``J V_k = U_{k+1} B_k`` with ``U_{k+1} e_1 = r / ||r||``.
