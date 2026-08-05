@@ -89,3 +89,45 @@ def test_the_default_config_never_takes_the_approximate_branch() -> None:
     first = exact_tangent_system(model, x, y, config)
     second = exact_tangent_system(model, x, y, config)
     assert torch.equal(first.jacobian, second.jacobian)
+
+
+def test_the_factored_spectrum_is_the_spectrum_of_j() -> None:
+    """``svd(J) = (A, S, VB)`` -- the identity the whole path rests on.
+
+    If this ever stops holding, every downstream consumer reading the factors
+    is silently deciding on a different operator than the one it thinks.
+    """
+    from fgdlib.search.damping import DAMPING_BRACKET
+    from fgdlib.search.mffactored import (
+        factored_minimal_relative_error,
+        factored_spectrum,
+    )
+
+    config = load_pipeline_config(APPROX).fgd_approx
+    _c, model, x, y = _probe(APPROX)
+    system = exact_tangent_system(model, x, y, config)
+    assert system.factors is not None
+
+    spectrum = factored_spectrum(system)
+    assert spectrum is not None
+    _left, singular_values, right = spectrum
+    _a, reference, _b = torch.linalg.svd(
+        system.jacobian.double(), full_matrices=False
+    )
+    count = singular_values.numel()
+    assert torch.allclose(reference[:count], singular_values, rtol=1e-5, atol=1e-8)
+
+    # Never an (N K, P) object anywhere in the factored route.
+    assert right.shape[1] == count < system.jacobian.shape[1]
+
+    factored = factored_minimal_relative_error(system, config, DAMPING_BRACKET[0])
+    assert factored == pytest.approx(
+        exact_relative_error(model, x, y, config, system=system), rel=1e-3
+    )
+
+
+def test_the_exact_system_carries_no_factors() -> None:
+    """The default config must not even have the option of this path."""
+    config = load_pipeline_config(LADDER).fgd_approx
+    _c, model, x, y = _probe(LADDER)
+    assert exact_tangent_system(model, x, y, config).factors is None
