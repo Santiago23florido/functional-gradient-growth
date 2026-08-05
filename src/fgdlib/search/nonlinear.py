@@ -25,6 +25,7 @@ from fgdlib.tangent import (
 
 __all__ = [
     "InterpolatedStep",
+    "build_nonlinear_probe",
     "NonlinearCandidate",
     "NonlinearCertificateStats",
     "scale_parameter_displacement",
@@ -105,6 +106,32 @@ class NonlinearCertificateStats:
         if not self.sensor_valid or self.gradient_sq_norm <= 0.0:
             return None
         return self.dot_product / self.gradient_sq_norm
+
+
+def build_nonlinear_probe(
+    loader,
+    probe_batches: int,
+    device: torch.device | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Concatenate the first ``probe_batches`` minibatches into one probe.
+
+    Deliberately NOT ``build_projection_probe``: that name belongs to the
+    tangent path, and the nonlinear primary must not reach into it even for a
+    helper that only concatenates. The nonlinear-only guarantee is easier to
+    keep true than to keep arguing about.
+    """
+    if probe_batches < 1:
+        raise ValueError("probe_batches must be a positive integer.")
+    xs: list[torch.Tensor] = []
+    ys: list[torch.Tensor] = []
+    for x, y in loader:
+        xs.append(x.to(device) if device is not None else x)
+        ys.append(y.to(device) if device is not None else y)
+        if len(xs) == probe_batches:
+            break
+    if not xs:
+        raise ValueError("The probe loader yielded no batches.")
+    return torch.cat(xs, dim=0), torch.cat(ys, dim=0)
 
 
 def _parameters_are_finite(model: torch.nn.Module) -> bool:
@@ -531,7 +558,14 @@ class InterpolatedStep:
 
     @property
     def functional_descent(self) -> float:
-        """``L(f_base) - L(f_alpha)`` measured on the certification split."""
+        """``L(f_base) - L(f_alpha)`` measured on the CERTIFICATE split.
+
+        Reported, and used to rank under ``alpha_policy="max_descent"``, but
+        deliberately NOT an admissibility screen: the descent criterion that
+        gates acceptance is measured on the TRANSACTIONAL split by the
+        caller's transactional conditions. Screening here as well would apply
+        a descent test on the wrong split and shortcut that gate.
+        """
         return self.stats.base_loss - self.stats.candidate_loss
 
 
@@ -589,8 +623,6 @@ def search_interpolated_step(
             reason = "sensor_invalid"
         elif not stats.certified:
             reason = "relative_error_above_threshold"
-        elif stats.base_loss - stats.candidate_loss <= 0.0:
-            reason = "no_functional_descent"
         trials.append(InterpolatedStep(alpha, stepped, stats, reason))
         if progress is not None:
             cosine = "n/a" if stats.cosine is None else f"{stats.cosine:.4f}"

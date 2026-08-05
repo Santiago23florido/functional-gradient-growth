@@ -15,6 +15,7 @@ from fgdlib import tangent
 from fgdlib.profile import reset, snapshot
 from fgdlib.search import certify, linearization, realize
 from fgdlib.search import damping as damping_search
+from fgdlib.search import nonlinear as nonlinear_module
 from fgdlib.search.nonlinear import (
     NonlinearCandidate,
     NonlinearCertificateStats,
@@ -357,11 +358,15 @@ def test_nonlinear_search_certifies_on_validation_loader_with_configured_cap(
         pipeline, "train_nonlinear_candidate", lambda **kwargs: generated
     )
     monkeypatch.setattr(pipeline, "stream_nonlinear_certificate", stream)
+    # The streaming cap is a property of the VALIDATION certificate path, so
+    # this test asks for that split explicitly rather than relying on a
+    # default (which is now "train", matching the ladder).
     config = replace(
         _tiny_pipeline_config(threshold=0.5),
         parametric_gd=replace(
             _tiny_pipeline_config().parametric_gd,
             certification_batches=1,
+            certificate_split="validation",
         ),
     )
     pipeline._search_nonlinear_primary_candidate(
@@ -428,13 +433,29 @@ def test_required_validation_descent_rejects_nonlinear_candidate(
         "stream_nonlinear_certificate",
         lambda **kwargs: stats,
     )
-    monkeypatch.setattr(pipeline, "family_lemma35_rate", lambda *args: 0.25)
+    # The committed step now comes from the interpolation search, and each
+    # alpha carries its OWN re-measured certificate. Hand it one certified
+    # interpolation whose realized eta* sits inside the Lemma 3.5 interval,
+    # so the only thing left that can reject it is the transactional descent
+    # condition on validation -- which is what this test is about.
+    admissible = nonlinear_module.InterpolatedStep(
+        alpha=1.0,
+        model=moved,
+        stats=replace(stats, dot_product=0.5, displacement_sq_norm=0.25),
+        rejection_reason=None,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "search_interpolated_step",
+        lambda **kwargs: (admissible, (admissible,)),
+    )
     config = replace(
         _tiny_pipeline_config(epochs=1, threshold=0.5),
         parametric_gd=replace(
             _tiny_pipeline_config().parametric_gd,
             inner_steps=(1,),
             functional_learning_rates=(0.5,),
+            certificate_split="validation",
         ),
     )
     theory_state = pipeline._FGDTheoryState(

@@ -67,12 +67,12 @@ from fgdlib.search.certify import (
 )
 from fgdlib.search.families import (
     certify_parametric_step_swept,
-    family_lemma35_rate,
 )
 from fgdlib.search.nonlinear import (
     NonlinearCandidate,
     NonlinearCertificateStats,
-    scale_parameter_displacement,
+    build_nonlinear_probe,
+    search_interpolated_step,
     stream_nonlinear_certificate,
     train_nonlinear_candidate,
 )
@@ -283,6 +283,21 @@ class HistoryEntry:
     nonlinear_certificate_valid: bool | None = None
     nonlinear_validation_descent_valid: bool | None = None
     nonlinear_committed_rate: float | None = None
+    #: Interpolation actually committed. Distinct from the eta_f that generated
+    #: the target and from the realized secant rate below.
+    nonlinear_committed_alpha: float | None = None
+    #: eta* = <Delta, r>/|r|^2 of the displacement that was APPLIED.
+    nonlinear_effective_secant_rate: float | None = None
+    #: Best cosine reached at this structure, over every candidate tried.
+    nonlinear_best_cosine: float | None = None
+    nonlinear_candidate_optimizer_steps: int | None = None
+    nonlinear_candidate_epochs: float | None = None
+    nonlinear_candidate_batches_seen: int | None = None
+    nonlinear_candidate_examples_seen: int | None = None
+    nonlinear_candidate_initial_objective: float | None = None
+    nonlinear_candidate_final_objective: float | None = None
+    nonlinear_candidate_objective_reduction: float | None = None
+    nonlinear_candidate_parameter_displacement_norm: float | None = None
     nonlinear_growth_requested: bool = False
     nonlinear_candidate_training_seconds: float = 0.0
     nonlinear_certification_seconds: float = 0.0
@@ -371,6 +386,11 @@ class _NonlinearPrimaryResult:
     candidate_training_seconds: float
     certification_seconds: float
     update_norm: float | None
+    #: Interpolation actually committed, or ``None`` when nothing certified.
+    committed_alpha: float | None = None
+    #: Best cosine any candidate reached at this structure. Kept so a failed
+    #: ladder reports how close it came instead of only its last attempt.
+    best_cosine: float | None = None
 
 
 @dataclass(frozen=True)
@@ -3092,6 +3112,29 @@ def _parameter_displacement_norm(
     return math.sqrt(squared)
 
 
+def _nonlinear_certification_source(
+    *,
+    split: str,
+    train_probe: tuple[torch.Tensor, torch.Tensor] | None,
+    validation_loader,
+):
+    """Iterable of ``(x, y)`` the directional certificate is measured over.
+
+    Under ``certificate_split="train"`` this is the SAME probe the candidate
+    was trained on -- the ladder's semantics, where the certificate is a
+    statement about the empirical objective the step is defined on. Under
+    ``"validation"`` it is the validation loader, which is a generalization
+    claim and a strictly different guarantee.
+    """
+    if split == "train":
+        if train_probe is None:
+            raise ValueError(
+                "parametric_gd.certificate_split='train' requires a train probe."
+            )
+        return [(train_probe[0], train_probe[1])]
+    return validation_loader
+
+
 def _search_nonlinear_primary_candidate(
     *,
     base_model: GrowingMLP,
@@ -3107,8 +3150,22 @@ def _search_nonlinear_primary_candidate(
     initial_functional_gap: float,
     theory_loss_star: float,
     progress: ProgressFn | None,
+    train_probe: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> _NonlinearPrimaryResult:
-    """Try only the configured AdamW nonlinear ladder at ``theta_t``."""
+    """Try only the configured AdamW nonlinear ladder at ``theta_t``.
+
+    Every functional rate ``eta_f`` is swept in the configured order and each
+    is certified on its own -- an ``eta_f`` that fails says the clone could not
+    realise THAT distance, not that the family is unavailable.
+
+    The step that is COMMITTED is the step that was CERTIFIED. For each
+    candidate the interpolations ``theta + alpha (theta' - theta)`` are
+    measured again from scratch, and the accepted one carries its own cosine,
+    its own relative error, and its own realized secant rate
+    ``eta* = <Delta_alpha, r> / |r|^2``. Nothing derived from the full
+    candidate is reused for a shorter step.
+    """
+    parametric = config.parametric_gd
     attempts = 0
     training_seconds = 0.0
     certification_seconds = 0.0
@@ -3117,10 +3174,24 @@ def _search_nonlinear_primary_candidate(
     last_trial: _FGDTrial | None = None
     last_certificate = _invalid_nonlinear_certificate()
     last_update_norm: float | None = None
+    best_cosine = -2.0
+
+    certification_source = _nonlinear_certification_source(
+        split=parametric.certificate_split,
+        train_probe=train_probe,
+        validation_loader=validation_loader,
+    )
+    # A train-probe certificate is one full-batch pass by construction; the
+    # streaming cap only applies to a validation loader.
+    certification_cap = (
+        parametric.certification_batches
+        if parametric.certificate_split == "validation"
+        else None
+    )
 
     with timed("nonlinear_total_seconds"):
-        for functional_learning_rate in config.parametric_gd.functional_learning_rates:
-            for inner_steps in config.parametric_gd.inner_steps:
+        for functional_learning_rate in parametric.functional_learning_rates:
+            for inner_steps in parametric.inner_steps:
                 attempts += 1
                 generated = train_nonlinear_candidate(
                     base_model=base_model,
@@ -3128,8 +3199,9 @@ def _search_nonlinear_primary_candidate(
                     device=device,
                     functional_learning_rate=functional_learning_rate,
                     inner_steps=inner_steps,
-                    config=config.parametric_gd,
+                    config=parametric,
                     fgd_config=config.fgd_approx,
+                    probe=train_probe,
                 )
                 last_candidate = generated
                 training_seconds += generated.training_seconds
@@ -3143,137 +3215,216 @@ def _search_nonlinear_primary_candidate(
                         )
                     continue
 
-                stats = stream_nonlinear_certificate(
+                if progress is not None:
+                    reduction = generated.objective_reduction
+                    progress(
+                        f"[NONLINEAR-CAND] eta_f={functional_learning_rate:g}, "
+                        f"inner_steps={inner_steps} ({generated.step_unit}), "
+                        f"optimizer_steps={generated.optimizer_steps}, "
+                        f"epochs={generated.epochs:g}, "
+                        f"batches={generated.batches_seen}, "
+                        f"examples={generated.examples_seen}, "
+                        f"objective {generated.initial_objective!r} -> "
+                        f"{generated.final_objective!r} "
+                        f"(reduction {reduction!r})"
+                    )
+
+                # The FULL candidate's certificate. Reported for diagnosis; it
+                # never licenses a shorter step.
+                candidate_stats = stream_nonlinear_certificate(
                     base_model=base_model,
                     candidate_model=generated.model,
-                    certification_loader=validation_loader,
+                    certification_loader=certification_source,
                     device=device,
                     config=config.fgd_approx,
-                    max_batches=config.parametric_gd.certification_batches,
+                    max_batches=certification_cap,
                 )
-                last_stats = stats
-                certification_seconds += stats.certification_seconds
-                rate = (
-                    family_lemma35_rate(
-                        stats.relative_error,
-                        config.fgd_approx,
-                    )
-                    if stats.certified and stats.relative_error is not None
-                    else None
-                )
-                last_certificate = _nonlinear_directional_certificate(
-                    stats=stats,
-                    learning_rate=rate,
-                    config=config.fgd_approx,
-                )
+                certification_seconds += candidate_stats.certification_seconds
+                last_stats = candidate_stats
+                if candidate_stats.cosine is not None:
+                    best_cosine = max(best_cosine, candidate_stats.cosine)
                 if progress is not None:
                     cosine = (
-                        f"{stats.cosine:.4f}" if stats.cosine is not None else "n/a"
+                        "n/a"
+                        if candidate_stats.cosine is None
+                        else f"{candidate_stats.cosine:.4f}"
                     )
                     epsilon = (
-                        f"{stats.relative_error:.4f}"
-                        if stats.relative_error is not None
-                        else "n/a"
+                        "n/a"
+                        if candidate_stats.relative_error is None
+                        else f"{candidate_stats.relative_error:.4f}"
                     )
+                    secant = candidate_stats.effective_secant_rate
                     progress(
                         f"[NONLINEAR] eta_f={functional_learning_rate:g}, "
                         f"inner_steps={inner_steps}, cos={cosine}, "
-                        f"eps={epsilon}, direction_certified={stats.certified}, "
-                        f"rate={rate if rate is not None else 'n/a'}"
+                        f"eps={epsilon}, "
+                        f"eta_star={'n/a' if secant is None else f'{secant:.4g}'}, "
+                        f"param_disp="
+                        f"{_parameter_displacement_norm(base_model, generated.model):.4g}, "
+                        f"full_candidate_certified={candidate_stats.certified}"
                     )
-                if not stats.certified or rate is None:
-                    continue
 
-                scaled_model = scale_parameter_displacement(
+                # Re-measure every interpolation. Each alpha is its own step
+                # with its own certificate; the full candidate's is not reused.
+                _, alpha_trials = search_interpolated_step(
                     base_model=base_model,
                     candidate_model=generated.model,
-                    rate=rate,
-                )
-                last_update_norm = _parameter_displacement_norm(
-                    base_model,
-                    scaled_model,
-                )
-                train_metrics = evaluate_regression_metrics(
-                    scaled_model,
-                    train_loader,
-                    loss_function,
+                    certification_loader=certification_source,
                     device=device,
-                    accuracy_tolerance=accuracy_tolerance,
-                    classification=classification,
+                    config=config.fgd_approx,
+                    alpha_grid=parametric.alpha_grid,
+                    policy=parametric.alpha_policy,
+                    max_batches=certification_cap,
+                    progress=progress,
                 )
-                test_metrics = evaluate_regression_metrics(
-                    scaled_model,
-                    test_loader,
-                    loss_function,
-                    device=device,
-                    accuracy_tolerance=accuracy_tolerance,
-                    classification=classification,
-                )
-                epoch_result = FGDApproxEpochResult(
-                    train_loss=train_metrics.loss,
-                    train_accuracy=train_metrics.accuracy,
-                    test_loss=test_metrics.loss,
-                    test_accuracy=test_metrics.accuracy,
-                    learning_rate=rate,
-                    next_learning_rate=rate,
-                    learning_rate_upper_bound=(
-                        last_certificate.learning_rate_upper_bound
-                    ),
-                    learning_rate_interval_valid=(
-                        last_certificate.learning_rate_interval_valid
-                    ),
-                    learning_rate_clipped_batches=0,
-                    skipped_batches=last_certificate.skipped_batches,
-                    relative_error_condition_valid=(
-                        last_certificate.relative_error_condition_valid
-                    ),
-                    loss_descent_valid=None,
-                    loss_non_descent_batches=0,
-                    gradient_sq_norm=last_certificate.gradient_sq_norm,
-                    theory_descent_coefficient=(
-                        last_certificate.theory_descent_coefficient
-                    ),
-                    min_positive_learning_rate=rate,
-                    relative_error=stats.relative_error,
-                    selected_layer_index=None,
-                    layer_relative_errors=[],
-                    output_relative_error=None,
-                    sensor_valid=last_certificate.sensor_valid,
-                    sensor_invalid_batches=(last_certificate.sensor_invalid_batches),
-                )
-                trial = _certify_fgd_candidate(
-                    candidate_model=scaled_model,
-                    epoch_result=epoch_result,
-                    certificate=last_certificate,
-                    validation_loader=validation_loader,
-                    device=device,
-                    config=config,
-                    theory_state=theory_state,
-                    initial_functional_gap=initial_functional_gap,
-                    theory_loss_star=theory_loss_star,
-                )
-                last_trial = trial
-                if not trial.all_conditions_valid:
-                    if progress is not None:
-                        progress(
-                            "[NONLINEAR] direction certified but transactional "
-                            "validation conditions rejected the scaled step"
-                        )
+                for trial_step in alpha_trials:
+                    certification_seconds += trial_step.stats.certification_seconds
+
+                admissible = [
+                    step for step in alpha_trials if step.rejection_reason is None
+                ]
+                if parametric.alpha_policy == "max_descent":
+                    admissible.sort(
+                        key=lambda step: step.functional_descent,
+                        reverse=True,
+                    )
+                else:
+                    admissible.sort(key=lambda step: step.alpha, reverse=True)
+
+                if not admissible:
+                    last_certificate = _nonlinear_directional_certificate(
+                        stats=candidate_stats,
+                        learning_rate=candidate_stats.effective_secant_rate,
+                        config=config.fgd_approx,
+                    )
                     continue
 
-                increment("nonlinear_accepted_steps")
-                return _NonlinearPrimaryResult(
-                    accepted=trial,
-                    last_trial=trial,
-                    certificate=last_certificate,
-                    stats=stats,
-                    candidate=generated,
-                    attempts=attempts,
-                    candidate_training_seconds=training_seconds,
-                    certification_seconds=certification_seconds,
-                    update_norm=last_update_norm,
-                )
+                for step in admissible:
+                    # The rate quoted with this certificate is the one this
+                    # displacement REALIZED, so Lemma 3.5's interval is checked
+                    # against the step actually being taken.
+                    realized_rate = step.stats.effective_secant_rate
+                    certificate = _nonlinear_directional_certificate(
+                        stats=step.stats,
+                        learning_rate=realized_rate,
+                        config=config.fgd_approx,
+                    )
+                    last_certificate = certificate
+                    if not certificate.learning_rate_interval_valid:
+                        if progress is not None:
+                            progress(
+                                f"[NONLINEAR-ALPHA] alpha={step.alpha:g} rejected: "
+                                f"realized eta*={realized_rate!r} outside the "
+                                "Lemma 3.5 interval for its OWN eps "
+                                f"{step.stats.relative_error!r}"
+                            )
+                        continue
 
+                    last_update_norm = _parameter_displacement_norm(
+                        base_model,
+                        step.model,
+                    )
+                    train_metrics = evaluate_regression_metrics(
+                        step.model,
+                        train_loader,
+                        loss_function,
+                        device=device,
+                        accuracy_tolerance=accuracy_tolerance,
+                        classification=classification,
+                    )
+                    test_metrics = evaluate_regression_metrics(
+                        step.model,
+                        test_loader,
+                        loss_function,
+                        device=device,
+                        accuracy_tolerance=accuracy_tolerance,
+                        classification=classification,
+                    )
+                    epoch_result = FGDApproxEpochResult(
+                        train_loss=train_metrics.loss,
+                        train_accuracy=train_metrics.accuracy,
+                        test_loss=test_metrics.loss,
+                        test_accuracy=test_metrics.accuracy,
+                        learning_rate=realized_rate,
+                        next_learning_rate=realized_rate,
+                        learning_rate_upper_bound=(
+                            certificate.learning_rate_upper_bound
+                        ),
+                        learning_rate_interval_valid=(
+                            certificate.learning_rate_interval_valid
+                        ),
+                        learning_rate_clipped_batches=0,
+                        skipped_batches=certificate.skipped_batches,
+                        relative_error_condition_valid=(
+                            certificate.relative_error_condition_valid
+                        ),
+                        loss_descent_valid=None,
+                        loss_non_descent_batches=0,
+                        gradient_sq_norm=certificate.gradient_sq_norm,
+                        theory_descent_coefficient=(
+                            certificate.theory_descent_coefficient
+                        ),
+                        min_positive_learning_rate=realized_rate,
+                        relative_error=step.stats.relative_error,
+                        selected_layer_index=None,
+                        layer_relative_errors=[],
+                        output_relative_error=None,
+                        sensor_valid=certificate.sensor_valid,
+                        sensor_invalid_batches=certificate.sensor_invalid_batches,
+                    )
+                    trial = _certify_fgd_candidate(
+                        candidate_model=step.model,
+                        epoch_result=epoch_result,
+                        certificate=certificate,
+                        validation_loader=validation_loader,
+                        device=device,
+                        config=config,
+                        theory_state=theory_state,
+                        initial_functional_gap=initial_functional_gap,
+                        theory_loss_star=theory_loss_star,
+                    )
+                    last_trial = trial
+                    last_stats = step.stats
+                    if not trial.all_conditions_valid:
+                        if progress is not None:
+                            progress(
+                                f"[NONLINEAR-ALPHA] alpha={step.alpha:g} certified "
+                                "but the transactional conditions rejected it"
+                            )
+                        continue
+
+                    if progress is not None:
+                        progress(
+                            f"[NONLINEAR-ACCEPT] alpha={step.alpha:g}, "
+                            f"eta_f={functional_learning_rate:g}, "
+                            f"cos={step.stats.cosine:.4f}, "
+                            f"eps={step.stats.relative_error:.4f}, "
+                            f"eta_star={realized_rate:.4g}, "
+                            f"descent={step.functional_descent:+.6e}, "
+                            f"param_disp={last_update_norm:.4g}"
+                        )
+                    increment("nonlinear_accepted_steps")
+                    return _NonlinearPrimaryResult(
+                        accepted=trial,
+                        last_trial=trial,
+                        certificate=certificate,
+                        stats=step.stats,
+                        candidate=generated,
+                        attempts=attempts,
+                        candidate_training_seconds=training_seconds,
+                        certification_seconds=certification_seconds,
+                        update_norm=last_update_norm,
+                        committed_alpha=step.alpha,
+                        best_cosine=(best_cosine if best_cosine > -2.0 else None),
+                    )
+
+    if progress is not None:
+        progress(
+            "[NONLINEAR] no candidate certified the step it would apply "
+            f"(best cos over {attempts} attempts: "
+            f"{'n/a' if best_cosine <= -2.0 else f'{best_cosine:.4f}'})"
+        )
     increment("nonlinear_failed_ladders")
     return _NonlinearPrimaryResult(
         accepted=None,
@@ -3285,6 +3436,8 @@ def _search_nonlinear_primary_candidate(
         candidate_training_seconds=training_seconds,
         certification_seconds=certification_seconds,
         update_norm=last_update_norm,
+        committed_alpha=None,
+        best_cosine=(best_cosine if best_cosine > -2.0 else None),
     )
 
 
@@ -4251,6 +4404,27 @@ def _run_nonlinear_pipeline(
             f"test_acc={test_metrics.accuracy:.3f}"
         )
 
+    # The certification probe. build_projection_probe only CONCATENATES
+    # minibatches -- no Jacobian, no tangent system, no projection solve -- so
+    # the nonlinear-only guarantee is untouched. With the ladder's
+    # probe_batches this is the entire training set, which is the empirical
+    # objective the certified step is defined on.
+    nonlinear_train_probe = build_nonlinear_probe(
+        train_loader,
+        config.fgd_approx.probe_batches,
+        device,
+    )
+    if progress is not None:
+        progress(
+            f"[NONLINEAR] certificate split="
+            f"{config.parametric_gd.certificate_split}, "
+            f"train probe={nonlinear_train_probe[0].shape[0]} examples, "
+            f"inner_step_unit={config.parametric_gd.inner_step_unit}, "
+            f"eta_f sweep={list(config.parametric_gd.functional_learning_rates)}, "
+            f"alpha grid={list(config.parametric_gd.alpha_grid) or [1.0]} "
+            f"({config.parametric_gd.alpha_policy})"
+        )
+
     last_test_loss = test_metrics.loss
     for epoch in range(1, config.training.epochs + 1):
         base_parameters = count_parameters(model)
@@ -4258,6 +4432,7 @@ def _run_nonlinear_pipeline(
         nonlinear_result = _search_nonlinear_primary_candidate(
             base_model=model,
             train_loader=train_loader,
+            train_probe=nonlinear_train_probe,
             validation_loader=validation_loader,
             test_loader=test_loader,
             loss_function=loss_function,
@@ -4387,6 +4562,35 @@ def _run_nonlinear_pipeline(
                 last_trial.loss_descent_valid if last_trial is not None else None
             ),
             nonlinear_committed_rate=committed_rate,
+            nonlinear_committed_alpha=nonlinear_result.committed_alpha,
+            nonlinear_effective_secant_rate=(
+                stats.effective_secant_rate if stats is not None else None
+            ),
+            nonlinear_best_cosine=nonlinear_result.best_cosine,
+            nonlinear_candidate_optimizer_steps=(
+                candidate.optimizer_steps if candidate is not None else None
+            ),
+            nonlinear_candidate_epochs=(
+                candidate.epochs if candidate is not None else None
+            ),
+            nonlinear_candidate_batches_seen=(
+                candidate.batches_seen if candidate is not None else None
+            ),
+            nonlinear_candidate_examples_seen=(
+                candidate.examples_seen if candidate is not None else None
+            ),
+            nonlinear_candidate_initial_objective=(
+                candidate.initial_objective if candidate is not None else None
+            ),
+            nonlinear_candidate_final_objective=(
+                candidate.final_objective if candidate is not None else None
+            ),
+            nonlinear_candidate_objective_reduction=(
+                candidate.objective_reduction if candidate is not None else None
+            ),
+            nonlinear_candidate_parameter_displacement_norm=(
+                nonlinear_result.update_norm
+            ),
             nonlinear_growth_requested=accepted is None,
             nonlinear_candidate_training_seconds=(
                 nonlinear_result.candidate_training_seconds
