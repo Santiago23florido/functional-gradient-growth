@@ -127,6 +127,13 @@ PROFILE_FIELDS = (
     # parent/child contract -- never sum streamed_jacobian_seconds into
     # tangent_system_total_seconds, it is a nested parent, not a sibling).
     "tangent_system_total_seconds",
+    # Matrix-free family. These were being passed to timed()/increment()
+    # without ever being declared, so FGD_PROFILE=1 raised KeyError on the
+    # first matrix-free call -- the one path that most needed measuring could
+    # not be measured at all.
+    "matrix_free_tangent_seconds",
+    "matrix_free_tangent_calls",
+    "matrix_free_vmap_fallbacks",
     "tangent_forward_target_seconds",
     "tangent_jacrev_seconds",
     "tangent_jacobian_flatten_seconds",
@@ -207,6 +214,8 @@ _COUNTER_FIELDS = {
     "tangent_peak_jacobian_block_columns",
     "tangent_parameter_count",
     "tangent_output_row_count",
+    "matrix_free_tangent_calls",
+    "matrix_free_vmap_fallbacks",
 }
 _VALUES: dict[str, float] = {field: 0.0 for field in PROFILE_FIELDS}
 _REASONS: dict[str, set[str]] = {}
