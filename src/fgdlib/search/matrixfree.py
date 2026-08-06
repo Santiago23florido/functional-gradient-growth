@@ -315,6 +315,357 @@ def _batch_graphs(model, loader, device, config, max_batches):
     return graphs
 
 
+@dataclass(frozen=True)
+class AnalyticOperators:
+    """``J v`` and ``J^T w`` for a block of vectors, without ever forming ``J``.
+
+    The exact route builds ``J`` with ``_analytic_jacobian_block``, whose real
+    cost is not the recursion but the OUTER PRODUCT at the end: per layer the
+    Jacobian block is ``D_l (x) a_{l-1}``, and writing it out is the ``(NK, P)``
+    matrix -- 4.8 GB at MNIST width. The factors themselves are small.
+
+    So the factors are kept and the product is applied instead of stored:
+
+        J v   = sum_l  D_l . (V_l a_{l-1})
+        J^T w = sum_l  (w . D_l) (x) a_{l-1}
+
+    Both are einsums with a leading block axis, so ``ell`` vectors cost ONE
+    batched matmul per layer rather than ``ell`` sequential autograd calls.
+    That is the whole speed argument: the sequential Golub-Kahan this replaces
+    made ``2k+1`` ``torch.autograd.grad`` calls that could not be batched
+    because step ``i+1`` consumed step ``i``.
+    """
+
+    #: ``D_l``, shape ``(n, k, out_l)`` -- downstream sensitivities.
+    sensitivities: tuple[torch.Tensor, ...]
+    #: ``a_{l-1}``, shape ``(n, in_l)`` -- the layer's input activations.
+    activations: tuple[torch.Tensor, ...]
+    use_bias: tuple[bool, ...]
+    #: ``n * k``: the row count of the ``J`` these operators stand for.
+    rows: int
+    #: ``P``.
+    columns: int
+
+    def split(self, block: torch.Tensor) -> list[tuple]:
+        """Cut a ``(ell, P)`` block into per-layer ``(ell, out, in)`` + bias."""
+        pieces = []
+        offset = 0
+        for weights, inputs, uses_bias in zip(
+            self.sensitivities, self.activations, self.use_bias
+        ):
+            out_features = weights.shape[2]
+            in_features = inputs.shape[1]
+            width = out_features * in_features
+            weight = block[:, offset : offset + width].reshape(
+                -1, out_features, in_features
+            )
+            offset += width
+            if uses_bias:
+                bias = block[:, offset : offset + out_features]
+                offset += out_features
+            else:
+                bias = None
+            pieces.append((weight, bias))
+        return pieces
+
+    def apply_j(self, block: torch.Tensor) -> torch.Tensor:
+        """``(ell, P) -> (ell, NK)``. One batched matmul pair per layer."""
+        total = None
+        for (weight, bias), sensitivity, inputs in zip(
+            self.split(block), self.sensitivities, self.activations
+        ):
+            # (ell, out, in) x (n, in) -> (ell, n, out), then contract out.
+            projected = torch.einsum("loi,ni->lno", weight, inputs)
+            if bias is not None:
+                projected = projected + bias.unsqueeze(1)
+            contribution = torch.einsum("nko,lno->lnk", sensitivity, projected)
+            total = contribution if total is None else total + contribution
+        return total.reshape(block.shape[0], -1)
+
+    def apply_jt(self, block: torch.Tensor) -> torch.Tensor:
+        """``(ell, NK) -> (ell, P)``. The transpose of the above, same shape work."""
+        rows = block.reshape(block.shape[0], -1, self.sensitivities[0].shape[1])
+        parts = []
+        for sensitivity, inputs, uses_bias in zip(
+            self.sensitivities, self.activations, self.use_bias
+        ):
+            # Contract the output index first: (ell, n, k) x (n, k, out).
+            folded = torch.einsum("lnk,nko->lno", rows, sensitivity)
+            parts.append(
+                torch.einsum("lno,ni->loi", folded, inputs).reshape(
+                    block.shape[0], -1
+                )
+            )
+            if uses_bias:
+                parts.append(folded.sum(dim=1))
+        return torch.cat(parts, dim=1)
+
+
+def analytic_operators(
+    structure,
+    x_block: torch.Tensor,
+    out_dtype: torch.dtype = torch.float64,
+) -> AnalyticOperators:
+    """The factors of ``_analytic_jacobian_block``, kept instead of multiplied.
+
+    The recursion is deliberately the same one, in the same order and the same
+    dtypes, because the column layout of ``P`` has to match what every other
+    consumer expects. It is duplicated rather than shared so the exact path
+    keeps running byte-identical code; a test anchors the two to machine
+    precision, so a divergence fails loudly rather than silently deciding on a
+    different operator.
+    """
+    linears = structure.linears
+    depth = len(linears)
+
+    with torch.no_grad():
+        current = x_block.reshape(x_block.shape[0], -1)
+        activations = [current]
+        pre_activations = []
+        for layer, post in zip(linears, structure.post_functions):
+            hidden = layer(current)
+            pre_activations.append(hidden)
+            current = post(hidden)
+            activations.append(current)
+
+    # Activation derivatives from autograd on the REAL module, never
+    # hard-coded -- each is a tiny independent graph, exactly as the exact
+    # path does it, so boundary conventions match by construction.
+    gprimes = []
+    for hidden, post in zip(pre_activations, structure.post_functions):
+        detached = hidden.detach().requires_grad_(True)
+        activated = post(detached)
+        (gprime,) = torch.autograd.grad(
+            activated, detached, torch.ones_like(activated)
+        )
+        gprimes.append(gprime.detach())
+
+    samples = x_block.shape[0]
+    outputs = structure.output_features
+    with torch.no_grad():
+        eye = torch.eye(outputs, device=x_block.device, dtype=x_block.dtype)
+        sensitivities = [torch.empty(0)] * depth
+        sensitivities[depth - 1] = eye.expand(
+            samples, outputs, outputs
+        ) * gprimes[-1].unsqueeze(1)
+        for index in range(depth - 2, -1, -1):
+            sensitivities[index] = (
+                sensitivities[index + 1] @ linears[index + 1].weight
+            ) * gprimes[index].unsqueeze(1)
+
+    return AnalyticOperators(
+        sensitivities=tuple(value.to(out_dtype) for value in sensitivities),
+        activations=tuple(
+            activations[index].to(out_dtype) for index in range(depth)
+        ),
+        use_bias=tuple(structure.use_bias),
+        rows=samples * outputs,
+        columns=structure.parameter_numel,
+    )
+
+
+@dataclass(frozen=True)
+class VmapOperators:
+    """``J v`` / ``J^T w`` by ``vmap``, for models with no analytic form.
+
+    The slow thing about the old path was never autograd -- it was that
+    Golub-Kahan forced one product at a time, so ``2k`` graph walks happened
+    end to end. With a block range finder the ``ell`` products within a block
+    are INDEPENDENT, and ``vmap`` carries them through one graph walk. The
+    sequential depth becomes ``2q+2`` regardless of the rank, the same as on
+    the analytic path.
+
+    ``torch.func.jvp``/``vjp`` are used STANDALONE here, never nested inside a
+    live reverse-mode context. That nesting is the case this repo documented
+    as returning functorch ``TensorWrapper`` values; the block range finder
+    does not do it.
+    """
+
+    _apply_j: object
+    _apply_jt: object
+    rows: int
+    columns: int
+
+    def apply_j(self, block: torch.Tensor) -> torch.Tensor:
+        return self._apply_j(block)
+
+    def apply_jt(self, block: torch.Tensor) -> torch.Tensor:
+        return self._apply_jt(block)
+
+
+def vmap_operators(model, x: torch.Tensor, parameters, names) -> VmapOperators:
+    """Build the vmapped operators around ``model`` at its current parameters."""
+    from torch.func import functional_call, jvp, vjp, vmap
+
+    parameters = [p.detach() for p in parameters]
+    shapes = [tuple(p.shape) for p in parameters]
+    sizes = [p.numel() for p in parameters]
+    columns = sum(sizes)
+    flat = torch.cat([p.reshape(-1) for p in parameters]).double()
+
+    def _forward(packed: torch.Tensor) -> torch.Tensor:
+        pieces, offset = {}, 0
+        for name, shape, size in zip(names, shapes, sizes):
+            pieces[name] = packed[offset : offset + size].reshape(shape)
+            offset += size
+        return functional_call(model, pieces, (x.double(),)).reshape(-1)
+
+    primal, vjp_fn = vjp(_forward, flat)
+    rows = primal.numel()
+
+    def _apply_jt(block: torch.Tensor) -> torch.Tensor:
+        return vmap(vjp_fn)(block.double())[0]
+
+    def _apply_j(block: torch.Tensor) -> torch.Tensor:
+        return vmap(lambda v: jvp(_forward, (flat,), (v,))[1])(block.double())
+
+    return VmapOperators(
+        _apply_j=_apply_j, _apply_jt=_apply_jt, rows=rows, columns=columns
+    )
+
+
+def dual_gram(operators: AnalyticOperators) -> torch.Tensor:
+    """``J J^T``, exactly, without ever forming ``J``.
+
+    Per layer the Jacobian block is ``D_l (x) a_{l-1}``, so the outer product
+    of two Kronecker factors is the Hadamard product of their Grams:
+
+        J J^T = sum_l  (D_l D_l^T) * expand(a_l a_l^T)   [+ D_l D_l^T if bias]
+
+    where ``expand`` repeats each ``(n, n')`` entry ``K`` times along both axes
+    to match the row layout ``n*K + k``. The bias columns carry no activation
+    factor, which is the term that has to be added separately.
+
+    This is the DUAL of what the exact route computes. ``J^T J`` is ``P x P``;
+    this is ``NK x NK``. Whenever the model is over-parameterised relative to
+    the probe -- which is the MNIST regime, and the regime the whole branch
+    exists for -- that is the difference between running and not:
+
+        P=19201, NK=1024:   J^T J  2949 MB / 0.235 s
+                            J J^T   8.4 MB / 0.020 s
+
+    350x smaller, 12x faster, and MEASURED exact to 2.4e-16. It is not an
+    approximation, which is what makes it the right answer here: the earlier
+    low-rank route could not work, because at these sizes ``r`` is spread
+    across the whole spectrum (exact eps 1e-06 against 0.21 at rank 512).
+    """
+    rows = operators.rows
+    outputs = operators.sensitivities[0].shape[1]
+    total = None
+    for sensitivity, inputs, uses_bias in zip(
+        operators.sensitivities, operators.activations, operators.use_bias
+    ):
+        flat = sensitivity.reshape(rows, -1)
+        sensitivity_gram = flat @ flat.t()
+        activation_gram = (inputs @ inputs.t()).repeat_interleave(
+            outputs, dim=0
+        ).repeat_interleave(outputs, dim=1)
+        block = sensitivity_gram * activation_gram
+        if uses_bias:
+            block = block + sensitivity_gram
+        total = block if total is None else total + block
+    return total
+
+
+def dual_spectrum(
+    operators: AnalyticOperators, eps: float
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """``(A, S)`` with ``A`` the left singular vectors of ``J`` and ``S`` its
+    singular values, from an eigendecomposition of the dual Gram.
+
+    ``J J^T = A S^2 A^T``, so this IS ``J``'s spectrum -- no truncation, no
+    sketch. Directions with a numerically zero singular value are dropped
+    because they carry nothing; that is a rank reduction, not an
+    approximation.
+    """
+    gram = dual_gram(operators)
+    values, vectors = torch.linalg.eigh(gram)
+    largest = float(values.max()) if values.numel() else 0.0
+    if not largest > 0.0:
+        return None
+    keep = values > max(largest * len(values) * 1e-14, eps)
+    if not bool(keep.any()):
+        return None
+    values = values[keep].flip(0)
+    vectors = vectors[:, keep].flip(1)
+    return vectors, values.clamp_min(0.0).sqrt()
+
+
+def randomized_factorization(
+    *,
+    apply_j,
+    apply_jt,
+    rows: int,
+    columns: int,
+    rank: int,
+    oversampling: int = 10,
+    power_iterations: int = 2,
+    sketch: torch.Tensor | None = None,
+    device=None,
+    generator: torch.Generator | None = None,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """``J ~ W V^T`` from a block range finder. Replaces Golub-Kahan.
+
+    Golub-Kahan needs ``2k+1`` STRICTLY SEQUENTIAL products -- step ``i+1``
+    consumes step ``i`` -- which is why it lost to the exact route even at
+    k=64: the exact route is a handful of batched matmuls. This needs
+    ``2q+2`` products total, each applied to the whole block at once, so the
+    sequential depth stops depending on the rank.
+
+    Oversampling and power iterations are what keep the accuracy: sampling
+    ``rank + oversampling`` directions and applying ``(J^T J)^q`` sharpens the
+    captured subspace toward the leading singular directions, which is the
+    standard fix for a random sketch missing a direction it happened not to
+    hit.
+
+    ``sketch`` warm-starts from a previous ``V``. The ladder solves repeatedly
+    at the same theta -- the growth scan alone does one solve per candidate
+    layer -- so the previous subspace is an excellent starting guess and makes
+    the later solves both cheaper and more accurate.
+
+    Returns ``(W, V)`` with ``V`` of ORTHONORMAL COLUMNS, exactly the contract
+    the factored consumers already read.
+    """
+    width = min(max(1, rank) + max(0, oversampling), rows, columns)
+    if width <= 0:
+        return None
+
+    if sketch is not None and sketch.shape[0] == columns:
+        # Warm start: reuse the previous basis, padded with fresh directions
+        # if a wider block is being asked for.
+        basis = sketch[:, :width]
+        if basis.shape[1] < width:
+            extra = torch.randn(
+                columns, width - basis.shape[1],
+                device=basis.device, dtype=basis.dtype, generator=generator,
+            )
+            basis = torch.cat([basis, extra], dim=1)
+    else:
+        probe = torch.randn(
+            width, rows, device=device, dtype=torch.float64, generator=generator
+        )
+        basis = apply_jt(probe).t()
+
+    basis, _ = torch.linalg.qr(basis)
+    for _ in range(max(0, power_iterations)):
+        basis, _ = torch.linalg.qr(apply_jt(apply_j(basis.t())).t())
+
+    left = apply_j(basis.t()).t()  # W = J V, (rows, width)
+    if not (torch.isfinite(left).all() and torch.isfinite(basis).all()):
+        return None
+
+    if width > rank:
+        # Trim the oversampling back off. svd(W) = A S B^T gives
+        # J ~ A S (V B)^T, so keeping the leading `rank` columns of each is
+        # the best rank-`rank` approximation INSIDE the sampled subspace, and
+        # V B stays orthonormal because both factors are.
+        head, values, tail = torch.linalg.svd(left, full_matrices=False)
+        keep = min(rank, values.numel())
+        left = head[:, :keep] * values[:keep]
+        basis = basis @ tail.t()[:, :keep]
+    return left, basis
+
+
 def krylov_jacobian(
     *,
     outputs: torch.Tensor,

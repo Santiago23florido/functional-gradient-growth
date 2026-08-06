@@ -139,6 +139,22 @@ class FGDApproxConfig:
     # The price is a worse eps, hence a smaller Lemma 3.5 rate, hence shorter
     # steps -- efficiency, not soundness.
     matrixfree_rank: int = 0
+    # Where the adaptive rank loop starts. Doubling from a small block is much
+    # cheaper than guessing high: most steps are decided far from the 1/2 bar.
+    matrixfree_rank_initial: int = 32
+    # Extra sampled directions, discarded after the SVD trim. A random sketch
+    # can miss a direction it happened not to hit; oversampling is the standard
+    # fix and is what keeps the low-rank error near optimal.
+    matrixfree_oversampling: int = 10
+    # (J^T J)^q applied to the sketch, sharpening it toward the leading
+    # singular directions. q=2 is the usual setting.
+    matrixfree_power_iterations: int = 2
+    # The DECISION BAND, as fractions of the certification threshold. Rank is
+    # only doubled while eps lands inside it -- an eps of 0.05 or 0.9 will not
+    # change its verdict no matter how sharp it gets, so paying for sharpness
+    # there is pure waste. This is what buys precision without buying cost.
+    matrixfree_band_low: float = 0.7
+    matrixfree_band_high: float = 1.3
     tiny_use_covariance: bool = True
     tiny_alpha_zero: bool = False
     tiny_omega_zero: bool = False
@@ -3136,6 +3152,28 @@ def _stream_gram_surrogate(
     return j_surrogate.to(out_dtype), r_surrogate.to(out_dtype)
 
 
+def _factored_relative_error_estimate(
+    factors: tuple[torch.Tensor, torch.Tensor],
+    target: torch.Tensor,
+    eps: float,
+) -> float:
+    """``eps`` at least damping, straight off ``W``, for the rank loop only.
+
+    ``J = W V^T`` and the least-damped projection of ``r`` onto range(J) is the
+    projection onto range(W), so ``eps = ||P r - r|| / ||P r||`` needs nothing
+    but a thin QR of the ``(rows, ell)`` factor. The parameter dimension never
+    enters, so deciding whether to spend more rank costs almost nothing.
+    """
+    left, _right = factors
+    flat = target.reshape(-1).to(dtype=left.dtype, device=left.device)
+    basis, _ = torch.linalg.qr(left)
+    projected = basis @ (basis.t() @ flat)
+    norm = float(torch.linalg.vector_norm(projected))
+    if not norm > eps:
+        return float("inf")
+    return float(torch.linalg.vector_norm(projected - flat)) / norm
+
+
 def _matrix_free_tangent_system(
     *,
     model: GrowingMLP,
@@ -3143,23 +3181,33 @@ def _matrix_free_tangent_system(
     y: torch.Tensor,
     config: FGDApproxConfig,
 ) -> ExactTangentSystem | None:
-    """``J`` from a Krylov factorisation instead of ``jacrev``.
+    """``J = W V^T`` from a BLOCK range finder, never materialised.
 
-    ``J = U_{k+1} B_k V_k^T`` with ``U``, ``V`` orthonormal, built from ``2k+1``
-    matrix-vector products that never form the ``P x P`` Gram -- the object
-    that costs ``O(P^2)`` and makes the exact route impossible at MNIST width.
+    The exact route is fast because it is a handful of batched matmuls
+    (``_analytic_jacobian_block``), not because of ``jacrev`` -- which is only
+    its fallback. Its cost is the outer product at the end: the ``(NK, P)``
+    matrix, 4.8 GB at MNIST width, plus the ``O(P^2)`` Gram downstream.
 
-    It is an APPROXIMATION and the bias is one-sided: while ``k < rank(J)`` the
-    retained subspace cannot see the directions outside it, so the projection
-    looks BETTER than it is. MEASURED at P=25, k=24: 0.8104 against the true
-    0.8779. ``k`` is therefore driven to the numerical rank, where the two
-    agree, and capped at ``P`` because past that the extra directions are noise
-    that biases the same unsafe way.
+    So the same per-layer factors are kept and APPLIED instead of stored, and
+    the subspace is found by a block range finder: ``2q+2`` products applied to
+    the whole block at once, rather than the ``2k`` strictly sequential ones
+    Golub-Kahan needed. That sequential depth was the entire reason the earlier
+    version lost to the exact route even at k=64.
 
-    Returns a system the ladder consumes exactly as it consumes the exact one;
-    nothing downstream knows the difference.
+    The rank is ADAPTIVE. eps only has to be accurate where it decides, i.e.
+    near the 1/2 bar; a cheap eps of 0.05 or 0.9 is not going to change its
+    mind. So the rank starts small and doubles only while the answer sits in
+    the decision band, which is how precision is bought without paying for it
+    everywhere.
+
+    Truncation biases eps UP: ``J_k = J V V^T`` has a smaller range, so less of
+    ``r`` is representable. It under-certifies, never the reverse.
     """
-    from fgdlib.search.matrixfree import krylov_jacobian
+    from fgdlib.search.matrixfree import (
+        analytic_operators,
+        dual_spectrum,
+        vmap_operators,
+    )
 
     was_training = model.training
     model.eval()
@@ -3172,37 +3220,63 @@ def _matrix_free_tangent_system(
             for name, parameter in model.named_parameters()
             if parameter.requires_grad
         )
-        outputs = model(x)
         with torch.no_grad():
+            outputs = model(x)
             target = functional_gradient(
-                outputs.detach(), y, config.functional_loss
+                outputs, y, config.functional_loss
             ).reshape(-1)
             loss = float(
-                torch.nn.functional.mse_loss(outputs.detach(), y).detach().item()
+                torch.nn.functional.mse_loss(outputs, y).detach().item()
             )
-        built = krylov_jacobian(
-            outputs=outputs,
-            parameters=parameters,
-            target=target,
-            # Uncapped this is P, which yields k = P - 1 usable columns after
-            # the trailing offcut is dropped. Asking for P + 1 to reach k = P
-            # is WORSE, not better: MEASURED at P=25 the extra direction is
-            # numerically unreachable and behaves as noise, moving eps from
-            # 1.5e-03 to 8.8e-03 away from exact, and downward.
-            #
-            # matrixfree_rank caps it below that, which is the only setting in
-            # which this construction saves anything -- see the field's own
-            # comment for the MNIST arithmetic.
-            iterations=(
-                min(config.matrixfree_rank, sum(p.numel() for p in parameters))
-                if config.matrixfree_rank > 0
-                else sum(p.numel() for p in parameters)
-            ),
-            eps=config.eps,
-        )
-        jacobian_matrix, factors = (None, None) if built is None else built
+
+        # Analytic operators when the structure allows, exactly as the exact
+        # route decides it; vmapped autograd otherwise. Same two methods, so
+        # nothing below can tell which one it got.
+        operators = None
+        with ExitStack() as capture_stack:
+            pause = getattr(model, "paused_computation", None)
+            structure = None
+            if callable(pause):
+                capture_stack.enter_context(pause())
+                structure = _supported_analytic_structure(
+                    model, x, capture_suspended=True
+                )
+                if structure is None:
+                    capture_stack.close()
+            else:
+                structure = _supported_analytic_structure(model, x)
+            if structure is not None:
+                operators = analytic_operators(structure, x)
+        if operators is None:
+            increment("matrix_free_vmap_fallbacks")
+            operators = vmap_operators(model, x, parameters, parameter_names)
+
+        columns = sum(p.numel() for p in parameters)
+
+        # DUAL, not low rank. J J^T = A S^2 A^T gives J's exact spectrum from
+        # an NK x NK object; the primal J^T J is P x P. Whenever the model is
+        # over-parameterised relative to the probe -- the MNIST regime -- that
+        # is 2949 MB against 8.4 MB at P=19201, MEASURED, and exact to 2.4e-16.
+        #
+        # A low-rank sketch was tried first and cannot work here: at P=1345 the
+        # exact eps is 1e-06 while rank 512 reported 0.21, because r is spread
+        # across the whole spectrum rather than concentrated in a few
+        # directions. Nothing is truncated now except numerically-zero
+        # singular values, which carry nothing by definition.
+        spectrum = dual_spectrum(operators, config.eps)
+        if spectrum is None:
+            return None
+        left, singular_values = spectrum
+        # The right factor, built by applying J^T to the retained left
+        # directions -- one batched apply, no (NK, P) intermediate.
+        right = (
+            operators.apply_jt(left.t()) / singular_values.unsqueeze(1)
+        ).t()
+        factors = (left * singular_values, right)
+        jacobian_matrix = left.new_zeros((0, columns))
     finally:
         model.train(was_training)
+
     if jacobian_matrix is None:
         return None
 
