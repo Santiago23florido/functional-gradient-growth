@@ -90,14 +90,20 @@ def factored_projection_solve(
     left_factor, right_factor = system.factors
     left_factor = left_factor.to(dtype=torch.float64)
     right_factor = right_factor.to(dtype=torch.float64)
-    flat_target = target.reshape(-1).to(dtype=torch.float64)
+    # Align to the factors' device: the model may be on CUDA while a target or
+    # an identity built without one lands on CPU.
+    flat_target = target.reshape(-1).to(
+        dtype=torch.float64, device=left_factor.device
+    )
     if left_factor.shape[0] != flat_target.numel():
         return None
 
     columns = left_factor.shape[1]
     small_gram = left_factor.t() @ left_factor
+    # Same device as the factors: the model may be on CUDA while a bare
+    # torch.eye lands on CPU.
     small_gram = small_gram + absolute_damping * torch.eye(
-        columns, dtype=torch.float64
+        columns, dtype=torch.float64, device=small_gram.device
     )
     try:
         coefficients = torch.linalg.solve(
@@ -167,7 +173,9 @@ def factored_minimal_relative_error(
     if spectrum is None:
         return float("inf")
     left, singular_values, _right = spectrum
-    target = system.target.reshape(-1).to(dtype=torch.float64)
+    target = system.target.reshape(-1).to(
+        dtype=torch.float64, device=left.device
+    )
     if target.numel() == 0:
         return float("inf")
     scale = float(singular_values.max()) ** 2
