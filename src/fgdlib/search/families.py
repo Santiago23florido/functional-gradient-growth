@@ -42,6 +42,7 @@ import torch
 
 from fgdlib.tangent import (
     FGDApproxConfig,
+    batch_functional_loss,
     mse_functional_gradient,
     theoretical_learning_rate_upper_bound,
 )
@@ -104,6 +105,14 @@ class ParametricFamilyResult:
     #: The eta_f whose target produced this displacement. Only interesting
     #: under the sweep, where it says WHICH distance certified.
     functional_learning_rate: float | None = None
+    #: Opt-in endpoint-transaction diagnostics. Defaults preserve every
+    #: existing positional construction and keep the exact ladder inert.
+    transactional_trial_count: int = 0
+    committed_parameter_fraction: float | None = None
+    functional_before: float | None = None
+    functional_after: float | None = None
+    predicted_functional_decrease: float | None = None
+    transactional_rejected: bool = False
 
 
 def certify_parametric_step(
@@ -232,14 +241,95 @@ def certify_parametric_step(
     # cosine and only the committed distance changes. (Shrinking the TARGET
     # instead was tried and MEASURED to be wrong -- it starves the clone's
     # alignment, N=1024 test 0.921 -> 0.841 with certifications 27 -> 3.)
+    committed_fraction = 1.0
     if certified and getattr(config, "certify_family_lemma35_rate", False):
-        rate = family_lemma35_rate(relative_error, config)
-        if rate is None:
+        lemma_rate = family_lemma35_rate(relative_error, config)
+        if lemma_rate is None:
             certified = False
         else:
+            committed_fraction = lemma_rate
+
+    transactional_trials = 0
+    functional_before = None
+    functional_after = None
+    predicted_decrease = None
+    transactional_rejected = False
+    if certified and getattr(config, "transactional_realized_descent", False):
+        # The trained clone is already the only O(P) model checkpoint this
+        # family needs. Keep one O(P) tuple of its displacement and rebuild
+        # every candidate from the unchanged base model; rejected endpoints
+        # therefore never contaminate later retries. Each retry costs one
+        # forward over the existing certification probe, not another inner
+        # optimization or tangent solve.
+        parameter_deltas = tuple(
+            moved.detach().clone().sub_(base.detach())
+            for base, moved in zip(model.parameters(), clone.parameters())
+        )
+        functional_before = float(
+            batch_functional_loss(f0, y, config.functional_loss).to(torch.float64)
+        )
+        attempt_fraction = float(committed_fraction)
+        floor = float(config.theory_lr_min + config.eps)
+        accepted_endpoint = False
+        for _retry in range(config.transactional_max_retries + 1):
+            if attempt_fraction <= floor:
+                break
             with torch.no_grad():
-                for base, moved in zip(model.parameters(), clone.parameters()):
-                    moved.mul_(rate).add_(base, alpha=1.0 - rate)
+                for base, moved, delta in zip(
+                    model.parameters(), clone.parameters(), parameter_deltas
+                ):
+                    moved.copy_(base).add_(delta, alpha=attempt_fraction)
+                endpoint = clone(x).detach()
+                ideal_endpoint = f0 - attempt_fraction * displacement
+                functional_after = float(
+                    batch_functional_loss(
+                        endpoint, y, config.functional_loss
+                    ).to(torch.float64)
+                )
+                ideal_after = float(
+                    batch_functional_loss(
+                        ideal_endpoint, y, config.functional_loss
+                    ).to(torch.float64)
+                )
+            transactional_trials += 1
+            predicted_decrease = functional_before - ideal_after
+            actual_decrease = functional_before - functional_after
+            required_decrease = max(
+                float(config.transactional_descent_atol),
+                float(config.transactional_min_predicted_decrease_fraction)
+                * max(predicted_decrease, 0.0),
+            )
+            finite = all(
+                math.isfinite(value)
+                for value in (
+                    functional_before,
+                    functional_after,
+                    predicted_decrease,
+                    actual_decrease,
+                )
+            )
+            accepted_endpoint = bool(
+                finite
+                and predicted_decrease > 0.0
+                and actual_decrease > required_decrease
+            )
+            if accepted_endpoint:
+                committed_fraction = attempt_fraction
+                break
+            attempt_fraction *= float(config.transactional_backtrack_factor)
+        if not accepted_endpoint:
+            certified = False
+            transactional_rejected = True
+            committed_fraction = None
+    elif certified and committed_fraction != 1.0:
+        # Historical opt-in Lemma-rate path. This branch is deliberately the
+        # same single interpolation as before when endpoint transactions are
+        # disabled, so all non-matrix-free configurations remain unchanged.
+        with torch.no_grad():
+            for base, moved in zip(model.parameters(), clone.parameters()):
+                moved.mul_(committed_fraction).add_(
+                    base, alpha=1.0 - committed_fraction
+                )
 
     return ParametricFamilyResult(
         relative_error=relative_error,
@@ -247,6 +337,14 @@ def certify_parametric_step(
         certified=certified,
         model=clone if certified else None,
         functional_learning_rate=functional_learning_rate,
+        transactional_trial_count=transactional_trials,
+        committed_parameter_fraction=(
+            committed_fraction if certified else None
+        ),
+        functional_before=functional_before,
+        functional_after=functional_after,
+        predicted_functional_decrease=predicted_decrease,
+        transactional_rejected=transactional_rejected,
     )
 
 
@@ -308,6 +406,24 @@ def certify_parametric_step_swept(
             inner_steps=inner_steps,
             inner_learning_rate=inner_learning_rate,
         )
+        transactional_trial_count = int(
+            getattr(result, "transactional_trial_count", 0)
+        )
+        if transactional_trial_count and progress is not None:
+            before_text = f"{result.functional_before:.6e}"
+            after_text = f"{result.functional_after:.6e}"
+            fraction_text = (
+                f"{result.committed_parameter_fraction:.4e}"
+                if result.committed_parameter_fraction is not None
+                else "none"
+            )
+            progress(
+                "[FAMILY-TRANSACTION] "
+                f"eta_f={rate:g} trials={transactional_trial_count} "
+                f"parameter_fraction={fraction_text} "
+                f"functional={before_text}->{after_text} "
+                f"accepted={result.certified}"
+            )
         if result.certified:
             if progress is not None:
                 progress(

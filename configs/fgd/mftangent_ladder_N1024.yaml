@@ -338,9 +338,9 @@ fgd_approx:
   # faster wall-clock even here where the Jacobian is cheap (far more on CIFAR,
   # where the per-iteration full Jacobian dominates).
   certify_realize_freeze_gram: true
-  # Matrix-free-only transaction: verify the nonlinear endpoint on the SAME
-  # full training probe before it can commit. Rejected endpoints are restored
-  # to the one pre-step checkpoint and retried from there at half the rate.
+  # Matrix-free-only transaction: verify tangent-realization and parametric-
+  # family endpoints on the SAME full training probe before either can commit.
+  # Rejected endpoints restart from one unchanged base state at half the rate.
   transactional_realized_descent: true
   transactional_max_retries: 3
   transactional_backtrack_factor: 0.5
