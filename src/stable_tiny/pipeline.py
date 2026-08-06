@@ -20,6 +20,7 @@ from stable_tiny.data import (
     make_mnist_dataloaders,
 )
 from fgdlib.tangent import (
+    ExactTangentSystem,
     FGDApproxConfig,
     FGDApproxEpochResult,
     FGDLayerRelError,
@@ -50,6 +51,8 @@ from fgdlib.tangent import (
     train_one_epoch_fgd_approx,
     validate_family_order,
     validate_functional_loss,
+    validate_exact_tangent_system,
+    validate_transactional_realized_descent,
 )
 from fgdlib.rkhs import (
     FGDRKHSConfig,
@@ -92,7 +95,11 @@ from fgdlib.search.damping import (
     select_projection_damping,
     select_projection_damping_factored,
 )
-from fgdlib.search.realize import realization_damping, realize_functional_step
+from fgdlib.search.realize import (
+    RealizationResult,
+    realization_damping,
+    realize_functional_step,
+)
 from fgdlib.search.linearization import certified_linear_learning_rate
 from fgdlib.search.growth import (
     GrowthResult,
@@ -320,6 +327,35 @@ class HistoryEntry:
     architecture_widths: tuple[int, ...] = ()
 
 
+@dataclass(frozen=True)
+class FGDTransactionalTrialRecord:
+    """Scalar-only audit record for one realized endpoint attempt."""
+
+    epoch: int
+    outer_step_index: int
+    outer_step_global_index: int
+    retry_index: int
+    transactional_trial_count: int
+    proposed_learning_rate: float
+    capped_learning_rate: float
+    trial_learning_rate: float
+    committed_learning_rate: float
+    realized_effective_learning_rate: float | None
+    realized_functional_before: float | None
+    realized_functional_after: float | None
+    realized_functional_delta: float | None
+    predicted_certified_decrease: float | None
+    realized_decrease_ratio: float | None
+    realization_residual_fraction: float
+    realization_realized_fraction: float
+    realization_iterations: int
+    selected_relative_damping: float
+    selected_absolute_damping: float
+    accepted: bool
+    rejected: bool
+    rejection_reason: str | None
+
+
 @dataclass
 class PipelineResult:
     config: PipelineConfig
@@ -327,6 +363,7 @@ class PipelineResult:
     growth_events: list[GrowthResult]
     model: GrowingMLP
     device: str
+    fgd_outer_steps: list[FGDTransactionalTrialRecord] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -378,6 +415,15 @@ class _FGDSearchResult:
     last_trial: _FGDTrial | None
     trial_count: int
     sensor_failure: bool
+
+
+@dataclass(frozen=True)
+class _TransactionalRealization:
+    base_model: GrowingMLP
+    candidate_model: GrowingMLP | None
+    direction: tuple[torch.Tensor, ...] | None
+    learning_rate: float | None
+    trials: tuple[FGDTransactionalTrialRecord, ...]
 
 
 @dataclass(frozen=True)
@@ -566,6 +612,7 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
     )
     validate_family_order(config.fgd_approx.family_order)
     validate_functional_loss(config.fgd_approx.functional_loss)
+    validate_transactional_realized_descent(config.fgd_approx)
     config.parametric_gd.validate()
     config.parametric_descent.validate()
     return config
@@ -1259,6 +1306,263 @@ def _apply_shared_direction_step(
             parameter.add_(update.to(parameter.device), alpha=-learning_rate)
 
 
+def _restore_model_from_checkpoint(
+    model: GrowingMLP,
+    checkpoint: GrowingMLP,
+) -> None:
+    """Restore parameters, buffers and train/eval flags without reallocating."""
+    destination_parameters = dict(model.named_parameters())
+    checkpoint_parameters = dict(checkpoint.named_parameters())
+    destination_buffers = dict(model.named_buffers())
+    checkpoint_buffers = dict(checkpoint.named_buffers())
+    if destination_parameters.keys() != checkpoint_parameters.keys():
+        raise RuntimeError("Transactional checkpoint parameter structure changed.")
+    if destination_buffers.keys() != checkpoint_buffers.keys():
+        raise RuntimeError("Transactional checkpoint buffer structure changed.")
+    with torch.no_grad():
+        for name, parameter in destination_parameters.items():
+            parameter.copy_(checkpoint_parameters[name])
+        for name, buffer in destination_buffers.items():
+            buffer.copy_(checkpoint_buffers[name])
+
+    destination_modules = dict(model.named_modules())
+    checkpoint_modules = dict(checkpoint.named_modules())
+    if destination_modules.keys() != checkpoint_modules.keys():
+        raise RuntimeError("Transactional checkpoint module structure changed.")
+    for name, module in destination_modules.items():
+        module.training = checkpoint_modules[name].training
+    _clear_inaccessible_tensor_caches(model)
+
+
+def _refresh_tangent_system_after_exact_restore(
+    system: ExactTangentSystem,
+    model: GrowingMLP,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    config: FGDApproxConfig,
+) -> ExactTangentSystem:
+    """Refresh version guards after a trusted bit-exact transactional restore.
+
+    Public validation remains strict: arbitrary mutation still invalidates a
+    system. This private bridge is used only immediately after copying the one
+    pre-step checkpoint back into the system's original owner.
+    """
+    named_parameters = _trainable_named_parameters(model)
+    named_buffers = tuple(model.named_buffers())
+    refreshed = replace(
+        system,
+        parameter_versions=tuple(
+            parameter._version for parameter in named_parameters.values()
+        ),
+        buffer_versions=tuple(buffer._version for _, buffer in named_buffers),
+        evaluation_state=tuple(
+            (name, module.training) for name, module in model.named_modules()
+        ),
+    )
+    validate_exact_tangent_system(refreshed, model, x, y, config)
+    return refreshed
+
+
+def _predicted_certified_decrease(
+    *,
+    system: ExactTangentSystem,
+    relative_error: float,
+    learning_rate: float,
+    config: FGDApproxConfig,
+) -> float | None:
+    coefficient = theoretical_descent_coefficient(
+        relative_error,
+        learning_rate,
+        config,
+    )
+    if coefficient is None:
+        return None
+    target_sq_norm = float(system.target.detach().to(torch.float64).square().sum())
+    predicted = learning_rate * coefficient * target_sq_norm
+    return predicted if math.isfinite(predicted) and predicted > 0.0 else None
+
+
+def _transactional_realize_functional_step(
+    *,
+    model: GrowingMLP,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    updates: tuple[torch.Tensor, ...],
+    proposed_learning_rate: float,
+    capped_learning_rate: float,
+    relative_error: float,
+    system: ExactTangentSystem,
+    selected_relative_damping: float,
+    selected_absolute_damping: float,
+    config: FGDApproxConfig,
+    epoch: int,
+    outer_step_index: int,
+    outer_step_global_index: int,
+    progress: ProgressFn | None = None,
+) -> _TransactionalRealization:
+    """Realize, verify and either commit or roll back a matrix-free endpoint."""
+    validate_transactional_realized_descent(config)
+    base_model = copy.deepcopy(model)
+    current_system = system
+    records: list[FGDTransactionalTrialRecord] = []
+    rate = float(capped_learning_rate)
+    floor = float(config.theory_lr_min + config.eps)
+
+    for retry_index in range(config.transactional_max_retries + 1):
+        if rate <= floor:
+            break
+        try:
+            realization: RealizationResult = realize_functional_step(
+                model,
+                x,
+                y,
+                updates,
+                rate,
+                config,
+                max_iterations=config.certify_realize_max_iterations,
+                tolerance=config.certify_realize_tolerance,
+                system=current_system,
+                damping=realization_damping(config, selected_absolute_damping),
+            )
+        except Exception:
+            _restore_model_from_checkpoint(model, base_model)
+            raise
+
+        predicted_decrease = _predicted_certified_decrease(
+            system=system,
+            relative_error=relative_error,
+            learning_rate=rate,
+            config=config,
+        )
+        before = realization.functional_before
+        after = realization.functional_after
+        actual_decrease = (
+            before - after if before is not None and after is not None else None
+        )
+        scalar_diagnostics = (
+            before,
+            after,
+            actual_decrease,
+            realization.residual_fraction,
+            realization.realised_fraction,
+            realization.effective_learning_rate,
+        )
+        finite = all(
+            value is not None and math.isfinite(float(value))
+            for value in scalar_diagnostics
+        )
+        if not finite:
+            accepted = False
+            rejection_reason = "non_finite_realization_diagnostics"
+        elif predicted_decrease is None:
+            accepted = False
+            rejection_reason = "invalid_predicted_decrease"
+        else:
+            required_decrease = max(
+                float(config.transactional_descent_atol),
+                float(config.transactional_min_predicted_decrease_fraction)
+                * predicted_decrease,
+            )
+            accepted = bool(actual_decrease > required_decrease)
+            rejection_reason = None if accepted else "insufficient_realized_descent"
+
+        decrease_ratio = (
+            actual_decrease / predicted_decrease
+            if actual_decrease is not None and predicted_decrease is not None
+            else None
+        )
+        records.append(
+            FGDTransactionalTrialRecord(
+                epoch=epoch,
+                outer_step_index=outer_step_index,
+                outer_step_global_index=outer_step_global_index,
+                retry_index=retry_index,
+                transactional_trial_count=0,
+                proposed_learning_rate=float(proposed_learning_rate),
+                capped_learning_rate=float(capped_learning_rate),
+                trial_learning_rate=rate,
+                committed_learning_rate=rate if accepted else 0.0,
+                realized_effective_learning_rate=(
+                    realization.effective_learning_rate
+                ),
+                realized_functional_before=before,
+                realized_functional_after=after,
+                realized_functional_delta=realization.functional_delta,
+                predicted_certified_decrease=predicted_decrease,
+                realized_decrease_ratio=decrease_ratio,
+                realization_residual_fraction=realization.residual_fraction,
+                realization_realized_fraction=realization.realised_fraction,
+                realization_iterations=realization.iterations,
+                selected_relative_damping=selected_relative_damping,
+                selected_absolute_damping=selected_absolute_damping,
+                accepted=accepted,
+                rejected=not accepted,
+                rejection_reason=rejection_reason,
+            )
+        )
+        increment("transactional_realization_trials")
+        if progress is not None:
+            before_text = f"{before:.6e}" if before is not None else "n/a"
+            after_text = f"{after:.6e}" if after is not None else "n/a"
+            progress(
+                "[TRANSACTION] "
+                f"retry={retry_index} eta={rate:.4e} "
+                f"functional={before_text}->{after_text} "
+                f"accepted={accepted}"
+            )
+
+        if accepted:
+            base_parameters = _trainable_named_parameters(base_model)
+            candidate_parameters = _trainable_named_parameters(model)
+            if base_parameters.keys() != candidate_parameters.keys():
+                _restore_model_from_checkpoint(model, base_model)
+                raise RuntimeError(
+                    "Transactional realization changed trainable parameter structure."
+                )
+            with torch.no_grad():
+                direction = tuple(
+                    (base_parameters[name].detach() - candidate_parameters[name].detach())
+                    / rate
+                    for name in base_parameters
+                )
+            increment("transactional_realization_accepted")
+            trial_count = len(records)
+            finalized = tuple(
+                replace(record, transactional_trial_count=trial_count)
+                for record in records
+            )
+            return _TransactionalRealization(
+                base_model=base_model,
+                candidate_model=model,
+                direction=direction,
+                learning_rate=rate,
+                trials=finalized,
+            )
+
+        increment("transactional_realization_rejected")
+        _restore_model_from_checkpoint(model, base_model)
+        current_system = _refresh_tangent_system_after_exact_restore(
+            system,
+            model,
+            x,
+            y,
+            config,
+        )
+        rate *= float(config.transactional_backtrack_factor)
+
+    trial_count = len(records)
+    finalized = tuple(
+        replace(record, transactional_trial_count=trial_count) for record in records
+    )
+    return _TransactionalRealization(
+        base_model=base_model,
+        candidate_model=None,
+        direction=None,
+        learning_rate=None,
+        trials=finalized,
+    )
+
+
 def _search_tangent_measured_descent(
     *,
     base_model: GrowingMLP,
@@ -1350,6 +1654,7 @@ def _evaluate_fgd_outer_trial(
     theory_state: _FGDTheoryState,
     initial_functional_gap: float,
     theory_loss_star: float,
+    candidate_model: GrowingMLP | None = None,
 ) -> _FGDTrial:
     """One genuine FGD outer step: theta - eta * u with the shared direction.
 
@@ -1371,8 +1676,14 @@ def _evaluate_fgd_outer_trial(
         config=config.fgd_approx,
         projection_sensor=False,
     )
-    trial_model = copy.deepcopy(base_model)
-    _apply_shared_direction_step(trial_model, direction, learning_rate)
+    if candidate_model is None:
+        trial_model = copy.deepcopy(base_model)
+        _apply_shared_direction_step(trial_model, direction, learning_rate)
+    else:
+        # The opt-in realization transaction already produced this exact
+        # endpoint. Reuse it instead of allocating a second model and
+        # reconstructing the same parameter displacement.
+        trial_model = candidate_model
     train_metrics = evaluate_regression_metrics(
         trial_model,
         train_batches,
@@ -5360,6 +5671,8 @@ def run_pipeline(
 
     history: list[HistoryEntry] = []
     growth_events: list[GrowthResult] = []
+    fgd_outer_steps: list[FGDTransactionalTrialRecord] = []
+    transactional_outer_step_global_index = 0
 
     if progress is not None:
         progress(f"Using device: {device}")
@@ -5980,7 +6293,9 @@ def run_pipeline(
                         # finite geometric/structural one -- the discriminator
                         # certify_force_growth_on_finite_step_failure needs.
                         direction_sensor_non_finite = False
+                        transactional_endpoint_rejected = False
                         tangent_system = None
+                        realized_candidate_model: GrowingMLP | None = None
                         if config.fgd_approx.grow_to_certify:
                             # GROW-TO-CERTIFY. Make the structure satisfy
                             # Lemma 3.5 BEFORE stepping, instead of stepping
@@ -6233,64 +6548,119 @@ def run_pipeline(
                                 config.fgd_approx.certify_realize_path
                                 and damping_choice.candidate.certified_learning_rate
                             ):
-                                # Realise the FULL certified functional step
-                                # by integrating toward it, then express the
-                                # path travelled as the equivalent single
-                                # update so everything downstream -- the
-                                # validation certificate, the trial, the
-                                # accounting -- sees an ordinary outer step
-                                # and reproduces this exact point.
-                                nominal = (
-                                    damping_choice.candidate
-                                    .certified_learning_rate
-                                )
-                                base_model = copy.deepcopy(model)
-                                walker = model
-                                realization = realize_functional_step(
-                                    walker,
-                                    fgd_train_probe[0],
-                                    fgd_train_probe[1],
-                                    tangent_direction,
-                                    nominal,
-                                    config.fgd_approx,
-                                    max_iterations=(
-                                        config.fgd_approx
-                                        .certify_realize_max_iterations
-                                    ),
-                                    tolerance=(
-                                        config.fgd_approx
-                                        .certify_realize_tolerance
-                                    ),
-                                    system=tangent_system,
-                                    damping=realization_damping(
+                                if config.fgd_approx.transactional_realized_descent:
+                                    assert tangent_system is not None
+                                    assert selected_learning_rate is not None
+                                    transactional_outer_step_global_index += 1
+                                    transaction = (
+                                        _transactional_realize_functional_step(
+                                            model=model,
+                                            x=fgd_train_probe[0],
+                                            y=fgd_train_probe[1],
+                                            updates=tangent_direction,
+                                            proposed_learning_rate=(
+                                                damping_choice.candidate
+                                                .certified_learning_rate
+                                            ),
+                                            capped_learning_rate=(
+                                                selected_learning_rate
+                                            ),
+                                            relative_error=(
+                                                certified_relative_error
+                                            ),
+                                            system=tangent_system,
+                                            selected_relative_damping=(
+                                                damping_choice.candidate
+                                                .relative_damping
+                                            ),
+                                            selected_absolute_damping=(
+                                                damping_choice.candidate
+                                                .absolute_damping
+                                            ),
+                                            config=config.fgd_approx,
+                                            epoch=epoch,
+                                            outer_step_index=_outer_step_index,
+                                            outer_step_global_index=(
+                                                transactional_outer_step_global_index
+                                            ),
+                                            progress=progress,
+                                        )
+                                    )
+                                    fgd_outer_steps.extend(transaction.trials)
+                                    for record in transaction.trials:
+                                        wandb_logger.log_transactional_trial(record)
+                                    if transaction.candidate_model is not None:
+                                        realized_candidate_model = (
+                                            transaction.candidate_model
+                                        )
+                                        tangent_direction = transaction.direction
+                                        selected_learning_rate = (
+                                            transaction.learning_rate
+                                        )
+                                        model = transaction.base_model
+                                    else:
+                                        # Every rejected attempt has already
+                                        # restored the original object exactly.
+                                        tangent_direction = None
+                                        selected_learning_rate = None
+                                        transactional_endpoint_rejected = True
+                                    tangent_system = None
+                                else:
+                                    # Historical path, intentionally kept as
+                                    # its own branch so the exact/base ladder
+                                    # performs the same copy, realization and
+                                    # downstream reconstruction as before.
+                                    nominal = (
+                                        damping_choice.candidate
+                                        .certified_learning_rate
+                                    )
+                                    base_model = copy.deepcopy(model)
+                                    walker = model
+                                    realization = realize_functional_step(
+                                        walker,
+                                        fgd_train_probe[0],
+                                        fgd_train_probe[1],
+                                        tangent_direction,
+                                        nominal,
                                         config.fgd_approx,
-                                        damping_choice.candidate.absolute_damping,
-                                    ),
-                                )
-                                if realization.iterations > 0:
-                                    with torch.no_grad():
-                                        tangent_direction = tuple(
-                                            (before.detach() - after.detach())
-                                            / nominal
-                                            for before, after in zip(
-                                                base_model.parameters(),
-                                                walker.parameters(),
+                                        max_iterations=(
+                                            config.fgd_approx
+                                            .certify_realize_max_iterations
+                                        ),
+                                        tolerance=(
+                                            config.fgd_approx
+                                            .certify_realize_tolerance
+                                        ),
+                                        system=tangent_system,
+                                        damping=realization_damping(
+                                            config.fgd_approx,
+                                            damping_choice.candidate.absolute_damping,
+                                        ),
+                                    )
+                                    if realization.iterations > 0:
+                                        with torch.no_grad():
+                                            tangent_direction = tuple(
+                                                (before.detach() - after.detach())
+                                                / nominal
+                                                for before, after in zip(
+                                                    base_model.parameters(),
+                                                    walker.parameters(),
+                                                )
                                             )
-                                        )
-                                    selected_learning_rate = nominal
-                                    if progress is not None:
-                                        progress(
-                                            "[REALIZE] "
-                                            f"eta={nominal:.4e} "
-                                            "realised="
-                                            f"{realization.realised_fraction:.1%} "
-                                            "residual="
-                                            f"{realization.residual_fraction:.1%} "
-                                            f"iters={realization.iterations}"
-                                        )
-                                model = base_model
-                                tangent_system = None
-                                del walker
+                                        selected_learning_rate = nominal
+                                        if progress is not None:
+                                            progress(
+                                                "[REALIZE] "
+                                                f"eta={nominal:.4e} "
+                                                "realised="
+                                                f"{realization.realised_fraction:.1%} "
+                                                "residual="
+                                                f"{realization.residual_fraction:.1%} "
+                                                f"iters={realization.iterations}"
+                                            )
+                                    model = base_model
+                                    tangent_system = None
+                                    del walker
                             if progress is not None:
                                 chosen = damping_choice.candidate
                                 progress(
@@ -6400,12 +6770,25 @@ def run_pipeline(
                                 # the comment above), so reaching here
                                 # always means a non-finite measurement.
                                 direction_sensor_non_finite = True
-                        else:
+                        elif not transactional_endpoint_rejected:
                             direction_sensor_failure = True
 
                         def evaluate_trial(candidate_learning_rate: float) -> _FGDTrial:
                             assert tangent_direction is not None
                             assert direction_stats is not None
+                            candidate_model = None
+                            if realized_candidate_model is not None:
+                                assert selected_learning_rate is not None
+                                if not math.isclose(
+                                    candidate_learning_rate,
+                                    selected_learning_rate,
+                                    rel_tol=0.0,
+                                    abs_tol=config.fgd_approx.eps,
+                                ):
+                                    raise RuntimeError(
+                                        "Transactional endpoint rate changed before commit."
+                                    )
+                                candidate_model = realized_candidate_model
                             return _evaluate_fgd_outer_trial(
                                 base_model=model,
                                 direction=tangent_direction,
@@ -6421,6 +6804,7 @@ def run_pipeline(
                                 theory_state=theory_state,
                                 initial_functional_gap=initial_functional_gap,
                                 theory_loss_star=theory_loss_star,
+                                candidate_model=candidate_model,
                             )
 
                         if (
@@ -9452,6 +9836,7 @@ def run_pipeline(
             growth_events=growth_events,
             model=model,
             device=str(device),
+            fgd_outer_steps=fgd_outer_steps,
         )
         wandb_logger.finish(history=history)
         return result
@@ -9461,13 +9846,19 @@ def run_pipeline(
 
 
 def result_payload(result: PipelineResult) -> dict[str, Any]:
-    return {
+    payload = {
         "config": config_payload(result.config),
         "device": result.device,
         "model": str(result.model),
         "history": [asdict(entry) for entry in result.history],
         "growth_events": [asdict(event) for event in result.growth_events],
     }
+    # Preserve the exact/base JSON shape unless the opt-in transaction ran.
+    if result.fgd_outer_steps:
+        payload["fgd_outer_steps"] = [
+            asdict(record) for record in result.fgd_outer_steps
+        ]
+    return payload
 
 
 def save_result_json(result: PipelineResult, path: str | Path) -> Path:

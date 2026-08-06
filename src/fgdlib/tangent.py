@@ -865,6 +865,22 @@ class FGDApproxConfig:
     # for the certified outer direction. Off preserves the historical inner
     # damping from projection_damping for every existing configuration.
     certify_realize_use_selected_damping: bool = False
+    # Transactional guard for the nonlinear endpoint produced by the
+    # realization path. This is deliberately off by default: the exact/base
+    # ladder must keep its historical control flow, allocations and numerical
+    # decisions unless a matrix-free experiment opts in explicitly.
+    transactional_realized_descent: bool = False
+    # Number of smaller functional targets tried after the first realization.
+    transactional_max_retries: int = 0
+    transactional_backtrack_factor: float = 0.5
+    # Require L_before - L_after to exceed both this absolute tolerance and
+    # the configured fraction of Lemma 3.5's predicted decrease.
+    transactional_descent_atol: float = 0.0
+    transactional_min_predicted_decrease_fraction: float = 0.0
+    # Optional ceiling for the FACTORED selector's certified functional rate.
+    # None preserves the selector byte-for-byte; the dense/exact selector does
+    # not read this field.
+    certify_functional_lr_cap: float | None = None
     # Bounded certification probe, sized to the NUMERICAL RANK of J. The
     # certificate eps<1/2 is a statement over the NK-dimensional probe residual,
     # but MEASURED the rank m* needed to certify grows SUBLINEARLY in NK (m*/NK:
@@ -1142,6 +1158,61 @@ def validate_family_order(family_order: tuple[str, ...]) -> None:
             "fgd_approx.family_order must start with 'tangent' in legacy mode, "
             "or be exactly ['matrix_free_tangent'] for the isolated primary "
             "family."
+        )
+
+
+def validate_transactional_realized_descent(config: FGDApproxConfig) -> None:
+    """Validate the opt-in matrix-free endpoint transaction settings."""
+    retries = config.transactional_max_retries
+    if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
+        raise ValueError(
+            "fgd_approx.transactional_max_retries must be a non-negative integer."
+        )
+    factor = float(config.transactional_backtrack_factor)
+    if not math.isfinite(factor) or not 0.0 < factor < 1.0:
+        raise ValueError(
+            "fgd_approx.transactional_backtrack_factor must be in (0, 1)."
+        )
+    atol = float(config.transactional_descent_atol)
+    if not math.isfinite(atol) or atol < 0.0:
+        raise ValueError(
+            "fgd_approx.transactional_descent_atol must be finite and non-negative."
+        )
+    fraction = float(config.transactional_min_predicted_decrease_fraction)
+    if not math.isfinite(fraction) or not 0.0 <= fraction <= 1.0:
+        raise ValueError(
+            "fgd_approx.transactional_min_predicted_decrease_fraction must be "
+            "in [0, 1]."
+        )
+    cap = config.certify_functional_lr_cap
+    if cap is not None:
+        cap = float(cap)
+        if not math.isfinite(cap) or cap <= config.theory_lr_min + config.eps:
+            raise ValueError(
+                "fgd_approx.certify_functional_lr_cap must be finite and strictly "
+                "above theory_lr_min."
+            )
+    if not config.transactional_realized_descent:
+        return
+    if tuple(config.family_order) != ("matrix_free_tangent",):
+        raise ValueError(
+            "fgd_approx.transactional_realized_descent is restricted to "
+            "family_order: [matrix_free_tangent]."
+        )
+    if not config.certify_realize_path:
+        raise ValueError(
+            "fgd_approx.transactional_realized_descent requires "
+            "certify_realize_path: true."
+        )
+    if not config.certify_apply_in_interval:
+        raise ValueError(
+            "fgd_approx.transactional_realized_descent requires "
+            "certify_apply_in_interval: true."
+        )
+    if not config.projection_damping_auto:
+        raise ValueError(
+            "fgd_approx.transactional_realized_descent requires "
+            "projection_damping_auto: true."
         )
 
 

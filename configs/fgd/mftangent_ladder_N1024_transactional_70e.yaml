@@ -1,3 +1,7 @@
+# Dedicated seed-0 validation run for the transactional matrix-free guard.
+# Derived from mftangent_ladder_N1024.yaml; do not use this file to alter the
+# exact/base ladder.
+
 # The family_ladder_N1024 ladder, with J built matrix-free.
 #
 # Derived from configs/fgd/family_ladder_N1024.yaml. The dense/exact file is
@@ -40,7 +44,7 @@
 # PL constant (mu = 2, L* = 0) where cross-entropy has none, and an epoch
 # costs seconds instead of minutes.
 run:
-  name: mftangent_ladder_N1024_FP
+  name: mftangent-transactional-70e-seed-0
   results_dir: results
   save_plot: false
   show_plot: false
@@ -69,7 +73,7 @@ model:
 
 training:
   method: fgd_approx
-  epochs: 25
+  epochs: 70
   accuracy_tolerance: 0.1
   gradient_clip_norm:
   log_every: 1

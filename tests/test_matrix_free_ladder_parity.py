@@ -45,14 +45,8 @@ def _dense(system):
     return left_factor.double() @ right_factor.double().t()
 
 
-def test_the_two_configs_differ_only_in_the_family_and_the_rank() -> None:
-    """Everything the ladder DECIDES with must be identical.
-
-    Exactly two fields may differ, and neither is a decision rule:
-    ``family_order`` selects the solver, and ``matrixfree_rank`` sets how much
-    of the spectrum that solver keeps. The set is asserted exactly so a third
-    difference cannot creep in and quietly make the comparison meaningless.
-    """
+def test_matrix_free_only_overrides_are_explicit_and_exact_defaults_stay_off() -> None:
+    """Pin every intentional matrix-free override and every safety default."""
     ladder = load_pipeline_config(LADDER).fgd_approx
     approx = load_pipeline_config(APPROX).fgd_approx
     differing = {
@@ -60,8 +54,22 @@ def test_the_two_configs_differ_only_in_the_family_and_the_rank() -> None:
         for field in dataclasses.fields(ladder)
         if getattr(ladder, field.name) != getattr(approx, field.name)
     }
-    assert differing == {"family_order", "matrixfree_rank"}
+    assert differing == {
+        "family_order",
+        "theory_lr_search_steps",
+        "tangent_measured_max_lr",
+        "transactional_realized_descent",
+        "transactional_max_retries",
+        "transactional_descent_atol",
+        "certify_functional_lr_cap",
+    }
     assert ladder.matrixfree_rank == 0, "the exact ladder must never truncate"
+    assert ladder.transactional_realized_descent is False
+    assert ladder.transactional_max_retries == 0
+    assert ladder.certify_functional_lr_cap is None
+    assert approx.transactional_realized_descent is True
+    assert approx.transactional_max_retries == 3
+    assert approx.certify_functional_lr_cap == pytest.approx(0.1)
 
 
 def test_truncation_is_conservative_not_optimistic() -> None:
@@ -271,4 +279,46 @@ def test_factored_damping_selection_agrees_on_eps_and_lambda() -> None:
     )
     assert factored.candidate.relative_error == pytest.approx(
         dense.candidate.relative_error, rel=1e-3
+    )
+
+
+def test_functional_rate_cap_applies_only_to_the_factored_selector() -> None:
+    """Keep theorem proposal separate from attempted matrix-free rate."""
+    from fgdlib.search.damping import (
+        select_projection_damping,
+        select_projection_damping_factored,
+    )
+
+    import dataclasses as dc
+
+    config, model, x, y = _wide(16)
+    cap = 1e-4
+    factored_config = dc.replace(
+        config.fgd_approx,
+        certify_functional_lr_cap=cap,
+    )
+    factored_system = exact_tangent_system(model, x, y, factored_config)
+    factored = select_projection_damping_factored(
+        model,
+        x,
+        y,
+        factored_config,
+        system=factored_system,
+    )
+    assert factored is not None
+    assert factored.candidate.certified_learning_rate is not None
+    assert factored.candidate.certified_learning_rate > cap
+    assert factored.candidate.learning_rate == pytest.approx(cap)
+
+    exact_config = dc.replace(factored_config, family_order=("tangent",))
+    exact = select_projection_damping(
+        model,
+        x,
+        y,
+        exact_config,
+        system=exact_tangent_system(model, x, y, exact_config),
+    )
+    assert exact is not None
+    assert exact.candidate.learning_rate == pytest.approx(
+        exact.candidate.certified_learning_rate
     )

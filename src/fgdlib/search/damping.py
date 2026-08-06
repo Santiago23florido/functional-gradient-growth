@@ -745,6 +745,15 @@ def select_projection_damping_factored(
                     # the run froze from epoch 2 to 400. The path is the
                     # realisability mechanism; do not double-gate.
                     learning_rate = certified_rate
+                    # Matrix-free-only belt around the transactional guard.
+                    # ``certified_rate`` remains the proposal licensed by the
+                    # theorem; ``learning_rate`` is the rate the realization
+                    # is allowed to attempt. None preserves this path exactly.
+                    functional_cap = getattr(
+                        config, "certify_functional_lr_cap", None
+                    )
+                    if functional_cap is not None:
+                        learning_rate = min(learning_rate, float(functional_cap))
                 elif config.certify_linearization_tolerance is None:
                     learning_rate = certified_rate
                 else:

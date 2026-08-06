@@ -44,6 +44,9 @@ class NullWandbLogger:
     def log_history_entry(self, entry: Any) -> None:
         return None
 
+    def log_transactional_trial(self, record: Any) -> None:
+        return None
+
     def log_growth_event(
         self,
         *,
@@ -121,6 +124,82 @@ class WandbRunLogger:
             "growth/*",
         ):
             self._run.define_metric(pattern, step_metric="epoch")
+        self._run.define_metric("fgd/outer_step_global_index")
+        for metric in (
+            "fgd/proposed_learning_rate",
+            "fgd/capped_learning_rate",
+            "fgd/trial_learning_rate",
+            "fgd/committed_learning_rate",
+            "fgd/realized_effective_learning_rate",
+            "fgd/realized_functional_before",
+            "fgd/realized_functional_after",
+            "fgd/realized_functional_delta",
+            "fgd/predicted_certified_decrease",
+            "fgd/realized_decrease_ratio",
+            "fgd/realization_residual_fraction",
+            "fgd/realization_realized_fraction",
+            "fgd/realization_iterations",
+            "fgd/selected_relative_damping",
+            "fgd/selected_absolute_damping",
+            "fgd/transactional_retry_index",
+            "fgd/transactional_trial_count",
+            "fgd/transactional_rejected",
+            "fgd/transactional_accepted",
+            "fgd/transactional_rejection_reason",
+            "fgd/outer_step_index",
+        ):
+            self._run.define_metric(
+                metric,
+                step_metric="fgd/outer_step_global_index",
+            )
+
+    def log_transactional_trial(self, record: Any) -> None:
+        """Log one scalar-only matrix-free endpoint attempt."""
+        if self._run is None:
+            return
+        payload: dict[str, Any] = {
+            "epoch": record.epoch,
+            "fgd/outer_step_global_index": record.outer_step_global_index,
+            "fgd/outer_step_index": record.outer_step_index,
+            "fgd/transactional_retry_index": record.retry_index,
+            "fgd/transactional_trial_count": record.transactional_trial_count,
+            "fgd/proposed_learning_rate": record.proposed_learning_rate,
+            "fgd/capped_learning_rate": record.capped_learning_rate,
+            "fgd/trial_learning_rate": record.trial_learning_rate,
+            "fgd/committed_learning_rate": record.committed_learning_rate,
+            "fgd/realization_residual_fraction": (
+                record.realization_residual_fraction
+            ),
+            "fgd/realization_realized_fraction": (
+                record.realization_realized_fraction
+            ),
+            "fgd/realization_iterations": record.realization_iterations,
+            "fgd/selected_relative_damping": record.selected_relative_damping,
+            "fgd/selected_absolute_damping": record.selected_absolute_damping,
+            "fgd/transactional_rejected": record.rejected,
+            "fgd/transactional_accepted": record.accepted,
+            "fgd/transactional_rejection_reason": (
+                record.rejection_reason or "accepted"
+            ),
+        }
+        for attribute_name, metric_name in (
+            (
+                "realized_effective_learning_rate",
+                "fgd/realized_effective_learning_rate",
+            ),
+            ("realized_functional_before", "fgd/realized_functional_before"),
+            ("realized_functional_after", "fgd/realized_functional_after"),
+            ("realized_functional_delta", "fgd/realized_functional_delta"),
+            (
+                "predicted_certified_decrease",
+                "fgd/predicted_certified_decrease",
+            ),
+            ("realized_decrease_ratio", "fgd/realized_decrease_ratio"),
+        ):
+            value = getattr(record, attribute_name, None)
+            if value is not None:
+                payload[metric_name] = value
+        self._run.log(payload)
 
     def log_history_entry(self, entry: Any) -> None:
         if self._run is None:
