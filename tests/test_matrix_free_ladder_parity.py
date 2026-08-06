@@ -34,8 +34,14 @@ def _probe(path):
     return config, model, x, y
 
 
-def test_the_two_configs_differ_only_in_the_family() -> None:
-    """Everything the ladder decides with must be identical."""
+def test_the_two_configs_differ_only_in_the_family_and_the_rank() -> None:
+    """Everything the ladder DECIDES with must be identical.
+
+    Exactly two fields may differ, and neither is a decision rule:
+    ``family_order`` selects the solver, and ``matrixfree_rank`` sets how much
+    of the spectrum that solver keeps. The set is asserted exactly so a third
+    difference cannot creep in and quietly make the comparison meaningless.
+    """
     ladder = load_pipeline_config(LADDER).fgd_approx
     approx = load_pipeline_config(APPROX).fgd_approx
     differing = {
@@ -43,7 +49,27 @@ def test_the_two_configs_differ_only_in_the_family() -> None:
         for field in dataclasses.fields(ladder)
         if getattr(ladder, field.name) != getattr(approx, field.name)
     }
-    assert differing == {"family_order"}
+    assert differing == {"family_order", "matrixfree_rank"}
+    assert ladder.matrixfree_rank == 0, "the exact ladder must never truncate"
+
+
+def test_truncation_is_conservative_not_optimistic() -> None:
+    """A lower rank must push ``eps`` UP, never down.
+
+    ``J_k = J V V^T`` has a smaller range than ``J``, so less of ``r`` is
+    representable. That makes truncation under-certify, which is the safe
+    direction -- and it is worth pinning, because the intuitive guess is the
+    opposite and I held it for a while. If this ever flips, a truncated run is
+    certifying directions the exact tangent would refuse.
+    """
+    import dataclasses as dc
+
+    config, model, x, y = _wide(16)
+    errors = {}
+    for rank in (0, 256, 128, 64):
+        approx = dc.replace(config.fgd_approx, matrixfree_rank=rank)
+        errors[rank] = exact_relative_error(model, x, y, approx)
+    assert errors[0] <= errors[256] <= errors[128] <= errors[64], errors
 
 
 def test_both_configs_run_the_ladder_not_a_standalone_family() -> None:

@@ -363,6 +363,17 @@ fgd_approx:
   families_available_without_growth: true
   local_acceptance_conditions: true
   eps: 1.0e-12
+  # Krylov rank cap. 0 runs to the numerical rank, which reproduces the exact
+  # tangent and saves NOTHING -- at k = rank the factors weigh as much as J.
+  # The saving exists only while k << min(NK, P).
+  #
+  # MEASURED at P=641 against exact eps 0.185677: k=127 gives 0.268 in 1.8 s
+  # against 36.7 s at full rank -- 20x, and 66x at P=1345. The bias is
+  # CONSERVATIVE: J_k = J V V^T has a smaller range, so less of r is
+  # representable and eps comes out HIGHER, never lower. It under-certifies.
+  # 0.268 is still comfortably under the 1/2 bar, so it still steps; the cost
+  # is a smaller Lemma 3.5 rate, i.e. shorter steps.
+  matrixfree_rank: 128
   tiny_use_covariance: true
   tiny_alpha_zero: false
   tiny_omega_zero: false

@@ -111,6 +111,34 @@ class FGDApproxConfig:
     stall_min_epoch_decrease: float = 2e-3
     stall_patience: int = 5
     eps: float = 1e-12
+    # Krylov rank cap for the matrix-free family. 0 runs to the numerical rank,
+    # which reproduces the exact tangent and buys NOTHING -- at k = rank the
+    # factors are as large as J itself, so the whole construction is a detour.
+    #
+    # The saving exists only while k << min(NK, P). At MNIST width (784 in,
+    # 10 out, 1024-example probe, P ~ 59k) the arithmetic is stark:
+    #
+    #   dense J            4.8 GB      20,481 sequential autograd calls
+    #   factors at k=200   110 MB         401 sequential autograd calls
+    #
+    # 44x memory, 51x compute -- and it is a LOW-RANK APPROXIMATION, not a
+    # cheaper exact route.
+    #
+    # The truncation bias is CONSERVATIVE, which is the good direction and is
+    # worth stating because the opposite is the intuitive guess. J_k = J V V^T
+    # has a SMALLER range than J, so LESS of r is representable and eps comes
+    # out HIGHER. Truncating under-certifies; it never certifies a direction
+    # that does not deserve it. MEASURED at P=641 against exact eps 0.185677:
+    #
+    #   k=255  0.200  (+7.7%)    5.9 s        full rank 36.7 s
+    #   k=127  0.268  (+44%)     1.8 s
+    #   k= 63  0.369  (+99%)     0.5 s
+    #   k= 31  0.512  (+176%)    0.2 s
+    #
+    # k=127 still certifies comfortably under the 1/2 bar at 20x less cost.
+    # The price is a worse eps, hence a smaller Lemma 3.5 rate, hence shorter
+    # steps -- efficiency, not soundness.
+    matrixfree_rank: int = 0
     tiny_use_covariance: bool = True
     tiny_alpha_zero: bool = False
     tiny_omega_zero: bool = False
@@ -3156,14 +3184,20 @@ def _matrix_free_tangent_system(
             outputs=outputs,
             parameters=parameters,
             target=target,
-            # P, which yields k = P - 1 usable columns after the trailing
-            # offcut is dropped. Asking for P + 1 to reach k = P is WORSE, not
-            # better: MEASURED at P=25 the extra direction is numerically
-            # unreachable and behaves as noise, moving eps from 1.5e-03 to
-            # 8.8e-03 away from exact, and downward. The Krylov subspace
-            # converges to a (P-1)-dimensional invariant subspace here, and
-            # that is the honest ceiling of this construction.
-            iterations=sum(p.numel() for p in parameters),
+            # Uncapped this is P, which yields k = P - 1 usable columns after
+            # the trailing offcut is dropped. Asking for P + 1 to reach k = P
+            # is WORSE, not better: MEASURED at P=25 the extra direction is
+            # numerically unreachable and behaves as noise, moving eps from
+            # 1.5e-03 to 8.8e-03 away from exact, and downward.
+            #
+            # matrixfree_rank caps it below that, which is the only setting in
+            # which this construction saves anything -- see the field's own
+            # comment for the MNIST arithmetic.
+            iterations=(
+                min(config.matrixfree_rank, sum(p.numel() for p in parameters))
+                if config.matrixfree_rank > 0
+                else sum(p.numel() for p in parameters)
+            ),
             eps=config.eps,
         )
         jacobian_matrix, factors = (None, None) if built is None else built
