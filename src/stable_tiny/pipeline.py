@@ -88,7 +88,10 @@ from fgdlib.search.unified import (
     rank_candidates_by_certified_gain,
     rank_limiting_locations,
 )
-from fgdlib.search.damping import select_projection_damping
+from fgdlib.search.damping import (
+    select_projection_damping,
+    select_projection_damping_factored,
+)
 from fgdlib.search.realize import realization_damping, realize_functional_step
 from fgdlib.search.linearization import certified_linear_learning_rate
 from fgdlib.search.growth import (
@@ -6179,8 +6182,17 @@ def run_pipeline(
                                         else "FAILS, so no rate is admissible"
                                     )
                                 )
+                        # Factored systems take the factored selector: it reads
+                        # the (rows, k) factor instead of J, which is the whole
+                        # point of carrying the factors. Only the matrix-free
+                        # family sets them, so the default path is unchanged.
+                        _select_damping = (
+                            select_projection_damping_factored
+                            if getattr(tangent_system, "factors", None) is not None
+                            else select_projection_damping
+                        )
                         damping_choice = (
-                            select_projection_damping(
+                            _select_damping(
                                 model,
                                 fgd_train_probe[0],
                                 fgd_train_probe[1],

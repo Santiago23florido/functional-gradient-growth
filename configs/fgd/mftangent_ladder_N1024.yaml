@@ -547,10 +547,10 @@ wandb:
   project: stable-tiny
   entity:
   run_name:
-  group: fgd-growth
+  group: mftangent-ladder-N1024
   job_type: train
-  tags: [fgd_approx, certified_growth, smooth_sin_tiny, from_3x2, mse, lemma35_cycle, fully_exact]
-  notes: Fully exact Lemma 3.5 cycle at minimum scale - full-dataset Jacobian, certified rate, integrated step
+  tags: [fgd_approx, certified_growth, smooth_sin_tiny, from_3x2, mse, lemma35_cycle, matrix_free, low_rank_k128]
+  notes: The family_ladder_N1024 algorithm with J built matrix-free from a rank-128 Krylov factorisation. Truncation biases eps UP (conservative), MEASURED +44% at P=641 for 20x less cost.
   mode: online
   dir: results
   log_code: false
