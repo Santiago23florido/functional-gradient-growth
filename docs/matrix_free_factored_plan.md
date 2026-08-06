@@ -2,7 +2,7 @@
 
 ## Where this stands
 
-`configs/fgd/mftangent_ladder_N1024.yaml` already runs the ladder's own
+`configs/fgd/family_ladder_matrix_free_N1024.yaml` runs the ladder's own
 algorithm with `J` built matrix-free (`_matrix_free_tangent_system` in
 `tangent.py`, gated on `family_order == ("matrix_free_tangent",)`). It removes
 the `O(P^2)` Gram -- the ~40 GB blocker at MNIST width -- but still materialises

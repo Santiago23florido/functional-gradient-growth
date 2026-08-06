@@ -120,10 +120,12 @@ def test_exact_config_file_and_transaction_defaults_are_unchanged() -> None:
     assert exact.certify_functional_lr_cap is None
 
 
-def test_70_epoch_config_differs_from_matrix_free_base_only_by_run_length() -> None:
-    base = load_pipeline_config("configs/fgd/mftangent_ladder_N1024.yaml")
+def test_canonical_matrix_free_config_preserves_the_70_epoch_experiment() -> None:
+    base = load_pipeline_config(
+        "configs/experiments/mftangent_ladder_N1024_25e.yaml"
+    )
     experiment = load_pipeline_config(
-        "configs/fgd/mftangent_ladder_N1024_transactional_70e.yaml"
+        "configs/fgd/family_ladder_matrix_free_N1024.yaml"
     )
     normalized = replace(
         experiment,
@@ -132,6 +134,7 @@ def test_70_epoch_config_differs_from_matrix_free_base_only_by_run_length() -> N
     )
     assert normalized == base
     assert experiment.training.epochs == 70
+    assert experiment.run.name == "family_ladder_matrix_free_N1024"
     assert experiment.fgd_approx.transactional_realized_descent is True
 
 
@@ -158,7 +161,7 @@ def test_transactional_config_rejects_invalid_bounds(
     import yaml
 
     raw = yaml.safe_load(
-        Path("configs/fgd/mftangent_ladder_N1024.yaml").read_text()
+        Path("configs/fgd/family_ladder_matrix_free_N1024.yaml").read_text()
     )
     raw["fgd_approx"][field] = value
     path = tmp_path / "invalid.yaml"

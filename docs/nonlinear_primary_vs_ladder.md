@@ -20,7 +20,8 @@ the loss frozen. This documents why, what was actually wrong, and what changed.
 ## Divergences found
 
 Measured against `configs/fgd/family_ladder_N1024.yaml`
-(`certify_family_*`) and `configs/fgd/nonlinear_family_ladder_N1024.yaml`.
+(`certify_family_*`) and
+`configs/experiments/nonlinear_family_ladder_N1024.yaml`.
 
 | # | Aspect | Ladder | Nonlinear-only (before) | Impact |
 |---|---|---|---|---|

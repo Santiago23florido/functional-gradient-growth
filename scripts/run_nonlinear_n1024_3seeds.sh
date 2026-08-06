@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-CONFIG="${REPO_ROOT}/configs/fgd/nonlinear_family_ladder_N1024.yaml"
+CONFIG="${REPO_ROOT}/configs/experiments/nonlinear_family_ladder_N1024.yaml"
 GROUP="nonlinear-n1024-2x2x2-3seeds"
 OUTPUT_ROOT="${REPO_ROOT}/results/nonlinear_n1024_3seeds"
 

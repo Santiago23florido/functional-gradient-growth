@@ -315,9 +315,10 @@ no cambia, la familia recertifica la misma dirección siempre y el crecimiento
 no llega nunca. Es exactamente el fallo que documenta el comentario de
 `certify_family_min_gain`. **Certificar no es progresar.**
 
-Nota: `configs/fgd/mnist_streaming.yaml` **sí** usa `lemma35_rate: true` con
-`certify_family_min_gain: 0.02`, o sea que la combinación gobernada funciona
-cuando el aplazamiento tiene que ganarse.
+Nota histórica: aquella variante de MNIST usaba `lemma35_rate: true` con
+`certify_family_min_gain: 0.02`. La configuración canónica actual unificó ambos
+campos con la base (`false` y `0.0`); no debe atribuirse aquel resultado al YAML
+actual sin volver a medirlo.
 
 ## ¿Crece de forma no uniforme? NO — y el patrón es diagnosticable
 
@@ -443,8 +444,9 @@ así que el criterio de PARADA debe ir aparte, sin tocar el de ADMISIÓN del pas
    para su accuracy (comparar contra grid por forma, no contra `lr` fijo).
 2. Validar que **no sesga hacia una arquitectura fija en otras bases de datos**
    — configs listas en `runs/cfg/mnist_base.yaml` y `runs/cfg/mnist_up.yaml`.
-   **Ojo:** la config de MNIST trae `certify_family_lemma35_rate: true` y
-   `certify_family_min_gain: 0.02`, régimen distinto al de smooth_sin.
+   **Ojo:** la variante histórica de MNIST usaba
+   `certify_family_lemma35_rate: true` y `certify_family_min_gain: 0.02`; la
+   configuración canónica actual ya no usa ese régimen.
 
 ## Advertencia metodológica
 

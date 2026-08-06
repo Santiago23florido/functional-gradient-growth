@@ -118,8 +118,14 @@ PYTHONPATH=src python -m stable_tiny --config configs/experiments/<name>.yaml
 
 - `configs/fgd/family_ladder_N1024.yaml` — **the default**, the best-performing
   configuration, kept exactly as it was launched.
-- `configs/experiments/` — every other configuration (baselines, ablations,
-  the data-density and regularisation sweeps used to reach the result).
+- `configs/fgd/family_ladder_matrix_free_N1024.yaml` — the same base ladder
+  with the factored matrix-free tangent and transactional endpoint guard.
+- `configs/fgd/cifar_streaming.yaml` and `configs/fgd/mnist_streaming.yaml` —
+  canonical exact/streamed dataset variants.
+- `configs/fgd/mnist_matrix_free.yaml` — MNIST with the factored matrix-free
+  tangent, a bounded dual probe and the 30,000-parameter cap.
+- `configs/experiments/` — historical baselines, ablations and retired FGD
+  configurations kept outside the canonical catalog.
 
 ## Tests
 

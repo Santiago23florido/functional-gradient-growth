@@ -106,7 +106,7 @@ def test_family_order_accepts_standalone_nonlinear_and_legacy_ladders() -> None:
 
 def test_dedicated_n1024_yaml_selects_nonlinear_2x2x2() -> None:
     config = pipeline.load_pipeline_config(
-        Path("configs/fgd/nonlinear_family_ladder_N1024.yaml")
+        Path("configs/experiments/nonlinear_family_ladder_N1024.yaml")
     )
     assert config.fgd_approx.family_order == ("nonlinear",)
     assert config.model.hidden_size == 2

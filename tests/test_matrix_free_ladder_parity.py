@@ -22,7 +22,7 @@ from stable_tiny.pipeline import (
 )
 
 LADDER = "configs/fgd/family_ladder_N1024.yaml"
-APPROX = "configs/fgd/mftangent_ladder_N1024.yaml"
+APPROX = "configs/fgd/family_ladder_matrix_free_N1024.yaml"
 
 
 def _probe(path):

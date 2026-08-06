@@ -2370,15 +2370,13 @@ def _probe_fgd_growth(
     # post-growth counts steers growth to the parameter-efficient
     # narrow-in / wide-late shape automatically, because the input layer
     # becomes unaffordable early while the late layers stay cheap.
-    max_parameters = config.fgd_approx.max_total_parameters
-    if max_parameters is not None:
-        affordable = [
-            probe
-            for probe in probes
-            if base_parameter_count + probe.added_parameters <= max_parameters
-        ]
-        if affordable:
-            probes = affordable
+    probes = _affordable_growth_probes(
+        probes,
+        base_parameter_count=base_parameter_count,
+        max_parameters=config.fgd_approx.max_total_parameters,
+    )
+    if not probes:
+        return None
 
     if select_by_epsilon:
         # R3 -- termination: None here means no candidate enlarges what the
@@ -2402,6 +2400,22 @@ def _probe_fgd_growth(
         probes,
         prefer_lower_error=config.fgd_approx.growth_prefer_lower_error,
     )
+
+
+def _affordable_growth_probes(
+    probes: list[_GrowthProbe],
+    *,
+    base_parameter_count: int,
+    max_parameters: int | None,
+) -> list[_GrowthProbe]:
+    """Drop every candidate whose post-growth model exceeds the hard cap."""
+    if max_parameters is None:
+        return probes
+    return [
+        probe
+        for probe in probes
+        if base_parameter_count + probe.added_parameters <= max_parameters
+    ]
 
 
 def _select_growth_probe_by_epsilon(
