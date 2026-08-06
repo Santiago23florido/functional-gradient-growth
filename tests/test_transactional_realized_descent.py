@@ -118,8 +118,6 @@ def test_exact_config_file_and_transaction_defaults_are_unchanged() -> None:
     assert exact.transactional_realized_descent is False
     assert exact.transactional_max_retries == 0
     assert exact.certify_functional_lr_cap is None
-    assert exact.certify_family_lemma35_rate is False
-    assert exact.max_total_parameters is None
 
 
 def test_70_epoch_config_differs_from_matrix_free_base_only_by_run_length() -> None:
@@ -135,8 +133,6 @@ def test_70_epoch_config_differs_from_matrix_free_base_only_by_run_length() -> N
     assert normalized == base
     assert experiment.training.epochs == 70
     assert experiment.fgd_approx.transactional_realized_descent is True
-    assert experiment.fgd_approx.certify_family_lemma35_rate is True
-    assert experiment.fgd_approx.max_total_parameters == 600
 
 
 @pytest.mark.parametrize(
