@@ -92,7 +92,15 @@ def _realization(before: float, after: float, rate: float) -> RealizationResult:
     )
 
 
-def _run_transaction(model, x, y, config, system):
+def _run_transaction(
+    model,
+    x,
+    y,
+    config,
+    system,
+    *,
+    full_train_batches=None,
+):
     return _transactional_realize_functional_step(
         model=model,
         x=x,
@@ -108,6 +116,10 @@ def _run_transaction(model, x, y, config, system):
         epoch=4,
         outer_step_index=2,
         outer_step_global_index=11,
+        full_train_batches=full_train_batches,
+        full_train_device=(
+            torch.device("cpu") if full_train_batches is not None else None
+        ),
     )
 
 
@@ -277,6 +289,97 @@ def test_retry_restores_original_reuses_system_and_allocates_one_checkpoint(
     assert torch.equal(reconstructed, model.weight)
 
 
+def test_full_train_guard_backtracks_after_probe_local_improvement(
+    monkeypatch,
+) -> None:
+    model = torch.nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        model.weight.fill_(1.0)
+    original = model.weight.detach().clone()
+    x = torch.tensor([[1.0]])
+    y = torch.tensor([[0.0]])
+    full_train_batches = [
+        (torch.tensor([[1.0], [2.0]]), torch.zeros((2, 1))),
+        (torch.tensor([[3.0]]), torch.zeros((1, 1))),
+    ]
+    config = _transaction_config()
+    system = _system(model, x, y, config)
+    starts: list[torch.Tensor] = []
+
+    def probe_improves_globally_only_after_backtrack(
+        walker,
+        _x,
+        _y,
+        _updates,
+        rate,
+        _config,
+        **kwargs,
+    ):
+        starts.append(walker.weight.detach().clone())
+        with torch.no_grad():
+            walker.weight.fill_(2.0 if len(starts) == 1 else 0.5)
+        # The small probe claims descent on both attempts. The full-train
+        # guard must reject the first endpoint and accept only the second.
+        return _realization(1.0, 0.5, rate)
+
+    monkeypatch.setattr(
+        pipeline,
+        "realize_functional_step",
+        probe_improves_globally_only_after_backtrack,
+    )
+    outcome = _run_transaction(
+        model,
+        x,
+        y,
+        config,
+        system,
+        full_train_batches=full_train_batches,
+    )
+
+    assert len(starts) == 2
+    assert all(torch.equal(start, original) for start in starts)
+    assert [record.trial_learning_rate for record in outcome.trials] == [0.1, 0.05]
+    assert outcome.trials[0].rejection_reason == "full_train_functional_increase"
+    assert outcome.trials[0].full_train_functional_delta > 0.0
+    assert outcome.trials[1].accepted is True
+    assert outcome.trials[1].full_train_functional_delta < 0.0
+    assert all(record.full_train_examples == 3 for record in outcome.trials)
+    assert outcome.candidate_model is model
+    assert outcome.learning_rate == pytest.approx(0.05)
+    assert torch.equal(model.weight, torch.tensor([[0.5]]))
+
+
+def test_full_train_guard_does_not_overrestrict_equal_global_loss(
+    monkeypatch,
+) -> None:
+    model = torch.nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        model.weight.fill_(1.0)
+    x = torch.tensor([[1.0]])
+    y = torch.tensor([[0.0]])
+    config = _transaction_config()
+    system = _system(model, x, y, config)
+
+    def equal_global_loss(walker, _x, _y, _updates, rate, _config, **kwargs):
+        with torch.no_grad():
+            walker.weight.fill_(-1.0)
+        return _realization(1.0, 0.5, rate)
+
+    monkeypatch.setattr(pipeline, "realize_functional_step", equal_global_loss)
+    outcome = _run_transaction(
+        model,
+        x,
+        y,
+        config,
+        system,
+        full_train_batches=[(x, y)],
+    )
+
+    assert outcome.trials[0].accepted is True
+    assert outcome.trials[0].full_train_functional_delta == pytest.approx(0.0)
+    assert outcome.learning_rate == pytest.approx(0.1)
+
+
 def test_all_retries_fail_and_leave_original_model_bit_exact(monkeypatch) -> None:
     model = torch.nn.Linear(1, 1, bias=False)
     with torch.no_grad():
@@ -364,8 +467,18 @@ def test_wandb_transaction_logging_is_scalar_only() -> None:
     logger = WandbRunLogger(WandbConfig(enabled=True))
     run = Run()
     logger._run = run
-    logger.log_transactional_trial(_record())
+    logger.log_transactional_trial(
+        replace(
+            _record(),
+            full_train_functional_before=12.0,
+            full_train_functional_after=10.0,
+            full_train_functional_delta=-2.0,
+            full_train_examples=10_000,
+        )
+    )
     assert run.payload["fgd/realized_functional_delta"] == pytest.approx(-0.5)
+    assert run.payload["fgd/full_train_functional_delta"] == pytest.approx(-2.0)
+    assert run.payload["fgd/full_train_examples"] == 10_000
     assert run.payload["fgd/transactional_rejection_reason"] == "accepted"
     assert all(
         value is None or isinstance(value, (bool, int, float, str))

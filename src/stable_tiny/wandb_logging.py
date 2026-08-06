@@ -134,6 +134,10 @@ class WandbRunLogger:
             "fgd/realized_functional_before",
             "fgd/realized_functional_after",
             "fgd/realized_functional_delta",
+            "fgd/full_train_functional_before",
+            "fgd/full_train_functional_after",
+            "fgd/full_train_functional_delta",
+            "fgd/full_train_examples",
             "fgd/predicted_certified_decrease",
             "fgd/realized_decrease_ratio",
             "fgd/realization_residual_fraction",
@@ -190,6 +194,19 @@ class WandbRunLogger:
             ("realized_functional_before", "fgd/realized_functional_before"),
             ("realized_functional_after", "fgd/realized_functional_after"),
             ("realized_functional_delta", "fgd/realized_functional_delta"),
+            (
+                "full_train_functional_before",
+                "fgd/full_train_functional_before",
+            ),
+            (
+                "full_train_functional_after",
+                "fgd/full_train_functional_after",
+            ),
+            (
+                "full_train_functional_delta",
+                "fgd/full_train_functional_delta",
+            ),
+            ("full_train_examples", "fgd/full_train_examples"),
             (
                 "predicted_certified_decrease",
                 "fgd/predicted_certified_decrease",

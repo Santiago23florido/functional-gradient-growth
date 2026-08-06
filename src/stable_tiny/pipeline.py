@@ -354,6 +354,13 @@ class FGDTransactionalTrialRecord:
     accepted: bool
     rejected: bool
     rejection_reason: str | None
+    # The small probe above remains the only input to the tangent/Jacobian
+    # calculation.  These fields audit the forward-only guard over the whole
+    # frozen training epoch used to accept or reject the realized endpoint.
+    full_train_functional_before: float | None = None
+    full_train_functional_after: float | None = None
+    full_train_functional_delta: float | None = None
+    full_train_examples: int | None = None
 
 
 @dataclass
@@ -1059,6 +1066,49 @@ def evaluate_functional_loss(
     return total_loss
 
 
+@torch.no_grad()
+def _evaluate_transactional_full_train_functional_loss(
+    model: torch.nn.Module,
+    train_batches: list[tuple[torch.Tensor, torch.Tensor]],
+    device: torch.device,
+    functional_loss: str,
+) -> tuple[float, int]:
+    """Stream the full-train acceptance loss without building a Jacobian.
+
+    Transactional realization uses a deliberately small probe for the
+    expensive tangent system.  This second, forward-only measurement prevents
+    a probe-local improvement from being committed when it increases the
+    functional loss over the complete frozen training epoch.
+
+    Preserve every module's mode exactly: the tangent system has strict state
+    guards, and a mixed train/eval hierarchy must survive this audit unchanged.
+    """
+    evaluation_state = tuple((module, module.training) for module in model.modules())
+    total_loss = 0.0
+    example_count = 0
+    try:
+        model.eval()
+        for inputs, targets in train_batches:
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            total_loss += float(
+                batch_functional_loss(
+                    model(inputs),
+                    targets,
+                    functional_loss,
+                )
+                .detach()
+                .item()
+            )
+            example_count += int(inputs.shape[0])
+    finally:
+        for module, training in evaluation_state:
+            module.training = training
+    if example_count == 0:
+        raise ValueError("Transactional full-train guard received no examples.")
+    return total_loss, example_count
+
+
 def certified_validation_learning_rate(
     certificate: FGDValidationCertificate,
     config: FGDApproxConfig,
@@ -1398,6 +1448,8 @@ def _transactional_realize_functional_step(
     epoch: int,
     outer_step_index: int,
     outer_step_global_index: int,
+    full_train_batches: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+    full_train_device: torch.device | None = None,
     progress: ProgressFn | None = None,
 ) -> _TransactionalRealization:
     """Realize, verify and either commit or roll back a matrix-free endpoint."""
@@ -1407,6 +1459,21 @@ def _transactional_realize_functional_step(
     records: list[FGDTransactionalTrialRecord] = []
     rate = float(capped_learning_rate)
     floor = float(config.theory_lr_min + config.eps)
+    full_train_before: float | None = None
+    full_train_examples: int | None = None
+    if full_train_batches is not None:
+        if full_train_device is None:
+            raise ValueError(
+                "Transactional full-train guard requires full_train_device."
+            )
+        full_train_before, full_train_examples = (
+            _evaluate_transactional_full_train_functional_loss(
+                base_model,
+                full_train_batches,
+                full_train_device,
+                config.functional_loss,
+            )
+        )
 
     for retry_index in range(config.transactional_max_retries + 1):
         if rate <= floor:
@@ -1427,6 +1494,30 @@ def _transactional_realize_functional_step(
         except Exception:
             _restore_model_from_checkpoint(model, base_model)
             raise
+
+        full_train_after: float | None = None
+        full_train_delta: float | None = None
+        if full_train_batches is not None:
+            assert full_train_device is not None
+            assert full_train_before is not None
+            try:
+                full_train_after, measured_examples = (
+                    _evaluate_transactional_full_train_functional_loss(
+                        model,
+                        full_train_batches,
+                        full_train_device,
+                        config.functional_loss,
+                    )
+                )
+            except Exception:
+                _restore_model_from_checkpoint(model, base_model)
+                raise
+            if measured_examples != full_train_examples:
+                _restore_model_from_checkpoint(model, base_model)
+                raise RuntimeError(
+                    "Transactional full-train guard example count changed."
+                )
+            full_train_delta = full_train_after - full_train_before
 
         predicted_decrease = _predicted_certified_decrease(
             system=system,
@@ -1454,6 +1545,17 @@ def _transactional_realize_functional_step(
         if not finite:
             accepted = False
             rejection_reason = "non_finite_realization_diagnostics"
+        elif full_train_delta is not None and not all(
+            math.isfinite(value)
+            for value in (
+                full_train_before,
+                full_train_after,
+                full_train_delta,
+            )
+            if value is not None
+        ):
+            accepted = False
+            rejection_reason = "non_finite_full_train_functional"
         elif predicted_decrease is None:
             accepted = False
             rejection_reason = "invalid_predicted_decrease"
@@ -1465,6 +1567,13 @@ def _transactional_realize_functional_step(
             )
             accepted = bool(actual_decrease > required_decrease)
             rejection_reason = None if accepted else "insufficient_realized_descent"
+            if accepted and full_train_delta is not None:
+                accepted = bool(
+                    full_train_delta
+                    <= float(config.transactional_descent_atol)
+                )
+                if not accepted:
+                    rejection_reason = "full_train_functional_increase"
 
         decrease_ratio = (
             actual_decrease / predicted_decrease
@@ -1498,16 +1607,27 @@ def _transactional_realize_functional_step(
                 accepted=accepted,
                 rejected=not accepted,
                 rejection_reason=rejection_reason,
+                full_train_functional_before=full_train_before,
+                full_train_functional_after=full_train_after,
+                full_train_functional_delta=full_train_delta,
+                full_train_examples=full_train_examples,
             )
         )
         increment("transactional_realization_trials")
         if progress is not None:
             before_text = f"{before:.6e}" if before is not None else "n/a"
             after_text = f"{after:.6e}" if after is not None else "n/a"
+            full_train_text = ""
+            if full_train_before is not None and full_train_after is not None:
+                full_train_text = (
+                    f" full_train={full_train_before:.6e}"
+                    f"->{full_train_after:.6e}"
+                )
             progress(
                 "[TRANSACTION] "
                 f"retry={retry_index} eta={rate:.4e} "
                 f"functional={before_text}->{after_text} "
+                f"{full_train_text} "
                 f"accepted={accepted}"
             )
 
@@ -6597,6 +6717,10 @@ def run_pipeline(
                                             outer_step_global_index=(
                                                 transactional_outer_step_global_index
                                             ),
+                                            full_train_batches=(
+                                                frozen_train_batches
+                                            ),
+                                            full_train_device=device,
                                             progress=progress,
                                         )
                                     )

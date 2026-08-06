@@ -3277,6 +3277,7 @@ def _matrix_free_tangent_system(
     from fgdlib.search.matrixfree import (
         analytic_operators,
         dual_spectrum,
+        randomized_factorization,
         vmap_operators,
     )
 
@@ -3324,27 +3325,62 @@ def _matrix_free_tangent_system(
 
         columns = sum(p.numel() for p in parameters)
 
-        # DUAL, not low rank. J J^T = A S^2 A^T gives J's exact spectrum from
-        # an NK x NK object; the primal J^T J is P x P. Whenever the model is
-        # over-parameterised relative to the probe -- the MNIST regime -- that
-        # is 2949 MB against 8.4 MB at P=19201, MEASURED, and exact to 2.4e-16.
+        # FACTOR THE SMALLER SIDE. rank(J) <= min(NK, P), so whichever of the
+        # two dimensions is smaller bounds the whole spectrum and a basis of
+        # that many columns captures the range EXACTLY. Nothing is truncated
+        # either way; only the arithmetic changes.
         #
-        # A low-rank sketch was tried first and cannot work here: at P=1345 the
-        # exact eps is 1e-06 while rank 512 reported 0.21, because r is spread
-        # across the whole spectrum rather than concentrated in a few
-        # directions. Nothing is truncated now except numerically-zero
-        # singular values, which carry nothing by definition.
-        spectrum = dual_spectrum(operators, config.eps)
-        if spectrum is None:
-            return None
-        left, singular_values = spectrum
-        # The right factor, built by applying J^T to the retained left
-        # directions -- one batched apply, no (NK, P) intermediate.
-        right = (
-            operators.apply_jt(left.t()) / singular_values.unsqueeze(1)
-        ).t()
-        factors = (left * singular_values, right)
-        jacobian_matrix = left.new_zeros((0, columns))
+        # This matters because the two regimes really happen:
+        #
+        #   P < NK   the probe is sized above the interpolation floor, which
+        #            certify_probe_kappa now enforces. MNIST: NK 7040, P 1612.
+        #   NK < P   the over-parameterised regime, where the dual is the
+        #            cheap side. MEASURED at P=19201, NK=1024: the primal Gram
+        #            is 2949 MB against the dual's 8.4 MB.
+        #
+        # The gate is the RATIO, not min(NK, P), because the two routes have
+        # different constants and the crossover is not at 1. MEASURED at the
+        # real dimensions of both configs:
+        #
+        #   N1024  NK/P 1.6    dual 0.262 s   P-side 3.19 s   -> dual  12x
+        #   MNIST  NK/P 4.37   dual 16.29 s   P-side 3.59 s   -> P-side 4.5x
+        #
+        # The dual's eigendecomposition is O(NK^3) and gets worse as kappa grows
+        # the probe with the net; the P-side pays O(NK P^2) but moves large
+        # blocks through the batched applies, which only pays off once NK is
+        # several times P. 2x sits between the two measured points and keeps
+        # N1024 on exactly the path it is on today.
+        #
+        # A low-rank SKETCH is a different thing and does not work here: at
+        # P=1345 the exact eps is 1e-06 while rank 512 reported 0.21, because r
+        # is spread across the whole spectrum. The rank below is the full
+        # min(NK, P), so nothing is truncated on either branch.
+        if operators.rows > 2 * columns:
+            built = randomized_factorization(
+                apply_j=operators.apply_j,
+                apply_jt=operators.apply_jt,
+                rows=operators.rows,
+                columns=columns,
+                rank=columns,
+                oversampling=0,
+                power_iterations=1,
+                device=x.device,
+            )
+            if built is None:
+                return None
+            factors = built
+        else:
+            spectrum = dual_spectrum(operators, config.eps)
+            if spectrum is None:
+                return None
+            left, singular_values = spectrum
+            # The right factor, built by applying J^T to the retained left
+            # directions -- one batched apply, no (NK, P) intermediate.
+            right = (
+                operators.apply_jt(left.t()) / singular_values.unsqueeze(1)
+            ).t()
+            factors = (left * singular_values, right)
+        jacobian_matrix = factors[0].new_zeros((0, columns))
     finally:
         model.train(was_training)
 

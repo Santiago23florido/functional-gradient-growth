@@ -133,7 +133,29 @@ fgd_approx:
   # 1280 x 1280 while the parameter-side representation remains factored.
   certify_stream_gram: false
   certify_stream_chunk: 1024
-  probe_batches: 2
+  # 11, not 2. THE ROOT CAUSE FIX.
+  #
+  # eps is an R^2-like ratio and least squares OVERFITS a finite probe: with
+  # more parameters than rows it interpolates, and eps collapses to a spurious
+  # near-zero. tangent.py:897 already names this the interpolation floor.
+  #
+  # The MNIST net is 1612 parameters BEFORE any growth (784 in, 10 out), and it
+  # cannot be made smaller -- a first attempt capped max_total_parameters at 300
+  # and only got "growth suppressed (parameter budget 300 reached: 1612
+  # params)". P is not the lever here; NK is.
+  #
+  #   probe_batches  2 -> NK  1280 -> NK/P 0.79   interpolates
+  #   probe_batches 11 -> NK  7040 -> NK/P 4.37   above the floor
+  #
+  # MEASURED at probe_batches 2 (run-20260806_144333): "[CERTIFY] eps -> 0.0179
+  # (certified)" and every transaction improved the PROBE while worsening the
+  # real loss -- functional 37.75 -> 24.27, full_train 14213 -> 14382. 20 of 30
+  # epochs committed nothing, lr was exactly 0, rel_err sat frozen at 0.339 for
+  # 17 epochs. Without the full_train guard the same config diverges instead
+  # (rel_err 102449): one failure, two faces.
+  #
+  # N1024 never had this: 1024 rows against ~620 parameters, NK/P = 1.65.
+  probe_batches: 11
   # Assemble that Jacobian in row-blocks. jacrev vmaps one backward pass per
   # output row and holds the batched activations for all of them at once, so
   # its peak scales with (rows) x (activations), not with J. MEASURED: the
@@ -382,6 +404,13 @@ fgd_approx:
   # adequate (eps < 1/2): otherwise growth correctly stops and the flow is
   # left with the tangent alone, which freezes it.
   families_available_without_growth: true
+  # REMOVED (was true). It forced a growth after a finite failed step to break
+  # the "eps=0.485 certifies but eta=8.80e-6 < theory_lr_min" deadlock. That
+  # deadlock is a SYMPTOM: eps only reads 0.485 because the probe carries 1280
+  # rows against a 30000-parameter budget, so least squares interpolates it and
+  # eps is biased down. Forcing growth spends parameters to chase a number that
+  # is wrong. The floor is fixed below instead; if the deadlock returns with a
+  # correctly sized probe, that is new information and not this knob's job.
   local_acceptance_conditions: true
   eps: 1.0e-12
   # Full numerical rank of the selected probe; no user rank truncation.
@@ -430,7 +459,38 @@ fgd_approx:
   # misleading inheritance).
   growth_function_preserving: true
   growth_requires_admissibility_failure: true
-  max_total_parameters: 30000
+  # 300, not 30000. THE ROOT CAUSE FIX, stage 1.
+  #
+  # eps is an R^2-like ratio and least squares OVERFITS a finite probe, so with
+  # more parameters than rows it interpolates and eps collapses to a spurious
+  # near-zero. The probe here is probe_batches 2 * batch_size 64 * K 10 = 1280
+  # rows. Against 30000 parameters that is 23 parameters per equation, and the
+  # certificate stops meaning anything.
+  #
+  # MEASURED in run-20260806_144333: "[CERTIFY] growth 1: eps -> 0.0179
+  # (certified)" and then every transaction improves the PROBE and worsens the
+  # real loss -- functional 37.75 -> 24.27 while full_train 14213 -> 14382.
+  # 20 of 30 epochs committed nothing, lr was exactly 0, and rel_err sat frozen
+  # at 0.339 for 17 consecutive epochs. Without the full_train guard the same
+  # config diverges instead (rel_err 102449, train_loss 0.17 -> 90.4): the two
+  # are one failure, not two.
+  #
+  # N1024 does not have this because its probe is 1024 rows against ~620
+  # parameters -- NK/P = 1.65, above the floor -- and it trains to 0.953.
+  #
+  # 300 keeps NK/P > 4 with the current probe. It caps capacity, which is why
+  # it is a diagnostic operating point and not the endpoint; certify_probe_kappa
+  # is the principled version and comes next.
+  # kappa = 4: size the probe so NK = 4 * rank(J) as the net grows, instead of
+  # trusting a hand-picked probe to stay above the floor. probe_batches above is
+  # only the starting point; this keeps the invariant NK > P holding after every
+  # growth. [4, 8] is the range the field documents as tested.
+  certify_probe_kappa: 4.0
+  # 5000, not 30000. With kappa = 4 a P of 30000 would demand NK = 120000 rows
+  # = 12000 images, and this config only loads mnist_train_samples: 10000. The
+  # budget and the probe are now coupled quantities; 5000 needs NK = 20000 rows
+  # = 2000 images, which fits.
+  max_total_parameters: 5000
   growth_preservation_tolerance: 1.0e-6
   # Ordered ladder of approximation families, evaluated top to bottom.
   # "tangent" must come first (it is the epoch's main transactional

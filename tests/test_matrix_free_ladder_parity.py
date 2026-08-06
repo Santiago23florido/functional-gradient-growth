@@ -167,8 +167,13 @@ def test_the_factored_spectrum_is_the_spectrum_of_j() -> None:
     count = singular_values.numel()
     assert torch.allclose(reference[:count], singular_values, rtol=1e-5, atol=1e-8)
 
-    # Never an (N K, P) object anywhere in the factored route.
-    assert right.shape[1] == count < dense.shape[1]
+    # Never an (N K, P) object anywhere in the factored route. The rank may
+    # now REACH P -- the P-side factorisation returns the full min(NK, P), so
+    # nothing is truncated -- which the old strict `<` wrongly forbade. What
+    # must hold is that the factors are bounded by min(NK, P) and that the
+    # dense J is never materialised.
+    assert right.shape[1] == count <= min(dense.shape)
+    assert system.jacobian.numel() == 0
 
     factored = factored_minimal_relative_error(system, config, DAMPING_BRACKET[0])
     assert factored == pytest.approx(
