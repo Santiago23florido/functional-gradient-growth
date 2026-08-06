@@ -325,6 +325,12 @@ fgd_approx:
   # identica a antes y al mismo coste. MEDIDO: descendente pierde (0.8823),
   # ascendente gana (0.9230 contra 0.9000 del baseline).
   certify_family_functional_lrs: [1.0, 2.0, 4.0, 8.0]
+  # Matrix-free-only distance guard for the nonlinear fallback family. Its
+  # cosine certifies a direction, not the full parameter displacement: commit
+  # that displacement at the learning rate licensed by the family's own
+  # Lemma 3.5 interval. This closes the unguarded jump observed at epoch 17
+  # (training functional 5.26 -> 34.45) before the tangent transaction starts.
+  certify_family_lemma35_rate: true
   certify_realize_max_iterations: 40
   certify_realize_tolerance: 0.05
   # Freeze the Gauss-Newton Gram across the inner realise iterations: build
@@ -455,7 +461,10 @@ fgd_approx:
   # misleading inheritance).
   growth_function_preserving: true
   growth_requires_admissibility_failure: true
-  max_total_parameters:
+  # Match the fixed 600-parameter comparison budget. Candidate growths are
+  # priced by their post-growth parameter count and rejected before commit if
+  # they would exceed this hard cap.
+  max_total_parameters: 600
   growth_preservation_tolerance: 1.0e-6
   # Ordered ladder of approximation families, evaluated top to bottom.
   # "tangent" must come first (it is the epoch's main transactional

@@ -62,14 +62,20 @@ def test_matrix_free_only_overrides_are_explicit_and_exact_defaults_stay_off() -
         "transactional_max_retries",
         "transactional_descent_atol",
         "certify_functional_lr_cap",
+        "certify_family_lemma35_rate",
+        "max_total_parameters",
     }
     assert ladder.matrixfree_rank == 0, "the exact ladder must never truncate"
     assert ladder.transactional_realized_descent is False
     assert ladder.transactional_max_retries == 0
     assert ladder.certify_functional_lr_cap is None
+    assert ladder.certify_family_lemma35_rate is False
+    assert ladder.max_total_parameters is None
     assert approx.transactional_realized_descent is True
     assert approx.transactional_max_retries == 3
     assert approx.certify_functional_lr_cap == pytest.approx(0.1)
+    assert approx.certify_family_lemma35_rate is True
+    assert approx.max_total_parameters == 600
 
 
 def test_truncation_is_conservative_not_optimistic() -> None:
