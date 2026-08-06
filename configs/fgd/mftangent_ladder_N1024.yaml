@@ -109,7 +109,27 @@ fgd_approx:
   theory_lr_initial: 0.01
   theory_lr_min: 1.0e-5
   theory_lr_follow_bound: false
-  theory_lr_search_steps: 8
+  # 16, not the base config's 8. When eps > 1/2 the Lemma 3.5 interval is
+  # invalid -- both ladders get there, eps peaks at 1.96 exact and 1.66 here --
+  # and the rate comes from the measured-descent sweep instead. That sweep is a
+  # geometric grid from tangent_measured_max_lr down to theory_lr_min, so 8
+  # points across FIVE orders of magnitude puts consecutive rungs 5.18x apart:
+  # 1.0, 0.193, 0.037, nothing in between.
+  #
+  # MEASURED consequence on seed 0: epoch 23 took lr=0.2192 -- the second rung,
+  # and 4x the largest step the exact ladder ever takes in 25 epochs (0.0556).
+  # Accuracy fell 0.859 -> 0.766 and that single step is the WHOLE final gap
+  # (0.9188 here against 0.935 exact); this run was AHEAD by up to +0.104 at
+  # epoch 11. 16 rungs are 2.15x apart, so the sweep can land between 0.037 and
+  # 0.193 instead of being forced onto one of them.
+  #
+  # Not a defect in the base config: it carries the same defaults and regresses
+  # the same way (epoch 5 +0.0030, epoch 18 +0.0047, 0.756 -> 0.637). It simply
+  # never hit a state where the high rung won. Fixed here only.
+  theory_lr_search_steps: 16
+  # Belt to the above. The exact ladder never exceeded 0.0556, so a 0.1 ceiling
+  # costs nothing observed and removes the rung that produced the outlier.
+  tangent_measured_max_lr: 0.1
   theory_lr_search_refinements: 4
   sufficient_descent_c: 0.1
   lr_backtrack: 0.5
