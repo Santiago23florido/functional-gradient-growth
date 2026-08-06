@@ -865,11 +865,10 @@ class FGDApproxConfig:
     # for the certified outer direction. Off preserves the historical inner
     # damping from projection_damping for every existing configuration.
     certify_realize_use_selected_damping: bool = False
-    # Transactional guard for nonlinear endpoints produced by both the tangent
-    # realization path and the optional parametric fallback family. This is
-    # deliberately off by default: the exact/base ladder must keep its
-    # historical control flow, allocations and numerical decisions unless a
-    # matrix-free experiment opts in explicitly.
+    # Transactional guard for the nonlinear endpoint produced by the
+    # realization path. This is deliberately off by default: the exact/base
+    # ladder must keep its historical control flow, allocations and numerical
+    # decisions unless a matrix-free experiment opts in explicitly.
     transactional_realized_descent: bool = False
     # Number of smaller functional targets tried after the first realization.
     transactional_max_retries: int = 0
