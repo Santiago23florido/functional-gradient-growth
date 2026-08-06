@@ -819,15 +819,27 @@ def _estimate_certification_rank(
 
     x, y = build_projection_probe(loader, sizing_batches, device)
     system = exact_tangent_system(model, x, y, config.fgd_approx)
-    if system is None or system.jacobian.numel() == 0:
+    if system is None:
         return None
-    singular_values = torch.linalg.svdvals(system.jacobian.to(torch.float32))
+    if getattr(system, "factors", None) is not None:
+        # Factored system: J is never materialised, so read the spectrum off
+        # the (rows, k) factor. svd(J) = (A, S, VB), so these ARE J's singular
+        # values -- truncated at k, which is exactly the rank this route can
+        # see and therefore the right number to report.
+        left_factor, right_factor = system.factors
+        singular_values = torch.linalg.svdvals(left_factor.to(torch.float32))
+        columns = right_factor.shape[0]
+    elif system.jacobian.numel() == 0:
+        return None
+    else:
+        singular_values = torch.linalg.svdvals(system.jacobian.to(torch.float32))
+        columns = max(system.jacobian.shape)
     if singular_values.numel() == 0:
         return None
     largest = float(singular_values.max())
     if not largest > 0.0:
         return None
-    tolerance = largest * max(system.jacobian.shape) * 1e-6
+    tolerance = largest * columns * 1e-6
     return int((singular_values > tolerance).sum())
 
 

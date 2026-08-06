@@ -373,7 +373,7 @@ fgd_approx:
   # representable and eps comes out HIGHER, never lower. It under-certifies.
   # 0.268 is still comfortably under the 1/2 bar, so it still steps; the cost
   # is a smaller Lemma 3.5 rate, i.e. shorter steps.
-  matrixfree_rank: 128
+  matrixfree_rank: 64
   tiny_use_covariance: true
   tiny_alpha_zero: false
   tiny_omega_zero: false

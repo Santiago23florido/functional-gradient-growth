@@ -391,7 +391,18 @@ def krylov_jacobian(
     # consumer for the same reason; this one has to be built that way.
     left = torch.stack(columns, dim=1).double()   # W = J V, (rows, k)
     right = basis.t().contiguous().double()       # V, (P, k), orthonormal cols
-    return left @ right.t(), (left, right)
+
+    # J IS NOT MATERIALISED. Building left @ right.t() would undo the whole
+    # point: at MNIST width (10,240 rows, P ~ 59,000) that product is 4.8 GB
+    # while the factors it came from are 110 MB at k=128, and the ladder builds
+    # a system several times per epoch.
+    #
+    # A 0-row placeholder is returned in its place rather than None. It carries
+    # shape[1] = P, so the consumers that only want the parameter count keep
+    # working unchanged, and numel() == 0 marks it as unmaterialised for the
+    # ones that check. None would turn every one of those reads into a crash.
+    placeholder = left.new_zeros((0, right.shape[0]))
+    return placeholder, (left, right)
 
 
 @dataclass(frozen=True)

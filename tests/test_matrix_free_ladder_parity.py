@@ -34,6 +34,17 @@ def _probe(path):
     return config, model, x, y
 
 
+def _dense(system):
+    """Rebuild ``J = W V^T`` for comparison.
+
+    Production never does this -- that product is 4.8 GB at MNIST width, which
+    is the entire reason it is not built. At test scale it is the only way to
+    check the factored route against the operator it claims to represent.
+    """
+    left_factor, right_factor = system.factors
+    return left_factor.double() @ right_factor.double().t()
+
+
 def test_the_two_configs_differ_only_in_the_family_and_the_rank() -> None:
     """Everything the ladder DECIDES with must be identical.
 
@@ -92,19 +103,25 @@ def test_approximated_system_matches_the_exact_one() -> None:
     system_exact = exact_tangent_system(model, x, y, config_exact)
     system_approx = exact_tangent_system(model, x, y, config_approx)
     assert system_approx is not None
-    assert system_approx.jacobian.shape == system_exact.jacobian.shape
+    # J itself is never built on the factored route; only its width survives,
+    # and the operator it stands for must have the exact one's shape.
+    assert system_approx.jacobian.numel() == 0
+    assert _dense(system_approx).shape == system_exact.jacobian.shape
 
     eps_exact = exact_relative_error(model, x, y, config_exact, system=system_exact)
     eps_approx = exact_relative_error(model, x, y, config_approx, system=system_approx)
-    # 5e-3, from measurement rather than taste. The Krylov subspace converges
-    # to a (P-1)-dimensional invariant subspace, so one direction of J is
-    # unreachable and eps comes out slightly LOW -- 1.5e-03 at P=25. Forcing
-    # k = P does not close it, it triples it (8.8e-03), because the extra
-    # direction is numerical noise. The bias is one-sided, so the guard that
-    # matters is elsewhere: the step is certified on the displacement actually
-    # applied, never on this eps.
+    # 5e-3, from measurement rather than taste, and it covers the NEAR-FULL
+    # rank regime only: here P=25 so the cap never binds and k = P - 1. The
+    # Krylov subspace converges to a (P-1)-dimensional invariant subspace, so
+    # one direction is unreachable and eps lands 1.5e-03 LOW. Forcing k = P
+    # triples that (8.8e-03) because the extra direction is numerical noise.
+    #
+    # This is a different regime from real truncation. Once k << rank the bias
+    # reverses and grows: J_k = J V V^T has a smaller RANGE, less of r is
+    # representable, and eps comes out HIGH -- +44% at k=127, P=641. That
+    # direction is the safe one and is pinned by
+    # test_truncation_is_conservative_not_optimistic.
     assert eps_approx == pytest.approx(eps_exact, rel=5e-3)
-    assert eps_approx < eps_exact, "the truncation bias is optimistic, by construction"
 
 
 def test_the_default_config_never_takes_the_approximate_branch() -> None:
@@ -137,14 +154,13 @@ def test_the_factored_spectrum_is_the_spectrum_of_j() -> None:
     spectrum = factored_spectrum(system)
     assert spectrum is not None
     _left, singular_values, right = spectrum
-    _a, reference, _b = torch.linalg.svd(
-        system.jacobian.double(), full_matrices=False
-    )
+    dense = _dense(system)
+    _a, reference, _b = torch.linalg.svd(_dense(system), full_matrices=False)
     count = singular_values.numel()
     assert torch.allclose(reference[:count], singular_values, rtol=1e-5, atol=1e-8)
 
     # Never an (N K, P) object anywhere in the factored route.
-    assert right.shape[1] == count < system.jacobian.shape[1]
+    assert right.shape[1] == count < dense.shape[1]
 
     factored = factored_minimal_relative_error(system, config, DAMPING_BRACKET[0])
     assert factored == pytest.approx(
@@ -179,7 +195,7 @@ def test_factored_gram_is_the_gram() -> None:
 
     config, model, x, y = _wide(16)
     system = exact_tangent_system(model, x, y, config.fgd_approx)
-    jacobian = system.jacobian.double()
+    jacobian = _dense(system)
     reference = jacobian.t() @ jacobian
     produced = factored_gram(system)
     gap = float(
@@ -201,7 +217,7 @@ def test_factored_solve_matches_the_dense_normal_equations() -> None:
 
     config, model, x, y = _wide(16)
     system = exact_tangent_system(model, x, y, config.fgd_approx)
-    jacobian = system.jacobian.double()
+    jacobian = _dense(system)
     target = system.target.reshape(-1).double()
     size = jacobian.shape[1]
     damping = 1e-6 * float(torch.linalg.matrix_norm(jacobian, 2)) ** 2
@@ -233,11 +249,21 @@ def test_factored_damping_selection_agrees_on_eps_and_lambda() -> None:
         select_projection_damping_factored,
     )
 
+    import dataclasses as dc
+
     config, model, x, y = _wide(16)
-    system = exact_tangent_system(model, x, y, config.fgd_approx)
-    dense = select_projection_damping(model, x, y, config.fgd_approx, system=system)
+    # FULL rank on both sides. This test is about the SELECTOR agreeing, not
+    # about truncation -- that is what the monotonicity test above measures,
+    # and at rank 128 the two would legitimately sit 44% apart.
+    factored_config = dc.replace(config.fgd_approx, matrixfree_rank=0)
+    system = exact_tangent_system(model, x, y, factored_config)
+    exact_config = dc.replace(factored_config, family_order=("tangent",))
+    dense = select_projection_damping(
+        model, x, y, exact_config,
+        system=exact_tangent_system(model, x, y, exact_config),
+    )
     factored = select_projection_damping_factored(
-        model, x, y, config.fgd_approx, system=system
+        model, x, y, factored_config, system=system
     )
     assert dense is not None and factored is not None
     assert factored.candidate.relative_damping == pytest.approx(
