@@ -13,9 +13,18 @@
 #   sinfo -p gpu -o "%P %l"
 # If MaxTime is finite, --time=0 is refused and you must name that value.
 #
+# NODE AND PARTITION MUST MATCH, or sbatch refuses with "Requested nodes not in
+# this partition" before anything runs. Check which partitions actually hold
+# the node before submitting:
+#   scontrol show node margpu010 | grep -i -E "NodeName|Partitions|Gres"
+# Both are overridable on the command line, which beats editing this file:
+#   sbatch --partition=<P> --nodelist=<N> cluster/slurm/mnist_depth_sweep.sbatch
+#
+# margpu010 is 2x A100 40G, 96 cores, 1024G RAM.
+#
 #SBATCH --job-name=mnist-depth
 #SBATCH --partition=gpu
-#SBATCH --nodelist=margpu002
+#SBATCH --nodelist=margpu010
 #SBATCH --gpus=1
 #SBATCH --cpus-per-gpu=8
 #SBATCH --time=0
@@ -39,14 +48,31 @@ VARIANTS=(depth2_small depth2_large depth3_small depth3_large depth4_small depth
 VARIANT="${VARIANTS[${SLURM_ARRAY_TASK_ID:-0}]}"
 
 # ---------------------------------------------------------------------------
-# Node-local data. /local on margpu002 is 11T of RAID; $HOME is shared storage
-# and reading 24,000 images off it every epoch is what makes these runs
-# IO-bound. Copy once, read from the node.
+# Node-local data. $HOME is shared storage and reading 24,000 images off it
+# every epoch is what makes these runs IO-bound, so MNIST is staged onto the
+# node once.
+#
+# The mount point is NOT the same on every GPU node and getting it wrong is a
+# hard failure at mkdir: margpu002/003 expose a writable /local, margpu008 and
+# margpu011 expose /local and /local2, while margpu009/010/012 expose only
+# /local/data and /local/tmp. Probe in preference order -- SSD before HDD --
+# and say out loud which one was taken.
 # ---------------------------------------------------------------------------
-LOCAL_ROOT="/local/${USER}/fgg"
-mkdir -p "${LOCAL_ROOT}"
+LOCAL_ROOT=""
+for candidate in /local/data /local2 /local /local/tmp "${TMPDIR:-/tmp}"; do
+  [[ -d "${candidate}" ]] || continue
+  if mkdir -p "${candidate}/${USER}/fgg" 2>/dev/null; then
+    LOCAL_ROOT="${candidate}/${USER}/fgg"
+    break
+  fi
+done
+if [[ -z "${LOCAL_ROOT}" ]]; then
+  echo "[FATAL] no writable node-local directory found on $(hostname)"; exit 1
+fi
+echo "[DATA] node-local root: ${LOCAL_ROOT}"
+
 if [[ ! -d "${LOCAL_ROOT}/MNIST/raw" ]]; then
-  echo "[DATA] staging MNIST to ${LOCAL_ROOT}"
+  echo "[DATA] staging MNIST from ${DATASET_ROOT}/MNIST"
   cp -r "${DATASET_ROOT}/MNIST" "${LOCAL_ROOT}/"
 fi
 ls "${LOCAL_ROOT}/MNIST/raw" >/dev/null
