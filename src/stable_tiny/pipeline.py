@@ -49,6 +49,7 @@ from fgdlib.tangent import (
     theoretical_learning_rate_upper_bound,
     tiny_optimal_update_kwargs,
     train_one_epoch_fgd_approx,
+    validate_bottleneck_stopping,
     validate_family_order,
     validate_functional_loss,
     validate_exact_tangent_system,
@@ -620,6 +621,7 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
     validate_family_order(config.fgd_approx.family_order)
     validate_functional_loss(config.fgd_approx.functional_loss)
     validate_transactional_realized_descent(config.fgd_approx)
+    validate_bottleneck_stopping(config.fgd_approx)
     config.parametric_gd.validate()
     config.parametric_descent.validate()
     return config
@@ -4479,6 +4481,7 @@ def _apply_nonlinear_primary_growth(
             train_loader,
             device,
             config.fgd_approx,
+            progress=progress,
         )
         if progress is not None:
             progress(
@@ -9051,7 +9054,8 @@ def run_pipeline(
                             # FGDApproxConfig.growth_where for why the other
                             # two rules run away on a solved task.
                             _bottlenecks = compute_expressivity_bottlenecks(
-                                model, train_loader, device, config.fgd_approx
+                                model, train_loader, device, config.fgd_approx,
+                                progress=progress,
                             )
                             _width_only = [
                                 c for c in candidates

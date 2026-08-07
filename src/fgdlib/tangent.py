@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import math
 import os
+import statistics
 from collections import OrderedDict
 from contextlib import ExitStack
 from dataclasses import dataclass, field
@@ -529,6 +530,36 @@ class FGDApproxConfig:
     # fitted per dataset, and magnitude cancels, so the same rule transfers
     # unchanged between bases. Off by default: it changes when growth ends.
     growth_bottleneck_significance: bool = False
+    # THE SAME STOPPING QUESTION, ASKED WHERE MARCHENKO-PASTUR CANNOT ANSWER
+    # IT. MP above is implemented and MEASURED AND REFUTED: it needs
+    # gamma = r / n to be appreciable, and here r is a hidden width (2-32)
+    # against n = 1024 probe rows, so gamma ~ 0.015 puts the edge at 1.26x the
+    # bulk and it filters nothing -- without a cap the shape then degenerated
+    # to 20-32-2 and growth blew its own numerical tolerance. Both the field
+    # and its helper are kept, off, so that negative result is not
+    # rediscovered.
+    #
+    # K-fold cross-validation asks instead whether the extension direction
+    # SURVIVES DATA IT WAS NOT FITTED ON, which needs no asymptotic regime at
+    # all. Fit (alpha, omega) on K-1 folds of the probe, freeze them, and score
+    # that pair against the held-out fold's OWN desired-update matrix N. In
+    # sample that same bilinear form IS the bottleneck --
+    # <alpha omega^T, N> = sum(s_i^2), which is what compute_optimal_added_
+    # parameters constructs -- so the held-out number is literally "this
+    # layer's bottleneck, measured where the direction was not chosen". A real
+    # direction scores positive on every fold; a direction fitted to sampling
+    # noise scatters around zero.
+    #
+    # Nothing is fitted per dataset and no magnitude is compared to anything:
+    # b_k is a Frobenius cosine, so scale cancels, and the bar is a t
+    # statistic rather than a level. 0 = off, and off is bit-identical.
+    growth_bottleneck_crossfold_folds: int = 0
+    # Grow only while t = mean(b) / (std(b) / sqrt(K)) clears this. 1.0 is one
+    # standard error above zero -- deliberately weak, because the K training
+    # sets overlap in K-2 of their K parts and that correlation makes the
+    # sample std understate the true spread. What is asked of it is a SIGN
+    # test with a scale attached, not a p-value.
+    growth_bottleneck_crossfold_t: float = 1.0
     # UN SOLO CRITERIO en todo el crecimiento. La cuenta adaptativa de
     # grow_until_certified decide CUANTAS neuronas comprar en la ubicacion ya
     # elegida, y su regla es de HUECO: "cerro esta neurona el 10% de lo que
@@ -1158,6 +1189,44 @@ def validate_family_order(family_order: tuple[str, ...]) -> None:
             "fgd_approx.family_order must start with 'tangent' in legacy mode, "
             "or be exactly ['matrix_free_tangent'] for the isolated primary "
             "family."
+        )
+
+
+def validate_bottleneck_stopping(config: FGDApproxConfig) -> None:
+    """Validate the opt-in budget-free stopping criteria.
+
+    The two are alternative answers to the SAME question -- is this
+    bottleneck real -- and they disagree by construction, since
+    Marchenko-Pastur was refuted precisely where the cross-validated test is
+    meant to work. Running both would silently take the intersection, so a
+    run that stopped could not be attributed to either. Refuse the pair.
+    """
+    folds = config.growth_bottleneck_crossfold_folds
+    if isinstance(folds, bool) or not isinstance(folds, int) or folds < 0:
+        raise ValueError(
+            "fgd_approx.growth_bottleneck_crossfold_folds must be a "
+            "non-negative integer (0 disables the criterion)."
+        )
+    if folds == 1:
+        raise ValueError(
+            "fgd_approx.growth_bottleneck_crossfold_folds must be 0 or at "
+            "least 2: a single fold holds nothing out."
+        )
+    bar = float(config.growth_bottleneck_crossfold_t)
+    if not math.isfinite(bar):
+        raise ValueError(
+            "fgd_approx.growth_bottleneck_crossfold_t must be finite."
+        )
+    if folds >= 2 and config.growth_bottleneck_significance:
+        raise ValueError(
+            "fgd_approx.growth_bottleneck_crossfold_folds and "
+            "growth_bottleneck_significance are alternative stopping rules; "
+            "enable at most one."
+        )
+    if folds >= 2 and config.growth_where != "expressivity_bottleneck":
+        raise ValueError(
+            "fgd_approx.growth_bottleneck_crossfold_folds requires "
+            "growth_where: expressivity_bottleneck."
         )
 
 
@@ -4310,11 +4379,226 @@ def marchenko_pastur_significant_count(
     return int(torch.sum(squared > edge).item())
 
 
+def _stride_fold_masks(count: int, folds: int) -> list[torch.Tensor]:
+    """Fold membership by STRIDE (``i % K``), never by contiguous block.
+
+    The probe arrives in whatever order its loader produced it, so a
+    contiguous split hands each fold a different slice of that order -- on a
+    class-grouped or sorted source that is not a resample of the same
+    distribution, it is a different dataset per fold. Striding gives every
+    fold the same distribution whatever the order is, and it is a pure
+    function of the index, so the split is identical on every call. The
+    pipeline is deterministic and this must not be the thing that breaks it.
+    """
+    index = torch.arange(count)
+    return [index % folds == fold for fold in range(folds)]
+
+
+def _materialize_loader(
+    data_loader: torch.utils.data.DataLoader,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Every batch as two tensors, plus the batch size to re-cut them with.
+
+    The folds have to be cut from the WHOLE probe, not from one batch at a
+    time, so the source is drained once here. The original batch size is
+    carried back out so each fold is fed to ``compute_statistics`` in the same
+    sized pieces the caller was already using -- the accumulation is over
+    batches either way, but the memory profile stays the one the config chose.
+    """
+    xs: list[torch.Tensor] = []
+    ys: list[torch.Tensor] = []
+    batch_size = 0
+    for x, y in data_loader:
+        xs.append(x.to(device))
+        ys.append(y.to(device))
+        batch_size = max(batch_size, int(x.shape[0]))
+    if not xs:
+        raise ValueError("Cannot cross-validate a bottleneck on an empty loader.")
+    return torch.cat(xs), torch.cat(ys), batch_size
+
+
+def _fold_loader(
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    batch_size: int,
+) -> torch.utils.data.DataLoader:
+    """A deterministic, unshuffled loader over one fold of the probe."""
+    rows = int(inputs.shape[0])
+    return torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(inputs, targets),
+        batch_size=max(1, min(int(batch_size), rows)) if rows else 1,
+        shuffle=False,
+    )
+
+
+def _fitted_extension_matrix(layer: LinearGrowingModule) -> torch.Tensor | None:
+    """``alpha omega``, the fitted extension direction, in ``N``'s own shape.
+
+    ``compute_optimal_added_parameters`` builds ``alpha = sqrt(s) S^{-1/2} U``
+    and ``omega = sqrt(s) V`` from the SVD of ``P = S^{-1/2} N``, and stores
+    them transposed across the two Linear layers. Their outer product is
+    ``S^{-1/2} P_k``, so its Frobenius inner product with ``N`` is
+    ``trace(P_k^T P) = sum(s_i^2)`` -- the bottleneck, exactly and not by
+    analogy. That identity is the entire reason this matrix is the right
+    object to carry to a fold it was not fitted on: scored against the
+    held-out fold's own ``N`` it returns the same quantity, measured where
+    the direction was not chosen.
+
+    ``None`` when the structure is not the two-Linear case the identity is
+    derived for; the caller must read that as "not measured", never as "not
+    significant".
+    """
+    extended_input = getattr(layer, "extended_input_layer", None)
+    previous = getattr(layer, "previous_module", None)
+    extended_output = getattr(previous, "extended_output_layer", None)
+    if extended_input is None or extended_output is None:
+        return None
+    omega = extended_input.weight.detach().double()  # (out_features, k)
+    alpha = extended_output.weight.detach().double()  # (k, prev_in_features)
+    bias = getattr(extended_output, "bias", None)
+    if bias is not None:
+        # gromo split alpha as ``alpha[:, :-1]`` and ``alpha[:, -1]``; putting
+        # the bias back as the LAST column is what restores N's row order.
+        alpha = torch.cat([alpha, bias.detach().double()[:, None]], dim=1)
+    if alpha.shape[0] != omega.shape[1]:
+        return None
+    return alpha.t() @ omega.t()
+
+
+def _held_out_bottleneck_cosine(
+    extension: torch.Tensor,
+    held_out_n: torch.Tensor,
+) -> float:
+    """``cos(alpha omega, N_held_out)`` in the Frobenius geometry.
+
+    The raw inner product is the bottleneck in the held-out fold's units, so
+    it is not comparable between folds, between layers or between datasets.
+    Dividing by both norms leaves a number in [-1, 1] whose SIGN says whether
+    the fitted direction still points at what the held-out data wants, and
+    whose scale is the problem's own. Magnitude cancels -- which is the
+    property that lets one rule serve smooth_sin and MNIST without retuning.
+    """
+    if extension.shape != held_out_n.shape:
+        return float("nan")
+    left = float(torch.linalg.norm(extension))
+    right = float(torch.linalg.norm(held_out_n))
+    if not (left > 0.0 and right > 0.0):
+        return 0.0
+    value = float(torch.sum(extension * held_out_n)) / (left * right)
+    return value if math.isfinite(value) else float("nan")
+
+
+def crossfold_bottleneck_significance(
+    model: GrowingMLP,
+    layer_index: int,
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    batch_size: int,
+    device: torch.device,
+    config: FGDApproxConfig,
+) -> tuple[float, list[float]]:
+    """Is this layer's bottleneck REAL, or is it a direction fitted to noise?
+
+    The stopping question, answered without a magnitude and without an
+    asymptotic regime. For each of ``K`` folds: fit the extension on the other
+    ``K-1``, freeze ``(alpha, omega)``, and score that frozen pair against the
+    held-out fold's own desired-update matrix ``N``. A direction the data
+    really asks for scores positive on every fold; a direction fitted to
+    sampling noise scatters around zero.
+
+    Returns ``(t, b)`` with ``t = mean(b) / (std(b) / sqrt(K))``. ``inf``
+    means NOT MEASURED (too few rows, or a structure the identity behind
+    :func:`_fitted_extension_matrix` is not derived for) and must never block
+    growth -- a stopping rule that fires because it could not measure is a
+    stopping rule that stops for the wrong reason.
+    """
+    folds = int(getattr(config, "growth_bottleneck_crossfold_folds", 0) or 0)
+    rows = int(inputs.shape[0])
+    if folds < 2 or rows < folds * 2:
+        return float("inf"), []
+
+    # The direction is what is being tested, so both of its factors have to
+    # exist. alpha_zero / omega_zero say how the neuron is INITIALISED once
+    # bought -- with either set there is no fitted direction to carry to a
+    # held-out fold at all. compute_delta is forced for the same reason: with
+    # use_projection the extension is fitted against tensor_n, which does not
+    # exist until the optimal delta does.
+    update_kwargs = dict(tiny_optimal_update_kwargs(config, compute_delta=True))
+    update_kwargs["alpha_zero"] = False
+    update_kwargs["omega_zero"] = False
+
+    masks = _stride_fold_masks(rows, folds)
+    values: list[float] = []
+
+    for mask in masks:
+        held_out = mask
+        fitted = ~mask
+        if int(fitted.sum()) == 0 or int(held_out.sum()) == 0:
+            continue
+
+        extension: torch.Tensor | None = None
+        try:
+            model.set_growing_layers(index=layer_index)
+            compute_statistics(
+                model,
+                _fold_loader(inputs[fitted], targets[fitted], batch_size),
+                loss_function=batch_functional_mse_loss,
+                device=device,
+            )
+            model.compute_optimal_updates(**update_kwargs)
+            model.reset_computation()
+            model.dummy_select_update()
+            extension = _fitted_extension_matrix(model.currently_updated_layer)
+        finally:
+            _cleanup_tiny_update(model)
+
+        if extension is None:
+            return float("inf"), []
+
+        held_out_n: torch.Tensor | None = None
+        try:
+            model.set_growing_layers(index=layer_index)
+            compute_statistics(
+                model,
+                _fold_loader(inputs[held_out], targets[held_out], batch_size),
+                loss_function=batch_functional_mse_loss,
+                device=device,
+            )
+            model.compute_optimal_updates(**update_kwargs)
+            model.dummy_select_update()
+            # tensor_n is a view over the accumulated statistics, not a stored
+            # tensor, so it has to be read BEFORE reset_computation clears
+            # them -- the fit above can reset first only because
+            # eigenvalues_extension survives as a plain attribute.
+            tensor_n = getattr(model.currently_updated_layer, "tensor_n", None)
+            if tensor_n is not None:
+                held_out_n = tensor_n.detach().double().clone()
+        finally:
+            _cleanup_tiny_update(model)
+
+        if held_out_n is None:
+            return float("inf"), []
+        values.append(_held_out_bottleneck_cosine(extension, held_out_n))
+
+    if len(values) < 2 or not all(math.isfinite(value) for value in values):
+        return float("inf"), values
+
+    mean = statistics.fmean(values)
+    spread = statistics.stdev(values)
+    if spread <= 0.0:
+        # Every fold agreed exactly. Positive is a unanimous yes; zero or
+        # below is a unanimous no, and neither is a failure to measure.
+        return (float("inf") if mean > 0.0 else float("-inf")), values
+    return mean / (spread / math.sqrt(len(values))), values
+
+
 def compute_expressivity_bottlenecks(
     model: GrowingMLP,
     train_loader: torch.utils.data.DataLoader,
     device: torch.device,
     config: FGDApproxConfig,
+    progress: Callable[[str], None] | None = None,
 ) -> list[float]:
     """Per-layer EXPRESSIVITY BOTTLENECK: what the layer's width cannot reach.
 
@@ -4396,6 +4680,44 @@ def compute_expressivity_bottlenecks(
             bottlenecks.append(value if math.isfinite(value) else 0.0)
         finally:
             _cleanup_tiny_update(model)
+
+    # SECOND PASS, and separate on purpose: the loop above is left exactly as
+    # it was so that with the criterion off nothing above this line can differ.
+    # A layer already at zero is skipped -- it costs nothing and there is
+    # nothing to test.
+    #
+    # A value is only ever turned INTO a zero, never moved, so the RANKING
+    # among the layers that pass is the in-sample one, untouched. But zeroing
+    # is per layer, and zeroing the argmax hands the turn to the runner-up --
+    # MEASURED on seed 1, which refused no growth at all and still landed on
+    # 4-9-20 instead of 7-11-12. So this gates ELIGIBILITY, and growth stops
+    # only when every layer fails at once; it is not a whether-only switch.
+    folds = int(getattr(config, "growth_bottleneck_crossfold_folds", 0) or 0)
+    if folds >= 2 and any(value > 0.0 for value in bottlenecks):
+        probe_x, probe_y, probe_batch = _materialize_loader(train_loader, device)
+        with timed("growth_crossfold_seconds"):
+            for layer_index, value in enumerate(bottlenecks):
+                if value <= 0.0:
+                    continue
+                increment("growth_crossfold_layers_tested")
+                statistic, samples = crossfold_bottleneck_significance(
+                    model=model,
+                    layer_index=layer_index,
+                    inputs=probe_x,
+                    targets=probe_y,
+                    batch_size=probe_batch,
+                    device=device,
+                    config=config,
+                )
+                if progress is not None:
+                    progress(
+                        f"[CROSSFOLD] L{layer_index} t={statistic:.4f} b="
+                        + " ".join(f"{sample:+.4f}" for sample in samples)
+                    )
+                bar = float(getattr(config, "growth_bottleneck_crossfold_t", 1.0))
+                if not (statistic > bar):
+                    increment("growth_crossfold_layers_rejected")
+                    bottlenecks[layer_index] = 0.0
 
     return bottlenecks
 

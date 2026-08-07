@@ -77,6 +77,13 @@ PROFILE_FIELDS = (
     "certify_family_deferral_refused",
     "certify_growth_not_warranted",
     "growth_where_base_unavailable",
+    # Declared late because it almost never fired: "every layer expresses what
+    # is asked of it, so buy nothing" was unreachable in practice until a
+    # stopping criterion started producing all-zero bottlenecks. It has been
+    # passed to fallback() since fe4c88d and was never registered, so
+    # FGD_PROFILE=1 raised KeyError the first time growth actually stopped --
+    # the one event the counter exists to record.
+    "growth_where_no_bottleneck",
     # certify_growth_target discriminators: how often the best available growth
     # failed the certify_growth_min_gain floor (the loop was chasing a target it
     # cannot reach at a price worth paying), how often max_total_parameters
@@ -97,6 +104,14 @@ PROFILE_FIELDS = (
     "nonlinear_accepted_steps",
     "nonlinear_failed_ladders",
     "nonlinear_growth_events",
+    # K-fold bottleneck significance. The cost is the whole risk of the
+    # criterion -- 2K statistics passes per layer per event against 1 today --
+    # so it is measured, never assumed. The two counters separate "the test
+    # ran" from "the test said no", which is what distinguishes a criterion
+    # that stops growth from one that was never consulted.
+    "growth_crossfold_seconds",
+    "growth_crossfold_layers_tested",
+    "growth_crossfold_layers_rejected",
     # --- exact tangent-system construction instrumentation (Phase A) ---
     # Counters.
     "tangent_system_calls",
@@ -184,6 +199,7 @@ _COUNTER_FIELDS = {
     "certify_family_deferral_refused",
     "certify_growth_not_warranted",
     "growth_where_base_unavailable",
+    "growth_where_no_bottleneck",
     "certify_growth_target_stalls",
     "certify_budget_stops",
     "certify_budget_rejected_candidates",
@@ -191,6 +207,8 @@ _COUNTER_FIELDS = {
     "nonlinear_accepted_steps",
     "nonlinear_failed_ladders",
     "nonlinear_growth_events",
+    "growth_crossfold_layers_tested",
+    "growth_crossfold_layers_rejected",
     "tangent_system_calls",
     "tangent_projection_solve_calls",
     "tangent_qr_calls",

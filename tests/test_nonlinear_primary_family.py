@@ -543,7 +543,7 @@ def test_nonlinear_mode_never_calls_tangent_operations_and_grows(
     monkeypatch.setattr(
         pipeline,
         "compute_expressivity_bottlenecks",
-        lambda model, loader, device, config: [1.0, 0.5],
+        lambda model, loader, device, config, progress=None: [1.0, 0.5],
     )
     monkeypatch.setenv("FGD_PROFILE", "1")
     reset()
@@ -748,7 +748,7 @@ def test_growth_is_function_preserving_and_uses_configured_argmax(
     monkeypatch.setattr(
         pipeline,
         "compute_expressivity_bottlenecks",
-        lambda model, loader, device, config: [0.25, 2.0],
+        lambda model, loader, device, config, progress=None: [0.25, 2.0],
     )
     outcome = pipeline._apply_nonlinear_primary_growth(
         model=model,
@@ -787,7 +787,7 @@ def test_failed_preservation_check_discards_grown_clone(monkeypatch) -> None:
     monkeypatch.setattr(
         pipeline,
         "compute_expressivity_bottlenecks",
-        lambda model, loader, device, config: [2.0, 1.0],
+        lambda model, loader, device, config, progress=None: [2.0, 1.0],
     )
     monkeypatch.setattr(
         pipeline,
@@ -812,7 +812,7 @@ def test_failed_ladder_retries_after_growth(monkeypatch) -> None:
     monkeypatch.setattr(
         pipeline,
         "compute_expressivity_bottlenecks",
-        lambda model, loader, device, config: [1.0, 0.5],
+        lambda model, loader, device, config, progress=None: [1.0, 0.5],
     )
     result = pipeline.run_pipeline(
         _tiny_pipeline_config(epochs=2),

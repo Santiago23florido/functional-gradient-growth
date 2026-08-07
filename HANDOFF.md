@@ -130,7 +130,72 @@ Las 4 superan 0.925 individualmente. Reproducido exacto en las 4. **El pipeline
 es determinista** (verificado: re-ejecutar da el mismo resultado bit a bit), asi
 que cualquier diferencia entre corridas es causal, nunca ruido.
 
-### LA UNICA PREGUNTA ABIERTA: como parar sin presupuesto
+### RESUELTA: como parar sin presupuesto (ver `docs/budget_free_stopping.md`)
+
+El candidato vivo de abajo esta **implementado y medido**:
+`growth_bottleneck_crossfold_folds` (0 = apagado y bit a bit identico).
+Ajusta la extension en K-1 pliegues, congela `(alpha, omega)` y la puntua
+contra la `N` del pliegue retenido. La identidad
+`<alpha omega, N> = sum(s_i^2)` hace que eso sea **el mismo cuello de botella**,
+medido donde la direccion no se eligio. Normalizado por las dos normas de
+Frobenius es un coseno, asi que la magnitud se cancela y la regla transfiere.
+Bar: `t = media(b) / (desv(b)/sqrt(K)) > 1`.
+
+**Dimensiona a la tarea, que era la pregunta** (presupuesto libre, config
+canonica, solo cambian los knobs de datos):
+
+| corrida | params | widths | acc | crecimientos rechazados |
+|---|---|---|---|---|
+| facil, off | 270 | 6-9-16 | 0.9996 | — |
+| **facil, K=5** | **158** | 5-6-12 | **1.0000** | **8 epochs** |
+| dificil, off | 252 | 11-8-10 | 0.1581 | — |
+| **dificil, K=5** | **252** | 11-8-10 | 0.1581 | **0** |
+
+La dificil es **identica**: el test corrio en cada decision y no rechazo
+ninguna (`t` 4.3-5.9, todos los pliegues positivos). La facil pierde el 41% de
+los parametros y la accuracy SUBE; una vez resuelta la tarea `t` llega a
+**-9.13**, o sea que la direccion que propone el cuello de botella dentro de
+muestra **contradice** los datos que no vio. Esa asimetria es lo que un tope no
+puede hacer, porque un tope no sabe que tarea esta cortando.
+
+**4 semillas N=1024, presupuesto libre, pareadas:**
+
+| | s0 | s1 | s2 | s3 | media |
+|---|---|---|---|---|---|
+| off acc | 0.9352 | 0.8101 | 0.5691 | 0.8237 | 0.7845 |
+| **on acc** | 0.9282 | 0.7964 | 0.5691 | 0.8237 | **0.7794** |
+| off params | 529 | 280 | 158 | 283 | 312.5 |
+| **on params** | **378** | 286 | 158 | 283 | **276.3** |
+
+-11.6% de parametros por -0.005 de accuracy, y **s2 y s3 son bit a bit
+identicas** — el criterio corrio en cada decision y no rechazo nada. Que sea
+inerte donde no pasa nada es la mitad de lo que se le pide.
+
+⚠️ **Leer esa columna de accuracy en corto.** El config canonico son 25 epochs
+y las cuatro semillas alcanzan su mejor accuracy en la ULTIMA epoch: estan
+limitadas por computo, no por estructura. No es comparable contra el 0.9435 del
+headline, que fue a 70 epochs con tope 600.
+
+⚠️ **Y una afirmacion mia que la medicion corrigio:** dije "decide SI crecer,
+nunca DONDE". Falso. Poner a cero es por capa, asi que anular el argmax le cede
+el turno a la segunda: s1 **no rechazo ni un crecimiento** y aun asi aterrizo en
+`4-9-20` en vez de `7-11-12`, con 22 eventos contra 19. Lo que si se sostiene es
+que ningun valor superviviente se reescala, asi que el ranking entre los que
+pasan es el de dentro de muestra.
+
+**Coste: +9.7% de reloj a K=5** (145 s -> 159 s, N=1024 s0), no el 10x que
+sugiere la aritmetica de `2K` pasadas: `growth_crossfold_seconds` marca 21.0 s
+pero la corrida solo se alarga 14 s, porque rechazar crecimiento tambien AHORRA
+(`where_total_seconds` 4.48 -> 2.27 con el mismo `tangent_system_total`).
+**El coste de MNIST no es este** — alli la sonda son 704x784 o 10000 filas y hay
+que re-medirlo antes de fiarse.
+
+Bug destapado y arreglado de paso: `growth_where_no_bottleneck` se pasaba a
+`fallback()` desde `fe4c88d` sin estar registrado en `PROFILE_FIELDS`, asi que
+`FGD_PROFILE=1` reventaba con KeyError **la primera vez que el crecimiento
+paraba de verdad** — justo el evento que ese contador existe para registrar.
+
+### El planteamiento original (conservado)
 
 Nada de esto se detiene solo. Las 4 semillas paran al agotar los 600
 parametros; s1 llego al tope en la epoch 35 y paso las 35 restantes congelada
@@ -152,7 +217,8 @@ Lo que falta es leerla como orden de parar.
   **invalido bajo function-preserving**, porque al crecer `f` no se mueve y no
   se cobra ningun decremento.
 
-**Candidato vivo: validacion cruzada en K pliegues.** Ajustar la direccion de
+**Candidato vivo (YA IMPLEMENTADO, ver arriba): validacion cruzada en K
+pliegues.** Ajustar la direccion de
 extension en K-1 pliegues de la sonda y medir su cuello de botella en el
 retenido. Una direccion real da valor positivo fuera de muestra; el ruido
 fluctua alrededor de cero. `t = media(b_k) / (desv(b_k)/sqrt(K))`, crecer solo

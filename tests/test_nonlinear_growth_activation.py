@@ -43,7 +43,7 @@ def _grow_once(config, device, train_loader, model, monkeypatch):
     monkeypatch.setattr(
         pipeline,
         "compute_expressivity_bottlenecks",
-        lambda model, loader, device, config: [0.25, 2.0],
+        lambda model, loader, device, config, progress=None: [0.25, 2.0],
     )
     outcome = pipeline._apply_nonlinear_primary_growth(
         model=model,
