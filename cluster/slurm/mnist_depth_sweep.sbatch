@@ -27,7 +27,7 @@ set -euo pipefail
 
 REPO_ROOT="${REPO_ROOT:-$HOME/dev/functional-gradient-growth}"
 DATASET_ROOT="${DATASET_ROOT:-$HOME/datasets}"
-CONDA_ENV="${CONDA_ENV:-base}"
+CONDA_ENV="${CONDA_ENV:-cct}"
 WANDB_GROUP="${WANDB_GROUP:-mnist-depth-sweep}"
 MODEL_SEED="${MODEL_SEED:-0}"
 # 5 turns on the budget-free stopping criterion; 0 (default) leaves the
