@@ -6,7 +6,6 @@ import os
 from dataclasses import dataclass
 from typing import Any, Literal
 
-
 WandbMode = Literal["online", "offline", "disabled"]
 
 # Numeric family identity for charting which family committed each epoch.
@@ -15,6 +14,7 @@ FAMILY_INDEX = {
     "rkhs_head": 1,
     "parametric_gd": 2,
     "parametric_descent": 3,
+    "nonlinear": 4,
 }
 
 
@@ -44,12 +44,18 @@ class NullWandbLogger:
     def log_history_entry(self, entry: Any) -> None:
         return None
 
+    def log_transactional_trial(self, record: Any) -> None:
+        return None
+
     def log_growth_event(
         self,
         *,
         event: Any,
         epoch: int,
         growth_count: int,
+        architecture_widths: tuple[int, ...] = (),
+        statistics_seconds: float | None = None,
+        application_seconds: float | None = None,
     ) -> None:
         return None
 
@@ -118,6 +124,99 @@ class WandbRunLogger:
             "growth/*",
         ):
             self._run.define_metric(pattern, step_metric="epoch")
+        self._run.define_metric("fgd/outer_step_global_index")
+        for metric in (
+            "fgd/proposed_learning_rate",
+            "fgd/capped_learning_rate",
+            "fgd/trial_learning_rate",
+            "fgd/committed_learning_rate",
+            "fgd/realized_effective_learning_rate",
+            "fgd/realized_functional_before",
+            "fgd/realized_functional_after",
+            "fgd/realized_functional_delta",
+            "fgd/full_train_functional_before",
+            "fgd/full_train_functional_after",
+            "fgd/full_train_functional_delta",
+            "fgd/full_train_examples",
+            "fgd/predicted_certified_decrease",
+            "fgd/realized_decrease_ratio",
+            "fgd/realization_residual_fraction",
+            "fgd/realization_realized_fraction",
+            "fgd/realization_iterations",
+            "fgd/selected_relative_damping",
+            "fgd/selected_absolute_damping",
+            "fgd/transactional_retry_index",
+            "fgd/transactional_trial_count",
+            "fgd/transactional_rejected",
+            "fgd/transactional_accepted",
+            "fgd/transactional_rejection_reason",
+            "fgd/outer_step_index",
+        ):
+            self._run.define_metric(
+                metric,
+                step_metric="fgd/outer_step_global_index",
+            )
+
+    def log_transactional_trial(self, record: Any) -> None:
+        """Log one scalar-only matrix-free endpoint attempt."""
+        if self._run is None:
+            return
+        payload: dict[str, Any] = {
+            "epoch": record.epoch,
+            "fgd/outer_step_global_index": record.outer_step_global_index,
+            "fgd/outer_step_index": record.outer_step_index,
+            "fgd/transactional_retry_index": record.retry_index,
+            "fgd/transactional_trial_count": record.transactional_trial_count,
+            "fgd/proposed_learning_rate": record.proposed_learning_rate,
+            "fgd/capped_learning_rate": record.capped_learning_rate,
+            "fgd/trial_learning_rate": record.trial_learning_rate,
+            "fgd/committed_learning_rate": record.committed_learning_rate,
+            "fgd/realization_residual_fraction": (
+                record.realization_residual_fraction
+            ),
+            "fgd/realization_realized_fraction": (
+                record.realization_realized_fraction
+            ),
+            "fgd/realization_iterations": record.realization_iterations,
+            "fgd/selected_relative_damping": record.selected_relative_damping,
+            "fgd/selected_absolute_damping": record.selected_absolute_damping,
+            "fgd/transactional_rejected": record.rejected,
+            "fgd/transactional_accepted": record.accepted,
+            "fgd/transactional_rejection_reason": (
+                record.rejection_reason or "accepted"
+            ),
+        }
+        for attribute_name, metric_name in (
+            (
+                "realized_effective_learning_rate",
+                "fgd/realized_effective_learning_rate",
+            ),
+            ("realized_functional_before", "fgd/realized_functional_before"),
+            ("realized_functional_after", "fgd/realized_functional_after"),
+            ("realized_functional_delta", "fgd/realized_functional_delta"),
+            (
+                "full_train_functional_before",
+                "fgd/full_train_functional_before",
+            ),
+            (
+                "full_train_functional_after",
+                "fgd/full_train_functional_after",
+            ),
+            (
+                "full_train_functional_delta",
+                "fgd/full_train_functional_delta",
+            ),
+            ("full_train_examples", "fgd/full_train_examples"),
+            (
+                "predicted_certified_decrease",
+                "fgd/predicted_certified_decrease",
+            ),
+            ("realized_decrease_ratio", "fgd/realized_decrease_ratio"),
+        ):
+            value = getattr(record, attribute_name, None)
+            if value is not None:
+                payload[metric_name] = value
+        self._run.log(payload)
 
     def log_history_entry(self, entry: Any) -> None:
         if self._run is None:
@@ -147,7 +246,11 @@ class WandbRunLogger:
         step_committed = candidate_accepted is True
         approximation_kind = getattr(entry, "fgd_approximation_kind", None)
 
-        if entry.step_type == "FGD" and entry.rel_error is not None:
+        if (
+            entry.step_type == "FGD"
+            and approximation_kind == "tangent"
+            and entry.rel_error is not None
+        ):
             payload["fgd/tangent_relative_error"] = entry.rel_error
 
         if step_committed and entry.rel_error is not None:
@@ -242,7 +345,8 @@ class WandbRunLogger:
             False,
         )
         if fgd_payload_active := (
-            getattr(entry, "rel_error", None) is not None
+            approximation_kind is not None
+            or getattr(entry, "rel_error", None) is not None
             or learning_rate_interval_valid is not None
             or relative_error_condition_valid is not None
             or loss_descent_valid is not None
@@ -250,9 +354,7 @@ class WandbRunLogger:
             or global_bound_valid is not None
             or getattr(entry, "fgd_sensor_valid", None) is not None
         ):
-            payload["fgd/theory_learning_rate_adjusted"] = (
-                theory_learning_rate_adjusted
-            )
+            payload["fgd/theory_learning_rate_adjusted"] = theory_learning_rate_adjusted
 
         if fgd_payload_active:
             payload["fgd/learning_rate_clipped_by_validation"] = bool(
@@ -312,6 +414,106 @@ class WandbRunLogger:
             if growth_probe_improved is not None:
                 payload["fgd/growth_probe_improved"] = growth_probe_improved
 
+        if approximation_kind == "nonlinear":
+            nonlinear_relative_error = getattr(entry, "nonlinear_relative_error", None)
+            if nonlinear_relative_error is not None:
+                payload["fgd/nonlinear_relative_error"] = nonlinear_relative_error
+                payload["nonlinear/relative_error"] = nonlinear_relative_error
+            for attribute_name, metric_name in (
+                (
+                    "nonlinear_functional_learning_rate",
+                    "fgd/nonlinear_functional_learning_rate",
+                ),
+                ("nonlinear_inner_steps", "fgd/nonlinear_inner_steps"),
+                (
+                    "nonlinear_adamw_learning_rate",
+                    "fgd/nonlinear_adamw_learning_rate",
+                ),
+                ("nonlinear_weight_decay", "fgd/nonlinear_weight_decay"),
+                ("nonlinear_cosine", "fgd/nonlinear_cosine"),
+                (
+                    "nonlinear_committed_rate",
+                    "fgd/nonlinear_committed_rate",
+                ),
+                (
+                    "nonlinear_candidate_training_seconds",
+                    "fgd/nonlinear_candidate_training_seconds",
+                ),
+                (
+                    "nonlinear_certification_seconds",
+                    "fgd/nonlinear_certification_seconds",
+                ),
+            ):
+                value = getattr(entry, attribute_name, None)
+                if value is not None:
+                    payload[metric_name] = value
+            for attribute_name, metric_name in (
+                ("nonlinear_cosine", "nonlinear/cosine"),
+                (
+                    "nonlinear_functional_learning_rate",
+                    "nonlinear/functional_learning_rate",
+                ),
+                ("nonlinear_inner_steps", "nonlinear/inner_steps"),
+                (
+                    "nonlinear_adamw_learning_rate",
+                    "nonlinear/adamw_learning_rate",
+                ),
+                ("nonlinear_weight_decay", "nonlinear/weight_decay"),
+                ("nonlinear_committed_rate", "nonlinear/commit_rate"),
+                (
+                    "nonlinear_candidate_training_seconds",
+                    "nonlinear/candidate_training_seconds",
+                ),
+                (
+                    "nonlinear_certification_seconds",
+                    "nonlinear/certification_seconds",
+                ),
+                (
+                    "nonlinear_growth_statistics_seconds",
+                    "nonlinear/growth_statistics_seconds",
+                ),
+                (
+                    "nonlinear_growth_application_seconds",
+                    "nonlinear/growth_application_seconds",
+                ),
+                ("nonlinear_ladder_attempts", "nonlinear/ladder_attempts"),
+                ("nonlinear_accepted_steps", "nonlinear/accepted_steps"),
+                ("nonlinear_failed_ladders", "nonlinear/failed_ladders"),
+                ("nonlinear_growth_events", "nonlinear/growth_events"),
+                (
+                    "nonlinear_full_jacobian_calls",
+                    "nonlinear/full_jacobian_calls",
+                ),
+                (
+                    "nonlinear_tangent_system_calls",
+                    "nonlinear/tangent_system_calls",
+                ),
+                (
+                    "nonlinear_tangent_projection_solves",
+                    "nonlinear/tangent_projection_solves",
+                ),
+            ):
+                value = getattr(entry, attribute_name, None)
+                if value is not None:
+                    payload[metric_name] = value
+            certificate_valid = getattr(entry, "nonlinear_certificate_valid", None)
+            if certificate_valid is not None:
+                payload["fgd/nonlinear_certificate_valid"] = certificate_valid
+                payload["nonlinear/certified"] = certificate_valid
+            validation_descent_valid = getattr(
+                entry, "nonlinear_validation_descent_valid", None
+            )
+            if validation_descent_valid is not None:
+                payload["nonlinear/validation_descent_valid"] = validation_descent_valid
+            payload["growth/requested_after_nonlinear_failure"] = bool(
+                getattr(entry, "nonlinear_growth_requested", False)
+            )
+            widths = tuple(getattr(entry, "architecture_widths", ()))
+            if widths:
+                payload["model/architecture_widths"] = list(widths)
+                for index, width in enumerate(widths):
+                    payload[f"model/hidden_width_{index}"] = width
+
         if getattr(entry, "selected_layer_index", None) is not None:
             payload["fgd/selected_layer_index"] = entry.selected_layer_index
 
@@ -348,6 +550,9 @@ class WandbRunLogger:
         event: Any,
         epoch: int,
         growth_count: int,
+        architecture_widths: tuple[int, ...] = (),
+        statistics_seconds: float | None = None,
+        application_seconds: float | None = None,
     ) -> None:
         if self._run is None:
             return
@@ -373,15 +578,23 @@ class WandbRunLogger:
                 ]
             )
 
-        self._run.log(
-            {
-                "epoch": epoch,
-                "growth/count": growth_count,
-                "growth/event": 1,
-                "growth/best_scaling_factor": event.best_scaling_factor,
-                "growth/best_train_loss": event.best_train_loss,
-            }
-        )
+        payload: dict[str, Any] = {
+            "epoch": epoch,
+            "growth/count": growth_count,
+            "growth/event": 1,
+            "growth/layer_index": event.layer_index,
+            "growth/best_scaling_factor": event.best_scaling_factor,
+            "growth/best_train_loss": event.best_train_loss,
+        }
+        if architecture_widths:
+            payload["model/architecture_widths"] = list(architecture_widths)
+            for index, width in enumerate(architecture_widths):
+                payload[f"model/hidden_width_{index}"] = width
+        if statistics_seconds is not None:
+            payload["growth/nonlinear_statistics_seconds"] = statistics_seconds
+        if application_seconds is not None:
+            payload["growth/nonlinear_application_seconds"] = application_seconds
+        self._run.log(payload)
 
     def finish(self, *, history: list[Any] | None = None) -> None:
         if self._run is None or self._wandb is None:

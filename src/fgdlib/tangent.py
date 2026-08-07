@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import math
 import os
+import statistics
 from collections import OrderedDict
 from contextlib import ExitStack
 from dataclasses import dataclass, field
@@ -111,6 +112,50 @@ class FGDApproxConfig:
     stall_min_epoch_decrease: float = 2e-3
     stall_patience: int = 5
     eps: float = 1e-12
+    # Krylov rank cap for the matrix-free family. 0 runs to the numerical rank,
+    # which reproduces the exact tangent and buys NOTHING -- at k = rank the
+    # factors are as large as J itself, so the whole construction is a detour.
+    #
+    # The saving exists only while k << min(NK, P). At MNIST width (784 in,
+    # 10 out, 1024-example probe, P ~ 59k) the arithmetic is stark:
+    #
+    #   dense J            4.8 GB      20,481 sequential autograd calls
+    #   factors at k=200   110 MB         401 sequential autograd calls
+    #
+    # 44x memory, 51x compute -- and it is a LOW-RANK APPROXIMATION, not a
+    # cheaper exact route.
+    #
+    # The truncation bias is CONSERVATIVE, which is the good direction and is
+    # worth stating because the opposite is the intuitive guess. J_k = J V V^T
+    # has a SMALLER range than J, so LESS of r is representable and eps comes
+    # out HIGHER. Truncating under-certifies; it never certifies a direction
+    # that does not deserve it. MEASURED at P=641 against exact eps 0.185677:
+    #
+    #   k=255  0.200  (+7.7%)    5.9 s        full rank 36.7 s
+    #   k=127  0.268  (+44%)     1.8 s
+    #   k= 63  0.369  (+99%)     0.5 s
+    #   k= 31  0.512  (+176%)    0.2 s
+    #
+    # k=127 still certifies comfortably under the 1/2 bar at 20x less cost.
+    # The price is a worse eps, hence a smaller Lemma 3.5 rate, hence shorter
+    # steps -- efficiency, not soundness.
+    matrixfree_rank: int = 0
+    # Where the adaptive rank loop starts. Doubling from a small block is much
+    # cheaper than guessing high: most steps are decided far from the 1/2 bar.
+    matrixfree_rank_initial: int = 32
+    # Extra sampled directions, discarded after the SVD trim. A random sketch
+    # can miss a direction it happened not to hit; oversampling is the standard
+    # fix and is what keeps the low-rank error near optimal.
+    matrixfree_oversampling: int = 10
+    # (J^T J)^q applied to the sketch, sharpening it toward the leading
+    # singular directions. q=2 is the usual setting.
+    matrixfree_power_iterations: int = 2
+    # The DECISION BAND, as fractions of the certification threshold. Rank is
+    # only doubled while eps lands inside it -- an eps of 0.05 or 0.9 will not
+    # change its verdict no matter how sharp it gets, so paying for sharpness
+    # there is pure waste. This is what buys precision without buying cost.
+    matrixfree_band_low: float = 0.7
+    matrixfree_band_high: float = 1.3
     tiny_use_covariance: bool = True
     tiny_alpha_zero: bool = False
     tiny_omega_zero: bool = False
@@ -131,12 +176,10 @@ class FGDApproxConfig:
     # the certified method's growth FP" -- that is always yes.
     growth_function_preserving: bool = False
     growth_preservation_tolerance: float = 1e-6
-    # Ordered ladder of approximation families. "tangent" must come first (it
-    # is the epoch's main transactional search); the remaining entries are
-    # tried in the listed order only after the previous family fails to
-    # certify, and structural growth is probed only after every listed family
-    # fails. Every family commits through the same full FGD certificate.
-    # Supported: "tangent", "rkhs_head", "parametric_gd".
+    # Ordered approximation families. The legacy ladder starts with "tangent"
+    # and retains its existing fallback semantics. The nonlinear primary mode
+    # is selected only by the standalone value ("nonlinear",); it bypasses all
+    # tangent construction and cannot be mixed with fallback families.
     family_order: tuple[str, ...] = ("tangent",)
     # Certify the tangent outer step by MEASURED validation descent
     # (Prop. 3.8) instead of the Lemma-3.5 relative-error interval. The
@@ -487,6 +530,36 @@ class FGDApproxConfig:
     # fitted per dataset, and magnitude cancels, so the same rule transfers
     # unchanged between bases. Off by default: it changes when growth ends.
     growth_bottleneck_significance: bool = False
+    # THE SAME STOPPING QUESTION, ASKED WHERE MARCHENKO-PASTUR CANNOT ANSWER
+    # IT. MP above is implemented and MEASURED AND REFUTED: it needs
+    # gamma = r / n to be appreciable, and here r is a hidden width (2-32)
+    # against n = 1024 probe rows, so gamma ~ 0.015 puts the edge at 1.26x the
+    # bulk and it filters nothing -- without a cap the shape then degenerated
+    # to 20-32-2 and growth blew its own numerical tolerance. Both the field
+    # and its helper are kept, off, so that negative result is not
+    # rediscovered.
+    #
+    # K-fold cross-validation asks instead whether the extension direction
+    # SURVIVES DATA IT WAS NOT FITTED ON, which needs no asymptotic regime at
+    # all. Fit (alpha, omega) on K-1 folds of the probe, freeze them, and score
+    # that pair against the held-out fold's OWN desired-update matrix N. In
+    # sample that same bilinear form IS the bottleneck --
+    # <alpha omega^T, N> = sum(s_i^2), which is what compute_optimal_added_
+    # parameters constructs -- so the held-out number is literally "this
+    # layer's bottleneck, measured where the direction was not chosen". A real
+    # direction scores positive on every fold; a direction fitted to sampling
+    # noise scatters around zero.
+    #
+    # Nothing is fitted per dataset and no magnitude is compared to anything:
+    # b_k is a Frobenius cosine, so scale cancels, and the bar is a t
+    # statistic rather than a level. 0 = off, and off is bit-identical.
+    growth_bottleneck_crossfold_folds: int = 0
+    # Grow only while t = mean(b) / (std(b) / sqrt(K)) clears this. 1.0 is one
+    # standard error above zero -- deliberately weak, because the K training
+    # sets overlap in K-2 of their K parts and that correlation makes the
+    # sample std understate the true spread. What is asked of it is a SIGN
+    # test with a scale attached, not a p-value.
+    growth_bottleneck_crossfold_t: float = 1.0
     # UN SOLO CRITERIO en todo el crecimiento. La cuenta adaptativa de
     # grow_until_certified decide CUANTAS neuronas comprar en la ubicacion ya
     # elegida, y su regla es de HUECO: "cerro esta neurona el 10% de lo que
@@ -823,6 +896,22 @@ class FGDApproxConfig:
     # for the certified outer direction. Off preserves the historical inner
     # damping from projection_damping for every existing configuration.
     certify_realize_use_selected_damping: bool = False
+    # Transactional guard for the nonlinear endpoint produced by the
+    # realization path. This is deliberately off by default: the exact/base
+    # ladder must keep its historical control flow, allocations and numerical
+    # decisions unless a matrix-free experiment opts in explicitly.
+    transactional_realized_descent: bool = False
+    # Number of smaller functional targets tried after the first realization.
+    transactional_max_retries: int = 0
+    transactional_backtrack_factor: float = 0.5
+    # Require L_before - L_after to exceed both this absolute tolerance and
+    # the configured fraction of Lemma 3.5's predicted decrease.
+    transactional_descent_atol: float = 0.0
+    transactional_min_predicted_decrease_fraction: float = 0.0
+    # Optional ceiling for the FACTORED selector's certified functional rate.
+    # None preserves the selector byte-for-byte; the dense/exact selector does
+    # not read this field.
+    certify_functional_lr_cap: float | None = None
     # Bounded certification probe, sized to the NUMERICAL RANK of J. The
     # certificate eps<1/2 is a statement over the NK-dimensional probe residual,
     # but MEASURED the rank m* needed to certify grows SUBLINEARLY in NK (m*/NK:
@@ -1051,6 +1140,12 @@ class FGDApproxConfig:
 
 SUPPORTED_FGD_FAMILIES = (
     "tangent",
+    # The isolated primary family of this branch. It was an AdamW clone
+    # ("nonlinear"); it is now the tangent's own algorithm solved matrix-free,
+    # so the name states what it is. The old spelling is still accepted so
+    # existing configs keep loading.
+    "matrix_free_tangent",
+    "nonlinear",
     "rkhs_head",
     "parametric_gd",
     "parametric_descent",
@@ -1070,11 +1165,6 @@ def validate_family_order(family_order: tuple[str, ...]) -> None:
     """Reject malformed fgd_approx.family_order values early."""
     if not family_order:
         raise ValueError("fgd_approx.family_order cannot be empty.")
-    if family_order[0] != "tangent":
-        raise ValueError(
-            "fgd_approx.family_order must start with 'tangent' (the epoch's "
-            "main transactional search)."
-        )
     unknown = sorted(set(family_order) - set(SUPPORTED_FGD_FAMILIES))
     if unknown:
         raise ValueError(
@@ -1084,6 +1174,115 @@ def validate_family_order(family_order: tuple[str, ...]) -> None:
         )
     if len(set(family_order)) != len(family_order):
         raise ValueError("fgd_approx.family_order entries must be unique.")
+    isolated = {"matrix_free_tangent", "nonlinear"} & set(family_order)
+    if isolated:
+        if len(family_order) != 1:
+            raise ValueError(
+                "fgd_approx.family_order selects "
+                f"'{family_order[0]}' as a standalone primary family and "
+                "therefore must be exactly that one entry; it cannot coexist "
+                "with tangent or fallback families."
+            )
+        return
+    if family_order[0] != "tangent":
+        raise ValueError(
+            "fgd_approx.family_order must start with 'tangent' in legacy mode, "
+            "or be exactly ['matrix_free_tangent'] for the isolated primary "
+            "family."
+        )
+
+
+def validate_bottleneck_stopping(config: FGDApproxConfig) -> None:
+    """Validate the opt-in budget-free stopping criteria.
+
+    The two are alternative answers to the SAME question -- is this
+    bottleneck real -- and they disagree by construction, since
+    Marchenko-Pastur was refuted precisely where the cross-validated test is
+    meant to work. Running both would silently take the intersection, so a
+    run that stopped could not be attributed to either. Refuse the pair.
+    """
+    folds = config.growth_bottleneck_crossfold_folds
+    if isinstance(folds, bool) or not isinstance(folds, int) or folds < 0:
+        raise ValueError(
+            "fgd_approx.growth_bottleneck_crossfold_folds must be a "
+            "non-negative integer (0 disables the criterion)."
+        )
+    if folds == 1:
+        raise ValueError(
+            "fgd_approx.growth_bottleneck_crossfold_folds must be 0 or at "
+            "least 2: a single fold holds nothing out."
+        )
+    bar = float(config.growth_bottleneck_crossfold_t)
+    if not math.isfinite(bar):
+        raise ValueError(
+            "fgd_approx.growth_bottleneck_crossfold_t must be finite."
+        )
+    if folds >= 2 and config.growth_bottleneck_significance:
+        raise ValueError(
+            "fgd_approx.growth_bottleneck_crossfold_folds and "
+            "growth_bottleneck_significance are alternative stopping rules; "
+            "enable at most one."
+        )
+    if folds >= 2 and config.growth_where != "expressivity_bottleneck":
+        raise ValueError(
+            "fgd_approx.growth_bottleneck_crossfold_folds requires "
+            "growth_where: expressivity_bottleneck."
+        )
+
+
+def validate_transactional_realized_descent(config: FGDApproxConfig) -> None:
+    """Validate the opt-in matrix-free endpoint transaction settings."""
+    retries = config.transactional_max_retries
+    if isinstance(retries, bool) or not isinstance(retries, int) or retries < 0:
+        raise ValueError(
+            "fgd_approx.transactional_max_retries must be a non-negative integer."
+        )
+    factor = float(config.transactional_backtrack_factor)
+    if not math.isfinite(factor) or not 0.0 < factor < 1.0:
+        raise ValueError(
+            "fgd_approx.transactional_backtrack_factor must be in (0, 1)."
+        )
+    atol = float(config.transactional_descent_atol)
+    if not math.isfinite(atol) or atol < 0.0:
+        raise ValueError(
+            "fgd_approx.transactional_descent_atol must be finite and non-negative."
+        )
+    fraction = float(config.transactional_min_predicted_decrease_fraction)
+    if not math.isfinite(fraction) or not 0.0 <= fraction <= 1.0:
+        raise ValueError(
+            "fgd_approx.transactional_min_predicted_decrease_fraction must be "
+            "in [0, 1]."
+        )
+    cap = config.certify_functional_lr_cap
+    if cap is not None:
+        cap = float(cap)
+        if not math.isfinite(cap) or cap <= config.theory_lr_min + config.eps:
+            raise ValueError(
+                "fgd_approx.certify_functional_lr_cap must be finite and strictly "
+                "above theory_lr_min."
+            )
+    if not config.transactional_realized_descent:
+        return
+    if tuple(config.family_order) != ("matrix_free_tangent",):
+        raise ValueError(
+            "fgd_approx.transactional_realized_descent is restricted to "
+            "family_order: [matrix_free_tangent]."
+        )
+    if not config.certify_realize_path:
+        raise ValueError(
+            "fgd_approx.transactional_realized_descent requires "
+            "certify_realize_path: true."
+        )
+    if not config.certify_apply_in_interval:
+        raise ValueError(
+            "fgd_approx.transactional_realized_descent requires "
+            "certify_apply_in_interval: true."
+        )
+    if not config.projection_damping_auto:
+        raise ValueError(
+            "fgd_approx.transactional_realized_descent requires "
+            "projection_damping_auto: true."
+        )
 
 
 @dataclass(frozen=True)
@@ -1113,6 +1312,135 @@ class ParametricGDConfig:
     # displacement generalizes to validation (closing the train/val gap
     # that caps the certified acceptance).
     weight_decay: float = 0.0
+    # Nonlinear-primary certification streams this many validation minibatches.
+    # None means one complete loader pass. Legacy parametric fallback families
+    # do not read this field.
+    certification_batches: int | None = None
+
+    # --- Nonlinear-primary family: EXPLICIT optimization-budget semantics ---
+    # The ladder's nonlinear family (certify_parametric_step) spends
+    # ``certify_family_inner_steps`` FULL-BATCH AdamW steps on the fixed probe.
+    # The nonlinear primary originally spent the same integer on loader
+    # MINIBATCH steps, which on N=1024/batch-64 is 64x fewer example-gradients
+    # per candidate -- MEASURED as the dominant cause of its non-certification
+    # (cos still climbing monotonically with the budget at the largest setting).
+    # The unit is therefore named rather than implied:
+    #   "probe"     -- full-batch steps on the certification probe (ladder parity)
+    #   "epoch"     -- complete loader passes
+    #   "minibatch" -- individual optimizer steps on loader minibatches
+    inner_step_unit: str = "minibatch"
+    # Reduction of the candidate's parametric objective. The ladder uses the
+    # sum-MSE convention that matches the certified functional; "mean" rescales
+    # the gradient by 1/(batch * out_features), which AdamW largely but not
+    # exactly absorbs (it does not rescale weight_decay or parameter_penalty).
+    candidate_objective: str = "mean"
+    # Whether the disposable clone trains in train() mode (the ladder) or in
+    # eval() mode. Only observable when the model has dropout / batch norm.
+    candidate_train_mode: bool = False
+    # Split the DIRECTIONAL certificate is measured on. The ladder trains and
+    # certifies on the same train probe; certifying on validation silently
+    # converts a statement about the step's own empirical objective into a
+    # generalization claim.
+    certificate_split: str = "train"
+    # Split the transactional acceptance conditions are measured on.
+    transactional_split: str = "validation"
+    # Interpolation factors alpha searched for the COMMITTED step, in the order
+    # given. Empty means "commit the full candidate only" (alpha = 1).
+    alpha_grid: tuple[float, ...] = ()
+    # How the committed alpha is chosen among those that RE-certify:
+    #   "largest_certified" -- the largest certified alpha (longest step)
+    #   "max_descent"       -- the certified alpha with the largest measured
+    #                          functional-loss decrease
+    #   "full_only"         -- only alpha = 1, and only when it certifies
+    alpha_policy: str = "largest_certified"
+    # Extra candidates trained at a functional rate DERIVED from the best
+    # relative error the fixed sweep achieved, rather than guessed in advance.
+    #
+    # A well-fitted clone realises eta* ~ eta_f, while Lemma 3.5 admits only
+    # eta <= 2(1 - 2 eps)/(L_s(1 + 2 eps)) -- a bound that depends on the eps
+    # the clone happens to reach, which is not known until it has been trained.
+    # A fixed grid therefore cannot be placed correctly in advance: MEASURED on
+    # N=1024, eta_f = 0.25 reaches eps 0.4045 whose bound is 0.1056, and
+    # eta_f = 0.0625 reaches eps 0.4779 whose bound is 0.0215 -- the target
+    # moves as fast as the guess does. Each retry trains one more candidate at
+    # theory_lr_safety * eta_bar(best eps) and certifies it on its own terms.
+    adaptive_rate_retries: int = 0
+    # What a candidate must satisfy to be committed. The ladder and the
+    # nonlinear primary were never asking the same question, which is the whole
+    # reason the ladder certifies where the primary does not:
+    #
+    #   "direction_only"   -- eps < min(rel_error_threshold, 1/2), and nothing
+    #                         else. This is EXACTLY the ladder
+    #                         (certify_parametric_step returns on the cosine
+    #                         test alone, certify_family_lemma35_rate defaults
+    #                         off, and grow_until_certified commits the
+    #                         returned model without a transactional gate).
+    #                         There is no statement about step LENGTH.
+    #   "measured_descent" -- direction, plus the transactional conditions,
+    #                         which measure real descent on the transactional
+    #                         split. Prop 3.8 with a measured coefficient
+    #                         rather than one lower-bounded through eps.
+    #   "theory_interval"  -- the above, plus the realized secant rate
+    #                         eta* = <Delta, r>/|r|^2 must lie inside the
+    #                         Lemma 3.5 interval implied by its OWN eps.
+    #                         Strictest, and the only one that certifies the
+    #                         DISTANCE actually travelled.
+    #
+    # The previous nonlinear-only code appeared to enforce the last one but did
+    # not: it quoted family_lemma35_rate(eps) as the step's rate, a number
+    # admissible by construction, while committing a displacement whose real
+    # eta* was never measured.
+    acceptance_rule: str = "theory_interval"
+    # Inner-optimizer learning-rate schedule for the candidate.
+    #
+    # At a CONSTANT lr, AdamW settles into a noise ball of radius ~lr and stops
+    # converging, so the only way to improve the fit is more steps -- which is
+    # why 400 -> 1600 -> 6400 kept helping and why this family ended up costing
+    # more than the Jacobian it replaces. Decaying the rate to zero lets the
+    # same clone actually converge, in far fewer steps.
+    inner_lr_schedule: str = "constant"
+    # Solve the OUTPUT layer against the functional target in closed form
+    # after the inner steps, instead of leaving it to the optimizer.
+    #
+    # The certified quantity is cos(Delta, r) with Delta = eta_f r - e, where e
+    # is the clone's fit residual. Iterative optimisation leaves an e that does
+    # NOT shrink as r does, so late in training cos collapses however long the
+    # clone trains -- MEASURED, eps sat at 0.58-0.99 for 28 consecutive epochs
+    # with the loss frozen. The network is exactly linear in its readout
+    # parameters, so fitting them is a least-squares solve with no
+    # approximation error, costing O(N H^2) in the last hidden width against
+    # O(N K P^2) for a tangent system over all P parameters. The hidden layers
+    # are still moved nonlinearly by AdamW first, so the family keeps reaching
+    # outside range(J); only the readout is exact.
+    candidate_readout_solve: bool = False
+    # Tikhonov term for that solve, for conditioning only.
+    candidate_readout_ridge: float = 1e-8
+    # --- Matrix-free tangent solver (the isolated family's engine) ---
+    # Conjugate-gradient iterations on J v / J^T w products. MEASURED at P=197
+    # against the exact Jacobian at damping 1e-2: 200 iterations agree to
+    # 3.6e-06 relative, 50 to 2.2e-03. Damping conditions the CG as well as
+    # regularising the projection, so the ladder's own regime is the easy one.
+    cg_iterations: int = 200
+    # How many examples the matrix-free solver accumulates per autograd call.
+    # NOT a hyperparameter: J and r are sums over examples, so the grouping is
+    # only how that sum is accumulated and cannot move the answer. MEASURED at
+    # N=1024, eps agreed to 6 significant figures across 64 / 128 / 256 / 512 /
+    # 1024 while the solve went 0.62s -> 0.06s. It is pure call overhead: each
+    # group is one torch.autograd.grad, Krylov is strictly sequential so the
+    # calls cannot be batched, and at these sizes the arithmetic inside one is
+    # negligible against the ~1ms dispatch around it. Larger is faster until
+    # the retained graphs stop fitting. 0 keeps the loader's own batching.
+    matrixfree_batch_size: int = 0
+    cg_tolerance: float = 1e-10
+    # projection_damping_auto, matrix-free: eps depends on lambda and the
+    # ladder picks the minimiser per step. Solving at the fixed 1e-2 instead
+    # reported eps 1.1-1.5 and never certified -- the wrong lambda, not a
+    # solver defect. The grid is swept reusing the retained batch graphs.
+    damping_grid: tuple[float, ...] = (1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1.0)
+    # The Lemma 3.5 rate is first order, so the displacement it produces is not
+    # exactly eta J u. These scales are tried in order and each is certified on
+    # the displacement it ACTUALLY applies.
+    step_backoff: tuple[float, ...] = (1.0, 0.5, 0.25, 0.125)
 
     def validate(self) -> None:
         if self.optimizer not in ("sgd", "adam", "adamw"):
@@ -1121,6 +1449,10 @@ class ParametricGDConfig:
             )
         if self.weight_decay < 0.0:
             raise ValueError("parametric_gd.weight_decay must be non-negative.")
+        if self.certification_batches is not None and self.certification_batches < 1:
+            raise ValueError(
+                "parametric_gd.certification_batches must be positive or null."
+            )
         if self.inner_learning_rate <= 0.0:
             raise ValueError("parametric_gd.inner_learning_rate must be positive.")
         if not self.inner_steps or any(v < 1 for v in self.inner_steps):
@@ -1137,6 +1469,62 @@ class ParametricGDConfig:
             raise ValueError("parametric_gd.min_cosine must lie in (0, 1].")
         if self.parameter_penalty < 0.0:
             raise ValueError("parametric_gd.parameter_penalty must be non-negative.")
+        if self.inner_step_unit not in ("minibatch", "epoch", "probe"):
+            raise ValueError(
+                "parametric_gd.inner_step_unit must be 'minibatch', 'epoch' "
+                "or 'probe'."
+            )
+        if self.candidate_objective not in ("mean", "sum"):
+            raise ValueError(
+                "parametric_gd.candidate_objective must be 'mean' or 'sum'."
+            )
+        if self.certificate_split not in ("train", "validation"):
+            raise ValueError(
+                "parametric_gd.certificate_split must be 'train' or 'validation'."
+            )
+        if self.transactional_split not in ("train", "validation"):
+            raise ValueError(
+                "parametric_gd.transactional_split must be 'train' or 'validation'."
+            )
+        if self.cg_iterations < 1:
+            raise ValueError("parametric_gd.cg_iterations must be positive.")
+        if not self.step_backoff or any(v <= 0.0 for v in self.step_backoff):
+            raise ValueError(
+                "parametric_gd.step_backoff entries must be positive."
+            )
+        if self.candidate_readout_ridge < 0.0:
+            raise ValueError(
+                "parametric_gd.candidate_readout_ridge must be non-negative."
+            )
+        if self.inner_lr_schedule not in ("constant", "cosine", "linear"):
+            raise ValueError(
+                "parametric_gd.inner_lr_schedule must be 'constant', "
+                "'cosine' or 'linear'."
+            )
+        if self.acceptance_rule not in (
+            "theory_interval",
+            "measured_descent",
+            "direction_only",
+        ):
+            raise ValueError(
+                "parametric_gd.acceptance_rule must be 'theory_interval', "
+                "'measured_descent' or 'direction_only'."
+            )
+        if self.adaptive_rate_retries < 0:
+            raise ValueError(
+                "parametric_gd.adaptive_rate_retries must be non-negative."
+            )
+        if any(not 0.0 < value <= 1.0 for value in self.alpha_grid):
+            raise ValueError("parametric_gd.alpha_grid entries must lie in (0, 1].")
+        if self.alpha_policy not in (
+            "largest_certified",
+            "max_descent",
+            "full_only",
+        ):
+            raise ValueError(
+                "parametric_gd.alpha_policy must be 'largest_certified', "
+                "'max_descent' or 'full_only'."
+            )
 
 
 @dataclass(frozen=True)
@@ -1923,6 +2311,7 @@ def _solve_tangent_projection(
     work_dtype: torch.dtype = torch.float64,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return parameter update and projected output gradient."""
+    increment("tangent_projection_solve_calls")
     if solver in {"exact", "exact_svd"}:
         return _solve_tangent_projection_svd(
             jacobian_matrix=jacobian_matrix,
@@ -1998,6 +2387,18 @@ class ExactTangentSystem:
     # statistics surrogate when ``certify_stream_gram`` is enabled; candidate
     # cross-statistics still need the original rows, but retaining this vector
     # is O(NK), not the forbidden O(NKP) second Jacobian.
+    #: ``(W, V)`` with ``J = W V^T``, ``W = J V`` of shape ``(rows, k)`` and
+    #: ``V`` of shape ``(P, k)`` with orthonormal columns. Present ONLY on the
+    #: matrix-free family; ``None`` on every exact system, which is what keeps
+    #: the default path constructing exactly what it constructs today.
+    #:
+    #: Carrying it is what lets the consumers skip ``J`` entirely: with
+    #: ``W = A S B^T``, ``J = A S (V B)^T`` and ``V B`` is orthonormal, so
+    #: ``svd(J) = (A, S, V B)`` EXACTLY -- from an SVD of a ``(rows, k)``
+    #: matrix. Memory ``O(NK k + P k)``, linear in ``P``.
+    factors: tuple[torch.Tensor, torch.Tensor] | None = field(
+        default=None, repr=False, compare=False
+    )
     full_target: torch.Tensor | None = field(default=None, repr=False, compare=False)
     owner_model: torch.nn.Module | None = field(default=None, repr=False, compare=False)
     parameter_names: tuple[str, ...] = field(default=(), repr=False)
@@ -2891,6 +3292,194 @@ def _stream_gram_surrogate(
     return j_surrogate.to(out_dtype), r_surrogate.to(out_dtype)
 
 
+def _factored_relative_error_estimate(
+    factors: tuple[torch.Tensor, torch.Tensor],
+    target: torch.Tensor,
+    eps: float,
+) -> float:
+    """``eps`` at least damping, straight off ``W``, for the rank loop only.
+
+    ``J = W V^T`` and the least-damped projection of ``r`` onto range(J) is the
+    projection onto range(W), so ``eps = ||P r - r|| / ||P r||`` needs nothing
+    but a thin QR of the ``(rows, ell)`` factor. The parameter dimension never
+    enters, so deciding whether to spend more rank costs almost nothing.
+    """
+    left, _right = factors
+    flat = target.reshape(-1).to(dtype=left.dtype, device=left.device)
+    basis, _ = torch.linalg.qr(left)
+    projected = basis @ (basis.t() @ flat)
+    norm = float(torch.linalg.vector_norm(projected))
+    if not norm > eps:
+        return float("inf")
+    return float(torch.linalg.vector_norm(projected - flat)) / norm
+
+
+def _matrix_free_tangent_system(
+    *,
+    model: GrowingMLP,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    config: FGDApproxConfig,
+) -> ExactTangentSystem | None:
+    """``J = W V^T`` from a BLOCK range finder, never materialised.
+
+    The exact route is fast because it is a handful of batched matmuls
+    (``_analytic_jacobian_block``), not because of ``jacrev`` -- which is only
+    its fallback. Its cost is the outer product at the end: the ``(NK, P)``
+    matrix, 4.8 GB at MNIST width, plus the ``O(P^2)`` Gram downstream.
+
+    So the same per-layer factors are kept and APPLIED instead of stored, and
+    the subspace is found by a block range finder: ``2q+2`` products applied to
+    the whole block at once, rather than the ``2k`` strictly sequential ones
+    Golub-Kahan needed. That sequential depth was the entire reason the earlier
+    version lost to the exact route even at k=64.
+
+    The rank is ADAPTIVE. eps only has to be accurate where it decides, i.e.
+    near the 1/2 bar; a cheap eps of 0.05 or 0.9 is not going to change its
+    mind. So the rank starts small and doubles only while the answer sits in
+    the decision band, which is how precision is bought without paying for it
+    everywhere.
+
+    Truncation biases eps UP: ``J_k = J V V^T`` has a smaller range, so less of
+    ``r`` is representable. It under-certifies, never the reverse.
+    """
+    from fgdlib.search.matrixfree import (
+        analytic_operators,
+        dual_spectrum,
+        randomized_factorization,
+        vmap_operators,
+    )
+
+    was_training = model.training
+    model.eval()
+    try:
+        parameters = tuple(
+            parameter for parameter in model.parameters() if parameter.requires_grad
+        )
+        parameter_names = tuple(
+            name
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad
+        )
+        with torch.no_grad():
+            outputs = model(x)
+            target = functional_gradient(
+                outputs, y, config.functional_loss
+            ).reshape(-1)
+            loss = float(
+                torch.nn.functional.mse_loss(outputs, y).detach().item()
+            )
+
+        # Analytic operators when the structure allows, exactly as the exact
+        # route decides it; vmapped autograd otherwise. Same two methods, so
+        # nothing below can tell which one it got.
+        operators = None
+        with ExitStack() as capture_stack:
+            pause = getattr(model, "paused_computation", None)
+            structure = None
+            if callable(pause):
+                capture_stack.enter_context(pause())
+                structure = _supported_analytic_structure(
+                    model, x, capture_suspended=True
+                )
+                if structure is None:
+                    capture_stack.close()
+            else:
+                structure = _supported_analytic_structure(model, x)
+            if structure is not None:
+                operators = analytic_operators(structure, x)
+        if operators is None:
+            increment("matrix_free_vmap_fallbacks")
+            operators = vmap_operators(model, x, parameters, parameter_names)
+
+        columns = sum(p.numel() for p in parameters)
+
+        # FACTOR THE SMALLER SIDE. rank(J) <= min(NK, P), so whichever of the
+        # two dimensions is smaller bounds the whole spectrum and a basis of
+        # that many columns captures the range EXACTLY. Nothing is truncated
+        # either way; only the arithmetic changes.
+        #
+        # This matters because the two regimes really happen:
+        #
+        #   P < NK   the probe is sized above the interpolation floor, which
+        #            certify_probe_kappa now enforces. MNIST: NK 7040, P 1612.
+        #   NK < P   the over-parameterised regime, where the dual is the
+        #            cheap side. MEASURED at P=19201, NK=1024: the primal Gram
+        #            is 2949 MB against the dual's 8.4 MB.
+        #
+        # The gate is the RATIO, not min(NK, P), because the two routes have
+        # different constants and the crossover is not at 1. MEASURED at the
+        # real dimensions of both configs:
+        #
+        #   N1024  NK/P 1.6    dual 0.262 s   P-side 3.19 s   -> dual  12x
+        #   MNIST  NK/P 4.37   dual 16.29 s   P-side 3.59 s   -> P-side 4.5x
+        #
+        # The dual's eigendecomposition is O(NK^3) and gets worse as kappa grows
+        # the probe with the net; the P-side pays O(NK P^2) but moves large
+        # blocks through the batched applies, which only pays off once NK is
+        # several times P. 2x sits between the two measured points and keeps
+        # N1024 on exactly the path it is on today.
+        #
+        # A low-rank SKETCH is a different thing and does not work here: at
+        # P=1345 the exact eps is 1e-06 while rank 512 reported 0.21, because r
+        # is spread across the whole spectrum. The rank below is the full
+        # min(NK, P), so nothing is truncated on either branch.
+        if operators.rows > 2 * columns:
+            built = randomized_factorization(
+                apply_j=operators.apply_j,
+                apply_jt=operators.apply_jt,
+                rows=operators.rows,
+                columns=columns,
+                rank=columns,
+                oversampling=0,
+                power_iterations=1,
+                device=x.device,
+            )
+            if built is None:
+                return None
+            factors = built
+        else:
+            spectrum = dual_spectrum(operators, config.eps)
+            if spectrum is None:
+                return None
+            left, singular_values = spectrum
+            # The right factor, built by applying J^T to the retained left
+            # directions -- one batched apply, no (NK, P) intermediate.
+            right = (
+                operators.apply_jt(left.t()) / singular_values.unsqueeze(1)
+            ).t()
+            factors = (left * singular_values, right)
+        jacobian_matrix = factors[0].new_zeros((0, columns))
+    finally:
+        model.train(was_training)
+
+    if jacobian_matrix is None:
+        return None
+
+    named_buffers = tuple(model.named_buffers())
+    return ExactTangentSystem(
+        jacobian=jacobian_matrix,
+        target=target,
+        parameters=parameters,
+        loss=loss,
+        factors=factors,
+        full_target=target,
+        owner_model=model,
+        parameter_names=parameter_names,
+        parameter_versions=tuple(parameter._version for parameter in parameters),
+        buffer_names=tuple(name for name, _ in named_buffers),
+        buffers=tuple(buffer for _, buffer in named_buffers),
+        buffer_versions=tuple(buffer._version for _, buffer in named_buffers),
+        probe_x=x,
+        probe_y=y,
+        probe_versions=(x._version, y._version),
+        config_signature=repr(config),
+        evaluation_state=tuple(
+            (name, module.training) for name, module in model.named_modules()
+        ),
+    )
+
+
 def exact_tangent_system(
     model: GrowingMLP,
     x: torch.Tensor,
@@ -2907,6 +3496,16 @@ def exact_tangent_system(
             if parameter.requires_grad
         ),
     )
+    if tuple(config.family_order) == ("matrix_free_tangent",):
+        # THE ONLY DIFFERENCE between the two ladder configurations. Every
+        # rung, the realisation path, the fallback and the growth loop below
+        # this point are the ladder's own code, reached by the ladder's own
+        # route; only the construction of J is approximated. Gated on the
+        # family so the default config takes the branch below untouched.
+        with timed("exact_tangent_system_seconds"):
+            return _matrix_free_tangent_system(
+                model=model, x=x, y=y, config=config
+            )
     with timed("exact_tangent_system_seconds"):
         step = _compute_exact_tangent_projection_step(
             model=model, x=x, y=y, config=config, return_system=True
@@ -3780,11 +4379,226 @@ def marchenko_pastur_significant_count(
     return int(torch.sum(squared > edge).item())
 
 
+def _stride_fold_masks(count: int, folds: int) -> list[torch.Tensor]:
+    """Fold membership by STRIDE (``i % K``), never by contiguous block.
+
+    The probe arrives in whatever order its loader produced it, so a
+    contiguous split hands each fold a different slice of that order -- on a
+    class-grouped or sorted source that is not a resample of the same
+    distribution, it is a different dataset per fold. Striding gives every
+    fold the same distribution whatever the order is, and it is a pure
+    function of the index, so the split is identical on every call. The
+    pipeline is deterministic and this must not be the thing that breaks it.
+    """
+    index = torch.arange(count)
+    return [index % folds == fold for fold in range(folds)]
+
+
+def _materialize_loader(
+    data_loader: torch.utils.data.DataLoader,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Every batch as two tensors, plus the batch size to re-cut them with.
+
+    The folds have to be cut from the WHOLE probe, not from one batch at a
+    time, so the source is drained once here. The original batch size is
+    carried back out so each fold is fed to ``compute_statistics`` in the same
+    sized pieces the caller was already using -- the accumulation is over
+    batches either way, but the memory profile stays the one the config chose.
+    """
+    xs: list[torch.Tensor] = []
+    ys: list[torch.Tensor] = []
+    batch_size = 0
+    for x, y in data_loader:
+        xs.append(x.to(device))
+        ys.append(y.to(device))
+        batch_size = max(batch_size, int(x.shape[0]))
+    if not xs:
+        raise ValueError("Cannot cross-validate a bottleneck on an empty loader.")
+    return torch.cat(xs), torch.cat(ys), batch_size
+
+
+def _fold_loader(
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    batch_size: int,
+) -> torch.utils.data.DataLoader:
+    """A deterministic, unshuffled loader over one fold of the probe."""
+    rows = int(inputs.shape[0])
+    return torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(inputs, targets),
+        batch_size=max(1, min(int(batch_size), rows)) if rows else 1,
+        shuffle=False,
+    )
+
+
+def _fitted_extension_matrix(layer: LinearGrowingModule) -> torch.Tensor | None:
+    """``alpha omega``, the fitted extension direction, in ``N``'s own shape.
+
+    ``compute_optimal_added_parameters`` builds ``alpha = sqrt(s) S^{-1/2} U``
+    and ``omega = sqrt(s) V`` from the SVD of ``P = S^{-1/2} N``, and stores
+    them transposed across the two Linear layers. Their outer product is
+    ``S^{-1/2} P_k``, so its Frobenius inner product with ``N`` is
+    ``trace(P_k^T P) = sum(s_i^2)`` -- the bottleneck, exactly and not by
+    analogy. That identity is the entire reason this matrix is the right
+    object to carry to a fold it was not fitted on: scored against the
+    held-out fold's own ``N`` it returns the same quantity, measured where
+    the direction was not chosen.
+
+    ``None`` when the structure is not the two-Linear case the identity is
+    derived for; the caller must read that as "not measured", never as "not
+    significant".
+    """
+    extended_input = getattr(layer, "extended_input_layer", None)
+    previous = getattr(layer, "previous_module", None)
+    extended_output = getattr(previous, "extended_output_layer", None)
+    if extended_input is None or extended_output is None:
+        return None
+    omega = extended_input.weight.detach().double()  # (out_features, k)
+    alpha = extended_output.weight.detach().double()  # (k, prev_in_features)
+    bias = getattr(extended_output, "bias", None)
+    if bias is not None:
+        # gromo split alpha as ``alpha[:, :-1]`` and ``alpha[:, -1]``; putting
+        # the bias back as the LAST column is what restores N's row order.
+        alpha = torch.cat([alpha, bias.detach().double()[:, None]], dim=1)
+    if alpha.shape[0] != omega.shape[1]:
+        return None
+    return alpha.t() @ omega.t()
+
+
+def _held_out_bottleneck_cosine(
+    extension: torch.Tensor,
+    held_out_n: torch.Tensor,
+) -> float:
+    """``cos(alpha omega, N_held_out)`` in the Frobenius geometry.
+
+    The raw inner product is the bottleneck in the held-out fold's units, so
+    it is not comparable between folds, between layers or between datasets.
+    Dividing by both norms leaves a number in [-1, 1] whose SIGN says whether
+    the fitted direction still points at what the held-out data wants, and
+    whose scale is the problem's own. Magnitude cancels -- which is the
+    property that lets one rule serve smooth_sin and MNIST without retuning.
+    """
+    if extension.shape != held_out_n.shape:
+        return float("nan")
+    left = float(torch.linalg.norm(extension))
+    right = float(torch.linalg.norm(held_out_n))
+    if not (left > 0.0 and right > 0.0):
+        return 0.0
+    value = float(torch.sum(extension * held_out_n)) / (left * right)
+    return value if math.isfinite(value) else float("nan")
+
+
+def crossfold_bottleneck_significance(
+    model: GrowingMLP,
+    layer_index: int,
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    batch_size: int,
+    device: torch.device,
+    config: FGDApproxConfig,
+) -> tuple[float, list[float]]:
+    """Is this layer's bottleneck REAL, or is it a direction fitted to noise?
+
+    The stopping question, answered without a magnitude and without an
+    asymptotic regime. For each of ``K`` folds: fit the extension on the other
+    ``K-1``, freeze ``(alpha, omega)``, and score that frozen pair against the
+    held-out fold's own desired-update matrix ``N``. A direction the data
+    really asks for scores positive on every fold; a direction fitted to
+    sampling noise scatters around zero.
+
+    Returns ``(t, b)`` with ``t = mean(b) / (std(b) / sqrt(K))``. ``inf``
+    means NOT MEASURED (too few rows, or a structure the identity behind
+    :func:`_fitted_extension_matrix` is not derived for) and must never block
+    growth -- a stopping rule that fires because it could not measure is a
+    stopping rule that stops for the wrong reason.
+    """
+    folds = int(getattr(config, "growth_bottleneck_crossfold_folds", 0) or 0)
+    rows = int(inputs.shape[0])
+    if folds < 2 or rows < folds * 2:
+        return float("inf"), []
+
+    # The direction is what is being tested, so both of its factors have to
+    # exist. alpha_zero / omega_zero say how the neuron is INITIALISED once
+    # bought -- with either set there is no fitted direction to carry to a
+    # held-out fold at all. compute_delta is forced for the same reason: with
+    # use_projection the extension is fitted against tensor_n, which does not
+    # exist until the optimal delta does.
+    update_kwargs = dict(tiny_optimal_update_kwargs(config, compute_delta=True))
+    update_kwargs["alpha_zero"] = False
+    update_kwargs["omega_zero"] = False
+
+    masks = _stride_fold_masks(rows, folds)
+    values: list[float] = []
+
+    for mask in masks:
+        held_out = mask
+        fitted = ~mask
+        if int(fitted.sum()) == 0 or int(held_out.sum()) == 0:
+            continue
+
+        extension: torch.Tensor | None = None
+        try:
+            model.set_growing_layers(index=layer_index)
+            compute_statistics(
+                model,
+                _fold_loader(inputs[fitted], targets[fitted], batch_size),
+                loss_function=batch_functional_mse_loss,
+                device=device,
+            )
+            model.compute_optimal_updates(**update_kwargs)
+            model.reset_computation()
+            model.dummy_select_update()
+            extension = _fitted_extension_matrix(model.currently_updated_layer)
+        finally:
+            _cleanup_tiny_update(model)
+
+        if extension is None:
+            return float("inf"), []
+
+        held_out_n: torch.Tensor | None = None
+        try:
+            model.set_growing_layers(index=layer_index)
+            compute_statistics(
+                model,
+                _fold_loader(inputs[held_out], targets[held_out], batch_size),
+                loss_function=batch_functional_mse_loss,
+                device=device,
+            )
+            model.compute_optimal_updates(**update_kwargs)
+            model.dummy_select_update()
+            # tensor_n is a view over the accumulated statistics, not a stored
+            # tensor, so it has to be read BEFORE reset_computation clears
+            # them -- the fit above can reset first only because
+            # eigenvalues_extension survives as a plain attribute.
+            tensor_n = getattr(model.currently_updated_layer, "tensor_n", None)
+            if tensor_n is not None:
+                held_out_n = tensor_n.detach().double().clone()
+        finally:
+            _cleanup_tiny_update(model)
+
+        if held_out_n is None:
+            return float("inf"), []
+        values.append(_held_out_bottleneck_cosine(extension, held_out_n))
+
+    if len(values) < 2 or not all(math.isfinite(value) for value in values):
+        return float("inf"), values
+
+    mean = statistics.fmean(values)
+    spread = statistics.stdev(values)
+    if spread <= 0.0:
+        # Every fold agreed exactly. Positive is a unanimous yes; zero or
+        # below is a unanimous no, and neither is a failure to measure.
+        return (float("inf") if mean > 0.0 else float("-inf")), values
+    return mean / (spread / math.sqrt(len(values))), values
+
+
 def compute_expressivity_bottlenecks(
     model: GrowingMLP,
     train_loader: torch.utils.data.DataLoader,
     device: torch.device,
     config: FGDApproxConfig,
+    progress: Callable[[str], None] | None = None,
 ) -> list[float]:
     """Per-layer EXPRESSIVITY BOTTLENECK: what the layer's width cannot reach.
 
@@ -3866,6 +4680,44 @@ def compute_expressivity_bottlenecks(
             bottlenecks.append(value if math.isfinite(value) else 0.0)
         finally:
             _cleanup_tiny_update(model)
+
+    # SECOND PASS, and separate on purpose: the loop above is left exactly as
+    # it was so that with the criterion off nothing above this line can differ.
+    # A layer already at zero is skipped -- it costs nothing and there is
+    # nothing to test.
+    #
+    # A value is only ever turned INTO a zero, never moved, so the RANKING
+    # among the layers that pass is the in-sample one, untouched. But zeroing
+    # is per layer, and zeroing the argmax hands the turn to the runner-up --
+    # MEASURED on seed 1, which refused no growth at all and still landed on
+    # 4-9-20 instead of 7-11-12. So this gates ELIGIBILITY, and growth stops
+    # only when every layer fails at once; it is not a whether-only switch.
+    folds = int(getattr(config, "growth_bottleneck_crossfold_folds", 0) or 0)
+    if folds >= 2 and any(value > 0.0 for value in bottlenecks):
+        probe_x, probe_y, probe_batch = _materialize_loader(train_loader, device)
+        with timed("growth_crossfold_seconds"):
+            for layer_index, value in enumerate(bottlenecks):
+                if value <= 0.0:
+                    continue
+                increment("growth_crossfold_layers_tested")
+                statistic, samples = crossfold_bottleneck_significance(
+                    model=model,
+                    layer_index=layer_index,
+                    inputs=probe_x,
+                    targets=probe_y,
+                    batch_size=probe_batch,
+                    device=device,
+                    config=config,
+                )
+                if progress is not None:
+                    progress(
+                        f"[CROSSFOLD] L{layer_index} t={statistic:.4f} b="
+                        + " ".join(f"{sample:+.4f}" for sample in samples)
+                    )
+                bar = float(getattr(config, "growth_bottleneck_crossfold_t", 1.0))
+                if not (statistic > bar):
+                    increment("growth_crossfold_layers_rejected")
+                    bottlenecks[layer_index] = 0.0
 
     return bottlenecks
 

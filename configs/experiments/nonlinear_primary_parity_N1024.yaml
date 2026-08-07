@@ -1,0 +1,200 @@
+# Nonlinear-primary PARITY configuration for N = 1024.
+#
+# Purpose: make the nonlinear primary family reproduce the ladder's nonlinear
+# family (certify_parametric_step / certify_parametric_step_swept) as closely
+# as the removal of the tangent path allows, so that any remaining difference
+# in behaviour is attributable and not an accident of configuration.
+#
+# The original nonlinear_family_ladder_N1024.yaml took its AdamW values from
+# the parametric_descent family (inner_learning_rate 0.003, inner_steps [40],
+# functional_learning_rates [0.5], weight_decay 0.05). That family accepts on
+# MEASURED descent with min_cosine 0.0; its values were never tuned for a
+# near-gradient certificate, and eta_f = 0.5 makes the functional target
+# exactly y (plain regression to the labels) rather than the ladder's
+# f - eta_f r overshoot. That file is preserved unchanged for reproducibility.
+#
+# Mapped from family_ladder_N1024.yaml's ladder nonlinear family:
+#
+#   certify_family_inner_steps 400        -> inner_steps [400]
+#                                            inner_step_unit "probe"
+#   certify_family_inner_learning_rate    -> inner_learning_rate 0.01
+#   certify_family_functional_lrs         -> functional_learning_rates
+#     [1.0, 2.0, 4.0, 8.0]                   [1.0, 2.0, 4.0, 8.0]
+#   torch AdamW default                   -> weight_decay 0.01
+#   clone.train()                         -> candidate_train_mode true
+#   ((clone(x) - target) ** 2).sum()      -> candidate_objective "sum"
+#   trains AND certifies on fgd_train_probe -> certificate_split "train"
+#   probe_batches 16 (the whole train set)  -> probe_batches 16
+#
+# The ONE deliberate difference, and the reason this branch exists: the step
+# that is committed is re-certified. The ladder certifies the full candidate
+# and then commits a parameter-space interpolation whose functional
+# displacement was never measured; here every alpha carries its own cosine,
+# its own relative error and its own realized secant rate.
+
+run:
+  name: nonlinear_primary_parity_N1024_2x2x2
+  results_dir: results
+  save_plot: false
+  show_plot: false
+
+# Preserved exactly from family_ladder_N1024.yaml (N = 16 * 64 = 1024).
+data:
+  kind: smooth_sin
+  in_features: 4
+  out_features: 1
+  train_batches: 16
+  validation_batches: 16
+  test_batches: 128
+  batch_size: 64
+  train_seed: 0
+  validation_seed: 2
+  test_seed: 1
+  active_features: 3
+  frequency: 1.5
+  phase_shift: 0.5
+  interaction_strength: 0.25
+  linear_strength: 0.1
+
+# Required initial hidden architecture: 2-2-2.
+model:
+  hidden_size: 2
+  number_hidden_layers: 3
+  model_seed: 0
+
+training:
+  method: fgd_approx
+  epochs: 25
+  accuracy_tolerance: 0.1
+  gradient_clip_norm:
+  log_every: 1
+  device: auto
+
+# Rebuilt after structural growth. Candidate optimization is configured below
+# and always uses AdamW independently of this outer optimizer.
+optimizer:
+  name: sgd
+  learning_rate: 0.01
+  momentum: 0.0
+  weight_decay: 0.0
+  nesterov: false
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+lr_scheduler:
+  name: cosineannealing
+  t_max: 50
+  eta_min: 0.0
+  restart_on_growth: true
+
+fgd_approx:
+  family_order:
+    - nonlinear
+  functional_loss: mse
+  rel_error_threshold: 0.5
+  # The whole N=1024 training set, exactly as the ladder probes it.
+  probe_batches: 16
+  learning_rate_policy: theory_interval
+  theory_smoothness_constant: 2.0
+  theory_alpha: 1.0
+  theory_beta: 1.0
+  theory_mu: 2.0
+  theory_loss_star: 0.0
+  theory_lr_safety: 0.95
+  theory_lr_initial: 0.01
+  theory_lr_min: 1.0e-5
+  local_acceptance_conditions: true
+  eps: 1.0e-12
+
+  # A failed nonlinear ladder directly requests one bounded structural event.
+  certify_max_growths: 200
+  max_total_parameters:
+  growth_where: expressivity_bottleneck
+  growth_selection: unified_expansion
+  growth_function_preserving: true
+  growth_preservation_tolerance: 1.0e-6
+  growth_compute_delta: false
+  tiny_use_covariance: true
+  tiny_alpha_zero: false
+  tiny_omega_zero: false
+  tiny_use_projection: true
+  tiny_ignore_singular_values: false
+  tiny_use_fisher: false
+  tiny_maximum_added_neurons: 1
+  tiny_numerical_threshold: 1.0e-6
+  tiny_statistical_threshold: 1.0e-3
+
+  # Existing nonlinear plateau support; disabled to retain the full configured
+  # inner budget unless explicitly enabled in a follow-up experiment.
+  certify_family_plateau_stop: false
+  certify_family_plateau_tol: 0.002
+
+parametric_gd:
+  optimizer: adamw
+
+  # --- Ladder-parity candidate generation ---
+  # 400 FULL-BATCH AdamW steps on the 1024-example train probe. The original
+  # nonlinear-only config spent its budget on 64-example minibatch steps, so
+  # "256" bought 16k example-gradients where the ladder's "400" buys 409,600 --
+  # and the logged cosine was still climbing monotonically with the budget at
+  # the largest setting, i.e. every candidate was cut off mid-optimization.
+  inner_step_unit: probe
+  inner_steps: [400]
+  inner_learning_rate: 0.01
+  candidate_objective: sum
+  candidate_train_mode: true
+
+  # Ascending sweep of the functional distance, in this order. A eta_f that
+  # fails says the clone could not realise THAT distance, not that the family
+  # is unavailable.
+  functional_learning_rates: [1.0, 2.0, 4.0, 8.0]
+
+  # torch's AdamW default; the ladder constructs AdamW(params, lr=...) and
+  # takes it. No parameter penalty and no clipping, also as the ladder does.
+  weight_decay: 0.01
+  parameter_penalty: 0.0
+  gradient_clip_norm:
+
+  min_cosine: 0.9
+
+  # --- Certificate and step ---
+  # Train and certify on the same probe, as the ladder does. Validation stays
+  # the transactional control, so a generalization failure still rejects the
+  # step -- but the DIRECTIONAL guarantee is not silently restated on a split
+  # the step was not defined on.
+  certificate_split: train
+  transactional_split: validation
+  certification_batches:
+
+  # Distance search over the committed step. Every alpha is re-measured on the
+  # probe and accepted only on its own certificate; the largest certified one
+  # is committed. alpha = 1 first, so a run whose full candidate certifies
+  # costs exactly one extra certification pass.
+  alpha_grid: [1.0, 0.5, 0.25, 0.125]
+  alpha_policy: largest_certified
+
+scaling_line_search:
+  method: golden_section
+  min_value: 0.0
+  max_value: 1.0
+  iterations: 12
+  tolerance: 0.001
+
+growth_schedule:
+  enabled: true
+  every: 100
+  first_epoch: 50
+  layer_policy: round_robin
+
+wandb:
+  enabled: false
+  project: stable-tiny
+  entity:
+  run_name:
+  group: nonlinear-primary-parity-n1024-2x2x2
+  job_type: train
+  tags: [fgd_approx, nonlinear, parity, certified_growth, smooth_sin_tiny, from_2x2x2]
+  notes: Nonlinear primary at ladder parity; recertified interpolated step
+  mode: disabled
+  dir: results
+  log_code: false

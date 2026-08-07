@@ -10,6 +10,7 @@ from stable_tiny.pipeline import (
     run_pipeline,
     with_fgd_overrides,
     with_growth_overrides,
+    with_model_overrides,
     with_run_overrides,
     with_wandb_overrides,
     write_outputs,
@@ -28,6 +29,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--results-dir", type=Path)
     parser.add_argument("--run-name")
+    parser.add_argument(
+        "--model-seed",
+        type=int,
+        help="Override model.model_seed without changing the YAML file.",
+    )
     parser.add_argument("--no-plot", action="store_true", help="Disable plot output.")
     parser.add_argument("--show-plot", action="store_true", help="Show plot window.")
     parser.add_argument(
@@ -43,9 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--global-bound-action",
         choices=("lr_then_growth", "grow", "ignore"),
-        help=(
-            "Override what to do when only the FGD global-convergence bound fails."
-        ),
+        help=("Override what to do when only the FGD global-convergence bound fails."),
     )
     wandb_toggle = parser.add_mutually_exclusive_group()
     wandb_toggle.add_argument(
@@ -73,6 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     config = load_pipeline_config(args.config)
+    config = with_model_overrides(config, model_seed=args.model_seed)
     config = with_run_overrides(
         config,
         name=args.run_name,

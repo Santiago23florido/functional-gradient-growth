@@ -6,7 +6,11 @@ import torch
 
 from fgdlib.search.growth import GrowthResult
 from fgdlib.tangent import FGDOutputRelError, FGDValidationCertificate
-from stable_tiny.pipeline import _GrowthProbe, _select_growth_probe, _select_growth_probe_by_descent
+from stable_tiny.pipeline import (
+    _affordable_growth_probes,
+    _GrowthProbe,
+    _select_growth_probe,
+)
 
 
 def _certificate(relative_error: float | None) -> FGDValidationCertificate:
@@ -135,6 +139,36 @@ def test_missing_relative_error_never_wins_over_a_measured_one() -> None:
 
 def test_empty_probe_list_selects_nothing() -> None:
     assert _select_growth_probe([]) is None
+
+
+def test_parameter_budget_drops_every_unaffordable_candidate() -> None:
+    probes = [
+        _probe_with_descent(layer_index=0, added_params=801, descent=10.0),
+        _probe_with_descent(layer_index=1, added_params=25, descent=1.0),
+    ]
+    assert _affordable_growth_probes(
+        probes,
+        base_parameter_count=29980,
+        max_parameters=30000,
+    ) == []
+
+
+def test_parameter_budget_retains_only_post_growth_counts_within_cap() -> None:
+    cheap = _probe_with_descent(layer_index=2, added_params=20, descent=1.0)
+    expensive = _probe_with_descent(
+        layer_index=0, added_params=801, descent=10.0
+    )
+    probes = [expensive, cheap]
+    assert _affordable_growth_probes(
+        probes,
+        base_parameter_count=29980,
+        max_parameters=30000,
+    ) == [cheap]
+    assert _affordable_growth_probes(
+        probes,
+        base_parameter_count=29980,
+        max_parameters=None,
+    ) is probes
 
 
 def test_prefer_lower_error_grows_the_impactful_expensive_layer() -> None:

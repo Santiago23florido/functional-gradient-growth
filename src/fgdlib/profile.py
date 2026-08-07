@@ -31,6 +31,7 @@ PROFILE_FIELDS = (
     "streamed_jacobian_seconds",
     "minimal_relative_error_seconds",
     "select_projection_damping_seconds",
+    "select_projection_damping_factored_seconds",
     "damping_factorization_seconds",
     "realize_initial_system_seconds",
     "realize_vjp_calls",
@@ -42,6 +43,11 @@ PROFILE_FIELDS = (
     "line_search_trials",
     "current_parameter_count",
     "realize_cholesky_fallbacks",
+    # Opt-in endpoint transaction. Existing tangent/realization counters show
+    # the expensive solves; these three expose the bounded retry decisions.
+    "transactional_realization_trials",
+    "transactional_realization_accepted",
+    "transactional_realization_rejected",
     "where_scans",
     "where_candidates",
     "where_base_system_reuses",
@@ -71,6 +77,13 @@ PROFILE_FIELDS = (
     "certify_family_deferral_refused",
     "certify_growth_not_warranted",
     "growth_where_base_unavailable",
+    # Declared late because it almost never fired: "every layer expresses what
+    # is asked of it, so buy nothing" was unreachable in practice until a
+    # stopping criterion started producing all-zero bottlenecks. It has been
+    # passed to fallback() since fe4c88d and was never registered, so
+    # FGD_PROFILE=1 raised KeyError the first time growth actually stopped --
+    # the one event the counter exists to record.
+    "growth_where_no_bottleneck",
     # certify_growth_target discriminators: how often the best available growth
     # failed the certify_growth_min_gain floor (the loop was chasing a target it
     # cannot reach at a price worth paying), how often max_total_parameters
@@ -79,6 +92,26 @@ PROFILE_FIELDS = (
     "certify_growth_target_stalls",
     "certify_budget_stops",
     "certify_budget_rejected_candidates",
+    # Nonlinear primary-family instrumentation. These fields stay independent
+    # of the tangent counters so a nonlinear smoke profile can prove both what
+    # it did and that no tangent construction occurred.
+    "nonlinear_total_seconds",
+    "nonlinear_candidate_training_seconds",
+    "nonlinear_certification_seconds",
+    "nonlinear_growth_statistics_seconds",
+    "nonlinear_growth_application_seconds",
+    "nonlinear_ladder_attempts",
+    "nonlinear_accepted_steps",
+    "nonlinear_failed_ladders",
+    "nonlinear_growth_events",
+    # K-fold bottleneck significance. The cost is the whole risk of the
+    # criterion -- 2K statistics passes per layer per event against 1 today --
+    # so it is measured, never assumed. The two counters separate "the test
+    # ran" from "the test said no", which is what distinguishes a criterion
+    # that stops growth from one that was never consulted.
+    "growth_crossfold_seconds",
+    "growth_crossfold_layers_tested",
+    "growth_crossfold_layers_rejected",
     # --- exact tangent-system construction instrumentation (Phase A) ---
     # Counters.
     "tangent_system_calls",
@@ -109,6 +142,13 @@ PROFILE_FIELDS = (
     # parent/child contract -- never sum streamed_jacobian_seconds into
     # tangent_system_total_seconds, it is a nested parent, not a sibling).
     "tangent_system_total_seconds",
+    # Matrix-free family. These were being passed to timed()/increment()
+    # without ever being declared, so FGD_PROFILE=1 raised KeyError on the
+    # first matrix-free call -- the one path that most needed measuring could
+    # not be measured at all.
+    "matrix_free_tangent_seconds",
+    "matrix_free_tangent_calls",
+    "matrix_free_vmap_fallbacks",
     "tangent_forward_target_seconds",
     "tangent_jacrev_seconds",
     "tangent_jacobian_flatten_seconds",
@@ -119,6 +159,7 @@ PROFILE_FIELDS = (
     "tangent_surrogate_seconds",
     "tangent_final_factorization_seconds",
     "tangent_projection_solve_seconds",
+    "tangent_projection_solve_calls",
     "tangent_sensor_seconds",
     # Max-gauges (written with set_max).
     "tangent_qr_input_rows",
@@ -139,6 +180,9 @@ _COUNTER_FIELDS = {
     "line_search_trials",
     "current_parameter_count",
     "realize_cholesky_fallbacks",
+    "transactional_realization_trials",
+    "transactional_realization_accepted",
+    "transactional_realization_rejected",
     "where_scans",
     "where_candidates",
     "where_base_system_reuses",
@@ -155,10 +199,18 @@ _COUNTER_FIELDS = {
     "certify_family_deferral_refused",
     "certify_growth_not_warranted",
     "growth_where_base_unavailable",
+    "growth_where_no_bottleneck",
     "certify_growth_target_stalls",
     "certify_budget_stops",
     "certify_budget_rejected_candidates",
+    "nonlinear_ladder_attempts",
+    "nonlinear_accepted_steps",
+    "nonlinear_failed_ladders",
+    "nonlinear_growth_events",
+    "growth_crossfold_layers_tested",
+    "growth_crossfold_layers_rejected",
     "tangent_system_calls",
+    "tangent_projection_solve_calls",
     "tangent_qr_calls",
     "tangent_sample_chunk_count",
     "tangent_backend_optimized_calls",
@@ -180,6 +232,8 @@ _COUNTER_FIELDS = {
     "tangent_peak_jacobian_block_columns",
     "tangent_parameter_count",
     "tangent_output_row_count",
+    "matrix_free_tangent_calls",
+    "matrix_free_vmap_fallbacks",
 }
 _VALUES: dict[str, float] = {field: 0.0 for field in PROFILE_FIELDS}
 _REASONS: dict[str, set[str]] = {}

@@ -73,6 +73,7 @@ from fgdlib.tangent import (
     _solve_tangent_projection,
     _trainable_named_parameters,
     _unflatten_parameter_update,
+    batch_functional_loss,
     exact_tangent_system,
     validate_exact_tangent_system,
 )
@@ -156,6 +157,15 @@ class RealizationResult:
     iterations: int
     #: Parameter displacement accumulated, for reporting only.
     parameter_displacement: float
+    #: Scalar diagnostics computed from outputs already evaluated by the
+    #: realization. Optional defaults keep positional construction compatible.
+    functional_before: float | None = None
+    functional_after: float | None = None
+    functional_delta: float | None = None
+    #: Signed progress along the intended output displacement. Unlike the norm
+    #: ratio above, this distinguishes aligned movement from orthogonal error.
+    aligned_realised_fraction: float | None = None
+    effective_learning_rate: float | None = None
 
 
 @dataclass(frozen=True)
@@ -245,8 +255,28 @@ def realize_functional_step(
         displacement = predicted_displacement(model, x, updates)
         target = start - learning_rate * displacement
         intended = float(torch.linalg.vector_norm(target - start))
+        transactional_diagnostics = bool(
+            getattr(config, "transactional_realized_descent", False)
+        )
         if not intended > 0.0:
-            return RealizationResult(0.0, 0.0, 0, 0.0)
+            if not transactional_diagnostics:
+                return RealizationResult(0.0, 0.0, 0, 0.0)
+            functional_before = float(
+                batch_functional_loss(start, y, config.functional_loss).to(
+                    torch.float64
+                )
+            )
+            return RealizationResult(
+                0.0,
+                0.0,
+                0,
+                0.0,
+                functional_before=functional_before,
+                functional_after=functional_before,
+                functional_delta=0.0,
+                aligned_realised_fraction=0.0,
+                effective_learning_rate=0.0,
+            )
 
         travelled = 0.0
         iterations = 0
@@ -306,7 +336,23 @@ def realize_functional_step(
                 if current_system is None:
                     break
                 solve_parameters = current_system.parameters
-                if freeze_gram:
+                if current_system.factors is not None:
+                    # Factored system: J = W V^T, so the damped solution lies
+                    # in span(V) and the normal equations collapse to a k x k
+                    # solve. Neither the O(P^2) Gram nor its factorisation is
+                    # built. Reached only by the matrix-free family.
+                    from fgdlib.search.mffactored import (
+                        factored_projection_solve,
+                    )
+
+                    with timed("realize_solve_seconds"):
+                        solved = factored_projection_solve(
+                            current_system, shortfall, absolute_damping
+                        )
+                    if solved is None:
+                        break
+                    flat_step = solved[0].to(shortfall.dtype)
+                elif freeze_gram:
                     # First inner iteration under freeze: build the Gram ONCE
                     # from the (streamed or full) Jacobian and factor-solve it;
                     # G = J^T J exactly in both cases (the streamed surrogate
@@ -385,11 +431,43 @@ def realize_functional_step(
             final = model(x).detach()
         residual = float(torch.linalg.vector_norm(target - final))
         moved = float(torch.linalg.vector_norm(final - start))
+        if not transactional_diagnostics:
+            return RealizationResult(
+                residual_fraction=residual / intended,
+                realised_fraction=moved / intended,
+                iterations=iterations,
+                parameter_displacement=travelled,
+            )
+        actual_displacement = final - start
+        intended_displacement = target - start
+        intended_sq = float(
+            torch.sum(
+                intended_displacement.to(torch.float64).square()
+            )
+        )
+        aligned_fraction = float(
+            torch.sum(
+                actual_displacement.to(torch.float64)
+                * intended_displacement.to(torch.float64)
+            )
+            / intended_sq
+        )
+        functional_after = float(
+            batch_functional_loss(final, y, config.functional_loss).to(torch.float64)
+        )
+        functional_before = float(
+            batch_functional_loss(start, y, config.functional_loss).to(torch.float64)
+        )
         return RealizationResult(
             residual_fraction=residual / intended,
             realised_fraction=moved / intended,
             iterations=iterations,
             parameter_displacement=travelled,
+            functional_before=functional_before,
+            functional_after=functional_after,
+            functional_delta=functional_after - functional_before,
+            aligned_realised_fraction=aligned_fraction,
+            effective_learning_rate=learning_rate * aligned_fraction,
         )
     finally:
         model.train(was_training)

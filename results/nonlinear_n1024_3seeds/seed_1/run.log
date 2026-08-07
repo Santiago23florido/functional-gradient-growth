@@ -1,0 +1,257 @@
+wandb: [wandb.login()] Using explicit session credentials for https://api.wandb.ai.
+wandb: Appending key for api.wandb.ai to your netrc file: /home/santiago/.netrc
+wandb: Currently logged in as: santiago-florido (TAU-Frugal) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: setting up run 7rd4ylja
+wandb: Tracking run with wandb version 0.28.0
+wandb: Run data is saved locally in results/wandb/run-20260804_145525-7rd4ylja
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run nonlinear-n1024-2x2x2-model-seed-1
+wandb: ⭐️ View project at https://wandb.ai/TAU-Frugal/stable-tiny
+wandb: 🚀 View run at https://wandb.ai/TAU-Frugal/stable-tiny/runs/7rd4ylja
+Using device: cuda
+Training method: fgd_approx
+Primary approximation family: nonlinear (dedicated AdamW minibatch pipeline; tangent path unreachable)
+W&B logging enabled: project=stable-tiny, run=nonlinear-n1024-2x2x2-model-seed-1
+Original model:
+LinearGrowingModule(LinearGrowingModule(Layer 0))(in_features=4, out_features=2, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 1))(in_features=2, out_features=2, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 2))(in_features=2, out_features=2, use_bias=True)
+LinearGrowingModule(LinearGrowingModule(Layer 3))(in_features=2, out_features=1, use_bias=True)
+[INIT] Epoch 0, train_loss=0.2323, validation_loss=0.2512, test_loss=0.2314, train_acc=0.165, validation_acc=0.160, test_acc=0.156
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.3033, eps=0.9529, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.3866, eps=0.9222, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.6541, eps=0.7564, direction_certified=False, rate=n/a
+[NONLINEAR-BOTTLENECK] Epoch 1, widths=(2, 2, 2) L0=4.9226e-03 L1=2.4067e-06 L2=3.3220e-05
+  function-preserving growth: drift=0.000e+00, train_loss=0.2323
+[NONLINEAR-GRO] Epoch 1: layer=0, widths (2, 2, 2) -> (3, 2, 2), max_drift=0.000e+00
+[NONLINEAR] Epoch 1, accepted=False, eps=0.7564, train_loss=0.2323, validation_loss=0.2512, test_loss=0.2314 (+0.0000), widths=(2, 2, 2)
+[GRO] Epoch 1, layer=0, widths=(3, 2, 2), parameters=32
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.3196, eps=0.9476, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.4244, eps=0.9055, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.6630, eps=0.7486, direction_certified=False, rate=n/a
+[NONLINEAR-BOTTLENECK] Epoch 2, widths=(3, 2, 2) L0=6.3265e-06 L1=1.3084e-02 L2=3.3220e-05
+  function-preserving growth: drift=0.000e+00, train_loss=0.2323
+[NONLINEAR-GRO] Epoch 2: layer=1, widths (3, 2, 2) -> (3, 3, 2), max_drift=0.000e+00
+[NONLINEAR] Epoch 2, accepted=False, eps=0.7486, train_loss=0.2323, validation_loss=0.2512, test_loss=0.2314 (+0.0000), widths=(3, 2, 2)
+[GRO] Epoch 2, layer=1, widths=(3, 3, 2), parameters=38
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.3594, eps=0.9332, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.5755, eps=0.8178, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.6536, eps=0.7569, direction_certified=False, rate=n/a
+[NONLINEAR-BOTTLENECK] Epoch 3, widths=(3, 3, 2) L0=6.3265e-06 L1=2.9041e-06 L2=9.2591e-02
+  function-preserving growth: drift=0.000e+00, train_loss=0.2323
+[NONLINEAR-GRO] Epoch 3: layer=2, widths (3, 3, 2) -> (3, 3, 3), max_drift=0.000e+00
+[NONLINEAR] Epoch 3, accepted=False, eps=0.7569, train_loss=0.2323, validation_loss=0.2512, test_loss=0.2314 (+0.0000), widths=(3, 3, 2)
+[GRO] Epoch 3, layer=2, widths=(3, 3, 3), parameters=43
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.4564, eps=0.8897, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.6381, eps=0.7700, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.6979, eps=0.7162, direction_certified=False, rate=n/a
+[NONLINEAR-BOTTLENECK] Epoch 4, widths=(3, 3, 3) L0=6.3265e-06 L1=2.9041e-06 L2=2.6390e-05
+  function-preserving growth: drift=0.000e+00, train_loss=0.2323
+[NONLINEAR-GRO] Epoch 4: layer=2, widths (3, 3, 3) -> (3, 3, 4), max_drift=0.000e+00
+[NONLINEAR] Epoch 4, accepted=False, eps=0.7162, train_loss=0.2323, validation_loss=0.2512, test_loss=0.2314 (+0.0000), widths=(3, 3, 3)
+[GRO] Epoch 4, layer=2, widths=(3, 3, 4), parameters=48
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.4690, eps=0.8832, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.6365, eps=0.7713, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.6901, eps=0.7237, direction_certified=False, rate=n/a
+[NONLINEAR-BOTTLENECK] Epoch 5, widths=(3, 3, 4) L0=6.3265e-06 L1=2.9041e-06 L2=1.9561e-05
+  function-preserving growth: drift=1.490e-08, train_loss=0.2323
+[NONLINEAR-GRO] Epoch 5: layer=2, widths (3, 3, 4) -> (3, 3, 5), max_drift=1.490e-08
+[NONLINEAR] Epoch 5, accepted=False, eps=0.7237, train_loss=0.2323, validation_loss=0.2512, test_loss=0.2314 (+0.0000), widths=(3, 3, 4)
+[GRO] Epoch 5, layer=2, widths=(3, 3, 5), parameters=53
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.4811, eps=0.8767, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.6342, eps=0.7732, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.6844, eps=0.7291, direction_certified=False, rate=n/a
+[NONLINEAR-BOTTLENECK] Epoch 6, widths=(3, 3, 5) L0=6.3265e-06 L1=2.9041e-06 L2=2.5296e-05
+  function-preserving growth: drift=0.000e+00, train_loss=0.2323
+[NONLINEAR-GRO] Epoch 6: layer=2, widths (3, 3, 5) -> (3, 3, 6), max_drift=0.000e+00
+[NONLINEAR] Epoch 6, accepted=False, eps=0.7291, train_loss=0.2323, validation_loss=0.2512, test_loss=0.2314 (-0.0000), widths=(3, 3, 5)
+[GRO] Epoch 6, layer=2, widths=(3, 3, 6), parameters=58
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.4941, eps=0.8694, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.6325, eps=0.7746, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.6840, eps=0.7295, direction_certified=False, rate=n/a
+[NONLINEAR-BOTTLENECK] Epoch 7, widths=(3, 3, 6) L0=6.3265e-06 L1=2.9041e-06 L2=2.7604e-05
+  function-preserving growth: drift=0.000e+00, train_loss=0.2323
+[NONLINEAR-GRO] Epoch 7: layer=2, widths (3, 3, 6) -> (3, 3, 7), max_drift=0.000e+00
+[NONLINEAR] Epoch 7, accepted=False, eps=0.7295, train_loss=0.2323, validation_loss=0.2512, test_loss=0.2314 (+0.0000), widths=(3, 3, 6)
+[GRO] Epoch 7, layer=2, widths=(3, 3, 7), parameters=63
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.5048, eps=0.8632, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.6312, eps=0.7756, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.6836, eps=0.7298, direction_certified=False, rate=n/a
+[NONLINEAR-BOTTLENECK] Epoch 8, widths=(3, 3, 7) L0=6.3265e-06 L1=2.9041e-06 L2=3.0288e-05
+  function-preserving growth: drift=0.000e+00, train_loss=0.2323
+[NONLINEAR-GRO] Epoch 8: layer=2, widths (3, 3, 7) -> (3, 3, 8), max_drift=0.000e+00
+[NONLINEAR] Epoch 8, accepted=False, eps=0.7298, train_loss=0.2323, validation_loss=0.2512, test_loss=0.2314 (+0.0000), widths=(3, 3, 7)
+[GRO] Epoch 8, layer=2, widths=(3, 3, 8), parameters=68
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.5165, eps=0.8563, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.6297, eps=0.7769, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.6836, eps=0.7299, direction_certified=False, rate=n/a
+[NONLINEAR-BOTTLENECK] Epoch 9, widths=(3, 3, 8) L0=6.3265e-06 L1=2.9041e-06 L2=3.1969e-05
+  function-preserving growth: drift=0.000e+00, train_loss=0.2323
+[NONLINEAR-GRO] Epoch 9: layer=2, widths (3, 3, 8) -> (3, 3, 9), max_drift=0.000e+00
+[NONLINEAR] Epoch 9, accepted=False, eps=0.7299, train_loss=0.2323, validation_loss=0.2512, test_loss=0.2314 (+0.0000), widths=(3, 3, 8)
+[GRO] Epoch 9, layer=2, widths=(3, 3, 9), parameters=73
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.5258, eps=0.8506, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.6281, eps=0.7781, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.6798, eps=0.7334, direction_certified=False, rate=n/a
+[NONLINEAR-BOTTLENECK] Epoch 10, widths=(3, 3, 9) L0=6.3265e-06 L1=2.9041e-06 L2=2.4647e-05
+  function-preserving growth: drift=0.000e+00, train_loss=0.2323
+[NONLINEAR-GRO] Epoch 10: layer=2, widths (3, 3, 9) -> (3, 3, 10), max_drift=0.000e+00
+[NONLINEAR] Epoch 10, accepted=False, eps=0.7334, train_loss=0.2323, validation_loss=0.2512, test_loss=0.2314 (+0.0000), widths=(3, 3, 9)
+[GRO] Epoch 10, layer=2, widths=(3, 3, 10), parameters=78
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.5337, eps=0.8457, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.6267, eps=0.7792, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.6756, eps=0.7372, direction_certified=False, rate=n/a
+[NONLINEAR-BOTTLENECK] Epoch 11, widths=(3, 3, 10) L0=6.3265e-06 L1=2.9041e-06 L2=1.7398e-05
+  function-preserving growth: drift=0.000e+00, train_loss=0.2323
+[NONLINEAR-GRO] Epoch 11: layer=2, widths (3, 3, 10) -> (3, 3, 11), max_drift=0.000e+00
+[NONLINEAR] Epoch 11, accepted=False, eps=0.7372, train_loss=0.2323, validation_loss=0.2512, test_loss=0.2314 (+0.0000), widths=(3, 3, 10)
+[GRO] Epoch 11, layer=2, widths=(3, 3, 11), parameters=83
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.5405, eps=0.8414, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.6253, eps=0.7804, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.6742, eps=0.7385, direction_certified=False, rate=n/a
+[NONLINEAR-BOTTLENECK] Epoch 12, widths=(3, 3, 11) L0=6.3265e-06 L1=2.9041e-06 L2=1.4953e-05
+  function-preserving growth: drift=0.000e+00, train_loss=0.2323
+[NONLINEAR-GRO] Epoch 12: layer=2, widths (3, 3, 11) -> (3, 3, 12), max_drift=0.000e+00
+[NONLINEAR] Epoch 12, accepted=False, eps=0.7385, train_loss=0.2323, validation_loss=0.2512, test_loss=0.2314 (+0.0000), widths=(3, 3, 11)
+[GRO] Epoch 12, layer=2, widths=(3, 3, 12), parameters=88
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.5463, eps=0.8376, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.6246, eps=0.7809, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.6712, eps=0.7413, direction_certified=False, rate=n/a
+[NONLINEAR-BOTTLENECK] Epoch 13, widths=(3, 3, 12) L0=6.3265e-06 L1=2.9041e-06 L2=1.7155e-05
+  function-preserving growth: drift=0.000e+00, train_loss=0.2323
+[NONLINEAR-GRO] Epoch 13: layer=2, widths (3, 3, 12) -> (3, 3, 13), max_drift=0.000e+00
+[NONLINEAR] Epoch 13, accepted=False, eps=0.7413, train_loss=0.2323, validation_loss=0.2512, test_loss=0.2314 (+0.0000), widths=(3, 3, 12)
+[GRO] Epoch 13, layer=2, widths=(3, 3, 13), parameters=93
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.5514, eps=0.8343, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.6239, eps=0.7815, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.6696, eps=0.7428, direction_certified=False, rate=n/a
+[NONLINEAR-BOTTLENECK] Epoch 14, widths=(3, 3, 13) L0=6.3265e-06 L1=2.9041e-06 L2=9.3565e-06
+  function-preserving growth: drift=0.000e+00, train_loss=0.2323
+[NONLINEAR-GRO] Epoch 14: layer=2, widths (3, 3, 13) -> (3, 3, 14), max_drift=0.000e+00
+[NONLINEAR] Epoch 14, accepted=False, eps=0.7428, train_loss=0.2323, validation_loss=0.2512, test_loss=0.2314 (+0.0000), widths=(3, 3, 13)
+[GRO] Epoch 14, layer=2, widths=(3, 3, 14), parameters=98
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.5553, eps=0.8317, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.6232, eps=0.7820, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.6699, eps=0.7425, direction_certified=False, rate=n/a
+[NONLINEAR-BOTTLENECK] Epoch 15, widths=(3, 3, 14) L0=6.3265e-06 L1=2.9041e-06 L2=8.3007e-06
+  function-preserving growth: drift=0.000e+00, train_loss=0.2323
+[NONLINEAR-GRO] Epoch 15: layer=2, widths (3, 3, 14) -> (3, 3, 15), max_drift=0.000e+00
+[NONLINEAR] Epoch 15, accepted=False, eps=0.7425, train_loss=0.2323, validation_loss=0.2512, test_loss=0.2314 (+0.0000), widths=(3, 3, 14)
+[GRO] Epoch 15, layer=2, widths=(3, 3, 15), parameters=103
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.5587, eps=0.8293, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.6225, eps=0.7826, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.6689, eps=0.7433, direction_certified=False, rate=n/a
+[NONLINEAR-BOTTLENECK] Epoch 16, widths=(3, 3, 15) L0=6.3265e-06 L1=2.9041e-06 L2=8.7125e-06
+  function-preserving growth: drift=0.000e+00, train_loss=0.2323
+[NONLINEAR-GRO] Epoch 16: layer=2, widths (3, 3, 15) -> (3, 3, 16), max_drift=0.000e+00
+[NONLINEAR] Epoch 16, accepted=False, eps=0.7433, train_loss=0.2323, validation_loss=0.2512, test_loss=0.2314 (+0.0000), widths=(3, 3, 15)
+[GRO] Epoch 16, layer=2, widths=(3, 3, 16), parameters=108
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.5612, eps=0.8277, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.6220, eps=0.7830, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.6694, eps=0.7429, direction_certified=False, rate=n/a
+[NONLINEAR-BOTTLENECK] Epoch 17, widths=(3, 3, 16) L0=6.3265e-06 L1=2.9041e-06 L2=1.2597e-05
+  function-preserving growth: drift=0.000e+00, train_loss=0.2323
+[NONLINEAR-GRO] Epoch 17: layer=2, widths (3, 3, 16) -> (3, 3, 17), max_drift=0.000e+00
+[NONLINEAR] Epoch 17, accepted=False, eps=0.7429, train_loss=0.2323, validation_loss=0.2512, test_loss=0.2314 (+0.0000), widths=(3, 3, 16)
+[GRO] Epoch 17, layer=2, widths=(3, 3, 17), parameters=113
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.5619, eps=0.8272, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.6218, eps=0.7832, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.6697, eps=0.7426, direction_certified=False, rate=n/a
+[NONLINEAR-BOTTLENECK] Epoch 18, widths=(3, 3, 17) L0=6.3265e-06 L1=2.9041e-06 L2=7.5006e-06
+  function-preserving growth: drift=0.000e+00, train_loss=0.2323
+[NONLINEAR-GRO] Epoch 18: layer=2, widths (3, 3, 17) -> (3, 3, 18), max_drift=0.000e+00
+[NONLINEAR] Epoch 18, accepted=False, eps=0.7426, train_loss=0.2323, validation_loss=0.2512, test_loss=0.2314 (+0.0000), widths=(3, 3, 17)
+[GRO] Epoch 18, layer=2, widths=(3, 3, 18), parameters=118
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.5634, eps=0.8262, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.6213, eps=0.7836, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.6709, eps=0.7415, direction_certified=False, rate=n/a
+[NONLINEAR-BOTTLENECK] Epoch 19, widths=(3, 3, 18) L0=6.3265e-06 L1=2.9041e-06 L2=4.3939e-06
+  function-preserving growth: drift=0.000e+00, train_loss=0.2323
+[NONLINEAR-GRO] Epoch 19: layer=0, widths (3, 3, 18) -> (4, 3, 18), max_drift=0.000e+00
+[NONLINEAR] Epoch 19, accepted=False, eps=0.7415, train_loss=0.2323, validation_loss=0.2512, test_loss=0.2314 (+0.0000), widths=(3, 3, 18)
+[GRO] Epoch 19, layer=0, widths=(4, 3, 18), parameters=126
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.5638, eps=0.8259, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.6225, eps=0.7826, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.6762, eps=0.7367, direction_certified=False, rate=n/a
+[NONLINEAR-BOTTLENECK] Epoch 20, widths=(4, 3, 18) L0=1.4492e-05 L1=6.6224e-04 L2=4.3939e-06
+  function-preserving growth: drift=0.000e+00, train_loss=0.2323
+[NONLINEAR-GRO] Epoch 20: layer=1, widths (4, 3, 18) -> (4, 4, 18), max_drift=0.000e+00
+[NONLINEAR] Epoch 20, accepted=False, eps=0.7367, train_loss=0.2323, validation_loss=0.2512, test_loss=0.2314 (+0.0000), widths=(4, 3, 18)
+[GRO] Epoch 20, layer=1, widths=(4, 4, 18), parameters=149
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.5813, eps=0.8137, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.6457, eps=0.7636, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.6946, eps=0.7194, direction_certified=False, rate=n/a
+[NONLINEAR-BOTTLENECK] Epoch 21, widths=(4, 4, 18) L0=1.4492e-05 L1=2.7164e-06 L2=4.0299e-03
+  function-preserving growth: drift=0.000e+00, train_loss=0.2323
+[NONLINEAR-GRO] Epoch 21: layer=2, widths (4, 4, 18) -> (4, 4, 19), max_drift=0.000e+00
+[NONLINEAR] Epoch 21, accepted=False, eps=0.7194, train_loss=0.2323, validation_loss=0.2512, test_loss=0.2314 (+0.0000), widths=(4, 4, 18)
+[GRO] Epoch 21, layer=2, widths=(4, 4, 19), parameters=155
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.5833, eps=0.8123, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.6480, eps=0.7616, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.7073, eps=0.7069, direction_certified=False, rate=n/awandb: updating run metadata; uploading artifact run-7rd4ylja-growthevents_table-9HhP2A; uploading history steps 61-76, summary, console lines 172-209; uploading artifact run-7rd4ylja-growthline_search_table-aeJ9Hg
+wandb: uploading artifact run-7rd4ylja-growthevents_table-9HhP2A; uploading artifact run-7rd4ylja-growthline_search_table-aeJ9Hg
+wandb: uploading artifact run-7rd4ylja-growthline_search_table-aeJ9Hg
+wandb: uploading wandb-summary.json; uploading config.yaml; uploading media/table/growth/events_table_76_965d93b367a94c56c407.table.json; uploading media/table/growth/line_search_table_77_9c74376ecbb6cfeeba4b.table.json; uploading output.log
+wandb: uploading history steps 77-77, summary
+wandb: 
+wandb: Run history:
+wandb:                                    epoch ▁▁▁▁▂▂▂▂▂▂▃▃▃▄▄▄▄▄▄▅▅▅▅▅▅▆▆▆▇▇▇▇▇▇▇█████
+wandb:                     fgd/lr_search_trials ▁█▁█▁▁█▁█▁█▁█▁██▁█▁██▁██▁▁█▁█▁▁██▁██▁█▁▁
+wandb:        fgd/nonlinear_adamw_learning_rate ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb: fgd/nonlinear_candidate_training_seconds ▁▇▇▇▆▇▇▇▇▇█▇▇▇▇▇█▇▇▇▇▇██▇▇▇▆▆▆▆▆▆▆▆▆▆▆▆▆
+wandb:      fgd/nonlinear_certification_seconds ▁▇▇▆▆▇▆▆▆▆█▇▇▇▇▇▇▇▇▇█▇▇▇▇▆▅▅▆▆▆▆▆▆▅▅▅▅▅▇
+wandb:                     fgd/nonlinear_cosine ▁▁▂▂▁▆▆▅▅▅▅▅▅▅▅▄▄▄▃▃▃▃▃▃▃▃▃▃▃▃▄▄▆▆▇██▇▇▇
+wandb:   fgd/nonlinear_functional_learning_rate ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:                fgd/nonlinear_inner_steps ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:             fgd/nonlinear_relative_error ██▇██▃▄▄▄▅▅▅▅▅▅▆▆▆▆▆▆▆▆▆▆▆▆▆▆▆▅▅▃▃▂▁▁▃▃▂
+wandb:               fgd/nonlinear_weight_decay ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+wandb:                                      +41 ...
+wandb: 
+wandb: Run summary:
+wandb:                                    epoch 25
+wandb:                          event/step_type GRO
+wandb:                   fgd/approximation_kind nonlinear
+wandb:                   fgd/candidate_accepted False
+wandb:  fgd/learning_rate_clipped_by_validation False
+wandb:         fgd/learning_rate_interval_valid False
+wandb:                     fgd/lr_search_trials 0
+wandb:        fgd/nonlinear_adamw_learning_rate 0.003
+wandb: fgd/nonlinear_candidate_training_seconds 2.62073
+wandb:          fgd/nonlinear_certificate_valid False
+wandb:                                      +59 ...
+wandb: 
+wandb: 🚀 View run nonlinear-n1024-2x2x2-model-seed-1 at: https://wandb.ai/TAU-Frugal/stable-tiny/runs/7rd4ylja
+wandb: ⭐️ View project at: https://wandb.ai/TAU-Frugal/stable-tiny
+wandb: Synced 5 W&B file(s), 2 media file(s), 4 artifact file(s) and 0 other file(s)
+wandb: Find logs at: results/wandb/run-20260804_145525-7rd4ylja/logs
+
+[NONLINEAR-BOTTLENECK] Epoch 22, widths=(4, 4, 19) L0=1.4492e-05 L1=2.7164e-06 L2=1.2061e-05
+  function-preserving growth: drift=0.000e+00, train_loss=0.2323
+[NONLINEAR-GRO] Epoch 22: layer=0, widths (4, 4, 19) -> (5, 4, 19), max_drift=0.000e+00
+[NONLINEAR] Epoch 22, accepted=False, eps=0.7069, train_loss=0.2323, validation_loss=0.2512, test_loss=0.2314 (+0.0000), widths=(4, 4, 19)
+[GRO] Epoch 22, layer=0, widths=(5, 4, 19), parameters=164
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.5834, eps=0.8122, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.6480, eps=0.7616, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.7123, eps=0.7019, direction_certified=False, rate=n/a
+[NONLINEAR-BOTTLENECK] Epoch 23, widths=(5, 4, 19) L0=1.5155e-05 L1=5.9985e-05 L2=1.2061e-05
+  function-preserving growth: drift=0.000e+00, train_loss=0.2323
+[NONLINEAR-GRO] Epoch 23: layer=1, widths (5, 4, 19) -> (5, 5, 19), max_drift=0.000e+00
+[NONLINEAR] Epoch 23, accepted=False, eps=0.7019, train_loss=0.2323, validation_loss=0.2512, test_loss=0.2314 (+0.0000), widths=(5, 4, 19)
+[GRO] Epoch 23, layer=1, widths=(5, 5, 19), parameters=189
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.5810, eps=0.8139, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.6472, eps=0.7623, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.7001, eps=0.7140, direction_certified=False, rate=n/a
+[NONLINEAR-BOTTLENECK] Epoch 24, widths=(5, 5, 19) L0=1.5155e-05 L1=9.4540e-06 L2=5.0959e-04
+  function-preserving growth: drift=0.000e+00, train_loss=0.2323
+[NONLINEAR-GRO] Epoch 24: layer=2, widths (5, 5, 19) -> (5, 5, 20), max_drift=0.000e+00
+[NONLINEAR] Epoch 24, accepted=False, eps=0.7140, train_loss=0.2323, validation_loss=0.2512, test_loss=0.2314 (+0.0000), widths=(5, 5, 19)
+[GRO] Epoch 24, layer=2, widths=(5, 5, 20), parameters=196
+[NONLINEAR] eta_f=0.5, inner_steps=16, cos=0.5803, eps=0.8144, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=64, cos=0.6469, eps=0.7626, direction_certified=False, rate=n/a
+[NONLINEAR] eta_f=0.5, inner_steps=256, cos=0.7043, eps=0.7099, direction_certified=False, rate=n/a
+[NONLINEAR-BOTTLENECK] Epoch 25, widths=(5, 5, 20) L0=1.5155e-05 L1=9.4540e-06 L2=2.0888e-04
+  function-preserving growth: drift=0.000e+00, train_loss=0.2323
+[NONLINEAR-GRO] Epoch 25: layer=2, widths (5, 5, 20) -> (5, 5, 21), max_drift=0.000e+00
+[NONLINEAR] Epoch 25, accepted=False, eps=0.7099, train_loss=0.2323, validation_loss=0.2512, test_loss=0.2314 (+0.0000), widths=(5, 5, 20)
+[GRO] Epoch 25, layer=2, widths=(5, 5, 21), parameters=203
+Saved history: /home/santiago/StageFrugal/stable-tiny-nonlinear/results/nonlinear_n1024_3seeds/seed_1/nonlinear-n1024-2x2x2-model-seed-1_history.json

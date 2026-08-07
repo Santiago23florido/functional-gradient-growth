@@ -202,6 +202,20 @@ def exact_relative_error(
     if system is None:
         return float("inf")
 
+    if system.factors is not None and config.projection_damping_auto:
+        # Factored system: the spectrum arrives as (W, V) with J = W V^T, and
+        # svd(J) = (A, S, VB) follows from an SVD of the (rows, k) factor
+        # alone. Same quantity, same least-damping point -- the parameter
+        # dimension simply never enters. MEASURED against the materialised J:
+        # singular values to 5.1e-08, eps to 1.7e-04. Only the matrix-free
+        # family sets factors, so the default path never reaches this.
+        from fgdlib.search.damping import DAMPING_BRACKET
+        from fgdlib.search.mffactored import factored_minimal_relative_error
+
+        return factored_minimal_relative_error(
+            system, config, DAMPING_BRACKET[0]
+        )
+
     if config.projection_damping_auto:
         # Imported here: damping.py imports from tangent.py, and certify.py
         # is imported by the pipeline before either -- a module-level import

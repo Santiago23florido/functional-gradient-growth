@@ -549,3 +549,254 @@ def select_projection_damping(
         candidates=tuple(candidates),
         tangent_system=system,
     )
+
+
+@profiled("select_projection_damping_factored_seconds")
+def select_projection_damping_factored(
+    model,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    config: FGDApproxConfig,
+    *,
+    system: ExactTangentSystem | None = None,
+) -> DampingChoice | None:
+    """``select_projection_damping`` reading the FACTORS instead of ``J``.
+
+    A deliberate second copy. The original is untouched and keeps serving
+    ``family_order: [tangent]``; only the spectrum source and the validation
+    differ, and both differences are marked inline below. Original docstring:
+
+    Return the damping maximising Lemma 3.5's guaranteed decrease.
+
+    ``None`` when no rung certifies AND realises a step. That is a real
+    outcome rather than a fallback: it says this model admits no
+    regularisation at which the tangent direction is both a good enough
+    approximation and a step the lemma actually describes, so the structure
+    has to change.
+    """
+    # Reached only with a factored system, which only the matrix-free family
+    # produces. No validation call: the system is not built from this model's
+    # dense Jacobian, it is built from its Krylov factors.
+    if system is None or system.factors is None:
+        return None
+
+    # float32 under the fast flag: the fan ranks rungs and the chosen step is
+    # realised by the self-correcting integration, so the precision loss is
+    # absorbed. Verified end to end (test 0.931 either way).
+    work_dtype = (
+        torch.float32
+        if getattr(config, "projection_fast_factorization", False)
+        else torch.float64
+    )
+    target = system.target.reshape(-1).to(dtype=work_dtype)
+    if target.numel() == 0:
+        return None
+
+    # The damping fan needs the singular values themselves, so this keeps a
+    # genuine SVD (eigh of the Gram would square the condition number and
+    # corrupt the spectrum) -- in the work_dtype chosen above.
+    # THE ONLY SUBSTANTIVE DIFFERENCE. J = W V^T with V orthonormal columns,
+    # so with W = A S B^T we get svd(J) = (A, S, VB) EXACTLY, from an SVD of
+    # the (rows, k) factor. MEASURED against svd of the materialised J:
+    # 5.1e-08 on the singular values. No (N K, P) object is ever held, and the
+    # O(P^2) Gram is not built -- which is the point at MNIST width.
+    from fgdlib.search.mffactored import factored_spectrum
+
+    with timed("damping_factorization_seconds"):
+        spectrum = factored_spectrum(system)
+    if spectrum is None:
+        return None
+    left, singular_values, right_columns = spectrum
+    left = left.to(dtype=work_dtype)
+    singular_values = singular_values.to(dtype=work_dtype)
+    # svd() returns V^T; factored_spectrum returns V. One transpose here so
+    # every line below reads exactly as it does in the original.
+    right = right_columns.to(dtype=work_dtype).t()
+    if singular_values.numel() == 0:
+        return None
+    scale = float(singular_values.max()) ** 2
+    if not scale > 0.0:
+        return None
+    coefficients = left.t() @ target
+    n_observations = int(target.numel())
+    target_sq_norm = float(target.square().sum())
+
+    threshold = min(config.rel_error_threshold, 0.5)
+    objective = getattr(config, "projection_damping_objective", "descent")
+
+    def solve(relative_damping: float):
+        """Re-weight the factorisation -- no new Jacobian, no new SVD."""
+        absolute = relative_damping * scale
+        denominator = singular_values.square() + absolute
+        filters = singular_values.square() / denominator  # sigma^2/(sigma^2+lambda)
+        approximation = left @ (filters * coefficients)
+        flat_update = right.t() @ (singular_values / denominator * coefficients)
+        return absolute, approximation, flat_update, filters
+
+    def gcv_at(
+        filters: torch.Tensor, approximation: torch.Tensor
+    ) -> tuple[float, float]:
+        """Return (df, GCV) for a rung, from its spectral filters.
+
+        df = tr H_lambda = sum sigma_i^2/(sigma_i^2 + lambda) is the sum of
+        the filter values -- H_lambda's eigenvalues -- and the GCV residual
+        ||r - H_lambda r|| is exact from the same quantities, no extra solve.
+        GCV is +inf once df >= N: that is the interpolating regime, refused
+        by construction rather than by a threshold.
+        """
+        degrees = float(filters.sum())
+        residual_sq = float((target - approximation).square().sum())
+        gap = 1.0 - degrees / n_observations
+        if gap <= 0.0:
+            return degrees, float("inf")
+        return degrees, (residual_sq / n_observations) / (gap * gap)
+
+    def relative_error_at(relative_damping: float) -> float:
+        _, approximation, flat_update, _ = solve(relative_damping)
+        if not torch.isfinite(flat_update).all():
+            return float("inf")
+        stats = _output_relative_error_from_tensors(
+            approximation=approximation.to(system.target.dtype),
+            target=system.target.reshape(-1),
+            eps=config.eps,
+        )
+        value = stats.output_error.relative_error
+        return float(value) if value is not None else float("inf")
+
+    # Bisect for rho*, the largest rho that still certifies. eps is increasing
+    # in rho, so the certified set is the interval below it.
+    low, high = DAMPING_BRACKET
+    if not relative_error_at(low) < threshold:
+        # Even the least regularised solve fails the criterion: no damping
+        # rescues an inadequate tangent space, which is the grow signal.
+        return None
+    if relative_error_at(high) < threshold:
+        boundary = high
+    else:
+        for _ in range(DAMPING_BISECTION_STEPS):
+            middle = (low * high) ** 0.5  # geometric: rho spans decades
+            if relative_error_at(middle) < threshold:
+                low = middle
+            else:
+                high = middle
+        boundary = low
+
+    candidates: list[DampingCandidate] = []
+    best: tuple[DampingCandidate, tuple[torch.Tensor, ...]] | None = None
+
+    def is_better(
+        candidate: DampingCandidate, incumbent: DampingCandidate | None
+    ) -> bool:
+        """Rank certified, realisable rungs by the configured objective.
+
+        "descent": maximise eta * ||g||^2, the decrease Lemma 3.5 guarantees.
+        "gcv":     minimise the leave-one-out risk estimate.
+        Both only ever compare rungs that certify AND realise a step; a rung
+        that does neither has score 0 / +inf and never wins.
+        """
+        if incumbent is None:
+            return True
+        if objective == "gcv":
+            return candidate.gcv < incumbent.gcv
+        return candidate.guaranteed_decrease > incumbent.guaranteed_decrease
+
+    for index in range(DAMPING_FAN_STEPS + 1):
+        relative_damping = boundary * (DAMPING_FAN_RATIO**index)
+        absolute_damping, approximation, flat_update, filters = solve(relative_damping)
+        if not torch.isfinite(flat_update).all():
+            continue
+
+        stats = _output_relative_error_from_tensors(
+            approximation=approximation.to(system.target.dtype),
+            target=system.target.reshape(-1),
+            eps=config.eps,
+        )
+        relative_error = stats.output_error.relative_error
+        update_norm = float(torch.linalg.vector_norm(flat_update))
+        approximation_norm = stats.output_error.approximation_norm
+        degrees, gcv = gcv_at(filters, approximation)
+
+        certified_rate: float | None = None
+        learning_rate: float | None = None
+        updates = _unflatten_parameter_update(
+            flat_update.to(system.target.dtype), system.parameters
+        )
+        if relative_error is not None and relative_error < threshold:
+            upper_bound = theoretical_learning_rate_upper_bound(relative_error, config)
+            if upper_bound is not None:
+                # Match the rate the STEP will actually take. eta_bar is where
+                # Lemma 3.5's guaranteed decrease vanishes, so the decrease
+                # peaks at eta_bar/2 (the interval midpoint); certify_optimal_
+                # rate takes that, otherwise theory_lr_safety of the edge.
+                fraction = (
+                    0.5
+                    if getattr(config, "certify_optimal_rate", False)
+                    else config.theory_lr_safety
+                )
+                certified_rate = fraction * upper_bound
+                if getattr(config, "certify_realize_path", False):
+                    # Realisability is provided by the integrated path, which
+                    # reaches the certified functional step in many short
+                    # sub-steps. Gating here on the SINGLE-JUMP linearisation
+                    # control would reject rungs the path handles fine, and
+                    # MEASURED it did exactly that: after two steps every
+                    # certified rung failed the single-jump check, select
+                    # returned None, growth saw eps < 1/2 so did not fire, and
+                    # the run froze from epoch 2 to 400. The path is the
+                    # realisability mechanism; do not double-gate.
+                    learning_rate = certified_rate
+                    # Matrix-free-only belt around the transactional guard.
+                    # ``certified_rate`` remains the proposal licensed by the
+                    # theorem; ``learning_rate`` is the rate the realization
+                    # is allowed to attempt. None preserves this path exactly.
+                    functional_cap = getattr(
+                        config, "certify_functional_lr_cap", None
+                    )
+                    if functional_cap is not None:
+                        learning_rate = min(learning_rate, float(functional_cap))
+                elif config.certify_linearization_tolerance is None:
+                    learning_rate = certified_rate
+                else:
+                    learning_rate = certified_linear_learning_rate(
+                        model, x, updates, certified_rate, config
+                    ).learning_rate
+
+        # Lemma 3.5's own guaranteed decrease is proportional to
+        # eta * ||g||^2, so that -- not eps, and not the rate alone -- is what
+        # the descent objective ranks by. A tiny eps bought with an
+        # unrealisable step scores zero, which is exactly right.
+        decrease = (
+            learning_rate * approximation_norm**2 if learning_rate is not None else 0.0
+        )
+        candidate = DampingCandidate(
+            relative_damping=relative_damping,
+            absolute_damping=absolute_damping,
+            relative_error=(
+                float(relative_error) if relative_error is not None else float("inf")
+            ),
+            update_norm=update_norm,
+            approximation_norm=approximation_norm,
+            certified_learning_rate=certified_rate,
+            learning_rate=learning_rate,
+            guaranteed_decrease=decrease,
+            effective_dof=degrees,
+            gcv=gcv,
+        )
+        candidates.append(candidate)
+        # A rung only competes if it both certifies and realises a step --
+        # the certificate is never traded away regardless of objective.
+        if (
+            learning_rate is not None
+            and decrease > 0.0
+            and is_better(candidate, best[0] if best else None)
+        ):
+            best = (candidate, updates)
+
+    if best is None:
+        return None
+    return DampingChoice(
+        candidate=best[0],
+        parameter_updates=best[1],
+        candidates=tuple(candidates),
+        tangent_system=system,
+    )

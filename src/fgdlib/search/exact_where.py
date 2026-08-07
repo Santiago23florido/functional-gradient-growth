@@ -266,8 +266,23 @@ def stream_shared_candidate_statistics(
 
     base_jacobian = system.jacobian
     base_is_materialized = base_jacobian.shape[0] == full_target.numel()
-    gram = base_jacobian.to(torch.float64).t() @ base_jacobian.to(torch.float64)
-    rhs = base_jacobian.to(torch.float64).t() @ system.target.to(torch.float64)
+    if system.factors is not None:
+        # Factored system: J^T J = V (W^T W) V^T, which is O(P^2 k) compute
+        # against O(NK P^2) for the product below. This is a COMPUTE win only
+        # -- the Gram is still a P x P object, because scoring candidate
+        # structures compares Grams rather than solves, so the dense form is
+        # genuinely needed here. Every other consumer avoids it entirely.
+        from fgdlib.search.mffactored import factored_gram
+
+        left_factor, right_factor = system.factors
+        gram = factored_gram(system)
+        rhs = right_factor.to(torch.float64) @ (
+            left_factor.to(torch.float64).t()
+            @ system.target.reshape(-1).to(torch.float64)
+        )
+    else:
+        gram = base_jacobian.to(torch.float64).t() @ base_jacobian.to(torch.float64)
+        rhs = base_jacobian.to(torch.float64).t() @ system.target.to(torch.float64)
     target_sq_norm = (system.target.to(torch.float64) ** 2).sum()
 
     cross = [
