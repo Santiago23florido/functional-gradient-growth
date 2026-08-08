@@ -1,0 +1,648 @@
+# MNIST depth/width sweep. Derived from configs/fgd/mnist_matrix_free.yaml;
+# ONLY these differ: number_hidden_layers 2, hidden_size 2,
+# mnist_train_samples 24000, max_total_parameters 60000,
+# epochs 150.
+#
+# The budget and the probe are COUPLED: certify_probe_kappa 4 with K = 10
+# outputs needs NK = 4P rows, so P = 60000 demands 240000 rows
+# = 24000 images, which is exactly mnist_train_samples. Raising
+# one without the other puts eps below the interpolation floor (abe380a).
+#
+# The budget-free stopping criterion is OFF here on purpose: these six runs
+# ask what shape the method reaches under a COMMON parameter ceiling, so the
+# ceiling has to be the only thing that ends growth. Add
+#   growth_bottleneck_crossfold_folds: 5
+# under fgd_approx for the paired sweep (see docs/budget_free_stopping.md).
+# MNIST with the same family ladder as mnist_streaming.yaml, replacing only
+# the dense tangent construction by the matrix-free factored route and its
+# opt-in endpoint transaction. The exact MNIST config remains unchanged.
+#
+# The matrix-free path never materialises J or the P x P streamed Gram. Its
+# exact dual is O((N*K)^2), so the probe is deliberately 2 batches:
+# 2 * 64 * 10 = 1280 output coordinates, the documented operating scale for
+# the dual implementation. The 30,000-parameter architecture budget is kept
+# from mnist_streaming.yaml. All other modelling/growth settings are copied
+# from that config; the explicit differences are pinned by tests.
+run:
+  name: mnist_family_ladder_matrix_free
+  results_dir: results
+  save_plot: false
+  show_plot: false
+
+data:
+  kind: mnist
+  in_features: 784
+  out_features: 10
+  data_dir:
+  batch_size: 64
+  train_seed: 0
+  validation_seed: 2
+  test_seed: 1
+  mnist_train_samples: 24000
+  mnist_validation_samples: 2000
+  mnist_test_samples: 2000
+model:
+  hidden_size: 2
+  number_hidden_layers: 2
+  model_seed: 0
+
+training:
+  method: fgd_approx
+  epochs: 150
+  accuracy_tolerance: 0.1
+  gradient_clip_norm:
+  log_every: 1
+  device: auto
+
+optimizer:
+  name: sgd
+  learning_rate: 0.01
+  momentum: 0.0
+  weight_decay: 0.0
+  nesterov: false
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+
+lr_scheduler:
+  name: cosineannealing
+  t_max: 50
+  eta_min: 0.0
+  restart_on_growth: true
+
+fgd_approx:
+  # The STEP certificate, back at 1/2. At 0.3 it was also the growth goal, and
+  # the two jobs are incompatible: every step site reads Lemma 3.5 as eps <
+  # min(rel_error_threshold, 1/2), so with eps at 0.457 no damping certified,
+  # no rate was admissible, and lr was 0 in every epoch -- the tangent step was
+  # dead by construction. What kept moving the model was the family ladder at
+  # functional_lr 1.0, i.e. full functional steps with no size control, which
+  # is why accuracy oscillated 0.33 <-> 0.74 while the functional loss barely
+  # moved (0.2393 -> 0.2382) and growth ran away to P ~ 31000 without finishing
+  # one outer step in 39 minutes.
+  rel_error_threshold: 0.5
+  # The GROWTH goal keeps the 0.3 that was wanted. The loop now aspires to it
+  # while the step commits at 0.457, and stops chasing it when a growth stops
+  # paying: MEASURED here, eps falls 0.0007 per growth against a gap of 0.157,
+  # a ratio of 0.0045 against the certify_growth_min_gain floor of 0.1 -- 22x
+  # below, so the cut is not a close call. (N1024, for contrast, gains 0.00707
+  # on a gap of 0.0267, ratio 0.265, and keeps growing.)
+  # UNIFICADO con los otros dos configs: el bucle persigue el mismo
+  # certificado que certifica el paso, min(rel_error_threshold, 0.5).
+  # Antes 0.3 solo aqui. SIN RE-MEDIR en MNIST.
+  certify_growth_target:
+  # 0 disables the eps-fraction refusal: on MNIST every growth buys
+  # ~1e-3 of eps, so any fraction of the gap rejects all of them and
+  # nothing ever grows. The cost is bounded by max_total_parameters
+  # instead, which is the quantity actually at stake.
+  # UNIFICADO: 0.1 por defecto, como los otros dos. Antes 0.0 solo aqui.
+  # SIN RE-MEDIR en MNIST.
+  certify_growth_min_gain: 0.1
+  rel_error_mode: tangent_projection
+  layer_selection: certifying
+  projection_solver: exact
+  learning_rate_policy: theory_interval
+  projection_damping: 0.01
+  cg_max_iterations: 16
+  cg_tolerance: 1.0e-4
+  theory_smoothness_constant: 2.0
+  theory_alpha: 1.0
+  theory_beta: 1.0
+  theory_mu: 2.0
+  theory_loss_star: 0.0
+  theory_lr_safety: 0.95
+  theory_lr_initial: 0.01
+  theory_lr_min: 1.0e-5
+  theory_lr_follow_bound: false
+  # Same denser measured-rate grid and ceiling as the canonical matrix-free
+  # ladder; these prevent a coarse high-rate rung from dominating a step.
+  theory_lr_search_steps: 16
+  tangent_measured_max_lr: 0.1
+  theory_lr_search_refinements: 4
+  sufficient_descent_c: 0.1
+  lr_backtrack: 0.5
+  lr_min_factor: 0.001
+  global_bound_action: grow
+  rel_error_compute_delta: true
+  growth_compute_delta: true
+  projection_group_size: 1
+  projection_group_auto: true
+  projection_group_max:
+  # Joint certification probe: number of mini-batches concatenated into the
+  # FIXED probe on which every certificate solves ONE shared-direction
+  # projection (the projection_group_* keys above are deprecated: they used
+  # to aggregate independent per-batch projections).
+  # Tractable probe. Exactness is preserved (full Jacobian, no CG); what the
+  # probe size sets is the STRENGTH of the certificate -- eps < 1/2 here is a
+  # statement about 64 samples x 10 classes = 640 output dimensions. Measured
+  # cost: 2.4 s per exact eps at this size against 11.1 s at 4 batches, and
+  # the loop pays that per candidate per growth.
+  # 2 x 128 = 256 samples x 3 outputs = 768 output dimensions. Sized so the
+  # loop can actually finish: the residual lives in N*K dimensions, so that
+  # is how much rank the tangent space must acquire to capture 80 % of the
+  # gradient energy, and the exact solver materialises a (N*K) x P Jacobian
+  # per candidate per growth. At 4 x 512 = 6144 rows the run died of CUDA
+  # OOM after 23 growths, with eps still at 0.545.
+  # Do NOT enable certify_stream_gram here: that is the exact P x P path.
+  # family_order: [matrix_free_tangent] selects the factored operator before
+  # the streamed-Gram branch can run. Two batches keep its exact dual at
+  # 1280 x 1280 while the parameter-side representation remains factored.
+  certify_stream_gram: false
+  certify_stream_chunk: 1024
+  # 11, not 2. THE ROOT CAUSE FIX.
+  #
+  # eps is an R^2-like ratio and least squares OVERFITS a finite probe: with
+  # more parameters than rows it interpolates, and eps collapses to a spurious
+  # near-zero. tangent.py:897 already names this the interpolation floor.
+  #
+  # The MNIST net is 1612 parameters BEFORE any growth (784 in, 10 out), and it
+  # cannot be made smaller -- a first attempt capped max_total_parameters at 300
+  # and only got "growth suppressed (parameter budget 300 reached: 1612
+  # params)". P is not the lever here; NK is.
+  #
+  #   probe_batches  2 -> NK  1280 -> NK/P 0.79   interpolates
+  #   probe_batches 11 -> NK  7040 -> NK/P 4.37   above the floor
+  #
+  # MEASURED at probe_batches 2 (run-20260806_144333): "[CERTIFY] eps -> 0.0179
+  # (certified)" and every transaction improved the PROBE while worsening the
+  # real loss -- functional 37.75 -> 24.27, full_train 14213 -> 14382. 20 of 30
+  # epochs committed nothing, lr was exactly 0, rel_err sat frozen at 0.339 for
+  # 17 epochs. Without the full_train guard the same config diverges instead
+  # (rel_err 102449): one failure, two faces.
+  #
+  # N1024 never had this: 1024 rows against ~620 parameters, NK/P = 1.65.
+  probe_batches: 11
+  # Assemble that Jacobian in row-blocks. jacrev vmaps one backward pass per
+  # output row and holds the batched activations for all of them at once, so
+  # its peak scales with (rows) x (activations), not with J. MEASURED: the
+  # 3840 x ~600 Jacobian is only ~9 MB and computing it in ONE call still ran
+  # the GPU out of memory -- the matrix was never the problem. Blocks rebuild
+  # the identical matrix (tests/test_jacobian_chunking.py) at a bounded peak,
+  # for one extra forward per block. This is what makes certifying over the
+  # whole dataset affordable rather than over a subsample.
+  jacobian_row_chunk: 256
+  # A rejected fallback family is skipped until this many ACCEPTED outer
+  # steps have been committed since the rejection (weight updates change the
+  # tangent space, so rejection is never permanent at a fixed architecture).
+  # Growth clears all rejection state immediately; 0 retries every epoch.
+  family_rejection_cooldown: 0
+  # Acceptance mode. true: an outer step commits on its four LOCAL
+  # conditions only (valid sensor, strict RelErr < 0.5, strict LR interval
+  # theory_lr_min < eta < eta_bar, STRICT realized validation descent) and
+  # the stationary/global bounds are computed and logged as trajectory
+  # diagnostics. false (default): legacy behavior — non-strict descent and
+  # Cstat/Cglob as acceptance gates.
+  outer_steps_per_epoch: 8
+  growth_patience: 1
+  # Certified functional: cross-entropy keeps convexity (global optimality)
+  # and is 4x smoother than MSE (wider admissible interval), but has NO
+  # global PL constant, so the C_glob linear envelope is left undefined.
+  # See report/CROSS_ENTROPY_FGD.md.
+  functional_loss: mse
+  # Cross-entropy's infimum is not attained (f_c -> inf), so SOME family
+  # step always certifies. Without this the structural step would be
+  # postponed for ever while the network stays inadequate. Self-limiting
+  # through eps -- no parameter budget involved.
+  admissibility_failure_forces_growth: false
+  growth_limit_criterion: epsilon_stationary
+  # SENN's where (arXiv:2307.04526). Locations are ranked by the natural
+  # expansion score -- GroMo's sum(eigenvalues_extension^2), which is the
+  # extension's first-order loss decrease -- and capacity is added at the
+  # argmax, with the scores RECOMPUTED after each addition (their Ingredient
+  # 4 adds and repeats). The addition budget per growth event equals the
+  # number of growable layers, exactly what uniform widening spends, so the
+  # comparison against search_ce_uniform.yaml isolates the ALLOCATION.
+  # GROW-TO-CERTIFY: grow until Lemma 3.5 holds, then step. Only the tangent
+  # family, only steps the 1/2 condition certifies. Parameter count is
+  # explicitly NOT a concern -- the question is whether exact certification
+  # alone reaches the best loss and accuracy.
+  grow_to_certify: true
+  # Sized from the MEASURED rate on this probe: eps falls ~0.0018 per growth
+  # (1.824 -> 1.643 over 46), so reaching 1/2 from a 3x2 start needs ~670.
+  # The reason is dimensional, not a defect: each preserving growth adds ~9
+  # tangent directions while the residual lives in 64x10 = 640 dimensions, and
+  # capturing 80% of the gradient energy over those needs hundreds. Parameter
+  # count is deliberately not a constraint here -- the question is whether
+  # exact certification, whatever it costs, delivers the best accuracy.
+  certify_function_preserving: true
+  certify_max_growths: 200
+  # PAPER-PURE STEP. Lemma 3.5 does not offer descent as a condition to
+  # verify -- it PROVES it: eps < 1/2 implies every eta in (0, eta_bar(eps))
+  # descends. So the flow keeps the rate the certificate licenses (the same
+  # theory_lr_safety * eta_bar the ordinary sweep would start from, 0.95 of
+  # the interval) and simply applies it -- one rate, no sweep, no empirical
+  # descent gate, exactly as the paper's algorithm does.
+  #
+  # The rate must come from THAT certificate and not be recomputed from
+  # another sample. MEASURED: deriving it from the train-probe eps the grow
+  # loop certifies looks like the same formula but is a different number --
+  # small eps means large eta_bar, and at eps ~ 0.42 it gave eta = 0.86
+  # against |u| = 15, a parameter displacement of ~13 that left the linear
+  # regime and diverged (validation loss 4.1e3 -> 2.7e4 in five steps).
+  # Lemma 3.5 governs a FUNCTION-space step f - eta g; what is taken is a
+  # PARAMETER-space step theta - eta u, and they agree only while eta |u| is
+  # small enough for f(theta - eta u) ~ f(theta) - eta J u to hold.
+  #
+  # Why this matters here, MEASURED: with the gate on, the flow deadlocked.
+  # eps = 0.475 certified the structure so no growth fired, while no rate
+  # produced held-out descent so no step committed -- epochs 2, 3 and 4 came
+  # out bit-identical (loss 0.0619, acc 0.566, delta +0.0000). The gate was
+  # unsatisfiable rather than informative: eps is certified on the TRAIN
+  # probe and descent was demanded on the VALIDATION probe, and Lemma 3.5
+  # guarantees descent only on the sample where eps was measured.
+  certify_apply_in_interval: true
+  # Enforce Lemma 3.5's HYPOTHESIS: that theta - eta u is the function-space
+  # step f - eta g the lemma is about. Without it this exact config diverged
+  # while the certificate stayed healthy -- eta rose 0.005 -> 0.855 as eps
+  # FELL 0.50 -> 0.085, loss 2.3e3 -> 7.5e7, accuracy 0.087 -> 0.004 -- because
+  # eta_bar(eps) -> 2/L_s as eps -> 0, so the better the certificate the larger
+  # the step it authorises and the further outside the linear regime it lands.
+  #
+  # 0.1: the realised displacement must match the predicted one to within
+  # 10 % of its size. This is not the descent check that was removed -- the
+  # defect never looks at the loss (tests/test_linearization.py pins that
+  # reversing the update's sign leaves it unchanged). It only narrows eta
+  # INSIDE the certified interval.
+  certify_linearization_tolerance: 0.1
+  # Choose the projection's regularisation by measurement rather than by the
+  # fixed projection_damping above. It is the knob arbitrating between the
+  # certificate (eps) and the realisability of the step (|u|), and they pull
+  # opposite ways -- MEASURED on one grown model here:
+  #
+  #   lambda 0     eps 0.045   |u| 3.6e5   no admissible rate
+  #   lambda 1e-2  eps 0.495   |u| 3.9e1   eta 1.6e-4
+  #   lambda 1e0   eps 0.845   |u| 4.1e0   eps >= 1/2
+  #
+  # Only a narrow window satisfies both, and 1e-2 lands in it by luck at THIS
+  # scale of J. Selection locates the window per step and picks the rung
+  # maximising eta*||g||^2, the decrease Lemma 3.5 guarantees; measured to
+  # land within 9 % of the hand-tuned constant on the task it was tuned for,
+  # with nothing dataset-specific in the rule.
+  projection_damping_auto: true
+  # Fast where: the min-damping eps that ranks growth candidates is computed by
+  # a float32 SVD instead of float64 -- ~9x faster and MEASURED to pick the
+  # identical growth location on every growth (30/30), the decision that
+  # matters. The absolute eps can differ ~4e-2 on a rank-deficient Jacobian
+  # (the near-null directions), but that offset hits all candidates equally so
+  # the argmin is unchanged.
+  projection_fast_factorization: true
+  # Realise the certified functional step by INTEGRATING toward it instead of
+  # jumping at it. theta - eta u is only the first Gauss-Newton iteration of
+  # "find theta' with f(theta') = f - eta g"; shrinking eta until that single
+  # iteration is accurate shrinks the functional movement by the same factor
+  # (MEASURED at 512x and 2047x), which is what stalled this run. Integrating
+  # keeps each sub-step short where the linearisation is used while delivering
+  # the FULL eta g the certificate licensed. MEASURED, same direction and
+  # certificate: loss 9.580e1 -> 8.567e1 against 9.576e1 for one jump -- 236x,
+  # realising 96.2 % of the intended displacement.
+  # eta at the ARGMAX of Lemma 3.5's guaranteed decrease, not at the edge of
+  # the interval. The bound's bracket vanishes at eta_bar, so the guaranteed
+  # decrease eta*bracket(eta) is a parabola peaking at eta_bar/2. Taking 0.95
+  # of the interval maximises the step and minimises what it buys; for
+  # sum-MSE it gives f_new - y = -0.9(f - y), an error that flips sign and
+  # shrinks only 10 % per step. MEASURED with the full step delivered: 0.95
+  # sent train_loss 0.0917 -> 0.3991 and validation accuracy 0.248 -> 0.123.
+  certify_optimal_rate: true
+  # Nothing to resample: probe_batches covers the entire training set, so the
+  # certificate is exact over all of it rather than over a draw from it.
+  probe_resample: false
+  certify_realize_path: true
+  # Adaptive early stop: 138 of ~200 steps ran the full 40 inner solves without
+  # reaching tolerance, but the late iterations barely move the residual. Stop
+  # once an iteration reduces it by < 0.5% of the intended displacement -- the
+  # certified direction and rate are untouched, only how far the fixed target
+  # is chased. Measured to keep test ~0.93 at a fraction of the inner cost.
+  certify_realize_min_progress: 0.005
+  # Certified family ladder: nonlinear within-MLP family before growing,
+  # accepted only by its OWN Crel<1/2. Makes FP growth affordable
+  # (MEASURED 57->6 growths on the synthetic task).
+  certify_family_ladder: true
+  certify_family_inner_steps: 400
+  certify_family_inner_learning_rate: 0.01
+  certify_family_functional_lr: 1.0
+  # Barrido ASCENDENTE de la distancia funcional de la familia. Cada eta_f
+  # certifica por su propio RelErr(Delta,r) < min(threshold, 0.5) sobre la
+  # misma sonda; eta_f=1 va primero, asi que una corrida que certifica ahi es
+  # identica a antes y al mismo coste. MEDIDO: descendente pierde (0.8823),
+  # ascendente gana (0.9230 contra 0.9000 del baseline).
+  certify_family_functional_lrs: [1.0, 2.0, 4.0, 8.0]
+  # UNIFICADO a false: la corrida que valido el criterio (media 0.9435) no
+  # lo llevaba, y estos ficheros deben ser esa corrida.
+  certify_family_plateau_stop: false
+  # Commit the family step at its OWN Lemma 3.5 rate, not whole.
+  # MEASURED: eps 0.292 allows eta_bar 0.263 at L_s = 2, so a full
+  # step overshoots the descent bound by 3.8x. Certifying the
+  # direction never licensed the distance.
+  # UNIFICADO a false. MEDIDO en smooth_sin: true SIN min_gain colapsa la
+  # corrida (25 certificaciones, 0 crecimientos, acc 0.15). Antes true
+  # solo aqui, apoyado en certify_family_min_gain. SIN RE-MEDIR en MNIST.
+  certify_family_lemma35_rate: false
+  # Let the ladder work in the band between the growth target and the
+  # certificate, where growth alone buys 0.0007 of eps per 800 params
+  # while the clone reaches 22 degrees against a 30 degree bar. Safe
+  # only because the step above is now bounded by its own Lemma 3.5
+  # rate; unbounded it diverged held-out loss 9.37 -> 44.53.
+  # UNIFICADO a false. Su propio comentario dice que solo es seguro junto
+  # a certify_family_lemma35_rate, que ahora esta en false.
+  certify_family_in_target_band: false
+  # The ladder DEFERS growth, so it must earn the deferral: close this
+  # fraction of the gap to the target or hand the turn to growth.
+  # MEASURED at 0.0 the ladder certified 20/20 epochs and the net never
+  # grew (GRO=0), plateauing at 0.113 from epoch 9.
+  # UNIFICADO a 0.0. Vigilaba el aplazamiento del crecimiento por pasos de
+  # familia que certifican sin progresar; con lemma35_rate en false el paso
+  # se compromete entero y ese fallo no aparece. SIN RE-MEDIR en MNIST.
+  certify_family_min_gain: 0.0
+  certify_realize_max_iterations: 40
+  certify_realize_tolerance: 0.05
+  # Freeze the Gauss-Newton Gram across the inner realise iterations (modified-
+  # Newton / chord): build J^T J once, then each iteration is one VJP instead of
+  # a full streamed all-data Jacobian. This is the dominant CIFAR cost -- the
+  # realise loop ran ~5 inner Jacobians/step, each O(NK*P); the freeze turns
+  # them into 1 Jacobian + VJPs. Same certified direction/rate/target and the
+  # same residual-reducing line search. VALIDATED on family_ladder_N1024 (test
+  # 0.936/0.934 vs 0.935/0.932, iters 5.34 vs 5.47, 0 NaN). Estimated ~2.4x
+  # faster per epoch on CIFAR (realise ~42 -> ~8 jacrev-equivalents/epoch).
+  certify_realize_freeze_gram: true
+  # Matrix-free-only endpoint transaction, matching the canonical synthetic
+  # matrix-free ladder. Disabled defaults keep both exact configs unchanged.
+  transactional_realized_descent: true
+  transactional_max_retries: 3
+  transactional_backtrack_factor: 0.5
+  transactional_descent_atol: 1.0e-10
+  transactional_min_predicted_decrease_fraction: 0.0
+  certify_functional_lr_cap: 0.1
+  tangent_measured_descent: false
+  # ===================== CRITERIO DE CRECIMIENTO =====================
+  # DONDE crecer: la capa con el mayor CUELLO DE BOTELLA DE EXPRESIVIDAD,
+  # es decir el argmax de activation_gradient * sum(eigenvalues_extension^2)
+  # -- el termino de extension de TINY, la masa del cambio funcional deseado
+  # que cae FUERA de lo que el ancho actual puede expresar. NO es el
+  # select_best_update de TINY: ese suma parameter_update_decrease, que mide
+  # cuanto ganaria reajustar los pesos EXISTENTES y por tanto habla de
+  # entrenamiento, no de ancho. Una neurona por evento, en esa capa.
+  #
+  # MEDIDO en N=1024, 4 semillas, 600 parametros, a igualdad de computo:
+  #   certified_gain          0.9230   formas 15-16-15 en 3 de 4 semillas
+  #   expressivity_bottleneck 0.9435   4 formas distintas, ratios 1.46-2.44
+  # Las cuatro semillas superan 0.925 individualmente.
+  growth_where: expressivity_bottleneck
+  # NO INERTE, verificado por medicion: quitarla movio s0 y s3 (s3 de 0.958 a
+  # 0.896). Se lee en DOS sitios y solo uno depende del modo:
+  #   pipeline.py  la rafaga del bloque de crecimiento por epoch -- APAGADA
+  #                bajo expressivity_bottleneck (una neurona por evento)
+  #   certify.py   la rafaga dentro de grow_until_certified, que compra en la
+  #                ubicacion ya elegida mientras cada incremento siga pagando
+  #                en eps -- NO depende del modo, y es la que actua aqui
+  certify_adaptive_growth: true
+  certify_adaptive_growth_min_gain: 0.1
+  # NO INERTES bajo expressivity_bottleneck, verificado por medicion: quitarlas
+  # movio s0 y s3 (s3 de 0.958 a 0.896, perdiendo la forma 9-16-22). No pasan
+  # por el ranking del cuello de botella, actuan ANTES:
+  #   growth_select_by_descent  decide si el crecimiento se dispara siquiera
+  #                             (pipeline.py, fgd_growth_probe_improved)
+  #   growth_prefer_lower_error elige entre sondas en _select_growth_probe,
+  #                             antes de que existan los candidatos
+  growth_select_by_descent: true
+  growth_prefer_lower_error: true
+  # ===================================================================
+  growth_selection: unified_expansion
+  # Generalised R1: eps < 1/2 is Lemma 3.5 step-admissibility, not structural
+  # adequacy. Before stopping, check whether growing the bottleneck reaches a
+  # strictly lower eps than training longer would (both clones trained the
+  # same steps -- an apples-to-apples look-ahead). Verified a strict
+  # generalisation: MNIST on==off (identical growths, 0 firings while eps>1/2).
+  # Only pays its cost in the tail (eps<1/2), and reuses tiny_statistical_
+  # threshold as the margin -- no new constant.
+  growth_lookahead_adequacy: true
+  growth_lookahead_steps: 10
+  # The fallback families must stay available once the structure becomes
+  # adequate (eps < 1/2): otherwise growth correctly stops and the flow is
+  # left with the tangent alone, which freezes it.
+  families_available_without_growth: true
+  # REMOVED (was true). It forced a growth after a finite failed step to break
+  # the "eps=0.485 certifies but eta=8.80e-6 < theory_lr_min" deadlock. That
+  # deadlock is a SYMPTOM: eps only reads 0.485 because the probe carries 1280
+  # rows against a 30000-parameter budget, so least squares interpolates it and
+  # eps is biased down. Forcing growth spends parameters to chase a number that
+  # is wrong. The floor is fixed below instead; if the deadlock returns with a
+  # correctly sized probe, that is new information and not this knob's job.
+  local_acceptance_conditions: true
+  eps: 1.0e-12
+  # Full numerical rank of the selected probe; no user rank truncation.
+  matrixfree_rank: 0
+  tiny_use_covariance: true
+  tiny_alpha_zero: false
+  tiny_omega_zero: false
+  tiny_use_projection: true
+  tiny_ignore_singular_values: false
+  # MEASURED: leave this false. Enabling the output-side Kronecker factor
+  # makes the score rank layer 2 top (37.7 vs 11.0 for layer 0) while the
+  # scaling line search then rejects that very extension outright
+  # (best_scaling = 0.000, train_loss 0.187 -- the WORST of the three). In
+  # the end-to-end run 7 of 8 growth events took scaling 0, adding dead
+  # parameters, so eps never improved, R1 re-fired every epoch and the run
+  # stalled at 65.6%. The Fisher-preconditioned score was anti-correlated
+  # with the realized outcome here.
+  #
+  # This is also the metric SENN's own theory states (their 3.4: "for the
+  # purposes of simplicity we choose the euclidean metric, corresponding to
+  # F := (1/N) J^T J"), and the one the bridge identity in
+  # report/SENN_EXPANSION_SCORE.md is derived under. KFAC S (x) A is their
+  # practical approximation to it, not the definition.
+  tiny_use_fisher: false
+  # ONE purchase per growth event -- one neuron or one layer. Maximum
+  # resolution, and every structural step is attributable to a single
+  # measured certificate, which is what the ranking by Delta(N eta)/cost
+  # compares. At 4 the input projection was bought 4 neurons at a time
+  # (+3180 parameters per event) and overshot to ~7175 before Lemma 3.5
+  # stopped it.
+  tiny_maximum_added_neurons: 1
+  tiny_numerical_threshold: 1.0e-6
+  tiny_statistical_threshold: 1.0e-3
+  # FUNCTION-PRESERVING GROWTH. Two flags govern two DIFFERENT growth
+  # mechanisms, and both are function-preserving for the certified method:
+  #   * certify_function_preserving (below) drives the grow-to-certify loop.
+  #   * growth_function_preserving (this flag) drives the standard growth path.
+  # The certified method's ACTIVE growth -- grow-to-certify and the unified /
+  # rank-cap expansion (growth_selection: unified_expansion) -- is
+  # function-preserving BY DESIGN (the theory needs f unchanged so the
+  # certified steps do all the descent), and the unified path enforces that
+  # regardless of this flag. This flag only affects the LEGACY SENN / uniform /
+  # expansion-per-parameter paths, which this config never runs. It is set
+  # true so the config reads honestly as function-preserving throughout and is
+  # never mistaken for a non-FP run (the previous `false` here was an inert,
+  # misleading inheritance).
+  growth_function_preserving: true
+  growth_requires_admissibility_failure: true
+  # 300, not 30000. THE ROOT CAUSE FIX, stage 1.
+  #
+  # eps is an R^2-like ratio and least squares OVERFITS a finite probe, so with
+  # more parameters than rows it interpolates and eps collapses to a spurious
+  # near-zero. The probe here is probe_batches 2 * batch_size 64 * K 10 = 1280
+  # rows. Against 30000 parameters that is 23 parameters per equation, and the
+  # certificate stops meaning anything.
+  #
+  # MEASURED in run-20260806_144333: "[CERTIFY] growth 1: eps -> 0.0179
+  # (certified)" and then every transaction improves the PROBE and worsens the
+  # real loss -- functional 37.75 -> 24.27 while full_train 14213 -> 14382.
+  # 20 of 30 epochs committed nothing, lr was exactly 0, and rel_err sat frozen
+  # at 0.339 for 17 consecutive epochs. Without the full_train guard the same
+  # config diverges instead (rel_err 102449, train_loss 0.17 -> 90.4): the two
+  # are one failure, not two.
+  #
+  # N1024 does not have this because its probe is 1024 rows against ~620
+  # parameters -- NK/P = 1.65, above the floor -- and it trains to 0.953.
+  #
+  # 300 keeps NK/P > 4 with the current probe. It caps capacity, which is why
+  # it is a diagnostic operating point and not the endpoint; certify_probe_kappa
+  # is the principled version and comes next.
+  # kappa = 4: size the probe so NK = 4 * rank(J) as the net grows, instead of
+  # trusting a hand-picked probe to stay above the floor. probe_batches above is
+  # only the starting point; this keeps the invariant NK > P holding after every
+  # growth. [4, 8] is the range the field documents as tested.
+  certify_probe_kappa: 4.0
+  # 5000, not 30000. With kappa = 4 a P of 30000 would demand NK = 120000 rows
+  # = 12000 images, and this config only loads mnist_train_samples: 10000. The
+  # budget and the probe are now coupled quantities; 5000 needs NK = 20000 rows
+  # = 2000 images, which fits.
+  max_total_parameters: 60000
+  growth_preservation_tolerance: 1.0e-6
+  # Ordered ladder of approximation families, evaluated top to bottom.
+  # "tangent" must come first (it is the epoch's main transactional
+  # search). Each following family is consulted only after every family
+  # above it fails to certify, and structural growth is probed only after
+  # ALL listed families fail. Every family commits through the same full
+  # FGD certificate (Crel, LR interval, descent, Cstat, Cglob).
+  # Uncomment a family to enable it, same pattern as
+  # growth_function_preserving:
+  family_order:
+    - matrix_free_tangent
+  # In-ladder rkhs_head margin: the head must improve the FULL validation
+  # functional by this relative amount (filters the train-subsample jitter
+  # that otherwise re-accepts an epsilon improvement forever).
+  rkhs_family_min_relative_improvement: 1.0e-3
+
+# Parametric-GD secant family. Only consulted when "parametric_gd" is
+# listed in fgd_approx.family_order. A disposable clone is trained
+# parametrically toward the functional target f - eta*r; the realized
+# output displacement Delta = F(base) - F(candidate) is screened on
+# validation by its directional cosine against the functional gradient
+# (min_cosine) and then certified at the scale-optimal declared rate
+# eta* = <Delta, r> / |r|^2, which is the fix for the historical scale
+# mismatch of this family. With eta* the best achievable relative error
+# is exactly sqrt(1 - cos^2), so cosines below sqrt(1 - 0.5^2) = 0.866
+# can never satisfy Crel < 0.5: candidates that fail the screen are
+# discarded BEFORE certification and the ladder simply moves on, so a
+# misaligned family can no longer push the flow into nonstop growth.
+# Measured on MNIST (widths 2-16, fresh and mid-training): best cosine
+# ~0.8 -> minimal RelErr ~0.6 > 0.5, so expect this family to decline
+# on MNIST at these widths; it is safe to enable and only fires when
+# its projection is genuinely admissible.
+parametric_gd:
+  optimizer: sgd            # sgd | adam (adam measured consistently less aligned)
+  inner_learning_rate: 0.05
+  inner_steps: [16, 64]     # coarse-to-fine inner budgets per candidate
+  functional_learning_rates: [0.2, 0.05]
+  min_cosine: 0.9           # mathematical floor for Crel<0.5 is 0.866
+  parameter_penalty: 1.0e-6
+  gradient_clip_norm: 1.0
+  # Matrix-free accumulation knobs. These are pure execution settings and do
+  # not alter the sums defining Jv/J^Tw. A 128-example group equals the whole
+  # two-batch certification probe.
+  cg_tolerance: 1.0e-10
+  matrixfree_batch_size: 128
+
+# Measured-descent parametric family. Only consulted when
+# "parametric_descent" is listed in fgd_approx.family_order. Same candidate
+# generation and eta* calibration as parametric_gd, but acceptance follows
+# Prop. 3.8 with the descent coefficient MEASURED on validation instead of
+# lower-bounded through the relative error: for the empirical sum-MSE
+# functional the function-space PL inequality is the exact identity
+# |grad L|^2 = 4 L (the configured theory_mu = 2, theory_loss_star = 0), so
+# the global contraction G_T <= prod(1 - 2 eta mu r_t) G_0 holds with
+# r_t = (L_t - L_{t+1}) / (eta* |grad L_t|^2) and equals the realized loss
+# ratio exactly. Crel and the LR interval are NOT gates here (they are one
+# sufficient mechanism, which the measurement replaces); the secant relative
+# error is still logged as a diagnostic. Cprog (min_progress), Cstat and
+# Cglob use the same accumulators as every other family. Because a merely
+# descending step certifies, this family fires where parametric_gd declines;
+# per-step it certifies realized progress rather than near-gradient
+# direction.
+parametric_descent:
+  optimizer: adamw
+  inner_learning_rate: 0.003
+  inner_steps: [40]
+  # 0.5 makes the functional target exactly y (plain parametric loss descent).
+  functional_learning_rates: [0.5]
+  weight_decay: 0.05
+  min_cosine: 0.0           # 0 = only require a descent direction (eta* > 0)
+  parameter_penalty: 1.0e-6
+  gradient_clip_norm: 1.0
+  # Cprog floor on eta* r_t = D_t / |grad L_t|^2 (= D/4L): every accepted
+  # step must remove at least 4*min_progress of the remaining loss (1e-3 =
+  # 0.4% per step). Steps below it are REJECTED, marking the structure
+  # exhausted for this family so growth takes over. This is the family's
+  # only binding gate besides measured descent: its Cglob envelope is tight
+  # by construction and Cstat loosens as steps shrink, so set this floor to
+  # the smallest per-step progress you consider worth an epoch. 1e-6
+  # stagnated MNIST 3x2 at ~40% accuracy on certified crumbs.
+  min_progress: 1.0e-4
+
+# Tangent projection only: the certified RKHS head phase is off, so the
+# growth_min_* thresholds below still govern the growth probe gate.
+# (With "rkhs_head" listed in family_order the phase runs as an in-ladder
+# family regardless of this flag.)
+secant_fgd:
+  enabled: false
+  inner_steps: 8
+  inner_learning_rate: 0.01
+  parameter_penalty: 1.0e-6
+  gradient_clip_norm: 1.0
+  search_steps: 3
+  max_learning_rate: 0.1
+  min_learning_rate_factor: 0.01
+  growth_min_relative_error_improvement: 0.001
+  growth_min_learning_rate_improvement: 0.05
+
+fgd_rkhs:
+  feature_whitening: true
+  epsilon: 0.25
+  lr_safety: 0.9
+  steps_per_epoch: 10
+  max_train_points: 4096
+  growth_epochs_per_cycle: 30
+
+# Ignored while growth_function_preserving is true (the extension is applied
+# with fixed scaling 1.0 and zero outgoing weights); kept for compatibility.
+scaling_line_search:
+  method: golden_section
+  min_value: 0.0
+  max_value: 1.0
+  iterations: 12
+  tolerance: 0.001
+
+# NOT a schedule under method: fgd_approx. Only `enabled` is read here, as
+# a master on/off switch for architecture changes; `every`, `first_epoch`
+# and `layer_policy` are consulted exclusively by method: normal. Growth
+# timing comes from the certificate alone -- Lemma 3.5 (eps >= 0.5) proposes
+# it and R1 (eps no longer decreasing) decides whether training may render
+# the proposal unnecessary. should_trigger_fgd_growth() opens with
+# `del epoch, last_growth_epoch`: no epoch, dwell or cap participates.
+growth_schedule:
+  enabled: true
+  every: 100
+  first_epoch: 50
+  layer_policy: round_robin
+
+wandb:
+  enabled: true
+  project: stable-tiny
+  entity:
+  run_name:
+  group: mnist-family-ladder-matrix-free
+  job_type: train
+  tags: [fgd_approx, certified_growth, mnist, from_3x2, mse, lemma35_cycle, matrix_free, transactional, exact_dual_spectrum]
+  notes: MNIST family ladder with factored matrix-free tangent, bounded exact dual probe, fast analytic operators and transactional endpoint descent
+  mode: online
+  dir: results
+  log_code: false

@@ -149,6 +149,12 @@ PROFILE_FIELDS = (
     "matrix_free_tangent_seconds",
     "matrix_free_tangent_calls",
     "matrix_free_vmap_fallbacks",
+    # How often the dual route was unreachable because the operators were the
+    # vmapped kind, which carries no analytic factors for dual_gram to read.
+    # Distinct from matrix_free_vmap_fallbacks: that counts "the analytic
+    # structure was refused", this counts "and the ratio gate would have sent
+    # it down a route that cannot serve it".
+    "matrix_free_dual_unavailable",
     "tangent_forward_target_seconds",
     "tangent_jacrev_seconds",
     "tangent_jacobian_flatten_seconds",
@@ -209,6 +215,7 @@ _COUNTER_FIELDS = {
     "nonlinear_growth_events",
     "growth_crossfold_layers_tested",
     "growth_crossfold_layers_rejected",
+    "matrix_free_dual_unavailable",
     "tangent_system_calls",
     "tangent_projection_solve_calls",
     "tangent_qr_calls",

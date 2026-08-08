@@ -3424,13 +3424,29 @@ def _matrix_free_tangent_system(
         # P=1345 the exact eps is 1e-06 while rank 512 reported 0.21, because r
         # is spread across the whole spectrum. The rank below is the full
         # min(NK, P), so nothing is truncated on either branch.
-        if operators.rows > 2 * columns:
+        #
+        # AND THE DUAL ROUTE IS NOT ALWAYS AVAILABLE. dual_gram reads the
+        # ANALYTIC factors -- sensitivities, activations, use_bias -- while the
+        # vmapped operators expose only the two applies, so on the fallback
+        # path it cannot run at all. MEASURED on MNIST at the cluster's width:
+        # the analytic structure was refused (forward_has_caching_side_effects)
+        # and, with NK 3840 against P 2399, the ratio gate chose the dual
+        # branch anyway and raised AttributeError on VmapOperators, killing the
+        # run mid-flight. The range finder needs nothing but the applies, so it
+        # serves both operator kinds; rank stays min(NK, P), which is the exact
+        # bound on rank(J), so nothing is truncated and the analytic path keeps
+        # the rank it has today (columns, since it only takes this branch when
+        # rows > 2 * columns).
+        dual_available = hasattr(operators, "sensitivities")
+        if not dual_available:
+            fallback("matrix_free_dual_unavailable", "vmap_operators_lack_factors")
+        if operators.rows > 2 * columns or not dual_available:
             built = randomized_factorization(
                 apply_j=operators.apply_j,
                 apply_jt=operators.apply_jt,
                 rows=operators.rows,
                 columns=columns,
-                rank=columns,
+                rank=min(operators.rows, columns),
                 oversampling=0,
                 power_iterations=1,
                 device=x.device,
