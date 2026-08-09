@@ -70,6 +70,13 @@ def test_mnist_matrix_free_changes_only_execution_and_matrix_free_gates() -> Non
         "certify_growth_lookahead",
         "certify_growth_lookahead_entry",
         "growth_bottleneck_crossfold_folds",
+        # 2, not the shared 10. Each lookahead call trains TWO clones for
+        # `steps` passes over every batch of the loader -- 10 * 157 * 2 = 3140
+        # forward/backward passes on MNIST, ~8 times per epoch. MEASURED: the
+        # epoch went 11 -> 42 minutes at 10 and back to ~15 at 2, while the
+        # predicate kept refusing at the same rate (10 yes / 5 no against
+        # 19 / 11), so the horizon was cut without disabling the question.
+        "growth_lookahead_steps",
     }
     assert _differing_fields(exact.parametric_gd, matrix_free.parametric_gd) == {
         "matrixfree_batch_size"

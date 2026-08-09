@@ -411,7 +411,19 @@ fgd_approx:
   # Only pays its cost in the tail (eps<1/2), and reuses tiny_statistical_
   # threshold as the margin -- no new constant.
   growth_lookahead_adequacy: true
-  growth_lookahead_steps: 10
+  # 2, no 10, y la razon es aritmetica del bucle de _train_parametric_gd_
+  # candidate: `for _ in range(steps): for x, y in train_batches`. Con
+  # train_batches = list(train_loader) eso son 157 lotes en MNIST, asi que
+  # cada consulta al lookahead cuesta steps * 157 * 2 clones pasadas
+  # forward/backward -- 3140 a steps=10, y hay ~8 consultas por epoch.
+  # MEDIDO: la epoch paso de ~11 a ~42 minutos al encender la entrada
+  # voluntaria, y ese es el unico termino que crecio.
+  #
+  # Bajarlo NO sesga la comparacion. El lookahead enfrenta "crecer y entrenar
+  # N pasos" contra "quedarse y entrenar N pasos", y es justa con cualquier N
+  # porque los dos lados reciben el mismo. Lo unico que cambia es el horizonte
+  # de la pregunta, que se vuelve mas corto y por tanto mas conservador.
+  growth_lookahead_steps: 2
   # The fallback families must stay available once the structure becomes
   # adequate (eps < 1/2): otherwise growth correctly stops and the flow is
   # left with the tangent alone, which freezes it.
