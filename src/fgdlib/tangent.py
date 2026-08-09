@@ -7,7 +7,7 @@ import math
 import os
 import statistics
 from collections import OrderedDict
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from typing import Callable, Literal
 
@@ -3314,6 +3314,34 @@ def _factored_relative_error_estimate(
     return float(torch.linalg.vector_norm(projected - flat)) / norm
 
 
+@contextmanager
+def _suspended_module_capture(model: GrowingMLP):
+    """``paused_computation`` for a gromo that does not have it.
+
+    The method landed on a branch, so whether the protection exists at all
+    depends on which checkout is installed -- and the failure it prevents does
+    not surface where it is caused: the modules cache functorch wrappers here,
+    and the crash arrives later, inside an unrelated ``copy.deepcopy(model)``.
+    A correctness property must not be contingent on a library branch, so the
+    two flags gromo's own context manager sets are set here directly, over the
+    same module set, and restored the same way.
+    """
+    flags = [
+        (module, module.store_input, module.store_pre_activity)
+        for module in model.modules()
+        if hasattr(module, "store_input") and hasattr(module, "store_pre_activity")
+    ]
+    try:
+        for module, _, _ in flags:
+            module.store_input = False
+            module.store_pre_activity = False
+        yield
+    finally:
+        for module, store_input, store_pre_activity in reversed(flags):
+            module.store_input = store_input
+            module.store_pre_activity = store_pre_activity
+
+
 def _matrix_free_tangent_system(
     *,
     model: GrowingMLP,
@@ -3352,6 +3380,9 @@ def _matrix_free_tangent_system(
 
     was_training = model.training
     model.eval()
+    # Held open across the whole vmap path and closed with the model's training
+    # flag; see the fallback below for why it cannot be a local `with`.
+    vmap_capture = ExitStack()
     try:
         parameters = tuple(
             parameter for parameter in model.parameters() if parameter.requires_grad
@@ -3374,8 +3405,8 @@ def _matrix_free_tangent_system(
         # route decides it; vmapped autograd otherwise. Same two methods, so
         # nothing below can tell which one it got.
         operators = None
+        pause = getattr(model, "paused_computation", None)
         with ExitStack() as capture_stack:
-            pause = getattr(model, "paused_computation", None)
             structure = None
             if callable(pause):
                 capture_stack.enter_context(pause())
@@ -3390,6 +3421,35 @@ def _matrix_free_tangent_system(
                 operators = analytic_operators(structure, x)
         if operators is None:
             increment("matrix_free_vmap_fallbacks")
+            # THE CACHE STAYS OFF FOR THE WHOLE VMAP PATH, not merely while the
+            # operators are built. gromo's growing modules store their input and
+            # pre-activity on EVERY forward -- which is the very reason the
+            # analytic structure was refused here
+            # (forward_has_caching_side_effects) -- so a vmapped forward leaves
+            # functorch TensorWrapper values sitting on the modules, and they
+            # outlive this function. MEASURED on Margaret: the run died later,
+            # in _transactional_realize_functional_step, on
+            # `copy.deepcopy(model)` with "Cannot access storage of
+            # TensorWrapper" -- a crash whose stack trace names none of this.
+            #
+            # The stack is closed in the `finally` below, not here, because the
+            # applies that do the caching happen in the factorisation further
+            # down, not at construction time.
+            #
+            # gromo's own paused_computation is preferred when present, but it
+            # arrived on a BRANCH (feature/pausable-statistics-capture) and a
+            # checkout without it silently loses the protection -- which is how
+            # the cluster hit this and a laptop did not. Correctness here
+            # cannot depend on which gromo is installed, so fall back to
+            # toggling the two flags directly. Same two flags, same restore.
+            if callable(pause):
+                vmap_capture.enter_context(pause())
+            else:
+                fallback(
+                    "matrix_free_capture_pause_missing",
+                    "gromo_without_paused_computation",
+                )
+                vmap_capture.enter_context(_suspended_module_capture(model))
             operators = vmap_operators(model, x, parameters, parameter_names)
 
         columns = sum(p.numel() for p in parameters)
@@ -3467,6 +3527,7 @@ def _matrix_free_tangent_system(
             factors = (left * singular_values, right)
         jacobian_matrix = factors[0].new_zeros((0, columns))
     finally:
+        vmap_capture.close()
         model.train(was_training)
 
     if jacobian_matrix is None:

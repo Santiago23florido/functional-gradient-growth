@@ -155,6 +155,7 @@ PROFILE_FIELDS = (
     # structure was refused", this counts "and the ratio gate would have sent
     # it down a route that cannot serve it".
     "matrix_free_dual_unavailable",
+    "matrix_free_capture_pause_missing",
     "tangent_forward_target_seconds",
     "tangent_jacrev_seconds",
     "tangent_jacobian_flatten_seconds",
@@ -216,6 +217,7 @@ _COUNTER_FIELDS = {
     "growth_crossfold_layers_tested",
     "growth_crossfold_layers_rejected",
     "matrix_free_dual_unavailable",
+    "matrix_free_capture_pause_missing",
     "tangent_system_calls",
     "tangent_projection_solve_calls",
     "tangent_qr_calls",
