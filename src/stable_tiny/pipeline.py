@@ -51,6 +51,7 @@ from fgdlib.tangent import (
     train_one_epoch_fgd_approx,
     validate_bottleneck_stopping,
     validate_family_order,
+    validate_growth_lookahead_entry,
     validate_functional_loss,
     validate_exact_tangent_system,
     validate_transactional_realized_descent,
@@ -622,6 +623,7 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
     validate_functional_loss(config.fgd_approx.functional_loss)
     validate_transactional_realized_descent(config.fgd_approx)
     validate_bottleneck_stopping(config.fgd_approx)
+    validate_growth_lookahead_entry(config.fgd_approx)
     config.parametric_gd.validate()
     config.parametric_descent.validate()
     return config

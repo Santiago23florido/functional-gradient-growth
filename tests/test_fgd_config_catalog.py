@@ -57,6 +57,19 @@ def test_mnist_matrix_free_changes_only_execution_and_matrix_free_gates() -> Non
         # 4P rows, and this config only loads 10000 images.
         "certify_probe_kappa",
         "max_total_parameters",
+        # The budget-free growth trigger and its two brakes. MEASURED without
+        # them on this exact config: eps parks at 0.4975 against a bar of 0.5,
+        # so `while epsilon >= target` never runs, and 150 epochs produce 2
+        # growths and accuracy 0.109 with every certificate reporting health.
+        # The lookahead could already say "training does not beat growing here"
+        # and had no way to act on it.
+        #
+        # These three cannot appear in mnist_streaming.yaml even if wanted:
+        # certify_growth_lookahead_entry is restricted to
+        # family_order: [matrix_free_tangent], and that file is [tangent].
+        "certify_growth_lookahead",
+        "certify_growth_lookahead_entry",
+        "growth_bottleneck_crossfold_folds",
     }
     assert _differing_fields(exact.parametric_gd, matrix_free.parametric_gd) == {
         "matrixfree_batch_size"

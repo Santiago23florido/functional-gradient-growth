@@ -76,6 +76,12 @@ PROFILE_FIELDS = (
     "certify_force_suppressed_nonfinite",
     "certify_family_deferral_refused",
     "certify_growth_not_warranted",
+    # Its counterpart, and the pair is the whole diagnostic: the lookahead is
+    # only useful if it says BOTH things. A run where _warranted_entries climbs
+    # monotonically while _not_warranted stays at 0 is a lookahead that is not
+    # discriminating -- it would grow one neuron per outer step until the
+    # parameter budget, which is the failure this trigger exists to avoid.
+    "certify_growth_warranted_entries",
     "growth_where_base_unavailable",
     # Declared late because it almost never fired: "every layer expresses what
     # is asked of it, so buy nothing" was unreachable in practice until a
@@ -205,6 +211,7 @@ _COUNTER_FIELDS = {
     "certify_force_suppressed_nonfinite",
     "certify_family_deferral_refused",
     "certify_growth_not_warranted",
+    "certify_growth_warranted_entries",
     "growth_where_base_unavailable",
     "growth_where_no_bottleneck",
     "certify_growth_target_stalls",

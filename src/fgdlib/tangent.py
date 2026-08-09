@@ -628,6 +628,29 @@ class FGDApproxConfig:
     # first outer step. Off by default; reuses growth_lookahead_steps and
     # tiny_statistical_threshold, so it introduces no new constant.
     certify_growth_lookahead: bool = False
+    # LET THAT ANSWER SAY YES, not only no. As written above the lookahead can
+    # only VETO: a "no" returns at once, but a "yes" falls through to
+    # `while epsilon >= target`, which excludes the very band the question was
+    # asked in. So it is a brake with no accelerator, and on MNIST that is the
+    # whole failure -- MEASURED, eps parks at 0.4975 against a bar of 0.5, the
+    # loop never runs, and the run spends 150 epochs at accuracy 0.109 with 2
+    # growths and every certificate reporting health. The rate collapses with
+    # it: eta_bar = 2(1-2eps)/(L(1+2eps)) is 0.0025 there, the committed step
+    # was 1.55e-05, so the loss moves 0.005% per step, eps never rises, and
+    # nothing ever grows again. It is a stable deadlock, not a plateau.
+    #
+    # RESTRICTED TO family_order: [matrix_free_tangent] by
+    # validate_growth_lookahead_entry, and that restriction is the point. The
+    # tangent route and configs/fgd/family_ladder_N1024.yaml are invariant on
+    # this branch, and "the flag is off over there" is not a guarantee --
+    # someone turns it on and it is gone. A load-time error is. Same gate
+    # transactional_realized_descent already uses.
+    #
+    # Bounded by construction: the authorisation is consumed by the first
+    # iteration, and the growth_turn_taken break that already exists ends the
+    # loop right after, so it buys ONE neuron per outer step and only while
+    # the lookahead keeps preferring growth to training.
+    certify_growth_lookahead_entry: bool = False
     # Let the exact per-candidate eps ranking choose the SHAPE, not just the
     # size. The rank cap filters candidates to the width minimum and mandates
     # levelling it, both justified by "rank J <= min_l w_l" -- which is FALSE
@@ -1227,6 +1250,33 @@ def validate_bottleneck_stopping(config: FGDApproxConfig) -> None:
         raise ValueError(
             "fgd_approx.growth_bottleneck_crossfold_folds requires "
             "growth_where: expressivity_bottleneck."
+        )
+
+
+def validate_growth_lookahead_entry(config: FGDApproxConfig) -> None:
+    """Keep the voluntary-growth entry off the tangent route, by construction.
+
+    The tangent path and ``configs/fgd/family_ladder_N1024.yaml`` are invariant
+    on this branch -- their behaviour is measured and good, and this change has
+    no business reaching them. Leaving the field at its default over there is
+    not a guarantee, it is a convention someone can break in one line. A
+    load-time error cannot be broken by accident.
+
+    Same gate ``validate_transactional_realized_descent`` already applies, for
+    the same reason.
+    """
+    if not config.certify_growth_lookahead_entry:
+        return
+    if tuple(config.family_order) != ("matrix_free_tangent",):
+        raise ValueError(
+            "fgd_approx.certify_growth_lookahead_entry is restricted to "
+            "family_order: [matrix_free_tangent]."
+        )
+    if not config.certify_growth_lookahead:
+        raise ValueError(
+            "fgd_approx.certify_growth_lookahead_entry requires "
+            "certify_growth_lookahead: true -- it authorises the SAME "
+            "predicate, so without it there is nothing to authorise."
         )
 
 

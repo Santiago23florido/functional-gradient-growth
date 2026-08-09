@@ -48,7 +48,7 @@ model:
 
 training:
   method: fgd_approx
-  epochs: 150
+  epochs: 40
   accuracy_tolerance: 0.1
   gradient_clip_norm:
   log_every: 1
@@ -386,6 +386,18 @@ fgd_approx:
   #   expressivity_bottleneck 0.9435   4 formas distintas, ratios 1.46-2.44
   # Las cuatro semillas superan 0.925 individualmente.
   growth_where: expressivity_bottleneck
+  # El lookahead ya existia pero solo sabia VETAR: un "si" caia al
+  # `while epsilon >= target`, que excluye justo la banda en la que se
+  # pregunta. MEDIDO aqui: eps se aparca en 0.4975 contra una barra de 0.5,
+  # el bucle no corre nunca, y 150 epochs dan 2 crecimientos y accuracy 0.109
+  # con todos los certificados sanos. Restringido por el validador a
+  # family_order: [matrix_free_tangent], asi que la ruta del tangente y
+  # family_ladder_N1024.yaml no pueden alcanzarlo.
+  certify_growth_lookahead: true
+  certify_growth_lookahead_entry: true
+  # El freno independiente: pone a cero el cuello de botella cuando la
+  # direccion no sobrevive fuera de muestra. Ver docs/budget_free_stopping.md.
+  growth_bottleneck_crossfold_folds: 5
   # NO INERTE, verificado por medicion: quitarla movio s0 y s3 (s3 de 0.958 a
   # 0.896). Se lee en DOS sitios y solo uno depende del modo:
   #   pipeline.py  la rafaga del bloque de crecimiento por epoch -- APAGADA
