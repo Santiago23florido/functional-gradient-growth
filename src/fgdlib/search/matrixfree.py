@@ -479,21 +479,53 @@ class VmapOperators:
     live reverse-mode context. That nesting is the case this repo documented
     as returning functorch ``TensorWrapper`` values; the block range finder
     does not do it.
+
+    ``chunk`` bounds how many directions ride through one ``vmap``. It exists
+    because the block width the range finder asks for is ``rank + oversampling``
+    -- of order ``P`` -- and ``vmap`` holds the FULL forward activations for
+    every direction at once. On an MLP an activation is ``(N, width)``; on a
+    conv it is ``(N, C, H, W)``, larger by the spatial extent. MEASURED on the
+    N=1024 MNIST conv stack: 1024 images x 2 channels x 28 x 28 x 8 bytes is
+    12.8 MB PER DIRECTION PER LAYER, so the 202-direction block at the initial
+    P=202 already asks for gigabytes, and at the 2500-parameter budget the
+    block is 2510 wide and the ask is tens of GB. That is what exhausted the
+    machine, and it is a defect of the approximation rather than a cost of the
+    problem: 1024 tiny images and 2500 parameters do not need that memory.
+
+    The directions in a block are independent, so ``vmap`` over them IS a
+    loop and chunking cannot change the result mathematically. In floating
+    point it moves by ONE ULP, because the reduction order inside the kernels
+    depends on the batch size: measured, ``|J^T w|`` of magnitude 9.2 moves by
+    1.8e-15. ``chunk = 0`` keeps the unchunked call, so every existing run
+    stays byte-identical; the bound is pinned in
+    ``tests/test_matrix_free_block_chunk.py``.
     """
 
     _apply_j: object
     _apply_jt: object
     rows: int
     columns: int
+    chunk: int = 0
+
+    def _chunked(self, function, block: torch.Tensor) -> torch.Tensor:
+        if self.chunk <= 0 or block.shape[0] <= self.chunk:
+            return function(block)
+        pieces = [
+            function(block[start : start + self.chunk])
+            for start in range(0, block.shape[0], self.chunk)
+        ]
+        return torch.cat(pieces, dim=0)
 
     def apply_j(self, block: torch.Tensor) -> torch.Tensor:
-        return self._apply_j(block)
+        return self._chunked(self._apply_j, block)
 
     def apply_jt(self, block: torch.Tensor) -> torch.Tensor:
-        return self._apply_jt(block)
+        return self._chunked(self._apply_jt, block)
 
 
-def vmap_operators(model, x: torch.Tensor, parameters, names) -> VmapOperators:
+def vmap_operators(
+    model, x: torch.Tensor, parameters, names, chunk: int = 0
+) -> VmapOperators:
     """Build the vmapped operators around ``model`` at its current parameters."""
     from torch.func import functional_call, jvp, vjp, vmap
 
@@ -520,7 +552,11 @@ def vmap_operators(model, x: torch.Tensor, parameters, names) -> VmapOperators:
         return vmap(lambda v: jvp(_forward, (flat,), (v,))[1])(block.double())
 
     return VmapOperators(
-        _apply_j=_apply_j, _apply_jt=_apply_jt, rows=rows, columns=columns
+        _apply_j=_apply_j,
+        _apply_jt=_apply_jt,
+        rows=rows,
+        columns=columns,
+        chunk=int(chunk),
     )
 
 

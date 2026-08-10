@@ -208,6 +208,19 @@ fgd_approx:
   # for one extra forward per block. This is what makes certifying over the
   # whole dataset affordable rather than over a subsample.
   jacobian_row_chunk: 256
+  # Bound how many directions ride through ONE vmap on the matrix-free path.
+  # The range finder asks for rank + oversampling of them, which is of order
+  # P, and vmap holds every direction's FULL forward activations at once. On
+  # an MLP an activation is (N, width); on a conv it is (N, C, H, W) -- larger
+  # by the spatial extent. MEASURED here: 1024 images x 2 channels x 28 x 28 x
+  # 8 bytes is 12.8 MB PER DIRECTION PER LAYER, so the block at the 2500
+  # parameter budget asks for tens of GB and takes the machine down. That is a
+  # defect of the approximation, not a cost of the problem: 1024 tiny images
+  # and 2500 parameters do not need that memory.
+  #
+  # Chunking is EXACTLY equivalent -- the directions in a block are
+  # independent -- so this changes the footprint and nothing else.
+  matrix_free_block_chunk: 16
   # A rejected fallback family is skipped until this many ACCEPTED outer
   # steps have been committed since the rejection (weight updates change the
   # tangent space, so rejection is never permanent at a fixed architecture).

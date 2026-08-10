@@ -917,6 +917,19 @@ class FGDApproxConfig:
     # statement about the training loss and a statement about 256 points.
     # 0 disables chunking.
     jacobian_row_chunk: int = 0
+    #: How many directions ride through ONE ``vmap`` on the matrix-free path.
+    #: 0 keeps the unchunked call, so every existing run is byte-identical.
+    #:
+    #: The range finder asks for a block of ``rank + oversampling`` directions
+    #: -- of order ``P`` -- and ``vmap`` holds the full forward activations for
+    #: all of them at once. On an MLP an activation is ``(N, width)``; on a
+    #: conv it is ``(N, C, H, W)``, larger by the spatial extent. MEASURED on
+    #: the N=1024 MNIST conv stack that is 12.8 MB PER DIRECTION PER LAYER, so
+    #: the block at the 2500-parameter budget asks for tens of GB and takes the
+    #: machine down. The directions in a block are independent, so chunking is
+    #: a loop and cannot change the result mathematically; in floating point it
+    #: moves by one ulp, because the reduction order depends on the batch size.
+    matrix_free_block_chunk: int = 0
     certify_realize_path: bool = False
     certify_realize_max_iterations: int = 40
     certify_realize_tolerance: float = 0.05
@@ -3528,7 +3541,13 @@ def _matrix_free_tangent_system(
                     "gromo_without_paused_computation",
                 )
                 vmap_capture.enter_context(_suspended_module_capture(model))
-            operators = vmap_operators(model, x, parameters, parameter_names)
+            operators = vmap_operators(
+                model,
+                x,
+                parameters,
+                parameter_names,
+                chunk=int(getattr(config, "matrix_free_block_chunk", 0) or 0),
+            )
 
         columns = sum(p.numel() for p in parameters)
 

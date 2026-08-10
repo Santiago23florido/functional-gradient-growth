@@ -128,6 +128,12 @@ def test_mnist_conv_changes_only_data_model_and_the_probe_gates() -> None:
         # rank(J) = 192 at P = 202, so NK/rank = 13.3.
         "certify_probe_kappa",
         "max_total_parameters",
+        # The vmap block bound. The range finder asks for rank + oversampling
+        # directions at once and vmap holds every direction's full forward
+        # activations; on a conv those carry the spatial extent, so the block
+        # is 784x heavier than on an MLP and exhausted the machine. 0
+        # everywhere else keeps the unchunked call.
+        "matrix_free_block_chunk",
     }
     # Exactly two, and both are data-size knobs. Three more are written out
     # EXPLICITLY in the conv yaml with their reasons -- certify_stream_gram,
