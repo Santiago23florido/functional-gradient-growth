@@ -651,6 +651,19 @@ class FGDApproxConfig:
     # loop right after, so it buys ONE neuron per outer step and only while
     # the lookahead keeps preferring growth to training.
     certify_growth_lookahead_entry: bool = False
+    # Hold the FAMILY step to the same bar the tangent step already answers to:
+    # the real training objective. Separate from transactional_realized_descent
+    # so the two guards can be measured apart -- turning that one off to test
+    # this one would remove the tangent guard as well and compare something
+    # else entirely. Only consulted where the transaction exists at all, so it
+    # inherits the family_order: [matrix_free_tangent] restriction and cannot
+    # reach the tangent route.
+    #
+    # On by default because the unguarded behaviour is a MEASURED defect, not a
+    # preference: three MNIST runs, one family step each, and the full-train
+    # functional went x3.97, x6.21 and x15.44 while the probe functional fell
+    # 32 %. False exists to reproduce that, not to prefer it.
+    transactional_family_step: bool = True
     # Let the exact per-candidate eps ranking choose the SHAPE, not just the
     # size. The rank cap filters candidates to the width minimum and mandates
     # levelling it, both justified by "rank J <= min_l w_l" -- which is FALSE

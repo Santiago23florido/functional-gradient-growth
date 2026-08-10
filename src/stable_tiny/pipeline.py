@@ -6606,6 +6606,7 @@ def run_pipeline(
                                     if (
                                         stepped is None
                                         or not config.fgd_approx.transactional_realized_descent
+                                        or not config.fgd_approx.transactional_family_step
                                     ):
                                         return stepped
                                     return _transactionally_accept_family_step(
