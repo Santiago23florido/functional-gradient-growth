@@ -40,7 +40,11 @@ from gromo.modules.growing_dropout import (
     GrowingDropout2d,
 )
 
-from gromo.modules.growing_normalisation import GrowingBatchNorm1d, GrowingBatchNorm2d
+from gromo.modules.growing_normalisation import (
+    GrowingBatchNorm,
+    GrowingBatchNorm1d,
+    GrowingBatchNorm2d,
+)
 from gromo.utils.utils import known_activations_zero_plus_gradient
 
 __all__ = [
@@ -114,17 +118,26 @@ def make_hidden_post_function(
     return nn.Sequential(*modules)
 
 
-def _hidden_norm(post_function: nn.Module | None) -> GrowingBatchNorm1d | None:
+def _hidden_norm(post_function: nn.Module | None) -> GrowingBatchNorm | None:
     """The growable batch-norm inside a hidden post-function, if any.
 
     Handles both a bare batch-norm and the ``Sequential`` post-function
-    :func:`make_hidden_post_function` builds.
+    :func:`make_hidden_post_function` / :func:`make_conv_post_function` build.
+    Matches the shared ``GrowingBatchNorm`` base so the 1-D and 2-D variants
+    are found by the same walk -- the conv stack needs the 2-D one, and it
+    normalises channels exactly as the 1-D one normalises features.
+
+    ``GrowingGroupNorm`` is deliberately NOT matched: no stack token builds
+    one, its channel count lives under a different attribute, and its
+    ``grow`` additionally requires the new total to stay divisible by the
+    group count. Adding untested support for an unreachable case would be
+    speculation.
     """
-    if isinstance(post_function, GrowingBatchNorm1d):
+    if isinstance(post_function, GrowingBatchNorm):
         return post_function
     if isinstance(post_function, nn.Sequential):
         for module in post_function:
-            if isinstance(module, GrowingBatchNorm1d):
+            if isinstance(module, GrowingBatchNorm):
                 return module
     return None
 
@@ -145,10 +158,35 @@ def sync_normalization(model: nn.Module) -> None:
         norm = _hidden_norm(getattr(layer, "post_layer_function", None))
         if norm is None:
             continue
+        _check_norm_rank(layer, norm)
+        # ``out_features`` is ``out_channels`` on a Conv2dGrowingModule, which
+        # is exactly the norm's ``num_features``; no conv special case needed.
         width = int(layer.out_features)
         current = int(norm.num_features)
         if width > current:
             norm.grow(width - current)
+
+
+def _check_norm_rank(layer: nn.Module, norm: GrowingBatchNorm) -> None:
+    """Refuse a 1-D norm on a conv layer, or a 2-D one on a linear layer.
+
+    Both would grow to the right WIDTH and then fail, or worse not fail, at
+    forward time on the wrong tensor rank. Silence here would surface far
+    away from the cause.
+    """
+    from gromo.modules.conv2d_growing_module import Conv2dGrowingModule
+
+    spatial = isinstance(layer, Conv2dGrowingModule)
+    if spatial and not isinstance(norm, GrowingBatchNorm2d):
+        raise TypeError(
+            f"{type(layer).__name__} '{getattr(layer, 'name', '?')}' carries a "
+            f"{type(norm).__name__}; a conv layer needs GrowingBatchNorm2d."
+        )
+    if not spatial and isinstance(norm, GrowingBatchNorm2d):
+        raise TypeError(
+            f"{type(layer).__name__} '{getattr(layer, 'name', '?')}' carries a "
+            "GrowingBatchNorm2d; a linear layer needs GrowingBatchNorm1d."
+        )
 
 
 def make_post_layer_function(
