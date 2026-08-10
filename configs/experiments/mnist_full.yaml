@@ -1,18 +1,19 @@
-# MNIST depth/width sweep. Derived from configs/fgd/mnist_matrix_free.yaml;
-# ONLY these differ: number_hidden_layers 4, hidden_size 16,
-# mnist_train_samples 24000, max_total_parameters 60000,
-# epochs 150.
+# MNIST COMPLETO, arrancando en 2-2-2. Derivado de
+# configs/fgd/mnist_matrix_free.yaml; SOLO cambian el tamaño de los splits,
+# el tope de parametros y las epochs.
 #
-# The budget and the probe are COUPLED: certify_probe_kappa 4 with K = 10
-# outputs needs NK = 4P rows, so P = 60000 demands 240000 rows
-# = 24000 images, which is exactly mnist_train_samples. Raising
-# one without the other puts eps below the interpolation floor (abe380a).
+# 50000 train + 10000 validation son exactamente el conjunto de train de
+# MNIST, y test son sus 10000 completos. El presupuesto va ACOPLADO a eso:
+# certify_probe_kappa 4 con K = 10 salidas pide NK = 4P filas, asi que
+# 50000 imagenes admiten P <= 125000; se fija 100000 para dejar holgura al
+# desbordamiento de una neurona (785 params en la capa de 784 entradas).
+# Subir uno sin el otro deja eps bajo el suelo de interpolacion (abe380a).
 #
-# The budget-free stopping criterion is OFF here on purpose: these six runs
-# ask what shape the method reaches under a COMMON parameter ceiling, so the
-# ceiling has to be the only thing that ends growth. Add
-#   growth_bottleneck_crossfold_folds: 5
-# under fgd_approx for the paired sweep (see docs/budget_free_stopping.md).
+# Referencia de lo que 0.98 pide en esta familia: 784-100-10 son 79510
+# parametros, asi que el tope esta en el orden correcto para el objetivo.
+#
+# transactional_family_step se deja en su default (true) y el sbatch lo
+# apaga en el brazo B del A/B.
 # MNIST with the same family ladder as mnist_streaming.yaml, replacing only
 # the dense tangent construction by the matrix-free factored route and its
 # opt-in endpoint transaction. The exact MNIST config remains unchanged.
@@ -38,12 +39,12 @@ data:
   train_seed: 0
   validation_seed: 2
   test_seed: 1
-  mnist_train_samples: 24000
-  mnist_validation_samples: 2000
-  mnist_test_samples: 2000
+  mnist_train_samples: 50000
+  mnist_validation_samples: 10000
+  mnist_test_samples: 10000
 model:
-  hidden_size: 16
-  number_hidden_layers: 4
+  hidden_size: 2
+  number_hidden_layers: 3
   model_seed: 0
 
 training:
@@ -529,7 +530,7 @@ fgd_approx:
   # = 12000 images, and this config only loads mnist_train_samples: 10000. The
   # budget and the probe are now coupled quantities; 5000 needs NK = 20000 rows
   # = 2000 images, which fits.
-  max_total_parameters: 60000
+  max_total_parameters: 100000
   growth_preservation_tolerance: 1.0e-6
   # Ordered ladder of approximation families, evaluated top to bottom.
   # "tangent" must come first (it is the epoch's main transactional

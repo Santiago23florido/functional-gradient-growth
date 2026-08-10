@@ -48,6 +48,16 @@ PROFILE_FIELDS = (
     "transactional_realization_trials",
     "transactional_realization_accepted",
     "transactional_realization_rejected",
+    # The same transaction, applied to the FAMILY step, which certified a
+    # direction on the probe and then committed a full-length displacement --
+    # MEASURED on MNIST, three runs, the full-train functional went x3.97,
+    # x6.21 and x15.44 on the one family step each of them took. The third
+    # counter is the risk of the guard rather than of the bug: if no alpha
+    # ever lowers the real objective the ladder is off in practice, and the
+    # ladder is what cuts function-preserving growths from 57 to 6.
+    "family_transaction_accepted",
+    "family_transaction_backtracks",
+    "family_transaction_rejected",
     "where_scans",
     "where_candidates",
     "where_base_system_reuses",
@@ -76,6 +86,12 @@ PROFILE_FIELDS = (
     "certify_force_suppressed_nonfinite",
     "certify_family_deferral_refused",
     "certify_growth_not_warranted",
+    # Its counterpart, and the pair is the whole diagnostic: the lookahead is
+    # only useful if it says BOTH things. A run where _warranted_entries climbs
+    # monotonically while _not_warranted stays at 0 is a lookahead that is not
+    # discriminating -- it would grow one neuron per outer step until the
+    # parameter budget, which is the failure this trigger exists to avoid.
+    "certify_growth_warranted_entries",
     "growth_where_base_unavailable",
     # Declared late because it almost never fired: "every layer expresses what
     # is asked of it, so buy nothing" was unreachable in practice until a
@@ -155,6 +171,7 @@ PROFILE_FIELDS = (
     # structure was refused", this counts "and the ratio gate would have sent
     # it down a route that cannot serve it".
     "matrix_free_dual_unavailable",
+    "matrix_free_capture_pause_missing",
     "tangent_forward_target_seconds",
     "tangent_jacrev_seconds",
     "tangent_jacobian_flatten_seconds",
@@ -189,6 +206,9 @@ _COUNTER_FIELDS = {
     "transactional_realization_trials",
     "transactional_realization_accepted",
     "transactional_realization_rejected",
+    "family_transaction_accepted",
+    "family_transaction_backtracks",
+    "family_transaction_rejected",
     "where_scans",
     "where_candidates",
     "where_base_system_reuses",
@@ -204,6 +224,7 @@ _COUNTER_FIELDS = {
     "certify_force_suppressed_nonfinite",
     "certify_family_deferral_refused",
     "certify_growth_not_warranted",
+    "certify_growth_warranted_entries",
     "growth_where_base_unavailable",
     "growth_where_no_bottleneck",
     "certify_growth_target_stalls",
@@ -216,6 +237,7 @@ _COUNTER_FIELDS = {
     "growth_crossfold_layers_tested",
     "growth_crossfold_layers_rejected",
     "matrix_free_dual_unavailable",
+    "matrix_free_capture_pause_missing",
     "tangent_system_calls",
     "tangent_projection_solve_calls",
     "tangent_qr_calls",

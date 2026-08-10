@@ -195,6 +195,64 @@ Bug destapado y arreglado de paso: `growth_where_no_bottleneck` se pasaba a
 `FGD_PROFILE=1` reventaba con KeyError **la primera vez que el crecimiento
 paraba de verdad** — justo el evento que ese contador existe para registrar.
 
+### EL PROBLEMA INVERSO: en MNIST no paraba, es que no arrancaba
+
+Distinto del de arriba y hay que no confundirlos. Aquel es "deja de crecer
+cuando ya no hace falta"; este es "empieza a crecer cuando si hace falta".
+
+MEDIDO, `mnist-depth3-small-seed-0`, 150 epochs terminadas:
+
+```
+ep=1  eps=0.8527  P=1612          por encima de la barra -> crece
+ep=1  eps=0.4965  P=2399          dos crecimientos lo meten debajo
+ep=2  eps=0.8505  P=2399          vuelve a subir -> crece
+ep=2  eps=0.4975  P=2405  (+6)    certifica... y ya nunca mas
+```
+
+**2 crecimientos, 16 pasos externos en 150 epochs, accuracy 0.109**, y todos
+los certificados sanos. eps se aparca dos milesimas bajo la barra; el Lema 3.5
+da `eta_bar = 0.0025` ahi y el paso comprometido fue `1.55e-05`, asi que la
+perdida se mueve un 0.005% por paso, eps no sube, y no se vuelve a crecer.
+Estable: 1500 epochs darian lo mismo.
+
+El segundo crecimiento fueron **6 parametros en una capa interna**, y con eso
+basto para bajar eps de 0.85 a 0.4975. Ese es el fondo: **`eps < 1/2` se
+satisface con una red trivialmente pequeña** en MNIST, porque eps es relativo.
+El certificado hace su trabajo — garantiza que existe un paso — pero no es un
+indicador de capacidad, y el crecimiento estaba cableado a el.
+
+**N1024 no lo sufre** porque alli eps vive POR ENCIMA de 0.5 (41/46, 29/44,
+28/30, 32/44 de los pasos en las cuatro semillas), asi que la puerta dispara
+sola.
+
+**El defecto, en una linea.** `certify.py:723` es
+`while (epsilon >= target or forced_remaining > 0)`, y el lookahead que si mira
+esa banda (`_growth_reduces_lookahead_epsilon`, `pipeline.py:2251`) solo sabia
+RETORNAR: un "no" salia, un "si" caia al `while`, que lo excluye. **Era un freno
+sin acelerador.**
+
+**Arreglado** con `certify_growth_lookahead_entry`, que deja al mismo predicado
+autorizar la entrada. Acotado por construccion: la autorizacion la consume la
+primera iteracion y el `break` de `growth_turn_taken` que ya existia cierra el
+bucle, o sea **una neurona por paso externo y solo mientras crecer le gane a
+entrenar**. Puentea `_growth_pays` igual que `is_forced`, porque bajo el
+certificado el hueco `(eps - target)` es NEGATIVO y esa regla no significa nada
+ahi.
+
+⚠️ **Restringido a `family_order: [matrix_free_tangent]` por el validador**, y
+esa restriccion es el punto: la ruta del tangente y `family_ladder_N1024.yaml`
+son invariantes, y "el flag esta apagado alli" no es garantia — alguien lo
+enciende y se acabo. Es un error de carga. Verificado ademas por regresion:
+N1024 semilla 0 reproduce **`acc 0.9352 / 529 params / widths (10,18,14) / 23
+crecimientos` identico** tras el cambio.
+
+**Sin medir todavia en MNIST.** El riesgo es que el lookahead diga que si
+siempre: con el entrenamiento parado el clon quieto casi no mejora y crecer gana
+por defecto. El diagnostico es el par de contadores
+`certify_growth_warranted_entries` / `certify_growth_not_warranted`: **si el
+primero sube monotono y el segundo se queda en 0, no esta discriminando** y hay
+que atacar el clon quieto, no aflojar el freno.
+
 ### El planteamiento original (conservado)
 
 Nada de esto se detiene solo. Las 4 semillas paran al agotar los 600

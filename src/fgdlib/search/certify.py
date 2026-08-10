@@ -107,8 +107,11 @@ class CertifyResult:
     #: Exact system for the returned model and probe, when non-degenerate.
     tangent_system: ExactTangentSystem | None = None
     #: Why the loop returned: "certified", "growth_target_unreachable",
-    #: "parameter_budget", "no_growth_reduced_epsilon", "max_growths" or
-    #: "family_stepped". Diagnostic; nothing branches on it.
+    #: "parameter_budget", "no_growth_reduced_epsilon", "max_growths",
+    #: "family_stepped", "training_beats_growing", "growth_turn_taken" or
+    #: "growth_turn_taken_voluntary" -- the last one meaning the certificate
+    #: was already met and only the lookahead asked for the neuron.
+    #: Diagnostic; nothing branches on it.
     stop_reason: str = "certified"
     #: The eps the loop was chasing -- ``certify_growth_target`` clamped to the
     #: certificate, i.e. ``rel_error_threshold`` when the field is unset.
@@ -657,6 +660,11 @@ def grow_until_certified(
     growths = 0
     family_steps = 0
     forced_remaining = 1 if force else 0
+    #: Set only by the lookahead below, and consumed by the first iteration of
+    #: the loop -- one increment, then the turn goes back to training.
+    warranted_entry = False
+    #: The same fact, kept for the stop_reason after warranted_entry is spent.
+    entered_voluntarily = False
     unpaid_growths = 0
     stop_reason: str | None = None
 
@@ -694,6 +702,29 @@ def grow_until_certified(
                 stop_reason="training_beats_growing",
                 growth_target=target,
             )
+        # AND THE ANSWER CAN SAY YES. Until now a "no" returned and a "yes"
+        # fell through to `while epsilon >= target`, which excludes exactly
+        # the band this question is asked in -- so the lookahead was a brake
+        # with no accelerator. MEASURED on MNIST: eps parks at 0.4975 against
+        # a bar of 0.5, the loop never runs, and 150 epochs produce 2 growths
+        # and accuracy 0.109 while every certificate reports health. Nothing
+        # was broken; the only thing that could have noticed had no way to act.
+        #
+        # Gated on family_order: [matrix_free_tangent] by
+        # validate_growth_lookahead_entry, so the tangent route cannot reach
+        # this line at all.
+        warranted_entry = bool(
+            getattr(config.fgd_approx, "certify_growth_lookahead_entry", False)
+        )
+        entered_voluntarily = warranted_entry
+        if warranted_entry:
+            increment("certify_growth_warranted_entries")
+            if progress is not None:
+                progress(
+                    f"[CERTIFY] eps {epsilon:.4f} certifies but growing "
+                    "reaches a lower eps than training would; buying one "
+                    "increment"
+                )
 
     # The budget exists (tangent.py) and is honoured at the end of each epoch,
     # but was invisible to the loop that spends the most -- this one. Checked
@@ -720,12 +751,22 @@ def grow_until_certified(
             growth_target=target,
         )
 
-    while (epsilon >= target or forced_remaining > 0) and growths < max_growths:
+    while (
+        epsilon >= target or forced_remaining > 0 or warranted_entry
+    ) and growths < max_growths:
         # Captured BEFORE the decrement: a forced growth is the answer to a
         # measured deadlock and must not be vetoed by the value criterion,
         # which would restore the deadlock it was added to break.
-        is_forced = forced_remaining > 0
+        #
+        # The lookahead's authorisation is the same kind of thing and is
+        # spent the same way, on the first iteration: it answers "training is
+        # not the binding constraint here", which is a measured deadlock, not
+        # a bet on marginal value. _growth_pays would refuse it anyway --
+        # below the certificate the gap (eps - target) is NEGATIVE, so the
+        # floor it computes is meaningless there.
+        is_forced = forced_remaining > 0 or warranted_entry
         forced_remaining = max(0, forced_remaining - 1)
+        warranted_entry = False
 
         # FAMILY LADDER, before growing: the tangent could not certify (that
         # is why we are here), so try a certified NON-tangent family at the
@@ -925,7 +966,16 @@ def grow_until_certified(
         # target. Above the certificate nothing is voluntary -- no step exists
         # at any damping -- so the loop keeps growing there, unchanged.
         if growth_warranted is not None and epsilon < certificate:
-            stop_reason = "growth_turn_taken"
+            # Two ways to arrive here and they must not be confused in a log:
+            # entering with eps ABOVE the certificate means the certificate
+            # demanded growth, entering BELOW it means only the lookahead did.
+            # Without the distinction there is no way to attribute anything
+            # the change produces.
+            stop_reason = (
+                "growth_turn_taken_voluntary"
+                if entered_voluntarily
+                else "growth_turn_taken"
+            )
             break
 
         # ADAPTIVE COUNT: keep adding at the just-chosen best location while each

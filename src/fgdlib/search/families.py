@@ -250,6 +250,55 @@ def certify_parametric_step(
     )
 
 
+@torch.no_grad()
+def measure_family_displacement(
+    base_model,
+    candidate,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    config,
+) -> tuple[float, float]:
+    """``(cosine, relative_error)`` of ``base -> candidate`` against ``r``.
+
+    The same measurement ``certify_parametric_step`` makes on its clone, as a
+    function of an ARBITRARY candidate, so a shortened version of a family step
+    can be certified on its own terms instead of inheriting the certificate of
+    the full one. That inheritance is the defect the nonlinear branch already
+    documented: interpolating in parameter space destroys the direction --
+    MEASURED ``cos 0.969 -> 0.640 -> 0.523 -> 0.476`` for
+    ``alpha`` 1 / .5 / .25 / .125 -- so a certificate earned at ``alpha = 1``
+    says nothing about the model actually committed.
+
+    A SECOND function rather than a refactor of the original: the original is
+    on the path that produces every existing result and stays byte-identical.
+    """
+    was_training = base_model.training
+    base_model.eval()
+    candidate_training = candidate.training
+    candidate.eval()
+    try:
+        f0 = base_model(x).detach()
+        # mse_functional_gradient, not the dispatching functional_gradient,
+        # because certify_parametric_step measures r that way too (line 140).
+        # This has to be the SAME quantity the original certified or the two
+        # numbers are not comparable, which is the whole point of re-measuring.
+        r = mse_functional_gradient(f0, y)
+        displacement = f0 - candidate(x).detach()
+    finally:
+        base_model.train(was_training)
+        candidate.train(candidate_training)
+
+    displacement_norm = float(torch.linalg.vector_norm(displacement))
+    residual_norm = float(torch.linalg.vector_norm(r))
+    if not (displacement_norm > 0.0 and residual_norm > 0.0):
+        return 0.0, float("inf")
+
+    cosine = float(
+        torch.sum(displacement * r) / (displacement_norm * residual_norm)
+    )
+    return cosine, math.sqrt(max(0.0, 1.0 - max(cosine, 0.0) ** 2))
+
+
 def certify_parametric_step_swept(
     model,
     x: torch.Tensor,

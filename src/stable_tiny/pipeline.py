@@ -51,6 +51,7 @@ from fgdlib.tangent import (
     train_one_epoch_fgd_approx,
     validate_bottleneck_stopping,
     validate_family_order,
+    validate_growth_lookahead_entry,
     validate_functional_loss,
     validate_exact_tangent_system,
     validate_transactional_realized_descent,
@@ -71,6 +72,7 @@ from fgdlib.search.certify import (
 )
 from fgdlib.search.families import (
     certify_parametric_step_swept,
+    measure_family_displacement,
 )
 from fgdlib.search.matrixfree import (
     apply_parameter_direction,
@@ -622,6 +624,7 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
     validate_functional_loss(config.fgd_approx.functional_loss)
     validate_transactional_realized_descent(config.fgd_approx)
     validate_bottleneck_stopping(config.fgd_approx)
+    validate_growth_lookahead_entry(config.fgd_approx)
     config.parametric_gd.validate()
     config.parametric_descent.validate()
     return config
@@ -1109,6 +1112,99 @@ def _evaluate_transactional_full_train_functional_loss(
     if example_count == 0:
         raise ValueError("Transactional full-train guard received no examples.")
     return total_loss, example_count
+
+
+def _interpolate_toward(base_model, target_model, alpha: float):
+    """A copy of ``base`` moved ``alpha`` of the way to ``target``."""
+    moved = copy.deepcopy(base_model)
+    with torch.no_grad():
+        for parameter, base, goal in zip(
+            moved.parameters(), base_model.parameters(), target_model.parameters()
+        ):
+            parameter.copy_(base * (1.0 - alpha) + goal * alpha)
+    return moved
+
+
+def _transactionally_accept_family_step(
+    *,
+    base_model,
+    stepped,
+    probe: tuple[torch.Tensor, torch.Tensor],
+    full_train_batches: list[tuple[torch.Tensor, torch.Tensor]],
+    device: torch.device,
+    config: PipelineConfig,
+    progress: ProgressFn | None,
+):
+    """The shortest family step that actually lowers the REAL objective.
+
+    The family certificate is a COSINE on the probe (``families.py``): it says
+    which way, never how far, and the ladder then commits the trained clone
+    whole -- a functional step of size 1. MEASURED on MNIST across three runs,
+    one family step each and one unexplained jump each: the full-train
+    functional went x3.97, x6.21 and x15.44 while the probe functional fell
+    32 %. The tangent path is guarded against exactly this and rejects it
+    (``full_train_functional_increase``); the family step never reached that
+    guard, and worse, the NEXT transaction re-based its ``full_train_before``
+    on the degraded model, so the regression became the new zero and every
+    certificate went on reporting health.
+
+    So the bar here is the objective itself, not another quantity computed on
+    the probe -- no probe-side bound, Lemma 3.5's or otherwise, can see a step
+    that improves the probe and worsens the truth.
+
+    Backtracking mirrors the tangent guard exactly, and reuses its three
+    constants. Each ``alpha`` is re-certified FROM SCRATCH, never inheriting
+    the full step's cosine, because parameter-space interpolation destroys the
+    direction it was earned with.
+
+    Returns the accepted model, or ``None`` -- which the ladder already reads
+    as "the family did not certify" and answers by growing instead.
+    """
+    approx = config.fgd_approx
+    threshold = min(float(approx.rel_error_threshold), 0.5)
+    atol = float(approx.transactional_descent_atol)
+    factor = float(approx.transactional_backtrack_factor)
+    attempts = max(1, int(approx.transactional_max_retries) + 1)
+
+    before, base_examples = _evaluate_transactional_full_train_functional_loss(
+        base_model, full_train_batches, device, approx.functional_loss
+    )
+
+    alpha = 1.0
+    for attempt in range(attempts):
+        candidate = stepped if alpha == 1.0 else _interpolate_toward(
+            base_model, stepped, alpha
+        )
+        cosine, relative_error = measure_family_displacement(
+            base_model, candidate, probe[0], probe[1], approx
+        )
+        certified = cosine > 0.0 and relative_error < threshold
+        after, examples = _evaluate_transactional_full_train_functional_loss(
+            candidate, full_train_batches, device, approx.functional_loss
+        )
+        if examples != base_examples:
+            raise ValueError(
+                "Family transaction compared different example counts: "
+                f"{base_examples} before, {examples} after."
+            )
+        delta = after - before
+        accepted = certified and delta <= atol
+        if progress is not None:
+            progress(
+                f"[FAMILY-TX] alpha={alpha:.4g} cos={cosine:.4f} "
+                f"eps={relative_error:.4f} full_train={before:.6e}->{after:.6e} "
+                f"accepted={accepted}"
+            )
+        if accepted:
+            increment("family_transaction_accepted")
+            if attempt:
+                increment("family_transaction_backtracks", attempt)
+            return candidate
+        alpha *= factor
+
+    increment("family_transaction_rejected")
+    fallback("family_transaction_rejected", "no_alpha_lowered_full_train")
+    return None
 
 
 def certified_validation_learning_rate(
@@ -6483,7 +6579,7 @@ def run_pipeline(
                                 # fails says the clone could not realise THAT
                                 # distance, not that the family is unavailable.
                                 def _family_step(candidate_model):
-                                    return certify_parametric_step_swept(
+                                    stepped = certify_parametric_step_swept(
                                         candidate_model,
                                         _fp[0],
                                         _fp[1],
@@ -6497,6 +6593,31 @@ def run_pipeline(
                                         ),
                                         progress=progress,
                                     ).model
+                                    # The certificate above is a cosine on the
+                                    # probe, so it licenses a DIRECTION and the
+                                    # ladder then commits the clone whole. Where
+                                    # the transactional guard is on, hold the
+                                    # family step to the same bar the tangent
+                                    # step already answers to: the real training
+                                    # objective. Off, this returns the clone
+                                    # untouched, so every existing result --
+                                    # N1024 included, where the guard is off and
+                                    # cannot be turned on -- is byte-identical.
+                                    if (
+                                        stepped is None
+                                        or not config.fgd_approx.transactional_realized_descent
+                                        or not config.fgd_approx.transactional_family_step
+                                    ):
+                                        return stepped
+                                    return _transactionally_accept_family_step(
+                                        base_model=candidate_model,
+                                        stepped=stepped,
+                                        probe=_fp,
+                                        full_train_batches=frozen_train_batches,
+                                        device=device,
+                                        config=config,
+                                        progress=progress,
+                                    )
                             model, certify_result = grow_until_certified(
                                 model=model,
                                 x=fgd_train_probe[0],
