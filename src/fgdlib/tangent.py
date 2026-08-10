@@ -5107,8 +5107,18 @@ def select_tiny_growth_layer_index(
                 compute_delta=config.growth_compute_delta,
             )
         )
+        # ``update_value`` is a float on ``SequentialGrowingModel``
+        # (``update_information`` calls ``.item()``) and a tensor on the
+        # containers that predate it. Only the number is wanted either way;
+        # assuming the tensor crashed the conv path with "'float' object has
+        # no attribute 'detach'" the first time growth was refused by the
+        # parameter budget, which is the one route that reaches this call.
         scores = {
-            int(index): float(info["update_value"].detach().cpu())
+            int(index): float(
+                value.detach().cpu()
+                if isinstance(value := info["update_value"], torch.Tensor)
+                else value
+            )
             for index, info in model.update_information().items()
         }
         if not scores:

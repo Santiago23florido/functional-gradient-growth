@@ -223,15 +223,15 @@ fgd_approx:
   # the identical matrix (tests/test_jacobian_chunking.py) at a bounded peak,
   # for one extra forward per block. This is what makes certifying over the
   # whole dataset affordable rather than over a subsample.
-  # 8, not config 2's 256, and this is the SAME defect as the vmap block
-  # below, in the other tangent route. The validation certificate takes the
-  # EXACT path: it calls jacrev per row-block, which vmaps one backward per
-  # output row, and each backward holds the whole probe's activations. On an
-  # MLP that is (N, width); on a conv it is (N, C, H, W). MEASURED on the 8 GB
-  # card at NK = 7040: row_chunk 256 OOMs outright, 16 peaks at 1.91 GB, and 8
-  # at 1.04 GB for the same 10 seconds. Same knob config 2 uses, a value the
-  # spatial extent forces.
-  jacobian_row_chunk: 8
+  # 32, and the value is MEASURED AT THE PROBE THE RUN ACTUALLY USES, which
+  # is the mistake the first attempt made. certify_probe_kappa shrinks the
+  # probe at run time -- NK settles at 1920, not the 7040 that probe_batches
+  # would give -- so calibrating the chunks against the full probe made both
+  # of them ~4x tighter than necessary and cost 4.5x on every certificate.
+  #
+  # At NK = 1920, P = 544: rows 8 -> 4.5 s, rows 32 -> 1.0 s, rows 64 -> 1.0 s
+  # at twice the memory, rows 128 -> OOM. 32 is where the curve flattens.
+  jacobian_row_chunk: 32
   # Bound how many directions ride through ONE vmap on the matrix-free path.
   # The range finder asks for rank + oversampling of them, which is of order
   # P, and vmap holds every direction's FULL forward activations at once. On
@@ -244,12 +244,11 @@ fgd_approx:
   #
   # Chunking is EXACTLY equivalent -- the directions in a block are
   # independent -- so this changes the footprint and nothing else.
-  # 8, MEASURED on the card rather than chosen: peak CUDA memory for one
-  # tangent solve is 1.60 GB at chunk 16 and 0.93 GB at 8, and chunk 32 OOMs
-  # outright on the 8 GB laptop GPU. The cost is 20% wall clock (17.1 s ->
-  # 20.5 s per solve), which is the right side of that trade when the
-  # alternative is not finishing.
-  matrix_free_block_chunk: 8
+  # 32, measured at the same real probe. Unlike the row chunk this one barely
+  # affects time (the solve is 5.8 s at chunk 8 and 4.2 s at 32), so raising
+  # it buys little and only costs memory -- 1.11 GB at 32 against 2.15 GB at
+  # 64 for the same speed, and 128 OOMs on the 8 GB card.
+  matrix_free_block_chunk: 32
   # A rejected fallback family is skipped until this many ACCEPTED outer
   # steps have been committed since the rejection (weight updates change the
   # tangent space, so rejection is never permanent at a fixed architecture).
@@ -555,10 +554,16 @@ fgd_approx:
   # linear ladder rank tracks P and the probe has to chase it; here NK = 7040
   # against rank ~200-300 leaves NK/rank at 23-35, far above the floor of 4.
   #
-  # What binds instead is memory, and it grows with P: one solve peaks at
-  # 0.65 GB at P=498 and 1.02 GB at P=1450. 1700 keeps the whole epoch inside
-  # the capped half of an 8 GB card, and the linear reference lands near 600
-  # parameters in this regime, so it is room rather than a corset.
+  # What binds is TIME, not the certificate: one tangent solve costs 4.2 s at
+  # P=544 and 25.5 s at P=1450, six times over, and an epoch spends about 24
+  # of them.
+  #
+  # 1000 was tried on that reasoning and it was the WRONG TRADE, measured:
+  # the run reached 996 parameters by epoch 2 and then spent every epoch
+  # unable to grow, with eps parked at 0.4997-0.5000 -- the same stall a cap
+  # produces in the linear ladder -- and accuracy froze at 0.349 against the
+  # 0.673 the same flow reached at 1700. A budget that changes the ANSWER is
+  # not an instrument, so it goes back up and the epochs cost what they cost.
   max_total_parameters: 1700
   # Also from config 2: the streamed Gram is for the flat-MNIST widths.
   certify_stream_gram: false
