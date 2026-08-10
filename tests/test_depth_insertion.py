@@ -112,7 +112,10 @@ def test_depth_cost_is_comparable_to_neuron_cost() -> None:
 
     neuron_costs = growable_neuron_costs(model, config.data.in_features)
     depth_cost = inserted_layer_cost(8)
-    assert depth_cost == 8 * 8 + 8
+    # A square weight, a bias, and the homotopy's alpha. The alpha used to be
+    # left out, which understated every insertion by one and disagreed with
+    # the measured count_parameters delta.
+    assert depth_cost == 8 * 8 + 8 + 1
 
     # A layer at width 8 costs far less than a neuron on the 784-wide input
     # projection, and more than one on a narrow late layer -- exactly the

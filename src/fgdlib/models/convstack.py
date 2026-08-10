@@ -348,6 +348,148 @@ class ConvStackModel(SequentialGrowingModel):
         # GroMo allocates the bordering convolution during this pass.
         freeze_growth_scratch(self)
 
+    # -- depth ----------------------------------------------------------
+    def insert_identity_at(
+        self,
+        position: int,
+        activation: nn.Module | None = None,
+        device: torch.device | None = None,
+        kernel_size: int | None = None,
+    ) -> nn.Module:
+        """Insert an exactly function-preserving identity layer.
+
+        ``position`` indexes ``self.layers``; the new module goes IMMEDIATELY
+        after ``layers[position - 1]`` in the execution plan, i.e. before any
+        op that follows it, so no downstream shape changes and the two convs
+        share a spatial grid -- which is also precisely the condition that
+        makes the new layer growable and therefore RELIEVES the predecessor's
+        pinned width. That is the whole point of the depth axis here.
+
+        For a conv predecessor the weight is a CENTRED DELTA, so the layer is
+        the identity including at the borders. That requires unit stride and
+        dilation, an odd kernel, and ``padding == k // 2``; anything else is
+        refused with ``ValueError``, which the growth caller already treats as
+        "skip this candidate".
+
+        A ``k x k`` delta rather than a 1x1: both are exactly the identity,
+        but a 1x1 can only ever mix channels, while the ``k x k`` starts at
+        the identity and can BECOME a real convolution. That is the same
+        argument :class:`~fgdlib.search.depth.IdentityHomotopyActivation`
+        makes for the nonlinearity -- the layer earns its capability by
+        descent instead of being handed it. Kernel, stride, padding and
+        dilation are read off the predecessor, so nothing here is a constant
+        fitted to a dataset.
+        """
+        from fgdlib.search.depth import IdentityHomotopyActivation
+
+        if not 1 <= position <= len(self.layers) - 1:
+            raise ValueError(
+                f"position must be in [1, {len(self.layers) - 1}], got {position}"
+            )
+        previous = self.layers[position - 1]
+        if activation is None:
+            activation = getattr(previous, "post_layer_function", nn.SELU())
+        post = IdentityHomotopyActivation(activation)
+
+        if isinstance(previous, Conv2dGrowingModule):
+            inserted = self._identity_conv(previous, post, device, kernel_size)
+        else:
+            inserted = self._identity_linear(previous, post, device)
+
+        rebuilt = list(self.layers)
+        rebuilt.insert(position, inserted)
+        self.layers = nn.ModuleList(rebuilt)
+
+        plan: list[tuple[str, int]] = []
+        for kind, payload in self._plan:
+            if kind == "layer":
+                shifted = payload + 1 if payload >= position else payload
+                plan.append((kind, shifted))
+                if payload == position - 1:
+                    plan.append(("layer", position))
+            else:
+                plan.append((kind, payload))
+        self._plan = plan
+
+        self.rebuild_links()
+        return inserted
+
+    @staticmethod
+    def _identity_conv(
+        previous: Conv2dGrowingModule,
+        post: nn.Module,
+        device: torch.device | None,
+        kernel_size: int | None,
+    ) -> Conv2dGrowingModule:
+        channels = int(previous.out_channels)
+        kernel = (
+            (int(kernel_size), int(kernel_size))
+            if kernel_size is not None
+            else tuple(int(k) for k in previous.kernel_size)
+        )
+        stride = tuple(int(s) for s in previous.stride)
+        dilation = tuple(int(d) for d in previous.dilation)
+        padding = (kernel[0] // 2, kernel[1] // 2)
+
+        if stride != (1, 1) or dilation != (1, 1):
+            raise ValueError(
+                "an identity conv needs unit stride and dilation, got "
+                f"stride={stride} dilation={dilation}"
+            )
+        if kernel[0] % 2 == 0 or kernel[1] % 2 == 0:
+            raise ValueError(f"an identity conv needs an odd kernel, got {kernel}")
+        previous_padding = tuple(int(p) for p in previous.padding)
+        if previous_padding != tuple(int(k) // 2 for k in previous.kernel_size):
+            raise ValueError(
+                "an identity conv must sit in a same-padding chain, but the "
+                f"predecessor pads {previous_padding} for kernel "
+                f"{tuple(previous.kernel_size)}"
+            )
+
+        inserted = type(previous)(
+            in_channels=channels,
+            out_channels=channels,
+            kernel_size=kernel,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            use_bias=True,
+            post_layer_function=post,
+            previous_module=None,  # rebuild_links owns this
+            name=f"Inserted {previous.name}",
+            device=device,
+        )
+        with torch.no_grad():
+            inserted.weight.zero_()
+            centre = (kernel[0] // 2, kernel[1] // 2)
+            for channel in range(channels):
+                inserted.weight[channel, channel, centre[0], centre[1]] = 1.0
+            if inserted.bias is not None:
+                inserted.bias.zero_()
+        return inserted
+
+    @staticmethod
+    def _identity_linear(
+        previous: LinearGrowingModule,
+        post: nn.Module,
+        device: torch.device | None,
+    ) -> LinearGrowingModule:
+        width = int(previous.out_features)
+        inserted = LinearGrowingModule(
+            width,
+            width,
+            post_layer_function=post,
+            previous_module=None,
+            use_bias=True,
+            name=f"Inserted {previous.name}",
+            device=device,
+        )
+        with torch.no_grad():
+            inserted.weight.copy_(torch.eye(width, device=inserted.weight.device))
+            if inserted.bias is not None:
+                inserted.bias.zero_()
+        return inserted
+
 
 def _spatial_after(op: OpSpec, height: int, width: int) -> tuple[int, int]:
     if op.kind == "maxpool":

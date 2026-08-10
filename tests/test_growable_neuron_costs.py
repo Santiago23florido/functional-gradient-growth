@@ -175,5 +175,5 @@ def test_growing_scratch_never_reaches_the_parameter_count() -> None:
 
 
 def test_inserted_layer_cost_defaults_to_the_linear_figure() -> None:
-    assert inserted_layer_cost(7) == 7 * 7 + 7
-    assert inserted_layer_cost(2, 9) == 2 * 2 * 9 + 2 == 38
+    assert inserted_layer_cost(7) == 7 * 7 + 7 + 1
+    assert inserted_layer_cost(2, 9) == 2 * 2 * 9 + 2 + 1 == 39
