@@ -11,7 +11,7 @@ CANONICAL_CONFIGS = {
     "cifar_streaming.yaml",
     "family_ladder_N1024.yaml",
     "family_ladder_matrix_free_N1024.yaml",
-    "mnist_conv_matrix_free_N1024.yaml",
+    "mnist_conv_matrix_free.yaml",
     "mnist_matrix_free.yaml",
     "mnist_streaming.yaml",
 }
@@ -107,47 +107,47 @@ def test_mnist_matrix_free_changes_only_execution_and_matrix_free_gates() -> Non
 
 
 def test_mnist_conv_inherits_config_2s_optimisation_set() -> None:
-    """The conv config is config 2's MNIST settings on a conv model.
+    """The conv config is config 2 with a conv model. Nothing else.
 
-    Config 1 (the N=1024 ladder) supplies the certified knobs, but the
-    EXECUTION and approximation settings must come from config 2, because
-    config 2 is the one built for MNIST scale -- its smaller probe, its cheap
-    lookahead, its streamed-Gram choice. Deriving from config 1 alone and
-    keeping its 16-batch probe and 10-step lookahead was the mistake this test
-    exists to prevent recurring.
+    Config 1 (the N=1024 ladder) supplied the certified knobs originally, but
+    the EXECUTION settings and the DATA have to come from config 2, because
+    config 2 is the MNIST one and this is its conv counterpart. Deriving from
+    config 1 and keeping its 16-batch probe, its 10-step lookahead, its 70
+    epochs and 1024 samples was the mistake this test exists to stop
+    recurring: it left the conv run with nothing comparable to measure
+    against.
 
-    Exactly three fields may differ, and each is forced by conv or by
-    N = 1024 rather than chosen.
+    Exactly three fgd_approx fields may differ, and each is forced by the
+    convolution rather than chosen.
     """
     config_2 = load_pipeline_config("configs/fgd/mnist_matrix_free.yaml")
-    conv = load_pipeline_config("configs/fgd/mnist_conv_matrix_free_N1024.yaml")
+    conv = load_pipeline_config("configs/fgd/mnist_conv_matrix_free.yaml")
 
     assert _differing_fields(config_2.fgd_approx, conv.fgd_approx) == {
+        # The validation certificate takes the EXACT route, whose jacrev vmaps
+        # one backward per output row, each holding the whole probe's
+        # activations. On an MLP that is (N, width); on a conv it is
+        # (N, C, H, W). MEASURED: 256 OOMs the 8 GB card.
+        "jacobian_row_chunk",
+        # Same defect in the matrix-free route's range finder.
+        "matrix_free_block_chunk",
         # GroMo's crossfold test cannot MEASURE on conv: its fitted extension
         # matrix assumes two linear layers, so with 4-D alpha/omega it returns
-        # inf and inf > 1 approves everything. Off beats looking live.
+        # inf, and inf > 1 approves everything. Off beats looking live.
         "growth_bottleneck_crossfold_folds",
-        # vmap holds every direction's activations at once, and a conv
-        # activation carries the spatial extent. MEASURED on the 8 GB card:
-        # 1.60 GB per solve at chunk 16, OOM at 32.
-        "matrix_free_block_chunk",
-        # Coupled to the probe by kappa. Config 2 loads 10000 images so it can
-        # spend NK = 20000 rows and afford 5000 parameters; at 1024 images the
-        # probe is NK = 7040 and kappa 4 holds only to rank(J) <= 1760.
-        "max_total_parameters",
-        # Same knob as config 2, a value the spatial extent forces. The
-        # validation certificate takes the EXACT route, whose jacrev vmaps one
-        # backward per output row, each holding the whole probe's activations.
-        # MEASURED at NK = 7040: 256 OOMs, 16 peaks at 1.91 GB, 8 at 1.04 GB
-        # for the same 10 seconds.
-        "jacobian_row_chunk",
     }
-    # The two settings whose absence made the first attempt unaffordable.
-    assert conv.fgd_approx.probe_batches == config_2.fgd_approx.probe_batches == 11
+    # The data differs only in the two ways a convolution requires.
+    assert _differing_fields(config_2.data, conv.data) == {"kind", "input_shape"}
+    assert conv.data.mnist_train_samples == config_2.data.mnist_train_samples
+    assert conv.training.epochs == config_2.training.epochs
+    # And the settings whose absence made the first attempt unaffordable.
+    assert conv.fgd_approx.probe_batches == config_2.fgd_approx.probe_batches
     assert conv.fgd_approx.growth_lookahead_steps == 2
     assert conv.fgd_approx.certify_growth_lookahead is True
     assert conv.fgd_approx.certify_growth_lookahead_entry is True
-    # And the certified core still comes from config 1, untouched.
+    assert conv.fgd_approx.max_total_parameters == 5000
+    assert conv.fgd_approx.certify_probe_kappa == 4.0
+    # The certified core is untouched.
     assert conv.fgd_approx.family_order == ("matrix_free_tangent",)
     assert conv.fgd_approx.growth_where == "expressivity_bottleneck"
     assert conv.fgd_approx.rel_error_threshold == 0.5
@@ -159,7 +159,7 @@ def test_the_conv_stack_builds_the_architecture_the_comments_claim() -> None:
 
     from stable_tiny.pipeline import build_dataloaders, build_model
 
-    config = load_pipeline_config("configs/fgd/mnist_conv_matrix_free_N1024.yaml")
+    config = load_pipeline_config("configs/fgd/mnist_conv_matrix_free.yaml")
     model = build_model(config, torch.device("cpu"))
     assert sum(p.numel() for p in model.parameters() if p.requires_grad) == 498
     assert len(model._growable_layers) == 3
@@ -203,7 +203,7 @@ def test_the_crossfold_test_really_cannot_measure_on_conv() -> None:
     y = torch.zeros(64, 10)
     y[torch.arange(64), torch.randint(0, 10, (64,), generator=generator)] = 1.0
     config = load_pipeline_config(
-        "configs/fgd/mnist_conv_matrix_free_N1024.yaml"
+        "configs/fgd/mnist_conv_matrix_free.yaml"
     ).fgd_approx
     for layer_index in range(len(model._growable_layers)):
         statistic, folds = crossfold_bottleneck_significance(

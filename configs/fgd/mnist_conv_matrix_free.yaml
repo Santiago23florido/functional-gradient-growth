@@ -40,7 +40,7 @@
 # PL constant (mu = 2, L* = 0) where cross-entropy has none, and an epoch
 # costs seconds instead of minutes.
 run:
-  name: mnist_conv_matrix_free_N1024
+  name: mnist_conv_matrix_free
   results_dir: results
   save_plot: false
   show_plot: false
@@ -58,7 +58,17 @@ data:
   out_features: 10
   batch_size: 64
   # N = 1024, the regime this whole line of work is calibrated in.
-  mnist_train_samples: 1024
+  # 10000, config 2's value. This config is the CONV COUNTERPART of
+  # mnist_matrix_free.yaml, so the data has to match or the comparison against
+  # it is not a comparison. An earlier version used 1024 and would have needed
+  # its own linear arm run separately just to have something to measure
+  # against.
+  #
+  # It costs less than it looks: the probe is not sized by the dataset but by
+  # certify_probe_kappa from rank(J), and on conv rank sits at 200-300 and
+  # FALLS as the net grows, so the probe settles near 192 images either way.
+  # What grows is the full-train evaluation, which is the cheap part.
+  mnist_train_samples: 10000
   mnist_validation_samples: 2000
   mnist_test_samples: 2000
   train_seed: 0
@@ -114,7 +124,7 @@ model:
 
 training:
   method: fgd_approx
-  epochs: 70
+  epochs: 40
   accuracy_tolerance: 0.1
   gradient_clip_norm:
   log_every: 1
@@ -558,13 +568,15 @@ fgd_approx:
   # P=544 and 25.5 s at P=1450, six times over, and an epoch spends about 24
   # of them.
   #
-  # 1000 was tried on that reasoning and it was the WRONG TRADE, measured:
-  # the run reached 996 parameters by epoch 2 and then spent every epoch
-  # unable to grow, with eps parked at 0.4997-0.5000 -- the same stall a cap
-  # produces in the linear ladder -- and accuracy froze at 0.349 against the
-  # 0.673 the same flow reached at 1700. A budget that changes the ANSWER is
-  # not an instrument, so it goes back up and the epochs cost what they cost.
-  max_total_parameters: 1700
+  # 5000, config 2's value, for the same reason the sample count is.
+  #
+  # A tighter cap was tried and it was the WRONG TRADE, measured: at 1000 the
+  # run reached 996 parameters by epoch 2 and then spent every epoch unable to
+  # grow, eps parked at 0.4997-0.5000 -- the same stall a cap produces in the
+  # linear ladder -- and accuracy froze at 0.349 against the 0.673 the same
+  # flow reached with room. A budget that changes the ANSWER is not an
+  # instrument, whatever it saves in wall clock.
+  max_total_parameters: 5000
   # Also from config 2: the streamed Gram is for the flat-MNIST widths.
   certify_stream_gram: false
   # GroMo's crossfold bottleneck test CANNOT MEASURE on conv: its fitted

@@ -118,7 +118,7 @@ def test_the_default_is_unchunked_so_existing_runs_are_untouched() -> None:
         config = load_pipeline_config(f"configs/fgd/{name}.yaml")
         assert config.fgd_approx.matrix_free_block_chunk == 0
 
-    conv = load_pipeline_config("configs/fgd/mnist_conv_matrix_free_N1024.yaml")
+    conv = load_pipeline_config("configs/fgd/mnist_conv_matrix_free.yaml")
     # 32, measured at the probe the run actually uses (NK=1920 after
     # certify_probe_kappa shrinks it), not at the full probe.
     assert conv.fgd_approx.matrix_free_block_chunk == 32

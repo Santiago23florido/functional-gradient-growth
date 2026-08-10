@@ -226,7 +226,7 @@ def test_the_dispatch_splits_the_catalog_the_way_it_claims() -> None:
         stack = load_pipeline_config(str(path)).model.stack
         if is_conv_stack(list(stack) if stack else None):
             conv_configs.add(path.name)
-    assert conv_configs == {"mnist_conv_matrix_free_N1024.yaml"}
+    assert conv_configs == {"mnist_conv_matrix_free.yaml"}
 
 
 def test_the_mlp_stack_path_is_untouched() -> None:
