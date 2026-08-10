@@ -143,7 +143,7 @@ from gromo.containers.sequential_growing_container import SequentialGrowingModel
 ProgressFn = Callable[[str], None]
 TrainingMethod = Literal["normal", "fgd_approx", "fgd_rkhs", "fgd_rkhs_grow"]
 StepType = Literal["INIT", "SGD", "FGD", "SEC", "GRO", "RKHS"]
-DataKind = Literal["multi_sin", "smooth_sin", "cifar10", "mnist"]
+DataKind = Literal["multi_sin", "smooth_sin", "cifar10", "mnist", "mnist2d"]
 
 
 @dataclass(frozen=True)
@@ -171,6 +171,9 @@ class DataConfig:
     mnist_train_samples: int | None = 10_000
     mnist_validation_samples: int | None = 2_000
     mnist_test_samples: int | None = 2_000
+    # Shape of ONE example, excluding the batch axis, for the kinds that emit
+    # images rather than vectors (``mnist2d``). ``None`` means flat.
+    input_shape: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -525,6 +528,13 @@ def _section_dataclass(
             else None
         )
 
+    if section_type is DataConfig and "input_shape" in values:
+        values["input_shape"] = (
+            tuple(int(value) for value in values["input_shape"])
+            if values["input_shape"] is not None
+            else None
+        )
+
     if section_type is FGDApproxConfig and "family_order" in values:
         values["family_order"] = tuple(
             str(value) for value in values["family_order"] or ()
@@ -775,6 +785,33 @@ def build_dataloaders(
             num_classes=data_config.out_features,
         )
 
+    if data_config.kind == "mnist2d":
+        # A separate kind, not a flag on "mnist": the branch above must not
+        # gain a conditional, or the flat runs stop being provably untouched.
+        if data_config.in_features != 784:
+            raise ValueError("mnist2d requires data.in_features=784.")
+        if data_config.out_features != 10:
+            raise ValueError("mnist2d requires data.out_features=10.")
+        image_shape = data_config.input_shape or (1, 28, 28)
+        elements = 1
+        for extent in image_shape:
+            elements *= int(extent)
+        if elements != data_config.in_features:
+            raise ValueError(
+                f"data.input_shape {tuple(image_shape)} has {elements} elements "
+                f"but data.in_features is {data_config.in_features}."
+            )
+        return make_mnist_dataloaders(
+            data_dir=data_config.data_dir,
+            train_samples=data_config.mnist_train_samples,
+            validation_samples=data_config.mnist_validation_samples,
+            test_samples=data_config.mnist_test_samples,
+            batch_size=data_config.batch_size,
+            seed=data_config.train_seed,
+            num_classes=data_config.out_features,
+            image_shape=tuple(image_shape),
+        )
+
     if data_config.kind == "multi_sin":
         loader_class = MultiSinDataLoader
         extra_kwargs: dict[str, Any] = {}
@@ -790,7 +827,7 @@ def build_dataloaders(
     else:
         raise ValueError(
             f"Unsupported data kind '{data_config.kind}'. "
-            "Use one of: multi_sin, smooth_sin, cifar10, mnist."
+            "Use one of: multi_sin, smooth_sin, cifar10, mnist, mnist2d."
         )
 
     train_loader = loader_class(
@@ -824,7 +861,7 @@ def build_dataloaders(
 
 
 def is_classification_task(config: PipelineConfig) -> bool:
-    return config.data.kind in {"cifar10", "mnist"}
+    return config.data.kind in {"cifar10", "mnist", "mnist2d"}
 
 
 def _functional_tikhonov_probe(
