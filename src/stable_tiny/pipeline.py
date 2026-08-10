@@ -91,6 +91,7 @@ from fgdlib.search.unified import (
     Candidate,
     bottleneck_relief_target,
     rank_candidates,
+    rank_candidates_by_bottleneck_per_parameter,
     rank_candidates_by_certified_gain,
     rank_limiting_locations,
 )
@@ -9246,7 +9247,103 @@ def run_pipeline(
                                         for i, v in enumerate(_bottlenecks)
                                     )
                                 )
-                            if _width_only and max(_bottlenecks) > 0.0:
+                            _balance = bool(
+                                getattr(
+                                    config.fgd_approx,
+                                    "growth_where_balance",
+                                    False,
+                                )
+                            )
+                            if _balance:
+                                # Let a NEW LAYER compete with the widenings,
+                                # in the same measured quantity. Both kinds
+                                # enter without moving f -- omega = 0 for a
+                                # width extension, an identity weight at
+                                # alpha = 0 for an insertion -- so r is the
+                                # same for every candidate and their
+                                # bottlenecks mean the same sentence. The
+                                # depth trials are already built above, so the
+                                # marginal cost is the statistics pass, not
+                                # the clone.
+                                _scores: dict[tuple[str, int], float] = {
+                                    ("width", index): value
+                                    for index, value in enumerate(_bottlenecks)
+                                }
+                                for _key, _trial in trials.items():
+                                    if _key[0] != "depth":
+                                        continue
+                                    _inserted = _trial.layers[_key[1]]
+                                    _where = next(
+                                        (
+                                            _i
+                                            for _i, _layer in enumerate(
+                                                _trial._growable_layers
+                                            )
+                                            if _layer is _inserted
+                                        ),
+                                        None,
+                                    )
+                                    if _where is None:
+                                        # The insertion landed somewhere GroMo
+                                        # cannot grow, so it buys no capacity
+                                        # that could be measured. Score 0 and
+                                        # it is never admitted.
+                                        continue
+                                    _trial_bottlenecks = (
+                                        compute_expressivity_bottlenecks(
+                                            _trial,
+                                            train_loader,
+                                            device,
+                                            config.fgd_approx,
+                                        )
+                                    )
+                                    if _where < len(_trial_bottlenecks):
+                                        _scores[_key] = _trial_bottlenecks[_where]
+                                _eligible = [
+                                    c for c in candidates
+                                    if not c.indices
+                                    and (c.kind, c.index) in _scores
+                                ]
+                                ranked = (
+                                    rank_candidates_by_bottleneck_per_parameter(
+                                        _eligible,
+                                        bottlenecks=_scores,
+                                        min_gain_fraction=(
+                                            config.fgd_approx
+                                            .growth_where_min_gain_fraction
+                                        ),
+                                        cost_exponent=(
+                                            config.fgd_approx
+                                            .growth_where_cost_exponent
+                                        ),
+                                    )
+                                )
+                                if progress is not None:
+                                    _costs = {
+                                        (c.kind, c.index): c.cost
+                                        for c in candidates
+                                    }
+                                    progress(
+                                        f"[BALANCE] Epoch {epoch} "
+                                        + " ".join(
+                                            f"{key[0][0].upper()}{key[1]}"
+                                            f"={value:.4e}"
+                                            f"/{_costs.get(key, 0)}"
+                                            for key, value in sorted(_scores.items())
+                                        )
+                                        + (
+                                            f" -> {ranked[0].kind}"
+                                            f"{ranked[0].index}"
+                                            if ranked
+                                            else " -> nothing pays"
+                                        )
+                                    )
+                                if not ranked:
+                                    fallback(
+                                        "growth_where_no_bottleneck",
+                                        "expressivity_bottleneck_all_zero",
+                                    )
+                            elif _width_only and max(_bottlenecks) > 0.0:
                                 ranked = sorted(
                                     _width_only,
                                     key=lambda c: _bottlenecks[c.index],
