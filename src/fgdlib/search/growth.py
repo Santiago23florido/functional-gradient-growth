@@ -14,7 +14,7 @@ ensure_gromo_importable()
 
 import torch
 
-from gromo.containers.growing_mlp import GrowingMLP
+from gromo.containers.sequential_growing_container import SequentialGrowingModel
 from gromo.utils.training_utils import compute_statistics, evaluate_model
 
 from fgdlib.models.regularized_mlp import sync_normalization
@@ -52,7 +52,7 @@ class ScalingLineSearchConfig:
 
 
 def _evaluate_scaling_factor(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     criterion: torch.nn.Module,
     device: torch.device,
@@ -87,7 +87,7 @@ def _evaluate_scaling_factor(
 
 
 def _golden_section_line_search(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     criterion: torch.nn.Module,
     device: torch.device,
@@ -172,7 +172,7 @@ def _golden_section_line_search(
 
 
 def _function_preserving_growth(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     layer_index: int,
     device: torch.device,
@@ -284,7 +284,7 @@ def _function_preserving_growth(
 
 
 def growable_neuron_costs(
-    model: GrowingMLP, input_features: int
+    model: SequentialGrowingModel, input_features: int
 ) -> list[int]:
     """Parameter cost of ONE neuron added at each growable location.
 
@@ -309,7 +309,7 @@ def growable_neuron_costs(
 
 
 def expansion_spectrum(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     layer_index: int,
     device: torch.device,
@@ -446,7 +446,7 @@ def allocate_by_expansion_per_parameter(
 
 
 def rank_layer_expansion_score(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     layer_index: int,
     device: torch.device,
@@ -503,7 +503,7 @@ def rank_layer_expansion_score(
 
 
 def grow_layer(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     layer_index: int,
     device: torch.device,

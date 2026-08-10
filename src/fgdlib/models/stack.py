@@ -44,6 +44,7 @@ from fgdlib.models.regularized_mlp import (
 ensure_gromo_importable()
 
 from gromo.containers.growing_mlp import GrowingMLP
+from gromo.containers.sequential_growing_container import SequentialGrowingModel
 from gromo.modules.linear_growing_module import LinearGrowingModule
 
 __all__ = ["LayerSpec", "build_stack_model", "parse_stack"]
@@ -125,7 +126,7 @@ def build_stack_model(
     out_features: int,
     device: torch.device,
     activation_factory=nn.SELU,
-) -> GrowingMLP:
+) -> SequentialGrowingModel:
     """Build a ``GrowingMLP`` whose hidden layers follow ``stack``.
 
     The blocks may have different widths.  We first use GroMo's constructor

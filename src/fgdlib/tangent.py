@@ -23,6 +23,7 @@ import torch
 from torch.func import functional_call, jacrev, jvp
 
 from gromo.containers.growing_mlp import GrowingMLP
+from gromo.containers.sequential_growing_container import SequentialGrowingModel
 from gromo.modules.linear_growing_module import LinearGrowingModule
 from gromo.utils.training_utils import compute_statistics
 
@@ -1958,7 +1959,7 @@ def tiny_optimal_update_kwargs(
     }
 
 
-def _cleanup_tiny_update(model: GrowingMLP) -> None:
+def _cleanup_tiny_update(model: SequentialGrowingModel) -> None:
     model.reset_computation()
     for layer in getattr(model, "_growing_layers", []):
         if hasattr(layer, "delete_update"):
@@ -1968,7 +1969,7 @@ def _cleanup_tiny_update(model: GrowingMLP) -> None:
 
 
 def _forward_with_tiny_update(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     x: torch.Tensor,
 ) -> torch.Tensor:
     """Forward the temporary layer delta all the way to the network output."""
@@ -3378,7 +3379,7 @@ def _factored_relative_error_estimate(
 
 
 @contextmanager
-def _suspended_module_capture(model: GrowingMLP):
+def _suspended_module_capture(model: SequentialGrowingModel):
     """``paused_computation`` for a gromo that does not have it.
 
     The method landed on a branch, so whether the protection exists at all
@@ -3407,7 +3408,7 @@ def _suspended_module_capture(model: GrowingMLP):
 
 def _matrix_free_tangent_system(
     *,
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     x: torch.Tensor,
     y: torch.Tensor,
     config: FGDApproxConfig,
@@ -3621,7 +3622,7 @@ def _matrix_free_tangent_system(
 
 
 def exact_tangent_system(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     x: torch.Tensor,
     y: torch.Tensor,
     config: FGDApproxConfig,
@@ -3654,7 +3655,7 @@ def exact_tangent_system(
 
 
 def _compute_exact_tangent_projection_step(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     x: torch.Tensor,
     y: torch.Tensor,
     config: FGDApproxConfig,
@@ -4072,7 +4073,7 @@ def _compute_exact_tangent_projection_step(
 
 
 def _compute_cg_tangent_projection_step(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     x: torch.Tensor,
     y: torch.Tensor,
     config: FGDApproxConfig,
@@ -4283,7 +4284,7 @@ def build_projection_probe(
 
 
 def _compute_tangent_projection_step(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     x: torch.Tensor,
     y: torch.Tensor,
     config: FGDApproxConfig,
@@ -4312,7 +4313,7 @@ def _compute_tangent_projection_step(
 
 
 def _apply_tangent_projection_step(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     x: torch.Tensor,
     y: torch.Tensor,
     step: _TangentProjectionStep,
@@ -4439,7 +4440,7 @@ def _apply_tangent_projection_step(
 
 @torch.no_grad()
 def _layer_functional_error(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     layer_index: int,
     device: torch.device,
@@ -4630,7 +4631,7 @@ def _held_out_bottleneck_cosine(
 
 
 def crossfold_bottleneck_significance(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     layer_index: int,
     inputs: torch.Tensor,
     targets: torch.Tensor,
@@ -4734,7 +4735,7 @@ def crossfold_bottleneck_significance(
 
 
 def compute_expressivity_bottlenecks(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     device: torch.device,
     config: FGDApproxConfig,
@@ -4863,7 +4864,7 @@ def compute_expressivity_bottlenecks(
 
 
 def compute_tiny_layer_relative_errors(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     device: torch.device,
     config: FGDApproxConfig,
@@ -4903,7 +4904,7 @@ def compute_tiny_layer_relative_errors(
 
 
 def apply_fgd_parameter_update(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     selected_layer: FGDLayerRelError,
     device: torch.device,
@@ -4959,7 +4960,7 @@ def _output_error_from_layer_error(
 
 
 def train_one_epoch_gromo_layer_proxy(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     test_loader: torch.utils.data.DataLoader,
     loss_function: torch.nn.Module,
@@ -5046,7 +5047,7 @@ def train_one_epoch_gromo_layer_proxy(
 
 
 def select_tiny_growth_layer_index(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     device: torch.device,
     config: FGDApproxConfig,
@@ -5081,7 +5082,7 @@ def select_tiny_growth_layer_index(
 
 
 def compute_tangent_projection_error(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     data_loader: torch.utils.data.DataLoader,
     device: torch.device,
     config: FGDApproxConfig,
@@ -5104,7 +5105,7 @@ def _count_all_parameters(model: torch.nn.Module) -> int:
 
 
 def select_certifying_growth_layer_index(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     validation_loader: torch.utils.data.DataLoader,
     device: torch.device,
@@ -5345,7 +5346,7 @@ def certificate_from_projection_stats(
 
 
 def measure_direction_projection(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     parameter_updates: tuple[torch.Tensor, ...],
     x: torch.Tensor,
     y: torch.Tensor,
@@ -5408,7 +5409,7 @@ def measure_direction_projection(
 
 
 def evaluate_fgd_validation_certificate(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     data_loader: torch.utils.data.DataLoader,
     device: torch.device,
     config: FGDApproxConfig,
@@ -5461,8 +5462,8 @@ def evaluate_fgd_validation_certificate(
 
 
 def evaluate_secant_validation_certificate(
-    base_model: GrowingMLP,
-    candidate_model: GrowingMLP,
+    base_model: SequentialGrowingModel,
+    candidate_model: SequentialGrowingModel,
     data_loader: torch.utils.data.DataLoader,
     device: torch.device,
     config: FGDApproxConfig,
@@ -5521,7 +5522,7 @@ def evaluate_secant_validation_certificate(
 
 
 def train_one_epoch_fgd_approx(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     test_loader: torch.utils.data.DataLoader,
     loss_function: torch.nn.Module,
