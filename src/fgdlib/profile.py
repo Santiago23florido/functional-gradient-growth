@@ -48,6 +48,16 @@ PROFILE_FIELDS = (
     "transactional_realization_trials",
     "transactional_realization_accepted",
     "transactional_realization_rejected",
+    # The same transaction, applied to the FAMILY step, which certified a
+    # direction on the probe and then committed a full-length displacement --
+    # MEASURED on MNIST, three runs, the full-train functional went x3.97,
+    # x6.21 and x15.44 on the one family step each of them took. The third
+    # counter is the risk of the guard rather than of the bug: if no alpha
+    # ever lowers the real objective the ladder is off in practice, and the
+    # ladder is what cuts function-preserving growths from 57 to 6.
+    "family_transaction_accepted",
+    "family_transaction_backtracks",
+    "family_transaction_rejected",
     "where_scans",
     "where_candidates",
     "where_base_system_reuses",
@@ -196,6 +206,9 @@ _COUNTER_FIELDS = {
     "transactional_realization_trials",
     "transactional_realization_accepted",
     "transactional_realization_rejected",
+    "family_transaction_accepted",
+    "family_transaction_backtracks",
+    "family_transaction_rejected",
     "where_scans",
     "where_candidates",
     "where_base_system_reuses",
