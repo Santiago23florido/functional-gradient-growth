@@ -211,14 +211,22 @@ def test_the_stack_is_rejected_when_it_cannot_be_built() -> None:
         )
 
 
-def test_is_conv_stack_is_false_for_every_canonical_config() -> None:
-    """So ``build_stack_model``'s MLP path is provably unreachable from them."""
+def test_the_dispatch_splits_the_catalog_the_way_it_claims() -> None:
+    """Exactly one canonical config takes the conv path; the rest cannot.
+
+    The MLP branch of ``build_stack_model`` is therefore provably unreachable
+    from the conv config, and vice versa -- which is what makes "the linear
+    runs are untouched" a fact about the code and not a hope.
+    """
     from stable_tiny.pipeline import load_pipeline_config
 
     root = Path(__file__).resolve().parents[1] / "configs" / "fgd"
+    conv_configs = set()
     for path in sorted(root.glob("*.yaml")):
         stack = load_pipeline_config(str(path)).model.stack
-        assert not is_conv_stack(list(stack) if stack else None), path.name
+        if is_conv_stack(list(stack) if stack else None):
+            conv_configs.add(path.name)
+    assert conv_configs == {"mnist_conv_matrix_free_N1024.yaml"}
 
 
 def test_the_mlp_stack_path_is_untouched() -> None:
