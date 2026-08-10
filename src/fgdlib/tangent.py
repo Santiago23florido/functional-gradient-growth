@@ -741,6 +741,20 @@ class FGDApproxConfig:
     #: three-hidden-layer family the reference and the exhaustive architecture
     #: search both live in.
     growth_where_allow_depth: bool = False
+    #: Let a DEPTH proposal compete with the width proposals under
+    #: ``growth_where: expressivity_bottleneck``, ranked by the same measured
+    #: bottleneck per parameter (``unified.rank_candidates_by_bottleneck_per_
+    #: parameter``). Off by default, and when off the branch runs exactly as
+    #: before -- the depth trials are still built and still discarded, which
+    #: is deliberate: constructing them consumes the global RNG, so skipping
+    #: the construction would shift every later draw and break the pin.
+    #:
+    #: Why this needs to exist at all: GroMo's topology pins some widths
+    #: outright. A conv whose consumer sits behind a pool, or a linear layer
+    #: behind a flatten, can never be widened however badly it is the
+    #: bottleneck -- the only relief is a new layer. A width-only rule cannot
+    #: express that trade, so it silently spends elsewhere forever.
+    growth_where_balance: bool = False
     #: Keep buying at the chosen location while each increment still pays.
     #: This is the HOW MUCH replacement; without it growth is one neuron per
     #: epoch and cannot reach the reference's widths in its epoch budget.
@@ -4816,7 +4830,11 @@ def compute_expressivity_bottlenecks(
                     bottlenecks.append(0.0)
                     continue
                 eigenvalues = eigenvalues[:kept]
-            gradient = float(layer.activation_gradient)
+            # ``.detach()``: for an inserted layer the derivative is computed
+            # from the homotopy's trainable ``alpha``, so the tensor carries a
+            # grad history that ``float()`` would warn about. The number is
+            # all this rule wants.
+            gradient = float(layer.activation_gradient.detach())
             value = gradient * float(torch.sum(eigenvalues.double() ** 2))
             bottlenecks.append(value if math.isfinite(value) else 0.0)
         finally:

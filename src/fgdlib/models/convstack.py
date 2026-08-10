@@ -80,6 +80,8 @@ __all__ = [
     "OpSpec",
     "build_conv_stack_model",
     "freeze_growth_scratch",
+    "invalidate_growth_scratch",
+    "refresh_growth_statistics",
     "is_conv_stack",
     "parse_conv_stack",
 ]
@@ -222,6 +224,86 @@ def parse_conv_stack(stack: list[Any]) -> list[ConvSpec | MlpSpec | OpSpec]:
     return specs
 
 
+def invalidate_growth_scratch(model: nn.Module) -> None:
+    """Drop GroMo's cached border-effect convolutions so they get rebuilt.
+
+    ``bordering_convolution`` is built ONCE, lazily, sized to the
+    predecessor's unfolded width ``in_channels * k_h * k_w + use_bias``
+    (``conv2d_growing_module.py:1508``), and GroMo never invalidates it. Two
+    things in this flow change that width underneath it:
+
+    * **growth** -- widening the predecessor is the entire point, and
+    * **depth insertion** -- the layer's predecessor becomes a different
+      module altogether.
+
+    Either way the next statistics pass feeds the stale helper a tensor with
+    the new channel count and torch raises ``Given groups=10, weight of size
+    [10, 1, 3, 3], expected input to have 10 channels, but got 19``. MEASURED:
+    without this, inserting a conv at position 1 raises immediately, and a
+    plain run would survive its first growth event and die on the statistics
+    pass after the second.
+
+    Clearing is the whole fix -- the helper is rebuilt on demand from the
+    current shapes, and it is a small depthwise conv, so the cost is noise.
+    """
+    for module in model.modules():
+        if getattr(module, "bordering_convolution", None) is not None:
+            module.bordering_convolution = None
+
+
+def refresh_growth_statistics(model: nn.Module) -> None:
+    """Re-pin each conv layer's statistic shapes to what its own update emits.
+
+    Works around a GroMo inconsistency. ``Conv2dGrowingModule.__init__``
+    (``conv2d_growing_module.py:717``) sizes ``S`` as
+
+        use_bias + in_channels * k_h * k_w
+
+    which is what ``compute_s_update`` actually produces -- the unfolded input
+    plus ONE row of ones for the bias. But ``layer_in_extension``
+    (``:1172``), which re-pins the statistic after a widening, computes
+
+        (in_channels + use_bias) * k_h * k_w
+
+    and those differ the moment the kernel is not 1x1: at ``in_channels = 3``,
+    ``k = 3``, with bias, 28 against 36. So the FIRST growth at a conv
+    location leaves the statistic expecting a shape its own update function
+    will never emit, and the next statistics pass dies on
+    ``TensorStatistic.update``'s assertion. ``LinearGrowingModule`` uses
+    ``in_features + use_bias`` in both places, which is why the MLP path has
+    never met this.
+
+    Re-pinning from the constructor's formula, at the start of every
+    statistics pass, is the smallest correct fix that lives on our side of
+    the boundary: patching the sibling GroMo checkout is how this repo
+    already got bitten once (commit b01284f -- a failure that turned out to
+    depend on which GroMo branch was installed).
+    """
+    from gromo.utils.tensor_statistic import TensorStatistic
+
+    for module in model.modules():
+        if not isinstance(module, Conv2dGrowingModule):
+            continue
+        kernel_area = int(module.kernel_size[0]) * int(module.kernel_size[1])
+        rows = int(module.use_bias) + int(module.in_channels) * kernel_area
+        statistic = getattr(module, "_tensor_s", None)
+        if statistic is not None and statistic._shape != (rows, rows):
+            module._tensor_s = TensorStatistic(
+                (rows, rows),
+                update_function=module.compute_s_update,
+                device=module.device,
+                name=statistic.name,
+            )
+        columns = int(module.out_channels)
+        if module.tensor_m._shape != (rows, columns):
+            module.tensor_m = TensorStatistic(
+                (rows, columns),
+                update_function=module.compute_m_update,
+                device=module.device,
+                name=module.tensor_m.name,
+            )
+
+
 def freeze_growth_scratch(model: nn.Module) -> None:
     """Mark GroMo's lazily-allocated conv growth scratch as non-trainable.
 
@@ -303,9 +385,12 @@ class ConvStackModel(SequentialGrowingModel):
         growable: list[nn.Module] = []
         for layer, link in zip(self.layers, links):
             layer.previous_module = link
-            # Reset GroMo's cached activation derivative: it is memoised
-            # against the PREVIOUS module's post-function, which just moved.
+            # Reset GroMo's caches that are memoised against the PREVIOUS
+            # module, which just moved: the activation derivative, and the
+            # border-effect helper sized to the predecessor's unfolded width.
             layer._activation_gradient_previous_module = None
+            if getattr(layer, "bordering_convolution", None) is not None:
+                layer.bordering_convolution = None
             if link is None:
                 continue
             same_kind = isinstance(link, Conv2dGrowingModule) == isinstance(
@@ -342,6 +427,20 @@ class ConvStackModel(SequentialGrowingModel):
                 if x_ext is not None:
                     x_ext = op(x_ext)
         return x
+
+    def init_computation(self) -> None:
+        # Every statistics pass starts from the CURRENT shapes. Growth widens
+        # predecessors and insertion replaces them, and GroMo's cached border
+        # helper is sized to neither afterwards.
+        invalidate_growth_scratch(self)
+        refresh_growth_statistics(self)
+        # The activation derivative is memoised too, and for an inserted
+        # layer it is not a constant: the homotopy's derivative at 0+ is
+        # 1 + alpha * (sigma'(0+) - 1), and alpha TRAINS. Re-reading it each
+        # pass costs one lookup and keeps the where-rule's factor current.
+        for layer in self.layers:
+            layer._activation_gradient_previous_module = None
+        super().init_computation()
 
     def update_computation(self) -> None:
         super().update_computation()
