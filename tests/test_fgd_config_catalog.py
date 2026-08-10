@@ -106,49 +106,51 @@ def test_mnist_matrix_free_changes_only_execution_and_matrix_free_gates() -> Non
     assert matrix_free.parametric_gd.matrixfree_batch_size == 128
 
 
-def test_mnist_conv_changes_only_data_model_and_the_probe_gates() -> None:
-    """The conv config must not become a second, unaccountable tuning surface.
+def test_mnist_conv_inherits_config_2s_optimisation_set() -> None:
+    """The conv config is config 2's MNIST settings on a conv model.
 
-    It is config 1 (the matrix-free N1024 ladder) with the DATA swapped for
-    MNIST images, the MODEL swapped for a conv stack, and the data-size knobs
-    taken from config 2. Every other certified knob is inherited verbatim, and
-    this test is what keeps it that way: a field that starts differing has to
-    be added here with a reason.
+    Config 1 (the N=1024 ladder) supplies the certified knobs, but the
+    EXECUTION and approximation settings must come from config 2, because
+    config 2 is the one built for MNIST scale -- its smaller probe, its cheap
+    lookahead, its streamed-Gram choice. Deriving from config 1 alone and
+    keeping its 16-batch probe and 10-step lookahead was the mistake this test
+    exists to prevent recurring.
+
+    Exactly three fields may differ, and each is forced by conv or by
+    N = 1024 rather than chosen.
     """
-    ladder = load_pipeline_config(
-        "configs/fgd/family_ladder_matrix_free_N1024.yaml"
-    )
+    config_2 = load_pipeline_config("configs/fgd/mnist_matrix_free.yaml")
     conv = load_pipeline_config("configs/fgd/mnist_conv_matrix_free_N1024.yaml")
 
-    assert _differing_fields(ladder, conv) == {"run", "data", "model", "fgd_approx"}
-    assert _differing_fields(ladder.fgd_approx, conv.fgd_approx) == {
-        # The probe floor, and the budget coupled to it. At kappa 4 the probe
-        # holds NK = 4 * rank(J) only while rank(J) <= 2560, since 16 batches
-        # of 64 with 10 outputs is 10240 rows. Measured at the start,
-        # rank(J) = 192 at P = 202, so NK/rank = 13.3.
-        "certify_probe_kappa",
-        "max_total_parameters",
-        # The vmap block bound. The range finder asks for rank + oversampling
-        # directions at once and vmap holds every direction's full forward
-        # activations; on a conv those carry the spatial extent, so the block
-        # is 784x heavier than on an MLP and exhausted the machine. 0
-        # everywhere else keeps the unchunked call.
-        "matrix_free_block_chunk",
-    }
-    # Exactly two, and both are data-size knobs. Three more are written out
-    # EXPLICITLY in the conv yaml with their reasons -- certify_stream_gram,
-    # growth_bottleneck_crossfold_folds and growth_where_balance -- but they
-    # do not appear above because config 1 already holds those values. Stating
-    # them is documentation of a deliberate choice, not divergence, and this
-    # assertion is what keeps the two categories apart.
-    for field in (
-        "certify_stream_gram",
+    assert _differing_fields(config_2.fgd_approx, conv.fgd_approx) == {
+        # GroMo's crossfold test cannot MEASURE on conv: its fitted extension
+        # matrix assumes two linear layers, so with 4-D alpha/omega it returns
+        # inf and inf > 1 approves everything. Off beats looking live.
         "growth_bottleneck_crossfold_folds",
-        "growth_where_balance",
-    ):
-        assert getattr(conv.fgd_approx, field) == getattr(ladder.fgd_approx, field)
+        # vmap holds every direction's activations at once, and a conv
+        # activation carries the spatial extent. MEASURED on the 8 GB card:
+        # 1.60 GB per solve at chunk 16, OOM at 32.
+        "matrix_free_block_chunk",
+        # Coupled to the probe by kappa. Config 2 loads 10000 images so it can
+        # spend NK = 20000 rows and afford 5000 parameters; at 1024 images the
+        # probe is NK = 7040 and kappa 4 holds only to rank(J) <= 1760.
+        "max_total_parameters",
+        # Same knob as config 2, a value the spatial extent forces. The
+        # validation certificate takes the EXACT route, whose jacrev vmaps one
+        # backward per output row, each holding the whole probe's activations.
+        # MEASURED at NK = 7040: 256 OOMs, 16 peaks at 1.91 GB, 8 at 1.04 GB
+        # for the same 10 seconds.
+        "jacobian_row_chunk",
+    }
+    # The two settings whose absence made the first attempt unaffordable.
+    assert conv.fgd_approx.probe_batches == config_2.fgd_approx.probe_batches == 11
+    assert conv.fgd_approx.growth_lookahead_steps == 2
+    assert conv.fgd_approx.certify_growth_lookahead is True
+    assert conv.fgd_approx.certify_growth_lookahead_entry is True
+    # And the certified core still comes from config 1, untouched.
     assert conv.fgd_approx.family_order == ("matrix_free_tangent",)
     assert conv.fgd_approx.growth_where == "expressivity_bottleneck"
+    assert conv.fgd_approx.rel_error_threshold == 0.5
     assert conv.fgd_approx.tiny_use_fisher is False
 
 
@@ -159,8 +161,14 @@ def test_the_conv_stack_builds_the_architecture_the_comments_claim() -> None:
 
     config = load_pipeline_config("configs/fgd/mnist_conv_matrix_free_N1024.yaml")
     model = build_model(config, torch.device("cpu"))
-    assert sum(p.numel() for p in model.parameters() if p.requires_grad) == 202
+    assert sum(p.numel() for p in model.parameters() if p.requires_grad) == 498
     assert len(model._growable_layers) == 3
+    # Every width the SEARCH can reach starts at 2, exactly as the linear
+    # reference does. The two the search cannot reach -- the last conv before
+    # each shape change -- are configured, and the head therefore sees 8*9=72
+    # rather than the 18 that strangled the first attempt.
+    assert [int(layer.in_neurons) for layer in model._growable_layers] == [2, 2, 2]
+    assert model.layers[4].in_features == 72
     growable = [
         index
         for index, layer in enumerate(model.layers)

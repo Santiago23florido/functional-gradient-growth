@@ -2427,7 +2427,10 @@ def _growth_reduces_lookahead_epsilon(
     Returns True only when growth beats training. With the flag off (the
     default) this is never called and behaviour is unchanged.
     """
-    widths = [int(layer.in_features) for layer in model._growable_layers]
+    # in_neurons, not in_features: identical on a Linear (the same
+    # attribute), but on a conv in_features is the UNFOLDED fan-in
+    # in_channels * k_h * k_w, so a 2-channel layer reported as width 18.
+    widths = [int(layer.in_neurons) for layer in model._growable_layers]
     limiting = rank_limiting_locations(widths)
     if not limiting:
         return False
@@ -8568,7 +8571,7 @@ def run_pipeline(
                         # minimum, no purchase elsewhere can raise what the
                         # structure is able to express.
                         widths = [
-                            int(layer.in_features)
+                            int(layer.in_neurons)
                             for layer in model._growable_layers
                         ]
                         # The rank cap both FILTERS candidates to the width
@@ -8694,7 +8697,7 @@ def run_pipeline(
                                         "mandate ends"
                                     )
                                 widths = [
-                                    int(layer.in_features)
+                                    int(layer.in_neurons)
                                     for layer in model._growable_layers
                                 ]
                                 bottlenecks = set(
@@ -9399,7 +9402,7 @@ def run_pipeline(
                                     + (
                                         "; widths "
                                         + "-".join(
-                                            str(int(layer.in_features))
+                                            str(int(layer.in_neurons))
                                             for layer in model._growable_layers
                                         )
                                         if where_mode == "certified_gain"

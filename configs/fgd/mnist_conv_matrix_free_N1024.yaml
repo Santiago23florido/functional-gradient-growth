@@ -66,8 +66,23 @@ data:
   test_seed: 1
 
 model:
-  # 202 parameters, three growable locations -- the same count the linear
+  # 498 parameters, three growable locations -- the same count the linear
   # reference starts with (hidden_size 2, number_hidden_layers 3).
+  #
+  # WHY SOME WIDTHS ARE CONFIGURED AND NOT SEARCHED. Growing a layer widens
+  # its INPUT, i.e. its predecessor's output. So a width is reachable by the
+  # search only if some growable layer consumes it -- and the last conv before
+  # any shape change has no such consumer, because a pool or a flatten sits
+  # between it and the next layer. In this stack that is B.out and D.out.
+  # They are configuration, not search, and the first attempt left both at 2:
+  # MEASURED, three epochs bought 290 parameters and every one of them went to
+  # the head, the trunk stayed 2->2->2->2, and train_loss stalled at 0.147 --
+  # ABOVE the 0.09 that predicting the class mean gives. The criterion was not
+  # malfunctioning; it was correctly reporting that the head was the only
+  # place with anything to buy, because 2 channels through an avgpool is 18
+  # numbers and no amount of head width invents information the trunk did not
+  # pass. So the two pinned widths are chosen (4 and 8) and everything the
+  # search CAN reach still starts at 2.
   #
   # WHICH layers are growable is GroMo's topology, not a choice here: a layer
   # grows only when its immediate predecessor is a module of the same kind
@@ -76,22 +91,20 @@ model:
   # and fc E sits behind the flatten with a conv before it (which
   # LinearGrowingModule refuses outright).
   #
-  # That is what makes the width/depth balance real rather than decorative:
-  # conv B's and conv D's OUTPUT widths are pinned -- their consumers are
-  # behind a pool -- so the only way to relieve them is to insert a layer.
-  # Per-channel costs measured: 28 at B, 37 at D, 29 at the head, against 39
-  # for an insertion. Same order of magnitude, genuinely contested.
+  # And it is what makes the width/depth balance real rather than decorative:
+  # inserting a conv between B and the pool gives B.out a growable consumer,
+  # which is the ONLY way the search can ever touch it. With the balance off
+  # those two widths stay exactly as configured for the whole run.
   stack:
-    - {conv: [2, 3]}      # A  1 -> 2, 3x3, pad 1        (not growable)
-    - {conv: [2, 3]}      # B  2 -> 2                    GROWABLE
+    - {conv: [2, 3]}      # A  1 -> 2  @28    A.out is GROWABLE (via B)
+    - {conv: [4, 3]}      # B  2 -> 4  @28    B.out is PINNED by the pool
     - maxpool             #    28x28 -> 14x14
-    - {conv: [2, 3]}      # C  2 -> 2                    (not growable)
-    - {conv: [2, 3]}      # D  2 -> 2                    GROWABLE
-    - maxpool             #    14x14 -> 7x7
-    - {avgpool: [3, 3]}   #    -> 3x3, which fixes the flatten width
-    - flatten             #    -> 18 features
-    - {mlp: [2, 1]}       # E  18 -> 2                   (not growable)
-    #                       F  2 -> 10 is appended        GROWABLE
+    - {conv: [2, 3]}      # C  4 -> 2  @14    C.out is GROWABLE (via D)
+    - {conv: [8, 3]}      # D  2 -> 8  @14    D.out is PINNED by the avgpool
+    - {avgpool: [3, 3]}   #    -> 3x3, so the head sees 8*9 = 72
+    - flatten
+    - {mlp: [2, 1]}       # E 72 -> 2         E.out is GROWABLE (via F)
+    #                       F  2 -> 10 appended
   # RestrictedConv2dGrowingModule (Conv -> 1x1) is GroMo's own default, what
   # VGG and ResNet use, and by far the better tested. "full" (Conv -> Conv)
   # is available for the A/B; it does not support tiny_use_fisher, which is
@@ -198,7 +211,10 @@ fgd_approx:
   # exactly when no residual is left on the probe to approximate. With the
   # full set there is no sampling at all and the certificate is a statement
   # about the training loss itself, which is what the theory is about.
-  probe_batches: 16
+  # 11, config 2's value, not config 1's 16. This is an MNIST-scale knob and
+  # this config runs on MNIST: NK = 11 * 64 * 10 = 7040 rows instead of 10240,
+  # which is a third off every factor and every probe forward.
+  probe_batches: 11
   # Assemble that Jacobian in row-blocks. jacrev vmaps one backward pass per
   # output row and holds the batched activations for all of them at once, so
   # its peak scales with (rows) x (activations), not with J. MEASURED: the
@@ -207,7 +223,15 @@ fgd_approx:
   # the identical matrix (tests/test_jacobian_chunking.py) at a bounded peak,
   # for one extra forward per block. This is what makes certifying over the
   # whole dataset affordable rather than over a subsample.
-  jacobian_row_chunk: 256
+  # 8, not config 2's 256, and this is the SAME defect as the vmap block
+  # below, in the other tangent route. The validation certificate takes the
+  # EXACT path: it calls jacrev per row-block, which vmaps one backward per
+  # output row, and each backward holds the whole probe's activations. On an
+  # MLP that is (N, width); on a conv it is (N, C, H, W). MEASURED on the 8 GB
+  # card at NK = 7040: row_chunk 256 OOMs outright, 16 peaks at 1.91 GB, and 8
+  # at 1.04 GB for the same 10 seconds. Same knob config 2 uses, a value the
+  # spatial extent forces.
+  jacobian_row_chunk: 8
   # Bound how many directions ride through ONE vmap on the matrix-free path.
   # The range finder asks for rank + oversampling of them, which is of order
   # P, and vmap holds every direction's FULL forward activations at once. On
@@ -220,7 +244,12 @@ fgd_approx:
   #
   # Chunking is EXACTLY equivalent -- the directions in a block are
   # independent -- so this changes the footprint and nothing else.
-  matrix_free_block_chunk: 16
+  # 8, MEASURED on the card rather than chosen: peak CUDA memory for one
+  # tangent solve is 1.60 GB at chunk 16 and 0.93 GB at 8, and chunk 32 OOMs
+  # outright on the 8 GB laptop GPU. The cost is 20% wall clock (17.1 s ->
+  # 20.5 s per solve), which is the right side of that trade when the
+  # alternative is not finishing.
+  matrix_free_block_chunk: 8
   # A rejected fallback family is skipped until this many ACCEPTED outer
   # steps have been committed since the rejection (weight updates change the
   # tangent space, so rejection is never permanent at a fixed architecture).
@@ -406,6 +435,13 @@ fgd_approx:
   #   certified_gain          0.9230   formas 15-16-15 en 3 de 4 semillas
   #   expressivity_bottleneck 0.9435   4 formas distintas, ratios 1.46-2.44
   # Las cuatro semillas superan 0.925 individualmente.
+  # Both from config 2, and both absent from config 1 (so they defaulted off).
+  # certify.py's while-loop reads only `epsilon >= target`, and the lookahead
+  # that DOES look at the band could previously only return "no": a brake with
+  # no accelerator. The entry flag lets the same predicate authorise growth,
+  # bounded by construction to one neuron per outer step.
+  certify_growth_lookahead: true
+  certify_growth_lookahead_entry: true
   growth_where: expressivity_bottleneck
   # Let a NEW LAYER compete with the widenings, in the same measured
   # bottleneck per parameter. This is the B arm; false is the A arm and runs
@@ -439,7 +475,10 @@ fgd_approx:
   # Only pays its cost in the tail (eps<1/2), and reuses tiny_statistical_
   # threshold as the margin -- no new constant.
   growth_lookahead_adequacy: true
-  growth_lookahead_steps: 10
+  # 2, config 2's value. At 10 the lookahead trains 3140 passes per question,
+  # which commit aa53ca4 measured as 75% of the epoch. That cost is what makes
+  # it unaffordable at MNIST scale, and this config is at MNIST scale.
+  growth_lookahead_steps: 2
   # The fallback families must stay available once the structure becomes
   # adequate (eps < 1/2): otherwise growth correctly stops and the flow is
   # left with the tangent alone, which freezes it.
@@ -507,12 +546,20 @@ fgd_approx:
   # documented range. From config 2 (mnist_matrix_free.yaml) -- it is a
   # data-size knob, and this config runs on the same data.
   certify_probe_kappa: 4.0
-  # An INSTRUMENT, not a solution, and sized by the kappa arithmetic above:
-  # the probe satisfies NK = 4*rank(J) only while rank(J) <= 2560, and 16
-  # batches of 64 with 10 outputs is 10240 rows in total. Measured at the
-  # start, rank(J) = 192 at P = 202, so NK/rank = 13.3 -- comfortable. Log
-  # the trace and cut this if NK/rank ever approaches 2.
-  max_total_parameters: 2500
+  # An INSTRUMENT, not a solution. The kappa floor turns out NOT to be what
+  # binds here, and the reason is worth recording because it is the opposite
+  # of the linear case: MEASURED on this stack, rank(J) FALLS as the net
+  # grows -- 307 at P=498, 236 at P=974, 199 at P=1450 -- because a
+  # convolution shares its weights, so the Jacobian's rank is limited by the
+  # data and the spatial structure rather than by the parameter count. In the
+  # linear ladder rank tracks P and the probe has to chase it; here NK = 7040
+  # against rank ~200-300 leaves NK/rank at 23-35, far above the floor of 4.
+  #
+  # What binds instead is memory, and it grows with P: one solve peaks at
+  # 0.65 GB at P=498 and 1.02 GB at P=1450. 1700 keeps the whole epoch inside
+  # the capped half of an 8 GB card, and the linear reference lands near 600
+  # parameters in this regime, so it is room rather than a corset.
+  max_total_parameters: 1700
   # Also from config 2: the streamed Gram is for the flat-MNIST widths.
   certify_stream_gram: false
   # GroMo's crossfold bottleneck test CANNOT MEASURE on conv: its fitted
