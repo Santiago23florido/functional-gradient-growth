@@ -204,7 +204,14 @@ class ModelConfig:
     #     - batchnorm
     #     - {mlp: [2, 1]}
     #     - {dropout: 0.2}
+    # A stack naming `conv` / `maxpool` / `avgpool` / `flatten` builds the
+    # convolutional container instead (fgdlib/models/convstack.py).
     stack: tuple[Any, ...] | None = None
+    # Which GroMo growth scheme a conv layer uses. "restricted" (Conv -> 1x1)
+    # is GroMo's own default and what VGG/ResNet use, and it is by far the
+    # better tested of the two; "full" (Conv -> Conv) exists for the A/B.
+    # Ignored by a non-conv stack.
+    conv_growth_scheme: str = "restricted"
 
 
 @dataclass(frozen=True)
@@ -1022,6 +1029,8 @@ def build_model(config: PipelineConfig, device: torch.device) -> SequentialGrowi
             in_features=data_config.in_features,
             out_features=data_config.out_features,
             device=device,
+            input_shape=data_config.input_shape,
+            conv_growth_scheme=model_config.conv_growth_scheme,
         )
 
     kwargs: dict[str, Any] = {}
