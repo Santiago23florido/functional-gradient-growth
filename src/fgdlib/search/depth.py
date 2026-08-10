@@ -139,10 +139,15 @@ def insert_identity_layer(
     return inserted
 
 
-def inserted_layer_cost(width: int) -> int:
-    """Parameters a depth insertion at ``width`` costs: ``width^2 + width``.
+def inserted_layer_cost(width: int, kernel_elements: int = 1) -> int:
+    """Parameters a depth insertion at ``width`` costs.
 
-    The counterpart of ``growable_neuron_costs`` for depth proposals, so the
-    two can be ranked together by certified decrease per parameter.
+    ``width^2 * kernel_elements + width``: a square weight plus a bias. The
+    counterpart of ``growable_neuron_costs`` for depth proposals, so the two
+    can be ranked together by certified decrease per parameter.
+
+    ``kernel_elements`` is ``k_h * k_w`` for a convolutional insertion and 1
+    for a linear one, which is the default and leaves every existing caller
+    returning the same number.
     """
-    return width * width + width
+    return width * width * kernel_elements + width
