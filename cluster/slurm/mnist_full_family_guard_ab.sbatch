@@ -35,6 +35,9 @@ DATASET_ROOT="${DATASET_ROOT:-$HOME/datasets}"
 CONDA_ENV="${CONDA_ENV:-cct}"
 WANDB_GROUP="${WANDB_GROUP:-mnist-full-family-guard-ab}"
 MODEL_SEED="${MODEL_SEED:-0}"
+# Optional metadata-only suffix for reruns. Empty preserves every historical
+# run name and results path; e.g. RUN_SUFFIX=probe-refine-r2 isolates a rerun.
+RUN_SUFFIX="${RUN_SUFFIX:-}"
 
 case "${SLURM_ARRAY_TASK_ID:-0}" in
   0) GUARD=true;  ARM=guard-on ;;
@@ -87,6 +90,7 @@ export PYTHONUNBUFFERED=1
 
 CONFIG="configs/experiments/mnist_full.yaml"
 RUN_NAME="mnist-full-${ARM}-seed-${MODEL_SEED}"
+[[ -n "${RUN_SUFFIX}" ]] && RUN_NAME="${RUN_NAME}-${RUN_SUFFIX}"
 
 # data_dir y el brazo del A/B se parchean en una COPIA node-local, de modo que
 # el fichero versionado sigue siendo exactamente lo que dice el repo.

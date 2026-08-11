@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import math
 import time
@@ -53,6 +54,7 @@ from fgdlib.tangent import (
     validate_bottleneck_stopping,
     validate_family_order,
     validate_growth_lookahead_entry,
+    validate_probe_refinement,
     validate_realizable_progress_growth,
     validate_functional_loss,
     validate_exact_tangent_system,
@@ -381,6 +383,40 @@ class FGDTransactionalTrialRecord:
     full_train_examples: int | None = None
 
 
+@dataclass(frozen=True)
+class _ProbeMismatch:
+    """Smallest rejected endpoint that contradicts the certification probe."""
+
+    trial: FGDTransactionalTrialRecord
+    # Full-train batch indices ranked by decreasing positive loss delta, with
+    # deterministic batch-index tie-breaking.
+    violating_batches: tuple[tuple[int, float], ...]
+
+
+@dataclass(frozen=True)
+class _ProbeCounterexample:
+    """One persistent full-train batch added to the certification domain."""
+
+    outer_step_global_index: int
+    batch_index: int
+    inputs: torch.Tensor
+    targets: torch.Tensor
+    fingerprint: str
+    functional_delta: float
+
+
+@dataclass
+class _AdaptiveCertificationProbe:
+    """Monotone probe union: rank-sized base plus discovered counterexamples."""
+
+    base_batches: list[tuple[torch.Tensor, torch.Tensor]]
+    fingerprints: set[str]
+    counterexamples: list[_ProbeCounterexample] = field(default_factory=list)
+    refinement_rounds: int = 0
+    mismatch_count: int = 0
+    exhausted: bool = False
+
+
 @dataclass
 class PipelineResult:
     config: PipelineConfig
@@ -449,6 +485,7 @@ class _TransactionalRealization:
     direction: tuple[torch.Tensor, ...] | None
     learning_rate: float | None
     trials: tuple[FGDTransactionalTrialRecord, ...]
+    probe_mismatch: _ProbeMismatch | None = None
 
 
 @dataclass(frozen=True)
@@ -648,6 +685,7 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
     validate_bottleneck_stopping(config.fgd_approx)
     validate_growth_lookahead_entry(config.fgd_approx)
     validate_realizable_progress_growth(config.fgd_approx)
+    validate_probe_refinement(config.fgd_approx)
     config.parametric_gd.validate()
     config.parametric_descent.validate()
     return config
@@ -902,6 +940,153 @@ def _functional_tikhonov_probe(
     return x, y / (1.0 + config.functional_tikhonov_gamma)
 
 
+def _probe_batch_fingerprint(
+    batch: tuple[torch.Tensor, torch.Tensor],
+) -> str:
+    """Stable content identity used to keep the probe union duplicate-free."""
+    digest = hashlib.blake2b(digest_size=16)
+    for tensor in batch:
+        value = tensor.detach().to("cpu").contiguous()
+        digest.update(str(value.dtype).encode("ascii"))
+        digest.update(repr(tuple(value.shape)).encode("ascii"))
+        digest.update(value.numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _take_probe_batches(
+    loader: torch.utils.data.DataLoader,
+    count: int,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Materialize the same first batches used by ``build_projection_probe``."""
+    if count < 1:
+        raise ValueError("fgd_approx.probe_batches must be a positive integer.")
+    batches: list[tuple[torch.Tensor, torch.Tensor]] = []
+    for batch in loader:
+        batches.append(batch)
+        if len(batches) == count:
+            break
+    if not batches:
+        raise ValueError("Cannot build a projection probe from an empty data loader.")
+    return batches
+
+
+def _new_adaptive_certification_probe(
+    loader: torch.utils.data.DataLoader,
+    base_batches: int,
+) -> _AdaptiveCertificationProbe:
+    """Capture B0 exactly as the existing first-batches probe."""
+    materialized = _take_probe_batches(loader, base_batches)
+    return _AdaptiveCertificationProbe(
+        base_batches=materialized,
+        fingerprints={_probe_batch_fingerprint(batch) for batch in materialized},
+    )
+
+
+def _compose_adaptive_certification_probe(
+    state: _AdaptiveCertificationProbe,
+    config: FGDApproxConfig,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build r/J input from the full monotone base/counterexample union."""
+    batches = state.base_batches + [
+        (counterexample.inputs, counterexample.targets)
+        for counterexample in state.counterexamples
+    ]
+    x = torch.cat([batch[0] for batch in batches]).to(device)
+    y = torch.cat([batch[1] for batch in batches]).to(device)
+    probe = _functional_tikhonov_probe((x, y), config)
+    assert probe is not None
+    return probe
+
+
+def _extend_adaptive_probe_base(
+    state: _AdaptiveCertificationProbe,
+    loader: torch.utils.data.DataLoader,
+    target_base_batches: int,
+) -> None:
+    """Grow the rank-aware base without discarding any prior probe batch."""
+    needed = max(0, int(target_base_batches) - len(state.base_batches))
+    if needed == 0:
+        return
+    for batch in loader:
+        fingerprint = _probe_batch_fingerprint(batch)
+        if fingerprint in state.fingerprints:
+            continue
+        state.base_batches.append(batch)
+        state.fingerprints.add(fingerprint)
+        needed -= 1
+        if needed == 0:
+            break
+
+
+def _refine_adaptive_certification_probe(
+    *,
+    state: _AdaptiveCertificationProbe,
+    mismatch: _ProbeMismatch,
+    frozen_train_batches: list[tuple[torch.Tensor, torch.Tensor]],
+    config: FGDApproxConfig,
+    model: torch.nn.Module,
+    device: torch.device,
+    progress: ProgressFn | None,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Append unseen empirical counterexamples and return the enlarged probe."""
+    state.mismatch_count += 1
+    max_rounds = config.certify_probe_refine_max_rounds
+    if state.refinement_rounds >= max_rounds:
+        state.exhausted = True
+        if progress is not None:
+            progress(
+                "[PROBE-REFINE] stop_reason=probe_refinement_exhausted "
+                f"round={state.refinement_rounds} max_rounds={max_rounds}"
+            )
+        return None
+
+    old_batches = len(state.base_batches) + len(state.counterexamples)
+    added: list[_ProbeCounterexample] = []
+    for batch_index, delta in mismatch.violating_batches:
+        if not 0 <= batch_index < len(frozen_train_batches):
+            raise RuntimeError("Probe counterexample batch index is out of range.")
+        inputs, targets = frozen_train_batches[batch_index]
+        fingerprint = _probe_batch_fingerprint((inputs, targets))
+        if fingerprint in state.fingerprints:
+            continue
+        counterexample = _ProbeCounterexample(
+            outer_step_global_index=mismatch.trial.outer_step_global_index,
+            batch_index=batch_index,
+            inputs=inputs.detach().to("cpu").clone(),
+            targets=targets.detach().to("cpu").clone(),
+            fingerprint=fingerprint,
+            functional_delta=float(delta),
+        )
+        state.counterexamples.append(counterexample)
+        state.fingerprints.add(fingerprint)
+        added.append(counterexample)
+        if len(added) == config.certify_probe_refine_batches_per_round:
+            break
+
+    if not added:
+        state.exhausted = True
+        if progress is not None:
+            progress(
+                "[PROBE-REFINE] stop_reason=probe_refinement_exhausted "
+                "reason=no_new_counterexample_batch"
+            )
+        return None
+
+    state.refinement_rounds += 1
+    _CERTIFICATION_RANK_CACHE.pop(id(model), None)
+    new_batches = len(state.base_batches) + len(state.counterexamples)
+    if progress is not None:
+        progress(
+            f"[PROBE-REFINE] round={state.refinement_rounds} "
+            f"old_batches={old_batches} added_batches={len(added)} "
+            f"new_batches={new_batches} "
+            f"worst_batch_delta={added[0].functional_delta:.6e} "
+            f"max_rounds={max_rounds}"
+        )
+    return _compose_adaptive_certification_probe(state, config, device)
+
+
 #: Cache of the certification rank per model, keyed by ``id(model)`` and its
 #: current parameter count, so the rank is re-estimated only when the structure
 #: has actually grown (once per growth, not once per outer step).
@@ -1147,13 +1332,13 @@ def evaluate_functional_loss(
 
 
 @torch.no_grad()
-def _evaluate_transactional_full_train_functional_loss(
+def _evaluate_transactional_full_train_batch_losses(
     model: torch.nn.Module,
     train_batches: list[tuple[torch.Tensor, torch.Tensor]],
     device: torch.device,
     functional_loss: str,
-) -> tuple[float, int]:
-    """Stream the full-train acceptance loss without building a Jacobian.
+) -> tuple[float, int, tuple[float, ...]]:
+    """Stream full-train total and per-batch losses, forward only.
 
     Transactional realization uses a deliberately small probe for the
     expensive tangent system.  This second, forward-only measurement prevents
@@ -1163,6 +1348,42 @@ def _evaluate_transactional_full_train_functional_loss(
     Preserve every module's mode exactly: the tangent system has strict state
     guards, and a mixed train/eval hierarchy must survive this audit unchanged.
     """
+    evaluation_state = tuple((module, module.training) for module in model.modules())
+    total_loss = 0.0
+    example_count = 0
+    batch_losses: list[float] = []
+    try:
+        model.eval()
+        for inputs, targets in train_batches:
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            batch_loss = float(
+                batch_functional_loss(
+                    model(inputs),
+                    targets,
+                    functional_loss,
+                )
+                .detach()
+                .item()
+            )
+            batch_losses.append(batch_loss)
+            total_loss += batch_loss
+            example_count += int(inputs.shape[0])
+    finally:
+        for module, training in evaluation_state:
+            module.training = training
+    if example_count == 0:
+        raise ValueError("Transactional full-train guard received no examples.")
+    return total_loss, example_count, tuple(batch_losses)
+
+
+def _evaluate_transactional_full_train_functional_loss(
+    model: torch.nn.Module,
+    train_batches: list[tuple[torch.Tensor, torch.Tensor]],
+    device: torch.device,
+    functional_loss: str,
+) -> tuple[float, int]:
+    """Stream the full-train acceptance loss without building a Jacobian."""
     evaluation_state = tuple((module, module.training) for module in model.modules())
     total_loss = 0.0
     example_count = 0
@@ -1187,6 +1408,43 @@ def _evaluate_transactional_full_train_functional_loss(
     if example_count == 0:
         raise ValueError("Transactional full-train guard received no examples.")
     return total_loss, example_count
+
+
+def _is_probe_full_train_mismatch(
+    *,
+    probe_before: float | None,
+    probe_after: float | None,
+    full_train_before: float | None,
+    full_train_after: float | None,
+    tolerance: float,
+) -> bool:
+    """True only for finite probe descent paired with full-train ascent."""
+    values = (probe_before, probe_after, full_train_before, full_train_after)
+    if not all(value is not None and math.isfinite(float(value)) for value in values):
+        return False
+    assert probe_before is not None and probe_after is not None
+    assert full_train_before is not None and full_train_after is not None
+    return bool(
+        probe_after < probe_before
+        and full_train_after > full_train_before + float(tolerance)
+    )
+
+
+def _rank_violating_full_train_batches(
+    before: tuple[float, ...],
+    after: tuple[float, ...],
+) -> tuple[tuple[int, float], ...]:
+    """Rank positive per-batch deltas, largest first and index-stable on ties."""
+    if len(before) != len(after):
+        raise RuntimeError("Full-train batch-loss count changed during transaction.")
+    violating = [
+        (index, float(candidate - base))
+        for index, (base, candidate) in enumerate(zip(before, after))
+        if math.isfinite(base)
+        and math.isfinite(candidate)
+        and candidate - base > 0.0
+    ]
+    return tuple(sorted(violating, key=lambda item: (-item[1], item[0])))
 
 
 def _interpolate_toward(base_model, target_model, alpha: float):
@@ -1513,6 +1771,22 @@ def _certify_force_growth(
     return True
 
 
+def _realizable_growth_is_active(
+    config: FGDApproxConfig,
+    *,
+    previous_step_committed: bool,
+    previous_failure_non_finite: bool,
+    probe_requires_consistency_check: bool,
+) -> bool:
+    """Gate structural scoring until a newly refined probe is transactional."""
+    return bool(
+        config.certify_realizable_progress_growth
+        and not previous_step_committed
+        and not previous_failure_non_finite
+        and not probe_requires_consistency_check
+    )
+
+
 def _apply_shared_direction_step(
     model: SequentialGrowingModel,
     direction: tuple[torch.Tensor, ...],
@@ -1634,19 +1908,39 @@ def _transactional_realize_functional_step(
     floor = float(config.theory_lr_min + config.eps)
     full_train_before: float | None = None
     full_train_examples: int | None = None
+    full_train_batch_losses_before: tuple[float, ...] | None = None
+    collect_probe_mismatch = bool(
+        config.certify_probe_refine_on_transaction_mismatch
+    )
     if full_train_batches is not None:
         if full_train_device is None:
             raise ValueError(
                 "Transactional full-train guard requires full_train_device."
             )
-        full_train_before, full_train_examples = (
-            _evaluate_transactional_full_train_functional_loss(
+        if collect_probe_mismatch:
+            (
+                full_train_before,
+                full_train_examples,
+                full_train_batch_losses_before,
+            ) = _evaluate_transactional_full_train_batch_losses(
                 base_model,
                 full_train_batches,
                 full_train_device,
                 config.functional_loss,
             )
-        )
+        else:
+            full_train_before, full_train_examples = (
+                _evaluate_transactional_full_train_functional_loss(
+                    base_model,
+                    full_train_batches,
+                    full_train_device,
+                    config.functional_loss,
+                )
+            )
+
+    # Rates decrease monotonically. Overwrite this whenever a smaller finite
+    # contradictory endpoint is found; only return it if no later retry commits.
+    smallest_probe_mismatch: _ProbeMismatch | None = None
 
     for retry_index in range(config.transactional_max_retries + 1):
         if rate <= floor:
@@ -1670,18 +1964,31 @@ def _transactional_realize_functional_step(
 
         full_train_after: float | None = None
         full_train_delta: float | None = None
+        full_train_batch_losses_after: tuple[float, ...] | None = None
         if full_train_batches is not None:
             assert full_train_device is not None
             assert full_train_before is not None
             try:
-                full_train_after, measured_examples = (
-                    _evaluate_transactional_full_train_functional_loss(
+                if collect_probe_mismatch:
+                    (
+                        full_train_after,
+                        measured_examples,
+                        full_train_batch_losses_after,
+                    ) = _evaluate_transactional_full_train_batch_losses(
                         model,
                         full_train_batches,
                         full_train_device,
                         config.functional_loss,
                     )
-                )
+                else:
+                    full_train_after, measured_examples = (
+                        _evaluate_transactional_full_train_functional_loss(
+                            model,
+                            full_train_batches,
+                            full_train_device,
+                            config.functional_loss,
+                        )
+                    )
             except Exception:
                 _restore_model_from_checkpoint(model, base_model)
                 raise
@@ -1753,39 +2060,54 @@ def _transactional_realize_functional_step(
             if actual_decrease is not None and predicted_decrease is not None
             else None
         )
-        records.append(
-            FGDTransactionalTrialRecord(
-                epoch=epoch,
-                outer_step_index=outer_step_index,
-                outer_step_global_index=outer_step_global_index,
-                retry_index=retry_index,
-                transactional_trial_count=0,
-                proposed_learning_rate=float(proposed_learning_rate),
-                capped_learning_rate=float(capped_learning_rate),
-                trial_learning_rate=rate,
-                committed_learning_rate=rate if accepted else 0.0,
-                realized_effective_learning_rate=(
-                    realization.effective_learning_rate
-                ),
-                realized_functional_before=before,
-                realized_functional_after=after,
-                realized_functional_delta=realization.functional_delta,
-                predicted_certified_decrease=predicted_decrease,
-                realized_decrease_ratio=decrease_ratio,
-                realization_residual_fraction=realization.residual_fraction,
-                realization_realized_fraction=realization.realised_fraction,
-                realization_iterations=realization.iterations,
-                selected_relative_damping=selected_relative_damping,
-                selected_absolute_damping=selected_absolute_damping,
-                accepted=accepted,
-                rejected=not accepted,
-                rejection_reason=rejection_reason,
-                full_train_functional_before=full_train_before,
-                full_train_functional_after=full_train_after,
-                full_train_functional_delta=full_train_delta,
-                full_train_examples=full_train_examples,
-            )
+        record = FGDTransactionalTrialRecord(
+            epoch=epoch,
+            outer_step_index=outer_step_index,
+            outer_step_global_index=outer_step_global_index,
+            retry_index=retry_index,
+            transactional_trial_count=0,
+            proposed_learning_rate=float(proposed_learning_rate),
+            capped_learning_rate=float(capped_learning_rate),
+            trial_learning_rate=rate,
+            committed_learning_rate=rate if accepted else 0.0,
+            realized_effective_learning_rate=realization.effective_learning_rate,
+            realized_functional_before=before,
+            realized_functional_after=after,
+            realized_functional_delta=realization.functional_delta,
+            predicted_certified_decrease=predicted_decrease,
+            realized_decrease_ratio=decrease_ratio,
+            realization_residual_fraction=realization.residual_fraction,
+            realization_realized_fraction=realization.realised_fraction,
+            realization_iterations=realization.iterations,
+            selected_relative_damping=selected_relative_damping,
+            selected_absolute_damping=selected_absolute_damping,
+            accepted=accepted,
+            rejected=not accepted,
+            rejection_reason=rejection_reason,
+            full_train_functional_before=full_train_before,
+            full_train_functional_after=full_train_after,
+            full_train_functional_delta=full_train_delta,
+            full_train_examples=full_train_examples,
         )
+        records.append(record)
+        if (
+            collect_probe_mismatch
+            and full_train_batch_losses_before is not None
+            and full_train_batch_losses_after is not None
+            and _is_probe_full_train_mismatch(
+                probe_before=before,
+                probe_after=after,
+                full_train_before=full_train_before,
+                full_train_after=full_train_after,
+                tolerance=config.transactional_descent_atol,
+            )
+        ):
+            violating = _rank_violating_full_train_batches(
+                full_train_batch_losses_before,
+                full_train_batch_losses_after,
+            )
+            if violating:
+                smallest_probe_mismatch = _ProbeMismatch(record, violating)
         increment("transactional_realization_trials")
         if progress is not None:
             before_text = f"{before:.6e}" if before is not None else "n/a"
@@ -1830,6 +2152,7 @@ def _transactional_realize_functional_step(
                 direction=direction,
                 learning_rate=rate,
                 trials=finalized,
+                probe_mismatch=None,
             )
 
         increment("transactional_realization_rejected")
@@ -1847,12 +2170,32 @@ def _transactional_realize_functional_step(
     finalized = tuple(
         replace(record, transactional_trial_count=trial_count) for record in records
     )
+    if smallest_probe_mismatch is not None:
+        finalized_trial = finalized[smallest_probe_mismatch.trial.retry_index]
+        smallest_probe_mismatch = replace(
+            smallest_probe_mismatch,
+            trial=finalized_trial,
+        )
+        if progress is not None:
+            trial = smallest_probe_mismatch.trial
+            assert trial.realized_functional_before is not None
+            assert trial.realized_functional_after is not None
+            assert trial.full_train_functional_before is not None
+            assert trial.full_train_functional_after is not None
+            progress(
+                "[PROBE-MISMATCH] "
+                f"probe_delta={trial.realized_functional_after - trial.realized_functional_before:.6e} "
+                f"full_train_delta={trial.full_train_functional_after - trial.full_train_functional_before:.6e} "
+                f"eta={trial.trial_learning_rate:.4e} "
+                f"trial={trial.retry_index}"
+            )
     return _TransactionalRealization(
         base_model=base_model,
         candidate_model=None,
         direction=None,
         learning_rate=None,
         trials=finalized,
+        probe_mismatch=smallest_probe_mismatch,
     )
 
 
@@ -6154,6 +6497,9 @@ def run_pipeline(
         certify_previous_failure_non_finite = False
         fgd_validation_probe: tuple[torch.Tensor, torch.Tensor] | None = None
         fgd_train_probe: tuple[torch.Tensor, torch.Tensor] | None = None
+        adaptive_probe_state: _AdaptiveCertificationProbe | None = None
+        probe_refinement_exhausted = False
+        probe_requires_consistency_check = False
         if config.training.method == "fgd_approx" and not nonlinear_mode:
             # Bounded certification probe: sized to kappa*rank(J) when enabled,
             # else the fixed probe_batches. Re-evaluated each outer step (rank
@@ -6171,17 +6517,29 @@ def run_pipeline(
                 _validation_probe_batches,
                 device,
             )
-            fgd_train_probe = build_projection_probe(
-                train_loader,
-                _probe_batches,
-                device,
-            )
+            if config.fgd_approx.certify_probe_refine_on_transaction_mismatch:
+                adaptive_probe_state = _new_adaptive_certification_probe(
+                    train_loader,
+                    _probe_batches,
+                )
+                fgd_train_probe = _compose_adaptive_certification_probe(
+                    adaptive_probe_state,
+                    config.fgd_approx,
+                    device,
+                )
+            else:
+                fgd_train_probe = build_projection_probe(
+                    train_loader,
+                    _probe_batches,
+                    device,
+                )
             # Functional Tikhonov: certify against L_data + gamma ||f||^2 by
             # shrinking the direction probe's targets. One point, and growth,
             # projection, realisation and GCV all inherit it.
-            fgd_train_probe = _functional_tikhonov_probe(
-                fgd_train_probe, config.fgd_approx
-            )
+            if adaptive_probe_state is None:
+                fgd_train_probe = _functional_tikhonov_probe(
+                    fgd_train_probe, config.fgd_approx
+                )
             fgd_validation_probe = _functional_tikhonov_probe(
                 fgd_validation_probe, config.fgd_approx
             )
@@ -6258,6 +6616,11 @@ def run_pipeline(
         growth_count = 0
         last_growth_epoch: int | None = None
         for epoch in range(1, config.training.epochs + 1):
+            if probe_refinement_exhausted:
+                # The previous epoch recorded the failed transaction and its
+                # final metrics. Stop cleanly rather than reuse a probe already
+                # contradicted by the full empirical objective forever.
+                break
             use_fgd_theory_learning_rate = (
                 config.training.method == "fgd_approx"
                 and not nonlinear_mode
@@ -6577,13 +6940,24 @@ def run_pipeline(
                         config.fgd_approx.outer_steps_per_epoch,
                     )
                     accepted_steps_this_epoch = 0
+                    refinement_attempt_budget = (
+                        config.fgd_approx.certify_probe_refine_max_rounds
+                        if adaptive_probe_state is not None
+                        else 0
+                    )
+                    frozen_outer_step_batches = None
                     # Multiple certified outer steps per epoch: each pass
                     # re-solves the shared direction at the CURRENT model and
                     # certifies it independently (k applications of the same
                     # per-step theorem). The epoch stops at the first
                     # rejected attempt; growth can only be requested when
                     # the FIRST attempt of the epoch fails.
-                    for _outer_step_index in range(max_outer_steps):
+                    for _outer_attempt_index in range(
+                        max_outer_steps + refinement_attempt_budget
+                    ):
+                        # Probe refinements retry the same logical outer step;
+                        # they do not consume one of outer_steps_per_epoch.
+                        _outer_step_index = accepted_steps_this_epoch
                         theory_state = _FGDTheoryState(
                             epoch_count=fgd_epoch_count,
                             min_gradient_sq_norm=fgd_min_gradient_sq_norm,
@@ -6595,7 +6969,9 @@ def run_pipeline(
                             ),
                         )
                         _clear_inaccessible_tensor_caches(model)
-                        frozen_train_batches = list(train_loader)
+                        if frozen_outer_step_batches is None:
+                            frozen_outer_step_batches = list(train_loader)
+                        frozen_train_batches = frozen_outer_step_batches
 
                         # One genuine outer step per epoch: solve the SHARED
                         # direction u* on the fixed train probe at the current
@@ -6654,12 +7030,26 @@ def run_pipeline(
                             )
                             if _needed > _probe_batches:
                                 _probe_batches = _needed
-                                fgd_train_probe = _functional_tikhonov_probe(
-                                    build_projection_probe(
-                                        train_loader, _probe_batches, device
-                                    ),
-                                    config.fgd_approx,
-                                )
+                                if adaptive_probe_state is not None:
+                                    _extend_adaptive_probe_base(
+                                        adaptive_probe_state,
+                                        train_loader,
+                                        _probe_batches,
+                                    )
+                                    fgd_train_probe = (
+                                        _compose_adaptive_certification_probe(
+                                            adaptive_probe_state,
+                                            config.fgd_approx,
+                                            device,
+                                        )
+                                    )
+                                else:
+                                    fgd_train_probe = _functional_tikhonov_probe(
+                                        build_projection_probe(
+                                            train_loader, _probe_batches, device
+                                        ),
+                                        config.fgd_approx,
+                                    )
                                 fgd_validation_probe = _functional_tikhonov_probe(
                                     build_projection_probe(
                                         validation_loader,
@@ -6732,11 +7122,19 @@ def run_pipeline(
                             # force growth". WHERE remains the configured
                             # expressivity bottleneck through layer_bottlenecks
                             # below, identically in both family-guard arms.
-                            _realizable_growth_active = bool(
-                                config.fgd_approx
-                                .certify_realizable_progress_growth
-                                and not certify_previous_step_committed
-                                and not certify_previous_failure_non_finite
+                            _realizable_growth_active = (
+                                _realizable_growth_is_active(
+                                    config.fgd_approx,
+                                    previous_step_committed=(
+                                        certify_previous_step_committed
+                                    ),
+                                    previous_failure_non_finite=(
+                                        certify_previous_failure_non_finite
+                                    ),
+                                    probe_requires_consistency_check=(
+                                        probe_requires_consistency_check
+                                    ),
+                                )
                             )
 
                             def _realizable_progress(candidate_model, _system, _epsilon):
@@ -7060,6 +7458,8 @@ def run_pipeline(
                                     fgd_outer_steps.extend(transaction.trials)
                                     for record in transaction.trials:
                                         wandb_logger.log_transactional_trial(record)
+                                    if transaction.probe_mismatch is None:
+                                        probe_requires_consistency_check = False
                                     if transaction.candidate_model is not None:
                                         realized_candidate_model = (
                                             transaction.candidate_model
@@ -7075,6 +7475,38 @@ def run_pipeline(
                                         tangent_direction = None
                                         selected_learning_rate = None
                                         transactional_endpoint_rejected = True
+                                        if (
+                                            transaction.probe_mismatch is not None
+                                            and adaptive_probe_state is not None
+                                        ):
+                                            refined_probe = (
+                                                _refine_adaptive_certification_probe(
+                                                    state=adaptive_probe_state,
+                                                    mismatch=(
+                                                        transaction.probe_mismatch
+                                                    ),
+                                                    frozen_train_batches=(
+                                                        frozen_train_batches
+                                                    ),
+                                                    config=config.fgd_approx,
+                                                    model=model,
+                                                    device=device,
+                                                    progress=progress,
+                                                )
+                                            )
+                                            if refined_probe is not None:
+                                                # The rejected endpoint was
+                                                # rolled back above. Only B_k
+                                                # changes; restart this logical
+                                                # outer step before growth sees
+                                                # the contradicted probe.
+                                                fgd_train_probe = refined_probe
+                                                probe_requires_consistency_check = True
+                                                tangent_system = None
+                                                continue
+                                            probe_refinement_exhausted = (
+                                                adaptive_probe_state.exhausted
+                                            )
                                     tangent_system = None
                                 else:
                                     # Historical path, intentionally kept as
@@ -7486,6 +7918,9 @@ def run_pipeline(
                         fgd_global_contraction = (
                             accepted_trial.global_contraction
                         )
+                        frozen_outer_step_batches = None
+                        if accepted_steps_this_epoch >= max_outer_steps:
+                            break
                     if accepted_steps_this_epoch == 0:
                         base_train_metrics = evaluate_regression_metrics(
                             model,

@@ -395,6 +395,13 @@ fgd_approx:
   # already ~0, but never merely because a step failed and never when the
   # candidate's certified realizable progress does not improve.
   certify_realizable_progress_growth: true
+  # The full-train transaction is also a counterexample oracle for the bounded
+  # certification sample. Refine only on the finite contradiction probe-down /
+  # full-train-up, retain every discovered batch, and re-solve from the same
+  # theta before realizability-aware growth sees the probe again.
+  certify_probe_refine_on_transaction_mismatch: true
+  certify_probe_refine_batches_per_round: 1
+  certify_probe_refine_max_rounds: 8
   # El lookahead ya existia pero solo sabia VETAR: un "si" caia al
   # `while epsilon >= target`, que excluye justo la banda en la que se
   # pregunta. MEDIDO aqui: eps se aparca en 0.4975 contra una barra de 0.5,

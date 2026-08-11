@@ -1017,6 +1017,19 @@ class FGDApproxConfig:
     # damping, linearisation, realization, and full-train transaction. The
     # default leaves grow_until_certified's exact eps argmin byte-identical.
     certify_realizable_progress_growth: bool = False
+    # Counterexample-guided refinement of the matrix-free certification probe.
+    # A rejected realized endpoint may expose a genuine sample contradiction:
+    # the endpoint lowers the probe functional while increasing the frozen
+    # full-training functional.  When enabled, the worst offending full-train
+    # batches are appended to the probe and the direction is re-certified from
+    # the unchanged parameter state.  Off by default so every existing probe,
+    # tangent system and growth decision remains byte-identical.
+    certify_probe_refine_on_transaction_mismatch: bool = False
+    # Number of new, distinct violating batches appended per refinement.
+    certify_probe_refine_batches_per_round: int = 1
+    # Hard limit on refinements of one run.  Zero is the disabled default; an
+    # enabled configuration must choose a positive, explicit budget.
+    certify_probe_refine_max_rounds: int = 0
     # Adaptive growth COUNT. The grow-to-certify loop adds a FIXED
     # tiny_maximum_added_neurons per growth, so on a hard task (CIFAR) reaching a
     # certifying width takes hundreds of full location scans -- one neuron at a
@@ -1363,6 +1376,51 @@ def validate_realizable_progress_growth(config: FGDApproxConfig) -> None:
             "fgd_approx.certify_realizable_progress_growth cannot be combined "
             "with certify_force_growth_on_finite_step_failure: growth must be "
             "authorised by measured certified realizable progress."
+        )
+
+
+def validate_probe_refinement(config: FGDApproxConfig) -> None:
+    """Confine adaptive probe refinement to the protected matrix-free path."""
+    batches = config.certify_probe_refine_batches_per_round
+    if isinstance(batches, bool) or not isinstance(batches, int) or batches < 1:
+        raise ValueError(
+            "fgd_approx.certify_probe_refine_batches_per_round must be a "
+            "positive integer."
+        )
+    rounds = config.certify_probe_refine_max_rounds
+    if isinstance(rounds, bool) or not isinstance(rounds, int) or rounds < 0:
+        raise ValueError(
+            "fgd_approx.certify_probe_refine_max_rounds must be a non-negative "
+            "integer."
+        )
+    if not config.certify_probe_refine_on_transaction_mismatch:
+        return
+    if rounds < 1:
+        raise ValueError(
+            "fgd_approx.certify_probe_refine_max_rounds must be positive when "
+            "adaptive probe refinement is enabled."
+        )
+    if tuple(config.family_order) != ("matrix_free_tangent",):
+        raise ValueError(
+            "fgd_approx.certify_probe_refine_on_transaction_mismatch is "
+            "restricted to family_order: [matrix_free_tangent]."
+        )
+    if not config.transactional_realized_descent or not config.certify_realize_path:
+        raise ValueError(
+            "fgd_approx.certify_probe_refine_on_transaction_mismatch requires "
+            "certify_realize_path and transactional_realized_descent to be true."
+        )
+    if not config.certify_realizable_progress_growth:
+        raise ValueError(
+            "fgd_approx.certify_probe_refine_on_transaction_mismatch requires "
+            "certify_realizable_progress_growth so a consistent probe is valued "
+            "before structural growth."
+        )
+    if config.probe_resample:
+        raise ValueError(
+            "fgd_approx.certify_probe_refine_on_transaction_mismatch requires "
+            "probe_resample: false so discovered counterexamples remain in a "
+            "monotone probe union."
         )
 
 
