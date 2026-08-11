@@ -118,9 +118,10 @@ def test_mnist_conv_inherits_config_2s_optimisation_set() -> None:
     recurring: it left the conv run with nothing comparable to measure
     against.
 
-    Five fgd_approx fields may differ. Three are forced by convolution. The
-    two realizability diagnostics are an explicit Conv-only response to the
-    measured finite-step deadlock; the linear config remains unchanged.
+    Six fgd_approx fields may differ. Three are forced by convolution, two
+    realizability diagnostics respond to the measured finite-step deadlock,
+    and one permits measured float32/cuDNN roundoff. The linear config remains
+    unchanged.
     """
     config_2 = load_pipeline_config("configs/fgd/mnist_matrix_free.yaml")
     conv = load_pipeline_config("configs/fgd/mnist_conv_matrix_free.yaml")
@@ -143,6 +144,10 @@ def test_mnist_conv_inherits_config_2s_optimisation_set() -> None:
         # by certified finite progress; they do not change config 2.
         "certify_probe_diagnostics",
         "certify_realizable_progress_growth",
+        # A zero-output-weight Conv extension is algebraically exact, but
+        # changing channel shape changes float32/cuDNN reduction order. Keep
+        # its measured roundoff allowance local to Conv.
+        "growth_preservation_tolerance",
     }
     # The data differs only in the two ways a convolution requires.
     assert _differing_fields(config_2.data, conv.data) == {"kind", "input_shape"}
@@ -159,6 +164,8 @@ def test_mnist_conv_inherits_config_2s_optimisation_set() -> None:
     assert config_2.fgd_approx.certify_realizable_progress_growth is False
     assert conv.fgd_approx.certify_probe_diagnostics is True
     assert conv.fgd_approx.certify_realizable_progress_growth is True
+    assert config_2.fgd_approx.growth_preservation_tolerance == 1e-6
+    assert conv.fgd_approx.growth_preservation_tolerance == 1e-5
     # The certified core is untouched.
     assert conv.fgd_approx.family_order == ("matrix_free_tangent",)
     assert conv.fgd_approx.growth_where == "expressivity_bottleneck"

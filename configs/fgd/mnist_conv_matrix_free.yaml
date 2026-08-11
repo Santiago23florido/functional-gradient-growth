@@ -600,7 +600,14 @@ fgd_approx:
   # than being off. 0 disables it, and a test pins the inf so the fact is
   # recorded rather than rediscovered.
   growth_bottleneck_crossfold_folds: 0
-  growth_preservation_tolerance: 1.0e-6
+  # Conv-specific float32 roundoff floor. Widening installs exactly-zero
+  # outgoing weights, so the represented function is unchanged algebraically,
+  # but changing a convolution's channel shape can change cuDNN's reduction
+  # order. MEASURED on margpu008: relative drift 1.281e-6
+  # (4.888e-6 / output scale 3.815) tripped the MLP-oriented 1e-6 guard and
+  # aborted seed 0. 1e-5 is still a strict five-significant-digit invariant
+  # and matches the Conv insertion tests; linear and N1024 retain 1e-6.
+  growth_preservation_tolerance: 1.0e-5
   # Ordered ladder of approximation families, evaluated top to bottom.
   # "tangent" must come first (it is the epoch's main transactional
   # search). Each following family is consulted only after every family
