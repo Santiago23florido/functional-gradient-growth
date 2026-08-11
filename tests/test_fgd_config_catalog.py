@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import re
 from pathlib import Path
 
 from stable_tiny.pipeline import load_pipeline_config
@@ -163,6 +164,18 @@ def test_mnist_conv_inherits_config_2s_optimisation_set() -> None:
     assert conv.fgd_approx.growth_where == "expressivity_bottleneck"
     assert conv.fgd_approx.rel_error_threshold == 0.5
     assert conv.fgd_approx.tiny_use_fisher is False
+
+
+def test_mnist_conv_declares_every_cluster_override() -> None:
+    """The Slurm launcher must be able to patch its node-local YAML copy."""
+    text = Path("configs/fgd/mnist_conv_matrix_free.yaml").read_text()
+    for key in (
+        "data_dir",
+        "jacobian_row_chunk",
+        "matrix_free_block_chunk",
+        "growth_where_balance",
+    ):
+        assert re.search(rf"^  {key}:.*$", text, flags=re.MULTILINE), key
 
 
 def test_the_conv_stack_builds_the_architecture_the_comments_claim() -> None:

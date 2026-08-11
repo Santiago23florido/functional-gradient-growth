@@ -56,6 +56,9 @@ data:
   in_features: 784
   input_shape: [1, 28, 28]
   out_features: 10
+  # Kept explicit because the Slurm launcher replaces it with node-local
+  # storage before starting the run.
+  data_dir:
   batch_size: 64
   # N = 1024, the regime this whole line of work is calibrated in.
   # 10000, config 2's value. This config is the CONV COUNTERPART of
