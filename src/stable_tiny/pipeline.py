@@ -41,6 +41,7 @@ from fgdlib.tangent import (
     compute_expressivity_bottlenecks,
     evaluate_fgd_validation_certificate,
     evaluate_secant_validation_certificate,
+    exact_tangent_system,
     measure_direction_projection,
     functional_gradient,
     select_tiny_growth_layer_index,
@@ -52,6 +53,7 @@ from fgdlib.tangent import (
     validate_bottleneck_stopping,
     validate_family_order,
     validate_growth_lookahead_entry,
+    validate_realizable_progress_growth,
     validate_functional_loss,
     validate_exact_tangent_system,
     validate_transactional_realized_descent,
@@ -67,6 +69,7 @@ from fgdlib.rkhs import (
 from fgdlib.gromo_setup import ensure_gromo_importable
 from fgdlib.profile import fallback, increment, timed
 from fgdlib.search.certify import (
+    CertifiedRealizableProgress,
     exact_relative_error,
     grow_until_certified,
 )
@@ -625,6 +628,7 @@ def load_pipeline_config(path: str | Path) -> PipelineConfig:
     validate_transactional_realized_descent(config.fgd_approx)
     validate_bottleneck_stopping(config.fgd_approx)
     validate_growth_lookahead_entry(config.fgd_approx)
+    validate_realizable_progress_growth(config.fgd_approx)
     config.parametric_gd.validate()
     config.parametric_descent.validate()
     return config
@@ -858,6 +862,52 @@ def _functional_tikhonov_probe(
 _CERTIFICATION_RANK_CACHE: dict[int, tuple[int, int]] = {}
 
 
+def _certification_system_numerical_rank(
+    system: ExactTangentSystem | None,
+) -> int | None:
+    """Numerical rank used by probe sizing, read from an existing system."""
+    if system is None:
+        return None
+    if getattr(system, "factors", None) is not None:
+        # Factored system: J = W V^T with V orthonormal, so svdvals(W) are the
+        # singular values of J. This is the same rank the sizing probe uses;
+        # no dense NK x P Jacobian is introduced for diagnostics.
+        left_factor, right_factor = system.factors
+        singular_values = torch.linalg.svdvals(left_factor.to(torch.float32))
+        columns = right_factor.shape[0]
+    elif system.jacobian.numel() == 0:
+        return None
+    else:
+        singular_values = torch.linalg.svdvals(system.jacobian.to(torch.float32))
+        columns = max(system.jacobian.shape)
+    if singular_values.numel() == 0:
+        return None
+    largest = float(singular_values.max())
+    if not largest > 0.0:
+        return None
+    tolerance = largest * columns * 1e-6
+    return int((singular_values > tolerance).sum())
+
+
+def _log_certification_probe(
+    model: torch.nn.Module,
+    system: ExactTangentSystem | None,
+    epsilon: float,
+    progress: ProgressFn,
+) -> None:
+    """Emit scalar evidence that the live probe is above interpolation."""
+    parameter_count = count_parameters(model)
+    rows = int(system.target.numel()) if system is not None else 0
+    rank = _certification_system_numerical_rank(system)
+    ratio = rows / rank if rank is not None and rank > 0 else None
+    progress(
+        f"[CERTIFY-PROBE] P={parameter_count} NK={rows} "
+        + (f"rank={rank} " if rank is not None else "rank=n/a ")
+        + (f"NK/rank={ratio:.4f} " if ratio is not None else "NK/rank=n/a ")
+        + f"eps={epsilon:.6g}"
+    )
+
+
 def _estimate_certification_rank(
     config: PipelineConfig,
     model: torch.nn.Module,
@@ -874,32 +924,9 @@ def _estimate_certification_rank(
     2092``, so sizing by ``P`` over-samples ~4x and needlessly slows the where.
     This measures the numerical rank directly on a bounded probe.
     """
-    from fgdlib.tangent import exact_tangent_system
-
     x, y = build_projection_probe(loader, sizing_batches, device)
     system = exact_tangent_system(model, x, y, config.fgd_approx)
-    if system is None:
-        return None
-    if getattr(system, "factors", None) is not None:
-        # Factored system: J is never materialised, so read the spectrum off
-        # the (rows, k) factor. svd(J) = (A, S, VB), so these ARE J's singular
-        # values -- truncated at k, which is exactly the rank this route can
-        # see and therefore the right number to report.
-        left_factor, right_factor = system.factors
-        singular_values = torch.linalg.svdvals(left_factor.to(torch.float32))
-        columns = right_factor.shape[0]
-    elif system.jacobian.numel() == 0:
-        return None
-    else:
-        singular_values = torch.linalg.svdvals(system.jacobian.to(torch.float32))
-        columns = max(system.jacobian.shape)
-    if singular_values.numel() == 0:
-        return None
-    largest = float(singular_values.max())
-    if not largest > 0.0:
-        return None
-    tolerance = largest * columns * 1e-6
-    return int((singular_values > tolerance).sum())
+    return _certification_system_numerical_rank(system)
 
 
 def _bounded_probe_batches(
@@ -1778,6 +1805,85 @@ def _transactional_realize_functional_step(
         direction=None,
         learning_rate=None,
         trials=finalized,
+    )
+
+
+def _measure_certified_realizable_progress(
+    *,
+    model: GrowingMLP,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    config: FGDApproxConfig,
+    full_train_batches: list[tuple[torch.Tensor, torch.Tensor]],
+    device: torch.device,
+    relative_error: float,
+) -> CertifiedRealizableProgress:
+    """Measure D(theta) with the same protected tangent path used to step.
+
+    The model supplied by grow_until_certified may be either the live current
+    structure or a candidate it could commit. Scoring is observational: build
+    and realize on a private clone, then retain only scalars. A positive score
+    therefore means one of the existing damping rungs satisfied Lemma 3.5 and
+    its nonlinear endpoint survived the existing realization and full-train
+    transaction. No certificate is replaced or bypassed.
+    """
+    scoring_model = copy.deepcopy(model)
+    system = exact_tangent_system(scoring_model, x, y, config)
+    if system is None:
+        return CertifiedRealizableProgress(relative_error, None, 0.0)
+    selector = (
+        select_projection_damping_factored
+        if system.factors is not None
+        else select_projection_damping
+    )
+    choice = selector(scoring_model, x, y, config, system=system)
+    if choice is None or choice.candidate.learning_rate is None:
+        return CertifiedRealizableProgress(relative_error, None, 0.0)
+
+    chosen = choice.candidate
+    rate = float(chosen.learning_rate)
+    if config.certify_realize_path:
+        if not config.transactional_realized_descent:
+            # Validation prevents the opt-in growth criterion from reaching
+            # this branch. Keep the measurement conservative if called
+            # directly with an invalid hand-built config.
+            return CertifiedRealizableProgress(relative_error, None, 0.0)
+        transaction = _transactional_realize_functional_step(
+            model=scoring_model,
+            x=x,
+            y=y,
+            updates=choice.parameter_updates,
+            proposed_learning_rate=float(chosen.certified_learning_rate),
+            capped_learning_rate=rate,
+            relative_error=float(chosen.relative_error),
+            system=choice.tangent_system,
+            selected_relative_damping=float(chosen.relative_damping),
+            selected_absolute_damping=float(chosen.absolute_damping),
+            config=config,
+            epoch=-1,
+            outer_step_index=-1,
+            outer_step_global_index=-1,
+            full_train_batches=full_train_batches,
+            full_train_device=device,
+            progress=None,
+        )
+        if transaction.learning_rate is None:
+            return CertifiedRealizableProgress(relative_error, None, 0.0)
+        rate = float(transaction.learning_rate)
+
+    predicted = _predicted_certified_decrease(
+        system=choice.tangent_system,
+        relative_error=float(chosen.relative_error),
+        learning_rate=rate,
+        config=config,
+    )
+    return CertifiedRealizableProgress(
+        # Report the structural epsilon used by grow_until_certified. The
+        # theorem score above correctly uses the selected damping rung's eps,
+        # which can be larger than this least-damped growth signal.
+        relative_error=relative_error,
+        learning_rate=rate if predicted is not None else None,
+        certified_progress=float(predicted) if predicted is not None else 0.0,
     )
 
 
@@ -6562,6 +6668,38 @@ def run_pipeline(
                                     config=config,
                                 )
 
+                            # Realizability-aware WHEN gate. It is only paid
+                            # after the preceding tangent attempt failed with
+                            # finite diagnostics; the decision itself is still
+                            # a fresh certified comparison, never "failure =>
+                            # force growth". WHERE remains the configured
+                            # expressivity bottleneck through layer_bottlenecks
+                            # below, identically in both family-guard arms.
+                            _realizable_growth_active = bool(
+                                config.fgd_approx
+                                .certify_realizable_progress_growth
+                                and not certify_previous_step_committed
+                                and not certify_previous_failure_non_finite
+                            )
+
+                            def _realizable_progress(candidate_model, _system, _epsilon):
+                                del _system
+                                return _measure_certified_realizable_progress(
+                                    model=candidate_model,
+                                    x=fgd_train_probe[0],
+                                    y=fgd_train_probe[1],
+                                    config=config.fgd_approx,
+                                    full_train_batches=frozen_train_batches,
+                                    device=device,
+                                    relative_error=_epsilon,
+                                )
+
+                            def _probe_diagnostic(candidate_model, system, epsilon):
+                                assert progress is not None
+                                _log_certification_probe(
+                                    candidate_model, system, epsilon, progress
+                                )
+
                             _family_step = None
                             if config.fgd_approx.certify_family_ladder:
                                 _fp = fgd_train_probe
@@ -6658,9 +6796,23 @@ def run_pipeline(
                                     if (
                                         config.fgd_approx.growth_where
                                         == "expressivity_bottleneck"
-                                        and config.fgd_approx
-                                        .certify_adaptive_growth_by_bottleneck
+                                        and (
+                                            config.fgd_approx
+                                            .certify_adaptive_growth_by_bottleneck
+                                            or _realizable_growth_active
+                                        )
                                     )
+                                    else None
+                                ),
+                                realizable_progress=(
+                                    _realizable_progress
+                                    if _realizable_growth_active
+                                    else None
+                                ),
+                                probe_diagnostic=(
+                                    _probe_diagnostic
+                                    if config.fgd_approx.certify_probe_diagnostics
+                                    and progress is not None
                                     else None
                                 ),
                                 # A step that did not commit while eps was

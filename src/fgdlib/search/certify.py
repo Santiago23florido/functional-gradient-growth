@@ -67,6 +67,7 @@ from fgdlib.tangent import (
 from fgdlib.training_utils.loop import count_parameters
 
 __all__ = [
+    "CertifiedRealizableProgress",
     "CertifyResult",
     "certify_growth_target",
     "exact_relative_error",
@@ -108,14 +109,24 @@ class CertifyResult:
     tangent_system: ExactTangentSystem | None = None
     #: Why the loop returned: "certified", "growth_target_unreachable",
     #: "parameter_budget", "no_growth_reduced_epsilon", "max_growths",
-    #: "family_stepped", "training_beats_growing", "growth_turn_taken" or
-    #: "growth_turn_taken_voluntary" -- the last one meaning the certificate
-    #: was already met and only the lookahead asked for the neuron.
+    #: "family_stepped", "training_beats_growing", "growth_turn_taken",
+    #: "growth_turn_taken_voluntary", "realizable_progress_not_improved" or
+    #: "realizable_growth_turn_taken". The two final values belong to the
+    #: opt-in finite-realizability comparison.
     #: Diagnostic; nothing branches on it.
     stop_reason: str = "certified"
     #: The eps the loop was chasing -- ``certify_growth_target`` clamped to the
     #: certificate, i.e. ``rel_error_threshold`` when the field is unset.
     growth_target: float | None = None
+
+
+@dataclass(frozen=True)
+class CertifiedRealizableProgress:
+    """A certified tangent step that the current parameterization can execute."""
+
+    relative_error: float
+    learning_rate: float | None
+    certified_progress: float
 
 
 def certify_growth_target(config: FGDApproxConfig) -> float:
@@ -579,6 +590,132 @@ def _select_growth_candidate(
     return best_model, best_epsilon, best_location, best_system, budget_exhausted
 
 
+def _select_realizable_progress_growth(
+    model,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    train_loader,
+    device: torch.device,
+    config,
+    function_preserving: bool,
+    current_epsilon: float,
+    current_progress: CertifiedRealizableProgress,
+    score_progress,
+    layer_bottlenecks,
+    *,
+    parameter_budget: int | None = None,
+    progress=None,
+):
+    """Value the expressivity bottleneck by executable certified progress.
+
+    ``growth_where: expressivity_bottleneck`` continues to answer WHERE: only
+    its argmax is grown. This helper answers WHETHER that purchase is useful by
+    comparing the existing certified-realization score on the current model and
+    its function-preserving grown clone. In particular, eps need not improve;
+    the candidate still has to produce a positive, finite certified decrease.
+    """
+    if not function_preserving:
+        raise ValueError(
+            "Realizability-aware certification growth must be function-preserving."
+        )
+    if layer_bottlenecks is None:
+        raise ValueError(
+            "Realizability-aware certification growth requires the configured "
+            "expressivity-bottleneck selector."
+        )
+
+    growable_count = len(getattr(model, "_growable_layers", []))
+    measured = list(layer_bottlenecks(model))
+    if len(measured) != growable_count:
+        raise RuntimeError(
+            "Expressivity-bottleneck count does not match growable locations."
+        )
+    if not measured or not max(measured) > 0.0:
+        if progress is not None:
+            progress(
+                "[REALIZABLE-GROWTH] no positive expressivity bottleneck; "
+                "no structural candidate"
+            )
+        return None, current_epsilon, None, None, current_progress, False
+
+    location = measured.index(max(measured))
+    candidate = _grow_clone(
+        model,
+        train_loader,
+        location,
+        device,
+        config,
+        function_preserving,
+    )
+    if candidate is None:
+        return None, current_epsilon, None, None, current_progress, False
+
+    delta_parameters = count_parameters(candidate) - count_parameters(model)
+    if parameter_budget is not None and count_parameters(candidate) > parameter_budget:
+        increment("certify_budget_rejected_candidates")
+        if progress is not None:
+            progress(
+                f"[REALIZABLE-GROWTH] location={location} rejected by parameter "
+                f"budget; delta_params={delta_parameters}"
+            )
+        return None, current_epsilon, None, None, current_progress, True
+
+    candidate_epsilon, candidate_system = _relative_error_and_system(
+        candidate, x, y, config.fgd_approx
+    )
+    candidate_progress = score_progress(
+        candidate, candidate_system, candidate_epsilon
+    )
+    finite = bool(
+        candidate_progress.learning_rate is not None
+        and candidate_progress.learning_rate > 0.0
+        and candidate_progress.certified_progress > 0.0
+        and torch.isfinite(
+            torch.tensor(
+                [
+                    candidate_progress.relative_error,
+                    candidate_progress.learning_rate,
+                    candidate_progress.certified_progress,
+                ],
+                dtype=torch.float64,
+            )
+        ).all()
+    )
+    delta_progress = (
+        candidate_progress.certified_progress - current_progress.certified_progress
+        if finite
+        else -current_progress.certified_progress
+    )
+    if progress is not None:
+        eta = (
+            f"{candidate_progress.learning_rate:.4e}"
+            if candidate_progress.learning_rate is not None
+            else "none"
+        )
+        progress(
+            f"[REALIZABLE-GROWTH] location={location} "
+            f"candidate_eps={candidate_progress.relative_error:.6g} "
+            f"candidate_eta={eta} "
+            "candidate_certified_progress="
+            f"{candidate_progress.certified_progress:.6e} "
+            f"delta_progress={delta_progress:.6e} "
+            f"delta_params={delta_parameters} "
+            "where=expressivity_bottleneck"
+        )
+
+    improvement_floor = float(config.fgd_approx.eps)
+    if not finite or not delta_progress > improvement_floor:
+        return None, current_epsilon, None, None, current_progress, False
+    return (
+        candidate,
+        candidate_epsilon,
+        location,
+        candidate_system,
+        candidate_progress,
+        False,
+    )
+
+
 def grow_until_certified(
     model,
     x: torch.Tensor,
@@ -593,6 +730,8 @@ def grow_until_certified(
     family_step=None,
     growth_warranted=None,
     layer_bottlenecks=None,
+    realizable_progress=None,
+    probe_diagnostic=None,
 ):
     """Grow until ``eps < certify_growth_target``; return the grown model.
 
@@ -612,9 +751,13 @@ def grow_until_certified(
     growth is deferred and, when it finally happens, is cheaper -- the whole
     point when growth is function-preserving and otherwise ruinous.
 
-    At each iteration every growable location is tried on a clone and scored
-    by its EXACT resulting ``eps``; the location with the lowest ``eps`` is
-    committed.
+    By default, at each iteration every growable location is tried on a clone
+    and scored by its EXACT resulting ``eps``; the location with the lowest
+    ``eps`` is committed. The opt-in ``realizable_progress`` callback is the
+    finite-step exception: it values exactly the location chosen by
+    ``layer_bottlenecks`` and authorises one growth only when that
+    function-preserving candidate has strictly greater certified executable
+    progress than the current structure.
 
     ``force`` grows at least once even when ``eps`` is already below the
     threshold. It exists to close a real deadlock, measured on MNIST: after
@@ -656,6 +799,8 @@ def grow_until_certified(
     )
     parameter_budget = getattr(config.fgd_approx, "max_total_parameters", None)
     epsilon, tangent_system = _relative_error_and_system(model, x, y, config.fgd_approx)
+    if probe_diagnostic is not None:
+        probe_diagnostic(model, tangent_system, epsilon)
     trajectory = [epsilon]
     growths = 0
     family_steps = 0
@@ -684,7 +829,11 @@ def grow_until_certified(
     # eps, i.e. whether the structure or the training is the binding
     # constraint. The scale it compares against is the problem's own, so it
     # transfers between datasets without a knob.
-    if growth_warranted is not None and epsilon < certificate:
+    if (
+        realizable_progress is None
+        and growth_warranted is not None
+        and epsilon < certificate
+    ):
         if not growth_warranted(model):
             fallback("certify_growth_not_warranted", "training_beats_growing")
             if progress is not None:
@@ -750,6 +899,63 @@ def grow_until_certified(
             stop_reason="parameter_budget",
             growth_target=target,
         )
+
+    # A failed finite step with eps already certified is the only state where
+    # this opt-in criterion is supplied by the pipeline. It is not a forced
+    # growth: both endpoints are measured with the existing realization stack,
+    # and the purchase is authorised only by a strictly larger certified
+    # functional decrease. Cache the winning clone so the expensive transaction
+    # is not evaluated twice before the growth commits.
+    realizable_entry = False
+    realizable_candidate = None
+    if realizable_progress is not None and epsilon < certificate:
+        current_progress = realizable_progress(model, tangent_system, epsilon)
+        if progress is not None:
+            eta = (
+                f"{current_progress.learning_rate:.4e}"
+                if current_progress.learning_rate is not None
+                else "none"
+            )
+            progress(
+                f"[REALIZABLE-GROWTH] current_eps="
+                f"{current_progress.relative_error:.6g} current_eta={eta} "
+                "current_certified_progress="
+                f"{current_progress.certified_progress:.6e}"
+            )
+        selected = _select_realizable_progress_growth(
+            model,
+            x,
+            y,
+            train_loader,
+            device,
+            config,
+            function_preserving,
+            epsilon,
+            current_progress,
+            realizable_progress,
+            layer_bottlenecks,
+            parameter_budget=parameter_budget,
+            progress=progress,
+        )
+        if selected[0] is None:
+            reason = (
+                "parameter_budget"
+                if selected[5]
+                else "realizable_progress_not_improved"
+            )
+            return model, CertifyResult(
+                relative_error=epsilon,
+                growths=0,
+                certified=epsilon < target,
+                trajectory=tuple(trajectory),
+                tangent_system=tangent_system,
+                stop_reason=reason,
+                growth_target=target,
+            )
+        realizable_entry = True
+        warranted_entry = True
+        entered_voluntarily = True
+        realizable_candidate = selected
 
     while (
         epsilon >= target or forced_remaining > 0 or warranted_entry
@@ -861,8 +1067,24 @@ def grow_until_certified(
         # step needs in order to exist at all. They disagree in practice --
         # with the adaptive count gated on "is this layer still the argmax
         # bottleneck?" it fired ZERO times in four seeds.
-        best_model, best_epsilon, best_location, best_system, budget_exhausted = (
-            _select_growth_candidate(
+        if realizable_entry and realizable_candidate is not None:
+            (
+                best_model,
+                best_epsilon,
+                best_location,
+                best_system,
+                _,
+                budget_exhausted,
+            ) = realizable_candidate
+            realizable_candidate = None
+        else:
+            (
+                best_model,
+                best_epsilon,
+                best_location,
+                best_system,
+                budget_exhausted,
+            ) = _select_growth_candidate(
                 model,
                 tangent_system,
                 x,
@@ -874,7 +1096,6 @@ def grow_until_certified(
                 epsilon,
                 parameter_budget=parameter_budget,
             )
-        )
 
         if best_model is None:
             if budget_exhausted:
@@ -947,12 +1168,18 @@ def grow_until_certified(
         tangent_system = best_system
         growths += 1
         trajectory.append(epsilon)
+        if probe_diagnostic is not None:
+            probe_diagnostic(model, tangent_system, epsilon)
         if progress is not None:
             progress(
                 f"[CERTIFY] growth {growths} at location {best_location}: "
                 f"eps -> {epsilon:.4f}"
                 + ("  (certified)" if epsilon < target else "")
             )
+
+        if realizable_entry:
+            stop_reason = "realizable_growth_turn_taken"
+            break
 
         # HOW MUCH, answered the same organic way as WHETHER. Once a step
         # already certifies, further growth is voluntary, so buy ONE increment
@@ -1027,6 +1254,8 @@ def grow_until_certified(
                 tangent_system = bigger_system
                 growths += 1
                 trajectory.append(epsilon)
+                if probe_diagnostic is not None:
+                    probe_diagnostic(model, tangent_system, epsilon)
                 if progress is not None:
                     progress(
                         f"[CERTIFY] adaptive +growth {growths} at location "
@@ -1060,6 +1289,8 @@ def grow_until_certified(
                 tangent_system = bigger_system
                 growths += 1
                 trajectory.append(epsilon)
+                if probe_diagnostic is not None:
+                    probe_diagnostic(model, tangent_system, epsilon)
                 if progress is not None:
                     progress(
                         f"[CERTIFY] adaptive +growth {growths} at location "

@@ -976,6 +976,19 @@ class FGDApproxConfig:
     # instead holds the probe above the interpolation floor by construction and
     # leaves the eps formula -- and every synthetic certificate -- untouched.
     certify_probe_kappa: float = 0.0
+    # Scalar-only observability for the rank-sized certification probe. The
+    # pipeline logs P, NK, numerical rank(J), NK/rank(J), and eps from the
+    # exact system already built for certification. Off by default, so neither
+    # probe sizing nor any existing experiment pays for the diagnostic SVD.
+    certify_probe_diagnostics: bool = False
+    # Value a function-preserving structural increment by the certified
+    # functional decrease it can REALISE, rather than requiring eps to fall.
+    # This is deliberately an opt-in deadlock gate for the isolated
+    # matrix-free tangent path: after a finite step failure it compares the
+    # current model with the expressivity-bottleneck growth using the existing
+    # damping, linearisation, realization, and full-train transaction. The
+    # default leaves grow_until_certified's exact eps argmin byte-identical.
+    certify_realizable_progress_growth: bool = False
     # Adaptive growth COUNT. The grow-to-certify loop adds a FIXED
     # tiny_maximum_added_neurons per growth, so on a hard task (CIFAR) reaching a
     # certifying width takes hundreds of full location scans -- one neuron at a
@@ -1290,6 +1303,38 @@ def validate_growth_lookahead_entry(config: FGDApproxConfig) -> None:
             "fgd_approx.certify_growth_lookahead_entry requires "
             "certify_growth_lookahead: true -- it authorises the SAME "
             "predicate, so without it there is nothing to authorise."
+        )
+
+
+def validate_realizable_progress_growth(config: FGDApproxConfig) -> None:
+    """Confine realizability-aware growth to its matrix-free experiment."""
+    if not config.certify_realizable_progress_growth:
+        return
+    if tuple(config.family_order) != ("matrix_free_tangent",):
+        raise ValueError(
+            "fgd_approx.certify_realizable_progress_growth is restricted to "
+            "family_order: [matrix_free_tangent]."
+        )
+    if config.growth_where != "expressivity_bottleneck":
+        raise ValueError(
+            "fgd_approx.certify_realizable_progress_growth requires "
+            "growth_where: expressivity_bottleneck."
+        )
+    if not config.grow_to_certify or not config.certify_function_preserving:
+        raise ValueError(
+            "fgd_approx.certify_realizable_progress_growth requires "
+            "grow_to_certify and certify_function_preserving to be true."
+        )
+    if not config.certify_realize_path or not config.transactional_realized_descent:
+        raise ValueError(
+            "fgd_approx.certify_realizable_progress_growth requires "
+            "certify_realize_path and transactional_realized_descent to be true."
+        )
+    if config.certify_force_growth_on_finite_step_failure:
+        raise ValueError(
+            "fgd_approx.certify_realizable_progress_growth cannot be combined "
+            "with certify_force_growth_on_finite_step_failure: growth must be "
+            "authorised by measured certified realizable progress."
         )
 
 

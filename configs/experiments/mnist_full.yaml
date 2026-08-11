@@ -387,6 +387,14 @@ fgd_approx:
   #   expressivity_bottleneck 0.9435   4 formas distintas, ratios 1.46-2.44
   # Las cuatro semillas superan 0.925 individualmente.
   growth_where: expressivity_bottleneck
+  # WHERE remains the expressivity bottleneck above. After a finite tangent
+  # step failure, this opt-in WHEN/value gate compares the current structure
+  # with that one function-preserving growth by the certified functional
+  # decrease each can actually realize through the existing damping,
+  # realization and full-train transaction. It may buy capacity when eps is
+  # already ~0, but never merely because a step failed and never when the
+  # candidate's certified realizable progress does not improve.
+  certify_realizable_progress_growth: true
   # El lookahead ya existia pero solo sabia VETAR: un "si" caia al
   # `while epsilon >= target`, que excluye justo la banda en la que se
   # pregunta. MEDIDO aqui: eps se aparca en 0.4975 contra una barra de 0.5,
@@ -526,6 +534,10 @@ fgd_approx:
   # only the starting point; this keeps the invariant NK > P holding after every
   # growth. [4, 8] is the range the field documents as tested.
   certify_probe_kappa: 4.0
+  # Scalar evidence for the live interpolation-floor invariant. This does not
+  # resize or redraw the probe; it reads the exact system certification already
+  # built and logs P, NK, numerical rank(J), NK/rank(J), and eps.
+  certify_probe_diagnostics: true
   # 5000, not 30000. With kappa = 4 a P of 30000 would demand NK = 120000 rows
   # = 12000 images, and this config only loads mnist_train_samples: 10000. The
   # budget and the probe are now coupled quantities; 5000 needs NK = 20000 rows
