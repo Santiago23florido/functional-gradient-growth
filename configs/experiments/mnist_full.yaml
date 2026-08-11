@@ -401,7 +401,13 @@ fgd_approx:
   # theta before realizability-aware growth sees the probe again.
   certify_probe_refine_on_transaction_mismatch: true
   certify_probe_refine_batches_per_round: 1
-  certify_probe_refine_max_rounds: 8
+  # MEASURED in the first counterexample-guided full-MNIST run: all 8 rounds
+  # found distinct violating batches while full-train loss and accuracy were
+  # still improving, so the safety cap -- not the 100000-parameter budget --
+  # stopped the run at epoch 5 and P~=9293. Double the finite allowance; this
+  # can retain at most 16 counterexample batches and still stops cleanly if
+  # the empirical mismatch persists.
+  certify_probe_refine_max_rounds: 16
   # El lookahead ya existia pero solo sabia VETAR: un "si" caia al
   # `while epsilon >= target`, que excluye justo la banda en la que se
   # pregunta. MEDIDO aqui: eps se aparca en 0.4975 contra una barra de 0.5,

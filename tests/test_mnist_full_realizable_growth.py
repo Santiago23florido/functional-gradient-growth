@@ -91,7 +91,7 @@ def test_only_deadlocked_mnist_matrix_free_runs_enable_new_options() -> None:
     assert conv.certify_realizable_progress_growth is True
     assert full.certify_probe_refine_on_transaction_mismatch is True
     assert full.certify_probe_refine_batches_per_round == 1
-    assert full.certify_probe_refine_max_rounds == 8
+    assert full.certify_probe_refine_max_rounds == 16
     assert conv.certify_probe_refine_on_transaction_mismatch is False
 
     for path in Path("configs/fgd").glob("*.yaml"):
