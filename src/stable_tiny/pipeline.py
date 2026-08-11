@@ -94,6 +94,7 @@ from fgdlib.search.unified import (
     Candidate,
     bottleneck_relief_target,
     rank_candidates,
+    rank_candidates_by_bottleneck_per_parameter,
     rank_candidates_by_certified_gain,
     rank_limiting_locations,
 )
@@ -140,12 +141,13 @@ ensure_gromo_importable()
 import torch
 
 from gromo.containers.growing_mlp import GrowingMLP
+from gromo.containers.sequential_growing_container import SequentialGrowingModel
 
 
 ProgressFn = Callable[[str], None]
 TrainingMethod = Literal["normal", "fgd_approx", "fgd_rkhs", "fgd_rkhs_grow"]
 StepType = Literal["INIT", "SGD", "FGD", "SEC", "GRO", "RKHS"]
-DataKind = Literal["multi_sin", "smooth_sin", "cifar10", "mnist"]
+DataKind = Literal["multi_sin", "smooth_sin", "cifar10", "mnist", "mnist2d"]
 
 
 @dataclass(frozen=True)
@@ -173,6 +175,9 @@ class DataConfig:
     mnist_train_samples: int | None = 10_000
     mnist_validation_samples: int | None = 2_000
     mnist_test_samples: int | None = 2_000
+    # Shape of ONE example, excluding the batch axis, for the kinds that emit
+    # images rather than vectors (``mnist2d``). ``None`` means flat.
+    input_shape: tuple[int, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -203,7 +208,14 @@ class ModelConfig:
     #     - batchnorm
     #     - {mlp: [2, 1]}
     #     - {dropout: 0.2}
+    # A stack naming `conv` / `maxpool` / `avgpool` / `flatten` builds the
+    # convolutional container instead (fgdlib/models/convstack.py).
     stack: tuple[Any, ...] | None = None
+    # Which GroMo growth scheme a conv layer uses. "restricted" (Conv -> 1x1)
+    # is GroMo's own default and what VGG/ResNet use, and it is by far the
+    # better tested of the two; "full" (Conv -> Conv) exists for the A/B.
+    # Ignored by a non-conv stack.
+    conv_growth_scheme: str = "restricted"
 
 
 @dataclass(frozen=True)
@@ -374,7 +386,7 @@ class PipelineResult:
     config: PipelineConfig
     history: list[HistoryEntry]
     growth_events: list[GrowthResult]
-    model: GrowingMLP
+    model: SequentialGrowingModel
     device: str
     fgd_outer_steps: list[FGDTransactionalTrialRecord] = field(default_factory=list)
 
@@ -408,7 +420,7 @@ class _NonlinearDirectionalCertificate:
 
 @dataclass(frozen=True)
 class _FGDTrial:
-    model: GrowingMLP
+    model: SequentialGrowingModel
     epoch_result: FGDApproxEpochResult
     certificate: FGDValidationCertificate | _NonlinearDirectionalCertificate
     theory_state: _FGDTheoryState
@@ -432,8 +444,8 @@ class _FGDSearchResult:
 
 @dataclass(frozen=True)
 class _TransactionalRealization:
-    base_model: GrowingMLP
-    candidate_model: GrowingMLP | None
+    base_model: SequentialGrowingModel
+    candidate_model: SequentialGrowingModel | None
     direction: tuple[torch.Tensor, ...] | None
     learning_rate: float | None
     trials: tuple[FGDTransactionalTrialRecord, ...]
@@ -458,14 +470,14 @@ class _NonlinearPrimaryResult:
     #: ladder reports how close it came instead of only its last attempt.
     best_cosine: float | None = None
     #: Model after the grow-until-certified inner loop, when it grew.
-    grown_model: GrowingMLP | None = None
+    grown_model: SequentialGrowingModel | None = None
     #: Growth events that loop consumed.
     growths: int = 0
 
 
 @dataclass(frozen=True)
 class _NonlinearGrowthOutcome:
-    model: GrowingMLP | None
+    model: SequentialGrowingModel | None
     result: GrowthResult | None
     layer_index: int | None
     statistics_seconds: float
@@ -475,7 +487,7 @@ class _NonlinearGrowthOutcome:
 
 @dataclass(frozen=True)
 class _GrowthProbe:
-    model: GrowingMLP
+    model: SequentialGrowingModel
     result: GrowthResult
     certificate: FGDValidationCertificate
     improves_fgd: bool
@@ -524,6 +536,13 @@ def _section_dataclass(
         values["levels"] = (
             tuple(int(value) for value in values["levels"])
             if values["levels"] is not None
+            else None
+        )
+
+    if section_type is DataConfig and "input_shape" in values:
+        values["input_shape"] = (
+            tuple(int(value) for value in values["input_shape"])
+            if values["input_shape"] is not None
             else None
         )
 
@@ -778,6 +797,33 @@ def build_dataloaders(
             num_classes=data_config.out_features,
         )
 
+    if data_config.kind == "mnist2d":
+        # A separate kind, not a flag on "mnist": the branch above must not
+        # gain a conditional, or the flat runs stop being provably untouched.
+        if data_config.in_features != 784:
+            raise ValueError("mnist2d requires data.in_features=784.")
+        if data_config.out_features != 10:
+            raise ValueError("mnist2d requires data.out_features=10.")
+        image_shape = data_config.input_shape or (1, 28, 28)
+        elements = 1
+        for extent in image_shape:
+            elements *= int(extent)
+        if elements != data_config.in_features:
+            raise ValueError(
+                f"data.input_shape {tuple(image_shape)} has {elements} elements "
+                f"but data.in_features is {data_config.in_features}."
+            )
+        return make_mnist_dataloaders(
+            data_dir=data_config.data_dir,
+            train_samples=data_config.mnist_train_samples,
+            validation_samples=data_config.mnist_validation_samples,
+            test_samples=data_config.mnist_test_samples,
+            batch_size=data_config.batch_size,
+            seed=data_config.train_seed,
+            num_classes=data_config.out_features,
+            image_shape=tuple(image_shape),
+        )
+
     if data_config.kind == "multi_sin":
         loader_class = MultiSinDataLoader
         extra_kwargs: dict[str, Any] = {}
@@ -793,7 +839,7 @@ def build_dataloaders(
     else:
         raise ValueError(
             f"Unsupported data kind '{data_config.kind}'. "
-            "Use one of: multi_sin, smooth_sin, cifar10, mnist."
+            "Use one of: multi_sin, smooth_sin, cifar10, mnist, mnist2d."
         )
 
     train_loader = loader_class(
@@ -827,7 +873,7 @@ def build_dataloaders(
 
 
 def is_classification_task(config: PipelineConfig) -> bool:
-    return config.data.kind in {"cifar10", "mnist"}
+    return config.data.kind in {"cifar10", "mnist", "mnist2d"}
 
 
 def _functional_tikhonov_probe(
@@ -995,7 +1041,7 @@ def _bounded_probe_batches(
     return max(1, min(batches, max_batches))
 
 
-def build_model(config: PipelineConfig, device: torch.device) -> GrowingMLP:
+def build_model(config: PipelineConfig, device: torch.device) -> SequentialGrowingModel:
     data_config = config.data
     model_config = config.model
     torch.manual_seed(model_config.model_seed)
@@ -1011,6 +1057,8 @@ def build_model(config: PipelineConfig, device: torch.device) -> GrowingMLP:
             in_features=data_config.in_features,
             out_features=data_config.out_features,
             device=device,
+            input_shape=data_config.input_shape,
+            conv_growth_scheme=model_config.conv_growth_scheme,
         )
 
     kwargs: dict[str, Any] = {}
@@ -1269,7 +1317,7 @@ def _certified_pl_constant(config: PipelineConfig) -> float:
 
 def _certify_fgd_candidate(
     *,
-    candidate_model: GrowingMLP,
+    candidate_model: SequentialGrowingModel,
     epoch_result: FGDApproxEpochResult,
     certificate: FGDValidationCertificate | _NonlinearDirectionalCertificate,
     validation_loader: torch.utils.data.DataLoader,
@@ -1466,7 +1514,7 @@ def _certify_force_growth(
 
 
 def _apply_shared_direction_step(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     direction: tuple[torch.Tensor, ...],
     learning_rate: float,
 ) -> None:
@@ -1482,8 +1530,8 @@ def _apply_shared_direction_step(
 
 
 def _restore_model_from_checkpoint(
-    model: GrowingMLP,
-    checkpoint: GrowingMLP,
+    model: SequentialGrowingModel,
+    checkpoint: SequentialGrowingModel,
 ) -> None:
     """Restore parameters, buffers and train/eval flags without reallocating."""
     destination_parameters = dict(model.named_parameters())
@@ -1511,7 +1559,7 @@ def _restore_model_from_checkpoint(
 
 def _refresh_tangent_system_after_exact_restore(
     system: ExactTangentSystem,
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     x: torch.Tensor,
     y: torch.Tensor,
     config: FGDApproxConfig,
@@ -1559,7 +1607,7 @@ def _predicted_certified_decrease(
 
 def _transactional_realize_functional_step(
     *,
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     x: torch.Tensor,
     y: torch.Tensor,
     updates: tuple[torch.Tensor, ...],
@@ -1810,7 +1858,7 @@ def _transactional_realize_functional_step(
 
 def _measure_certified_realizable_progress(
     *,
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     x: torch.Tensor,
     y: torch.Tensor,
     config: FGDApproxConfig,
@@ -1889,7 +1937,7 @@ def _measure_certified_realizable_progress(
 
 def _search_tangent_measured_descent(
     *,
-    base_model: GrowingMLP,
+    base_model: SequentialGrowingModel,
     direction: tuple[torch.Tensor, ...],
     direction_stats: _FunctionalStepStats,
     train_batches: list[tuple[torch.Tensor, torch.Tensor]],
@@ -1964,7 +2012,7 @@ def _search_tangent_measured_descent(
 
 def _evaluate_fgd_outer_trial(
     *,
-    base_model: GrowingMLP,
+    base_model: SequentialGrowingModel,
     direction: tuple[torch.Tensor, ...],
     direction_stats: _FunctionalStepStats,
     train_batches: list[tuple[torch.Tensor, torch.Tensor]],
@@ -1978,7 +2026,7 @@ def _evaluate_fgd_outer_trial(
     theory_state: _FGDTheoryState,
     initial_functional_gap: float,
     theory_loss_star: float,
-    candidate_model: GrowingMLP | None = None,
+    candidate_model: SequentialGrowingModel | None = None,
 ) -> _FGDTrial:
     """One genuine FGD outer step: theta - eta * u with the shared direction.
 
@@ -2057,7 +2105,7 @@ def _evaluate_fgd_outer_trial(
 
 def _evaluate_secant_fgd_trial(
     *,
-    base_model: GrowingMLP,
+    base_model: SequentialGrowingModel,
     train_batches: list[tuple[torch.Tensor, torch.Tensor]],
     validation_loader: torch.utils.data.DataLoader,
     loss_function: torch.nn.Module,
@@ -2219,7 +2267,7 @@ def _apply_lemma35_step(
     evaluate_trial: Callable[[float], _FGDTrial],
     config: FGDApproxConfig,
     learning_rate: float | None = None,
-    model: GrowingMLP | None = None,
+    model: SequentialGrowingModel | None = None,
     probe_inputs: torch.Tensor | None = None,
     updates: tuple[torch.Tensor, ...] | None = None,
     progress: Callable[[str], None] | None = None,
@@ -2452,7 +2500,7 @@ def _growth_certificate_improves(
 
 def _growth_reduces_lookahead_epsilon(
     *,
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_batches: list[tuple[torch.Tensor, torch.Tensor]],
     train_loader: torch.utils.data.DataLoader,
     validation_loader: torch.utils.data.DataLoader,
@@ -2485,14 +2533,17 @@ def _growth_reduces_lookahead_epsilon(
     Returns True only when growth beats training. With the flag off (the
     default) this is never called and behaviour is unchanged.
     """
-    widths = [int(layer.in_features) for layer in model._growable_layers]
+    # in_neurons, not in_features: identical on a Linear (the same
+    # attribute), but on a conv in_features is the UNFOLDED fan-in
+    # in_channels * k_h * k_w, so a 2-channel layer reported as width 18.
+    widths = [int(layer.in_neurons) for layer in model._growable_layers]
     limiting = rank_limiting_locations(widths)
     if not limiting:
         return False
     bottleneck = limiting[0]
     steps = config.fgd_approx.growth_lookahead_steps
 
-    def _epsilon_after_training(candidate: GrowingMLP) -> float | None:
+    def _epsilon_after_training(candidate: SequentialGrowingModel) -> float | None:
         trained = _train_parametric_gd_candidate(
             base_model=candidate,
             train_batches=train_batches,
@@ -2550,7 +2601,7 @@ def _growth_reduces_lookahead_epsilon(
 
 def _probe_fgd_growth(
     *,
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_batches: list[tuple[torch.Tensor, torch.Tensor]],
     validation_loader: torch.utils.data.DataLoader,
     base_certificate: FGDValidationCertificate,
@@ -2855,7 +2906,7 @@ def _select_growth_probe(
 
 def _search_secant_fgd_candidate(
     *,
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_batches: list[tuple[torch.Tensor, torch.Tensor]],
     validation_loader: torch.utils.data.DataLoader,
     loss_function: torch.nn.Module,
@@ -2908,8 +2959,8 @@ def _search_secant_fgd_candidate(
 
 def _measure_secant_projection(
     *,
-    base_model: GrowingMLP,
-    candidate_model: GrowingMLP,
+    base_model: SequentialGrowingModel,
+    candidate_model: SequentialGrowingModel,
     validation_loader: torch.utils.data.DataLoader,
     device: torch.device,
     eps: float,
@@ -2953,7 +3004,7 @@ def _measure_secant_projection(
 
 
 
-def _wake_dormant_outgoing_weights(model: GrowingMLP, scale: float) -> None:
+def _wake_dormant_outgoing_weights(model: SequentialGrowingModel, scale: float) -> None:
     """Break the w = 0 degeneracy on a DISPOSABLE scoring clone.
 
     A function-preserving neuron enters with its outgoing weight at zero, so
@@ -2993,7 +3044,7 @@ def _wake_dormant_outgoing_weights(model: GrowingMLP, scale: float) -> None:
 
 
 def _prune_negligible_units(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     probe: tuple[torch.Tensor, torch.Tensor],
     tolerance: float,
 ) -> int:
@@ -3077,14 +3128,14 @@ def _prune_negligible_units(
 
 def _train_parametric_gd_candidate(
     *,
-    base_model: GrowingMLP,
+    base_model: SequentialGrowingModel,
     train_batches: list[tuple[torch.Tensor, torch.Tensor]],
     device: torch.device,
     functional_learning_rate: float,
     steps: int,
     config: ParametricGDConfig | ParametricDescentConfig,
     functional_loss: str = "mse",
-) -> GrowingMLP | None:
+) -> SequentialGrowingModel | None:
     """Train a disposable clone toward the functional target f - eta * r.
 
     With eta = 0.5 the target f - 0.5 * 2(f - y) is exactly y, so that
@@ -3159,7 +3210,7 @@ def _train_parametric_gd_candidate(
 
 def _evaluate_parametric_gd_trial(
     *,
-    base_model: GrowingMLP,
+    base_model: SequentialGrowingModel,
     train_batches: list[tuple[torch.Tensor, torch.Tensor]],
     validation_loader: torch.utils.data.DataLoader,
     loss_function: torch.nn.Module,
@@ -3289,8 +3340,8 @@ def _functional_gradient_sq_norm(
 
 def _certify_measured_descent_candidate(
     *,
-    candidate_model: GrowingMLP,
-    base_model: GrowingMLP,
+    candidate_model: SequentialGrowingModel,
+    base_model: SequentialGrowingModel,
     train_batches: list[tuple[torch.Tensor, torch.Tensor]],
     validation_loader: torch.utils.data.DataLoader,
     loss_function: torch.nn.Module,
@@ -3507,7 +3558,7 @@ def _certify_measured_descent_candidate(
 
 def _evaluate_parametric_descent_trial(
     *,
-    base_model: GrowingMLP,
+    base_model: SequentialGrowingModel,
     train_batches: list[tuple[torch.Tensor, torch.Tensor]],
     validation_loader: torch.utils.data.DataLoader,
     loss_function: torch.nn.Module,
@@ -3571,7 +3622,7 @@ def _evaluate_parametric_descent_trial(
 
 def _search_parametric_descent_candidate(
     *,
-    base_model: GrowingMLP,
+    base_model: SequentialGrowingModel,
     train_batches: list[tuple[torch.Tensor, torch.Tensor]],
     validation_loader: torch.utils.data.DataLoader,
     loss_function: torch.nn.Module,
@@ -3662,7 +3713,7 @@ def _certified_trial_progress(trial: _FGDTrial) -> float:
 
 def _search_parametric_gd_candidate(
     *,
-    base_model: GrowingMLP,
+    base_model: SequentialGrowingModel,
     train_batches: list[tuple[torch.Tensor, torch.Tensor]],
     validation_loader: torch.utils.data.DataLoader,
     loss_function: torch.nn.Module,
@@ -3821,7 +3872,7 @@ def _nonlinear_certification_source(
 
 def _search_nonlinear_primary_candidate(
     *,
-    base_model: GrowingMLP,
+    base_model: SequentialGrowingModel,
     train_loader,
     validation_loader,
     test_loader,
@@ -4287,7 +4338,7 @@ _MFTANGENT_MAX_BURST = 8
 
 def _search_matrix_free_tangent_step(
     *,
-    base_model: GrowingMLP,
+    base_model: SequentialGrowingModel,
     train_loader,
     validation_loader,
     test_loader,
@@ -4346,7 +4397,7 @@ def _search_matrix_free_tangent_step(
 
     threshold = min(fa.rel_error_threshold, 0.5)
     growths = 0
-    grown_model: GrowingMLP | None = None
+    grown_model: SequentialGrowingModel | None = None
     previous_error: float | None = None
     burst = 1
 
@@ -4615,17 +4666,23 @@ def _search_matrix_free_tangent_step(
     )
 
 
-def _architecture_widths(model: GrowingMLP) -> tuple[int, ...]:
+def _architecture_widths(model: SequentialGrowingModel) -> tuple[int, ...]:
+    # ``in_neurons``, not ``in_features``: on a LinearGrowingModule the two are
+    # the same attribute (``self.layer.in_features``), so this is a no-op for
+    # every MLP run, but on a Conv2dGrowingModule ``in_features`` is the
+    # UNFOLDED fan-in ``in_channels * k_h * k_w`` while ``in_neurons`` is
+    # ``in_channels`` -- the width that growth actually buys, and the one the
+    # logs and the growth ledger are about.
     return tuple(
-        int(layer.in_features) for layer in getattr(model, "_growable_layers", [])
+        int(layer.in_neurons) for layer in getattr(model, "_growable_layers", [])
     )
 
 
 @torch.no_grad()
 def _stream_max_function_drift(
     *,
-    base_model: GrowingMLP,
-    grown_model: GrowingMLP,
+    base_model: SequentialGrowingModel,
+    grown_model: SequentialGrowingModel,
     loader: torch.utils.data.DataLoader,
     device: torch.device,
 ) -> float | None:
@@ -4656,7 +4713,7 @@ def _stream_max_function_drift(
 
 def _apply_nonlinear_primary_growth(
     *,
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader,
     preservation_loader=None,
     device: torch.device,
@@ -5034,7 +5091,7 @@ def _run_fgd_rkhs_pipeline(
     )
 
 
-def _frozen_feature_map_from_grown_mlp(mlp: GrowingMLP) -> FrozenAffineFeatureMap:
+def _frozen_feature_map_from_grown_mlp(mlp: SequentialGrowingModel) -> FrozenAffineFeatureMap:
     """Snapshot the hidden layers of a grown MLP as the frozen feature map.
 
     The constant-1 feature is appended so the certified head is exactly an
@@ -5055,7 +5112,7 @@ def _frozen_feature_map_from_grown_mlp(mlp: GrowingMLP) -> FrozenAffineFeatureMa
     return FrozenAffineFeatureMap(weights, biases, activations, append_one=True)
 
 
-def _apply_certified_head(mlp: GrowingMLP, kernel_model: KernelDictionaryModel) -> None:
+def _apply_certified_head(mlp: SequentialGrowingModel, kernel_model: KernelDictionaryModel) -> None:
     """Write the certified-optimal head into the grown network's output layer."""
     head = kernel_model.linear_head_weight()
     output_layer = mlp.layers[-1].layer
@@ -5080,7 +5137,7 @@ def _apply_certified_head(mlp: GrowingMLP, kernel_model: KernelDictionaryModel) 
 
 
 def _select_rkhs_growth_layer(
-    mlp: GrowingMLP,
+    mlp: SequentialGrowingModel,
     growth_count: int,
     config: PipelineConfig,
 ) -> int | None:
@@ -5410,7 +5467,7 @@ class _RKHSPhaseResult:
 
 def _run_rkhs_head_phase(
     *,
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_batches: list[tuple[torch.Tensor, torch.Tensor]],
     config: PipelineConfig,
     device: torch.device,
@@ -5510,7 +5567,7 @@ def _run_nonlinear_pipeline(
     failed_ladders = 0
     growth_count = 0
 
-    def metrics(candidate: GrowingMLP, loader: torch.utils.data.DataLoader):
+    def metrics(candidate: SequentialGrowingModel, loader: torch.utils.data.DataLoader):
         return evaluate_regression_metrics(
             candidate,
             loader,
@@ -6634,7 +6691,7 @@ def run_pipeline(
                         direction_sensor_non_finite = False
                         transactional_endpoint_rejected = False
                         tangent_system = None
-                        realized_candidate_model: GrowingMLP | None = None
+                        realized_candidate_model: SequentialGrowingModel | None = None
                         if config.fgd_approx.grow_to_certify:
                             # GROW-TO-CERTIFY. Make the structure satisfy
                             # Lemma 3.5 BEFORE stepping, instead of stepping
@@ -8666,7 +8723,7 @@ def run_pipeline(
                         # minimum, no purchase elsewhere can raise what the
                         # structure is able to express.
                         widths = [
-                            int(layer.in_features)
+                            int(layer.in_neurons)
                             for layer in model._growable_layers
                         ]
                         # The rank cap both FILTERS candidates to the width
@@ -8792,7 +8849,7 @@ def run_pipeline(
                                         "mandate ends"
                                     )
                                 widths = [
-                                    int(layer.in_features)
+                                    int(layer.in_neurons)
                                     for layer in model._growable_layers
                                 ]
                                 bottlenecks = set(
@@ -8804,9 +8861,9 @@ def run_pipeline(
                             >= config.fgd_approx.rel_error_threshold
                         )
                         candidates: list[Candidate] = []
-                        trials: dict[tuple[str, int], GrowingMLP] = {}
+                        trials: dict[tuple[str, int], SequentialGrowingModel] = {}
 
-                        def _certificate_for(trial: GrowingMLP) -> float | None:
+                        def _certificate_for(trial: SequentialGrowingModel) -> float | None:
                             measured = evaluate_fgd_validation_certificate(
                                 model=trial,
                                 data_loader=validation_loader,
@@ -8828,7 +8885,7 @@ def run_pipeline(
                         # expansion_value's max(..., 0) was clamping away.
                         # Kept as a single seam so the exact block-Schur fast
                         # path can be adopted here later behind its own flag.
-                        def _train_epsilon(trial: GrowingMLP) -> float | None:
+                        def _train_epsilon(trial: SequentialGrowingModel) -> float | None:
                             if fgd_train_probe is None:
                                 return None
                             try:
@@ -8842,7 +8899,7 @@ def run_pipeline(
                                 return None
 
                         def _ladder_residual(
-                            trial: GrowingMLP,
+                            trial: SequentialGrowingModel,
                         ) -> float | None:
                             """How close the LADDER can bring this candidate
                             to the functional target it is already chasing.
@@ -8918,7 +8975,7 @@ def run_pipeline(
                             _res = _num / _den
                             return _res if math.isfinite(_res) else None
 
-                        def _score_for(trial: GrowingMLP) -> float | None:
+                        def _score_for(trial: SequentialGrowingModel) -> float | None:
                             if where_mode != "certified_gain":
                                 return _certificate_for(trial)
                             # Score the candidate AWAKE, not dormant, WITHOUT
@@ -8971,7 +9028,7 @@ def run_pipeline(
                                 return 0.5 * (_tr + _va)
                             return _train_epsilon(trial)
 
-                        def _rank_score(trial: GrowingMLP) -> float | None:
+                        def _rank_score(trial: SequentialGrowingModel) -> float | None:
                             """Score used to RANK where to grow.
 
                             Identical to _score_for unless the ladder score is
@@ -9345,7 +9402,103 @@ def run_pipeline(
                                         for i, v in enumerate(_bottlenecks)
                                     )
                                 )
-                            if _width_only and max(_bottlenecks) > 0.0:
+                            _balance = bool(
+                                getattr(
+                                    config.fgd_approx,
+                                    "growth_where_balance",
+                                    False,
+                                )
+                            )
+                            if _balance:
+                                # Let a NEW LAYER compete with the widenings,
+                                # in the same measured quantity. Both kinds
+                                # enter without moving f -- omega = 0 for a
+                                # width extension, an identity weight at
+                                # alpha = 0 for an insertion -- so r is the
+                                # same for every candidate and their
+                                # bottlenecks mean the same sentence. The
+                                # depth trials are already built above, so the
+                                # marginal cost is the statistics pass, not
+                                # the clone.
+                                _scores: dict[tuple[str, int], float] = {
+                                    ("width", index): value
+                                    for index, value in enumerate(_bottlenecks)
+                                }
+                                for _key, _trial in trials.items():
+                                    if _key[0] != "depth":
+                                        continue
+                                    _inserted = _trial.layers[_key[1]]
+                                    _where = next(
+                                        (
+                                            _i
+                                            for _i, _layer in enumerate(
+                                                _trial._growable_layers
+                                            )
+                                            if _layer is _inserted
+                                        ),
+                                        None,
+                                    )
+                                    if _where is None:
+                                        # The insertion landed somewhere GroMo
+                                        # cannot grow, so it buys no capacity
+                                        # that could be measured. Score 0 and
+                                        # it is never admitted.
+                                        continue
+                                    _trial_bottlenecks = (
+                                        compute_expressivity_bottlenecks(
+                                            _trial,
+                                            train_loader,
+                                            device,
+                                            config.fgd_approx,
+                                        )
+                                    )
+                                    if _where < len(_trial_bottlenecks):
+                                        _scores[_key] = _trial_bottlenecks[_where]
+                                _eligible = [
+                                    c for c in candidates
+                                    if not c.indices
+                                    and (c.kind, c.index) in _scores
+                                ]
+                                ranked = (
+                                    rank_candidates_by_bottleneck_per_parameter(
+                                        _eligible,
+                                        bottlenecks=_scores,
+                                        min_gain_fraction=(
+                                            config.fgd_approx
+                                            .growth_where_min_gain_fraction
+                                        ),
+                                        cost_exponent=(
+                                            config.fgd_approx
+                                            .growth_where_cost_exponent
+                                        ),
+                                    )
+                                )
+                                if progress is not None:
+                                    _costs = {
+                                        (c.kind, c.index): c.cost
+                                        for c in candidates
+                                    }
+                                    progress(
+                                        f"[BALANCE] Epoch {epoch} "
+                                        + " ".join(
+                                            f"{key[0][0].upper()}{key[1]}"
+                                            f"={value:.4e}"
+                                            f"/{_costs.get(key, 0)}"
+                                            for key, value in sorted(_scores.items())
+                                        )
+                                        + (
+                                            f" -> {ranked[0].kind}"
+                                            f"{ranked[0].index}"
+                                            if ranked
+                                            else " -> nothing pays"
+                                        )
+                                    )
+                                if not ranked:
+                                    fallback(
+                                        "growth_where_no_bottleneck",
+                                        "expressivity_bottleneck_all_zero",
+                                    )
+                            elif _width_only and max(_bottlenecks) > 0.0:
                                 ranked = sorted(
                                     _width_only,
                                     key=lambda c: _bottlenecks[c.index],
@@ -9401,7 +9554,7 @@ def run_pipeline(
                                     + (
                                         "; widths "
                                         + "-".join(
-                                            str(int(layer.in_features))
+                                            str(int(layer.in_neurons))
                                             for layer in model._growable_layers
                                         )
                                         if where_mode == "certified_gain"

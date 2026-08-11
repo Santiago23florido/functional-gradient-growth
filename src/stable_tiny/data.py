@@ -303,10 +303,33 @@ def make_mnist_dataloaders(
     batch_size: int = 64,
     seed: int = 0,
     num_classes: int = 10,
+    image_shape: tuple[int, ...] | None = None,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
-    """Return MNIST loaders with one-hot targets for the MSE FGD pipeline."""
+    """Return MNIST loaders with one-hot targets for the MSE FGD pipeline.
+
+    ``image_shape`` reshapes each example on the way out, e.g. ``(1, 28, 28)``
+    for a convolutional stack; ``None`` keeps the flat 784-vector.
+
+    It is deliberately a RESHAPE at the end of this one function rather than a
+    second loader. Normalisation is per-pixel over the flat view and the
+    split/shuffle/one-hot draws are the same statements on the same generator,
+    so the 2-D loader is the flat one to the bit: same examples, same order,
+    same labels, and ``x_2d.flatten(1) == x_flat`` exactly. That identity is
+    what makes the linear reference arm a fair comparison instead of an
+    approximate one -- and it holds by construction, not by two copies of the
+    code being kept in step.
+    """
     if num_classes != 10:
         raise ValueError("MNIST requires data.out_features = 10.")
+    if image_shape is not None:
+        expected = 1
+        for extent in image_shape:
+            expected *= int(extent)
+        if expected != 784:
+            raise ValueError(
+                f"MNIST image_shape {tuple(image_shape)} has {expected} elements, "
+                "but an MNIST image has 784."
+            )
 
     required_files = (
         "train-images-idx3-ubyte.gz",
@@ -364,6 +387,12 @@ def make_mnist_dataloaders(
             f"({test_samples} > {test_x.shape[0]})."
         )
     test_indices = test_order[:test_samples]
+
+    # After every draw above, so the split stayed on the flat view.
+    if image_shape is not None:
+        shape = tuple(int(extent) for extent in image_shape)
+        train_x = train_x.reshape(-1, *shape)
+        test_x = test_x.reshape(-1, *shape)
 
     def one_hot(labels: torch.Tensor) -> torch.Tensor:
         return torch.nn.functional.one_hot(labels, num_classes=num_classes).float()

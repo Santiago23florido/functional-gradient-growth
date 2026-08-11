@@ -72,15 +72,19 @@ def test_guard_arms_differ_only_in_family_transaction(tmp_path: Path) -> None:
     assert "--gpus=1" in launcher
 
 
-def test_only_full_mnist_enables_new_options() -> None:
+def test_only_deadlocked_mnist_matrix_free_runs_enable_new_options() -> None:
     full = load_pipeline_config("configs/experiments/mnist_full.yaml").fgd_approx
+    conv = load_pipeline_config("configs/fgd/mnist_conv_matrix_free.yaml").fgd_approx
     assert full.certify_probe_diagnostics is True
     assert full.certify_realizable_progress_growth is True
+    assert conv.certify_probe_diagnostics is True
+    assert conv.certify_realizable_progress_growth is True
 
     for path in Path("configs/fgd").glob("*.yaml"):
         config = load_pipeline_config(path).fgd_approx
-        assert config.certify_probe_diagnostics is False, path
-        assert config.certify_realizable_progress_growth is False, path
+        expected = path.name == "mnist_conv_matrix_free.yaml"
+        assert config.certify_probe_diagnostics is expected, path
+        assert config.certify_realizable_progress_growth is expected, path
 
 
 @pytest.mark.parametrize(

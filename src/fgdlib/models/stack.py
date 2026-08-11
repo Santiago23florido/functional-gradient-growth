@@ -44,6 +44,7 @@ from fgdlib.models.regularized_mlp import (
 ensure_gromo_importable()
 
 from gromo.containers.growing_mlp import GrowingMLP
+from gromo.containers.sequential_growing_container import SequentialGrowingModel
 from gromo.modules.linear_growing_module import LinearGrowingModule
 
 __all__ = ["LayerSpec", "build_stack_model", "parse_stack"]
@@ -125,7 +126,9 @@ def build_stack_model(
     out_features: int,
     device: torch.device,
     activation_factory=nn.SELU,
-) -> GrowingMLP:
+    input_shape: tuple[int, ...] | None = None,
+    conv_growth_scheme: str = "restricted",
+) -> SequentialGrowingModel:
     """Build a ``GrowingMLP`` whose hidden layers follow ``stack``.
 
     The blocks may have different widths.  We first use GroMo's constructor
@@ -134,7 +137,28 @@ def build_stack_model(
     ``LinearGrowingModule`` instances, so downstream training and growth code
     sees the same graph it would see after a search had widened the layers.
     The output layer is never regularized.
+
+    A stack naming any convolutional component is handed to
+    :mod:`fgdlib.models.convstack` instead: pooling and flatten change the
+    tensor shape, so they cannot be folded into a ``post_layer_function`` the
+    way batch-norm and dropout are, and a ``GrowingMLP`` -- whose forward is
+    ``flatten(x)`` then a straight run over ``layers`` -- cannot express them
+    however many tokens ``parse_stack`` learns. One config key, one entry
+    point, two containers.
     """
+    from fgdlib.models.convstack import build_conv_stack_model, is_conv_stack
+
+    if is_conv_stack(stack):
+        return build_conv_stack_model(
+            stack,
+            in_features=in_features,
+            out_features=out_features,
+            device=device,
+            activation_factory=activation_factory,
+            input_shape=input_shape,
+            conv_growth_scheme=conv_growth_scheme,
+        )
+
     specs = parse_stack(stack)
     width = specs[0].width
 

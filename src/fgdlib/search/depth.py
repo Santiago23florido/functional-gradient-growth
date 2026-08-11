@@ -84,7 +84,15 @@ def insert_identity_layer(
     Returns the inserted module. The caller is responsible for re-running
     whatever statistics the growth machinery caches, since the layer list
     has changed.
+
+    A container that knows how to insert into itself -- the conv stack, whose
+    ``layers`` are interleaved with shape-changing ops that this function's
+    flat rebuild would scramble -- handles it instead.
     """
+    inserter = getattr(model, "insert_identity_at", None)
+    if inserter is not None:
+        return inserter(position, activation=activation, device=device)
+
     layers = getattr(model, "layers", None)
     if layers is None:
         raise TypeError("model has no `layers` ModuleList to insert into")
@@ -139,10 +147,21 @@ def insert_identity_layer(
     return inserted
 
 
-def inserted_layer_cost(width: int) -> int:
-    """Parameters a depth insertion at ``width`` costs: ``width^2 + width``.
+def inserted_layer_cost(width: int, kernel_elements: int = 1) -> int:
+    """Parameters a depth insertion at ``width`` costs.
 
-    The counterpart of ``growable_neuron_costs`` for depth proposals, so the
-    two can be ranked together by certified decrease per parameter.
+    ``width^2 * kernel_elements + width + 1``: a square weight, a bias, and
+    the homotopy's ``alpha``. The counterpart of ``growable_neuron_costs`` for
+    depth proposals, so the two can be ranked together by certified decrease
+    per parameter.
+
+    ``kernel_elements`` is ``k_h * k_w`` for a convolutional insertion and 1
+    for a linear one.
+
+    The ``+ 1`` is :class:`IdentityHomotopyActivation`'s ``alpha``. It is a
+    real trainable parameter -- the one the new layer uses to earn its
+    nonlinearity -- so leaving it out understated every insertion by one and
+    disagreed with the measured ``count_parameters`` delta, which is what
+    ``tests/test_conv_depth_insertion.py`` checks the figure against.
     """
-    return width * width + width
+    return width * width * kernel_elements + width + 1

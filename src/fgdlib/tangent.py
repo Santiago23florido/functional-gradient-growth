@@ -23,6 +23,7 @@ import torch
 from torch.func import functional_call, jacrev, jvp
 
 from gromo.containers.growing_mlp import GrowingMLP
+from gromo.containers.sequential_growing_container import SequentialGrowingModel
 from gromo.modules.linear_growing_module import LinearGrowingModule
 from gromo.utils.training_utils import compute_statistics
 
@@ -740,6 +741,20 @@ class FGDApproxConfig:
     #: three-hidden-layer family the reference and the exhaustive architecture
     #: search both live in.
     growth_where_allow_depth: bool = False
+    #: Let a DEPTH proposal compete with the width proposals under
+    #: ``growth_where: expressivity_bottleneck``, ranked by the same measured
+    #: bottleneck per parameter (``unified.rank_candidates_by_bottleneck_per_
+    #: parameter``). Off by default, and when off the branch runs exactly as
+    #: before -- the depth trials are still built and still discarded, which
+    #: is deliberate: constructing them consumes the global RNG, so skipping
+    #: the construction would shift every later draw and break the pin.
+    #:
+    #: Why this needs to exist at all: GroMo's topology pins some widths
+    #: outright. A conv whose consumer sits behind a pool, or a linear layer
+    #: behind a flatten, can never be widened however badly it is the
+    #: bottleneck -- the only relief is a new layer. A width-only rule cannot
+    #: express that trade, so it silently spends elsewhere forever.
+    growth_where_balance: bool = False
     #: Keep buying at the chosen location while each increment still pays.
     #: This is the HOW MUCH replacement; without it growth is one neuron per
     #: epoch and cannot reach the reference's widths in its epoch budget.
@@ -902,6 +917,19 @@ class FGDApproxConfig:
     # statement about the training loss and a statement about 256 points.
     # 0 disables chunking.
     jacobian_row_chunk: int = 0
+    #: How many directions ride through ONE ``vmap`` on the matrix-free path.
+    #: 0 keeps the unchunked call, so every existing run is byte-identical.
+    #:
+    #: The range finder asks for a block of ``rank + oversampling`` directions
+    #: -- of order ``P`` -- and ``vmap`` holds the full forward activations for
+    #: all of them at once. On an MLP an activation is ``(N, width)``; on a
+    #: conv it is ``(N, C, H, W)``, larger by the spatial extent. MEASURED on
+    #: the N=1024 MNIST conv stack that is 12.8 MB PER DIRECTION PER LAYER, so
+    #: the block at the 2500-parameter budget asks for tens of GB and takes the
+    #: machine down. The directions in a block are independent, so chunking is
+    #: a loop and cannot change the result mathematically; in floating point it
+    #: moves by one ulp, because the reduction order depends on the batch size.
+    matrix_free_block_chunk: int = 0
     certify_realize_path: bool = False
     certify_realize_max_iterations: int = 40
     certify_realize_tolerance: float = 0.05
@@ -2003,7 +2031,7 @@ def tiny_optimal_update_kwargs(
     }
 
 
-def _cleanup_tiny_update(model: GrowingMLP) -> None:
+def _cleanup_tiny_update(model: SequentialGrowingModel) -> None:
     model.reset_computation()
     for layer in getattr(model, "_growing_layers", []):
         if hasattr(layer, "delete_update"):
@@ -2013,7 +2041,7 @@ def _cleanup_tiny_update(model: GrowingMLP) -> None:
 
 
 def _forward_with_tiny_update(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     x: torch.Tensor,
 ) -> torch.Tensor:
     """Forward the temporary layer delta all the way to the network output."""
@@ -3423,7 +3451,7 @@ def _factored_relative_error_estimate(
 
 
 @contextmanager
-def _suspended_module_capture(model: GrowingMLP):
+def _suspended_module_capture(model: SequentialGrowingModel):
     """``paused_computation`` for a gromo that does not have it.
 
     The method landed on a branch, so whether the protection exists at all
@@ -3452,7 +3480,7 @@ def _suspended_module_capture(model: GrowingMLP):
 
 def _matrix_free_tangent_system(
     *,
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     x: torch.Tensor,
     y: torch.Tensor,
     config: FGDApproxConfig,
@@ -3558,7 +3586,13 @@ def _matrix_free_tangent_system(
                     "gromo_without_paused_computation",
                 )
                 vmap_capture.enter_context(_suspended_module_capture(model))
-            operators = vmap_operators(model, x, parameters, parameter_names)
+            operators = vmap_operators(
+                model,
+                x,
+                parameters,
+                parameter_names,
+                chunk=int(getattr(config, "matrix_free_block_chunk", 0) or 0),
+            )
 
         columns = sum(p.numel() for p in parameters)
 
@@ -3666,7 +3700,7 @@ def _matrix_free_tangent_system(
 
 
 def exact_tangent_system(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     x: torch.Tensor,
     y: torch.Tensor,
     config: FGDApproxConfig,
@@ -3699,7 +3733,7 @@ def exact_tangent_system(
 
 
 def _compute_exact_tangent_projection_step(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     x: torch.Tensor,
     y: torch.Tensor,
     config: FGDApproxConfig,
@@ -4117,7 +4151,7 @@ def _compute_exact_tangent_projection_step(
 
 
 def _compute_cg_tangent_projection_step(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     x: torch.Tensor,
     y: torch.Tensor,
     config: FGDApproxConfig,
@@ -4328,7 +4362,7 @@ def build_projection_probe(
 
 
 def _compute_tangent_projection_step(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     x: torch.Tensor,
     y: torch.Tensor,
     config: FGDApproxConfig,
@@ -4357,7 +4391,7 @@ def _compute_tangent_projection_step(
 
 
 def _apply_tangent_projection_step(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     x: torch.Tensor,
     y: torch.Tensor,
     step: _TangentProjectionStep,
@@ -4484,7 +4518,7 @@ def _apply_tangent_projection_step(
 
 @torch.no_grad()
 def _layer_functional_error(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     layer_index: int,
     device: torch.device,
@@ -4675,7 +4709,7 @@ def _held_out_bottleneck_cosine(
 
 
 def crossfold_bottleneck_significance(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     layer_index: int,
     inputs: torch.Tensor,
     targets: torch.Tensor,
@@ -4779,7 +4813,7 @@ def crossfold_bottleneck_significance(
 
 
 def compute_expressivity_bottlenecks(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     device: torch.device,
     config: FGDApproxConfig,
@@ -4860,7 +4894,11 @@ def compute_expressivity_bottlenecks(
                     bottlenecks.append(0.0)
                     continue
                 eigenvalues = eigenvalues[:kept]
-            gradient = float(layer.activation_gradient)
+            # ``.detach()``: for an inserted layer the derivative is computed
+            # from the homotopy's trainable ``alpha``, so the tensor carries a
+            # grad history that ``float()`` would warn about. The number is
+            # all this rule wants.
+            gradient = float(layer.activation_gradient.detach())
             value = gradient * float(torch.sum(eigenvalues.double() ** 2))
             bottlenecks.append(value if math.isfinite(value) else 0.0)
         finally:
@@ -4908,7 +4946,7 @@ def compute_expressivity_bottlenecks(
 
 
 def compute_tiny_layer_relative_errors(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     device: torch.device,
     config: FGDApproxConfig,
@@ -4948,7 +4986,7 @@ def compute_tiny_layer_relative_errors(
 
 
 def apply_fgd_parameter_update(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     selected_layer: FGDLayerRelError,
     device: torch.device,
@@ -5004,7 +5042,7 @@ def _output_error_from_layer_error(
 
 
 def train_one_epoch_gromo_layer_proxy(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     test_loader: torch.utils.data.DataLoader,
     loss_function: torch.nn.Module,
@@ -5091,7 +5129,7 @@ def train_one_epoch_gromo_layer_proxy(
 
 
 def select_tiny_growth_layer_index(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     device: torch.device,
     config: FGDApproxConfig,
@@ -5114,8 +5152,18 @@ def select_tiny_growth_layer_index(
                 compute_delta=config.growth_compute_delta,
             )
         )
+        # ``update_value`` is a float on ``SequentialGrowingModel``
+        # (``update_information`` calls ``.item()``) and a tensor on the
+        # containers that predate it. Only the number is wanted either way;
+        # assuming the tensor crashed the conv path with "'float' object has
+        # no attribute 'detach'" the first time growth was refused by the
+        # parameter budget, which is the one route that reaches this call.
         scores = {
-            int(index): float(info["update_value"].detach().cpu())
+            int(index): float(
+                value.detach().cpu()
+                if isinstance(value := info["update_value"], torch.Tensor)
+                else value
+            )
             for index, info in model.update_information().items()
         }
         if not scores:
@@ -5126,7 +5174,7 @@ def select_tiny_growth_layer_index(
 
 
 def compute_tangent_projection_error(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     data_loader: torch.utils.data.DataLoader,
     device: torch.device,
     config: FGDApproxConfig,
@@ -5149,7 +5197,7 @@ def _count_all_parameters(model: torch.nn.Module) -> int:
 
 
 def select_certifying_growth_layer_index(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     validation_loader: torch.utils.data.DataLoader,
     device: torch.device,
@@ -5390,7 +5438,7 @@ def certificate_from_projection_stats(
 
 
 def measure_direction_projection(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     parameter_updates: tuple[torch.Tensor, ...],
     x: torch.Tensor,
     y: torch.Tensor,
@@ -5453,7 +5501,7 @@ def measure_direction_projection(
 
 
 def evaluate_fgd_validation_certificate(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     data_loader: torch.utils.data.DataLoader,
     device: torch.device,
     config: FGDApproxConfig,
@@ -5506,8 +5554,8 @@ def evaluate_fgd_validation_certificate(
 
 
 def evaluate_secant_validation_certificate(
-    base_model: GrowingMLP,
-    candidate_model: GrowingMLP,
+    base_model: SequentialGrowingModel,
+    candidate_model: SequentialGrowingModel,
     data_loader: torch.utils.data.DataLoader,
     device: torch.device,
     config: FGDApproxConfig,
@@ -5566,7 +5614,7 @@ def evaluate_secant_validation_certificate(
 
 
 def train_one_epoch_fgd_approx(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     test_loader: torch.utils.data.DataLoader,
     loss_function: torch.nn.Module,

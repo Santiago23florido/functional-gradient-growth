@@ -14,7 +14,7 @@ ensure_gromo_importable()
 
 import torch
 
-from gromo.containers.growing_mlp import GrowingMLP
+from gromo.containers.sequential_growing_container import SequentialGrowingModel
 from gromo.utils.training_utils import compute_statistics, evaluate_model
 
 from fgdlib.models.regularized_mlp import sync_normalization
@@ -52,7 +52,7 @@ class ScalingLineSearchConfig:
 
 
 def _evaluate_scaling_factor(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     criterion: torch.nn.Module,
     device: torch.device,
@@ -87,7 +87,7 @@ def _evaluate_scaling_factor(
 
 
 def _golden_section_line_search(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     criterion: torch.nn.Module,
     device: torch.device,
@@ -172,7 +172,7 @@ def _golden_section_line_search(
 
 
 def _function_preserving_growth(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     layer_index: int,
     device: torch.device,
@@ -284,32 +284,59 @@ def _function_preserving_growth(
 
 
 def growable_neuron_costs(
-    model: GrowingMLP, input_features: int
+    model: SequentialGrowingModel, input_features: int
 ) -> list[int]:
     """Parameter cost of ONE neuron added at each growable location.
 
     Growing ``_growable_layers[i]`` widens its *input* dimension, so each new
-    neuron costs its incoming weights and bias in the preceding layer, plus
+    neuron costs its incoming weights and bias in the PRECEDING layer, plus
     its outgoing weights in this one::
 
-        cost_i = fan_in_i + 1 + growable[i].out_features
+        cost_i = prev.in_features + prev.use_bias + layer.out_features * k
 
     The spread is the whole point: on MNIST from 3x2 this is 787 parameters
     at the input projection against 5 and 13 later -- a factor of ~150 that
     an absolute singular-value threshold cannot see.
+
+    Two things this reads carefully.
+
+    **The predecessor is ``layer.previous_module``, not ``growable[i - 1]``.**
+    Those coincide on a ``GrowingMLP`` only because ``_growable_layers`` is
+    ``layers[1:]`` there, so the growable list is contiguous. In a conv stack
+    it is NOT (pooling and the flatten make layers ungrowable in the middle),
+    and ``growable[i - 1]`` would be an unrelated module several steps away.
+
+    **``k`` is the kernel area of the receiving layer.** On a conv the new
+    channel arrives through a full ``k_h x k_w`` kernel per output channel:
+    ``RestrictedConv2dGrowingModule`` builds a 1x1 and zero-pads it to the
+    layer's kernel (``linear_layer_of_tensor``), and those zeros are
+    allocated, trainable parameters from the moment they exist. The honest
+    price is what is allocated. Note ``prev.in_features`` needs no such
+    correction: for a conv it is ALREADY the unfolded fan-in
+    ``in_channels * k_h * k_w``.
+
+    Verified against measurement, not just derived: on the base conv stack
+    this returns ``[28, 37, 29]`` and each figure equals the observed
+    ``count_parameters`` delta of actually growing there
+    (``tests/test_growable_neuron_costs.py``).
     """
     growable = list(getattr(model, "_growable_layers", []))
     costs: list[int] = []
-    for index, layer in enumerate(growable):
-        fan_in = (
-            input_features if index == 0 else growable[index - 1].in_features
-        )
-        costs.append(int(fan_in) + 1 + int(layer.out_features))
+    for layer in growable:
+        previous = getattr(layer, "previous_module", None)
+        if previous is None:
+            fan_in, has_bias = int(input_features), 1
+        else:
+            fan_in = int(previous.in_features)
+            has_bias = int(bool(getattr(previous, "use_bias", True)))
+        kernel = getattr(layer, "kernel_size", None)
+        kernel_area = int(kernel[0]) * int(kernel[1]) if kernel is not None else 1
+        costs.append(fan_in + has_bias + int(layer.out_features) * kernel_area)
     return costs
 
 
 def expansion_spectrum(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     layer_index: int,
     device: torch.device,
@@ -446,7 +473,7 @@ def allocate_by_expansion_per_parameter(
 
 
 def rank_layer_expansion_score(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     layer_index: int,
     device: torch.device,
@@ -503,7 +530,7 @@ def rank_layer_expansion_score(
 
 
 def grow_layer(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     layer_index: int,
     device: torch.device,

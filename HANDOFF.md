@@ -579,3 +579,159 @@ intervenciones probadas mueve la media más de 2. Con n=4 cualquier ranking de
 reglas es provisional. Varias conclusiones de esta sesión se dieron por buenas y
 luego resultaron artefactos de medición — **medir antes de afirmar**, y usar el
 ledger `[WHY]` para distinguir "no gana" de "no se evaluó".
+
+---
+
+# Rama `feat/conv-growth`: convoluciones en el flujo certificado
+
+Rama aparte, no mezclada con lo de arriba. El pin lineal
+(`configs/fgd/family_ladder_N1024.yaml` semilla 0 -> acc 0.9351806640625 /
+529 params / 10-18-14 / 23 crecimientos) se verifica **bit a bit** en cada
+commit, historia y eventos incluidos, no solo la accuracy.
+
+La suite pasa de 3 rojos a **744 verdes**: los tres fallos "preexistentes"
+de `test_regularized_mlp.py` eran `GrowingDropout` instanciada siendo
+abstracta (ver abajo).
+
+## Qué se puede correr
+
+```bash
+# el config conv: es configs/fgd/mnist_matrix_free.yaml (config 2) con un
+# modelo conv, y nada mas que conv no fuerce
+PYTHONPATH=src python -m stable_tiny --config configs/fgd/mnist_conv_matrix_free.yaml
+
+# SIEMPRE bajo el tope de memoria en una maquina de escritorio:
+env FGD_CUDA_FRACTION=0.45 PYTHONPATH=src python runs/memcap.py 4.0 \
+    stable_tiny --config <copia.yaml> --results-dir runs/eval --no-wandb --no-plot
+```
+
+`cluster/slurm/mnist_conv.sbatch` esta escrito pero **NO validado**: array
+por semillas, `BALANCE=true` para el brazo de ancho-vs-profundidad, y los dos
+troceos expuestos como variables porque los del config son una restriccion de
+una tarjeta de 8 GB, no del metodo.
+
+## Cinco defectos que solo aparecen en conv
+
+Tres son de GroMo y uno de este repo. Ninguno se ve creciendo UNA vez, que es
+lo que hacian los tests: todos aparecen en la pasada SIGUIENTE.
+
+1. **`GrowingDropout` es abstracta** en esta rama de gromo (hereda de
+   `_DropoutNd`, sin `forward`). Las concretas son 1d/2d y las dos son dropout
+   por CANAL, inservibles para un MLP. De ahi `GrowingDropoutFlat`.
+2. **La derivada del dropout al 0+ la adivinaba gromo.** Lo que no reconoce lo
+   diferencia numericamente sobre un escalar 0-D, y para dropout eso es una
+   moneda: MEDIDO, eval da 1.0507 y train da 0.0 cuando el elemento sondeado
+   es el que se tira -- y se MEMOIZA. Como el where es
+   `activation_gradient * sum(s_i^2)`, un 0.0 cacheado retira esa capa el
+   resto de la corrida. Se declara 1.0 en la tabla.
+3. **La forma del estadistico S.** `Conv2dGrowingModule.__init__` la fija como
+   `use_bias + in_channels*k^2`, que es lo que emite `compute_s_update`, pero
+   `layer_in_extension` la re-fija como `(in_channels + use_bias)*k^2`. Con 3
+   canales y kernel 3 eso es 28 contra 36: el PRIMER crecimiento deja el
+   estadistico esperando una forma que nunca llegara. Linear coincide consigo
+   mismo en los dos sitios, por eso el MLP no lo vio jamas.
+4. **`bordering_convolution` no se invalida** al cambiar el predecesor (crecer
+   o insertar). Ademas llega como parametro ENTRENABLE siendo un delta
+   constante, y todo aqui se filtra por `requires_grad`: inflaba un canal
+   conv de 28 a 118 parametros y metia columnas de scratch en el jacobiano.
+5. **`select_tiny_growth_layer_index` hacia `.detach()`** sobre lo que
+   `SequentialGrowingModel.update_information` devuelve con `.item()`. Solo se
+   alcanza cuando el presupuesto rechaza un crecimiento, que es justo lo que
+   un tope provoca.
+
+## Lo que de verdad costaba: dos `vmap` calibrados para un MLP
+
+El sintoma era que la maquina se quedaba sin RAM con 1024 imagenes de 28x28 y
+2500 parametros. Eso no es un coste del problema, y no lo era.
+
+Los dos caminos del tangente pasan un BLOQUE de direcciones por `vmap`, que
+retiene las activaciones completas de cada direccion. En un MLP una activacion
+es `(N, ancho)`; en una conv es `(N, C, H, W)`, mayor por la extension
+espacial. Con 1024 imagenes y 2 canales son **12.8 MB por direccion y por
+capa**, 784 veces mas, y el bloque es del orden de `P`.
+
+| ruta | knob | valor MLP | valor conv | medido |
+|---|---|---|---|---|
+| range finder (matrix-free) | `matrix_free_block_chunk` | sin trocear | 32 | 1.60 GB a 16, OOM a 32 con el probe grande |
+| certificado (exacta, `jacrev`) | `jacobian_row_chunk` | 256 | 32 | 256 OOM; 8 -> 4.5 s, 32 -> 1.0 s |
+
+Trocear es un bucle sobre direcciones independientes, asi que no cambia el
+resultado matematicamente; en coma flotante mueve UN ULP (orden de reduccion),
+y el test fija esa cota en vez de un "suficientemente parecido".
+
+**Aviso para quien recalibre:** los dos se midieron primero contra el probe
+completo y quedaron ~4x mas apretados de lo necesario, porque
+`certify_probe_kappa` ENCOGE el probe en ejecucion -- NK acaba en 1920, no en
+7040. Medir contra el probe real, no contra `probe_batches`.
+
+## Lo que decide la arquitectura, y no es una preferencia
+
+Crecer una capa ensancha su ENTRADA, o sea la salida de su predecesor. Asi que
+un ancho solo es alcanzable por la busqueda si alguna capa crecible lo
+consume, y **la ultima conv antes de cada cambio de forma no tiene ese
+consumidor**: un pool o el flatten se interponen. Esos anchos son
+configuracion, no busqueda.
+
+El primer intento los dejo en 2 y la red no aprendia: MEDIDO, tres epochs
+compraron 290 parametros, TODOS a la cabeza, el tronco se quedo en
+`2->2->2->2` y `train_loss` se paro en 0.147 -- por encima del 0.09 que da
+predecir la media. El criterio no fallaba; informaba correctamente de que la
+cabeza era el unico sitio con algo que comprar, porque 2 canales tras un
+avgpool son 18 numeros y ningun ancho de cabeza inventa informacion que el
+tronco no paso.
+
+Con esos dos anchos en 4 y 8 (cabeza viendo 72) y los tres que la busqueda SI
+alcanza arrancando en 2, como la referencia lineal.
+
+## Medido en MNIST, 10000 muestras (el mismo dato que config 2)
+
+| | eps | test_acc | train_loss |
+|---|---|---|---|
+| primer intento (cabeza estrangulada) | 0.78 -> 0.93, subiendo | 0.103 | 0.147 |
+| **con todo arreglado, epoch 1** | **0.87 -> 0.0083** | **0.666** | **0.084** |
+
+Referencia guardada del ladder LINEAL matrix-free sobre MNIST:
+`mnist-family-ladder-matrix-free-seed-0-retry` = **0.1025 tras 43 epochs**,
+P=2405. **Ojo:** esa corrida es con `kappa 0.0` y `lookahead False`, o sea
+ANTES de los knobs que existen para arreglar ese encallamiento. La config 2 tal
+como esta hoy **no la ha medido nadie**; esa es la referencia que falta.
+
+Coste: **~25 min/epoch** en una 4070 Laptop. La causa esta identificada y no es
+un knob: conv no tiene ruta analitica del jacobiano
+(`tangent_analytic_jacobian_calls=0`, `matrix_free_vmap_fallbacks=72`), asi que
+cada sistema tangente pasa por el range finder vmapeado contra los matmuls por
+lotes del camino lineal.
+
+## Abierto
+
+1. **La primera conv nunca crece.** MEDIDO epoch 1: `location 0` recibe CERO
+   compras contra 6 y 7 de las otras dos, y su cuello de botella es 650x menor
+   (`L0=2.1e-04` contra `L2=1.4e-01`). Es el muro de asignacion de credito a la
+   capa de entrada que este HANDOFF ya documenta para el caso lineal. La red
+   extrae features de MNIST con 2 filtros.
+2. **`rel_err` del paso va en 1.0-1.4** mientras el eps del bucle certifica en
+   0.008. Es la contradiccion entre los dos eps ya documentada arriba, ahora
+   tambien en conv.
+3. **El criterio de balance no se ha medido end-to-end.** Esta implementado,
+   testeado y apagado por defecto. R5 SI esta despejado: los candidatos de
+   profundidad puntuan 6.5e-06 a 5.9e-02 sobre la pila base, cuatro ordenes de
+   magnitud, asi que rankear ahi es medir y no desempatar.
+4. **`growth_bottleneck_crossfold_folds` no puede medir en conv** -- devuelve
+   `inf`, y `inf > 1` aprueba todo. Esta a 0 y hay un test que lo fija, para
+   que el hecho quede registrado en vez de redescubrirse.
+
+## Seguimiento tras la ultima ejecucion Conv
+
+La corrida `runs/log/convA.log` continuo mas alla de la epoch 1 y confirmo el
+mismo bloqueo de realizabilidad finita observado en el MNIST lineal completo:
+entre las epochs 4 y 8 quedaron identicos loss y accuracy, con `eps ~= 9e-4`,
+105 transacciones rechazadas acumuladas, `LINEAR -> none` repetido y siete
+eventos `no growth reduced eps`. No es falta de representabilidad tangente;
+la direccion infinitesimal existe pero el endpoint no sobrevive la proteccion
+full-train.
+
+Por eso `mnist_conv_matrix_free.yaml` activa el mismo gate opt-in: WHERE sigue
+siendo `expressivity_bottleneck`, y solo compra su crecimiento
+function-preserving cuando mejora estrictamente el descenso certificado que la
+parametrizacion puede realizar. `certify_probe_diagnostics` queda activo para
+confirmar en el cluster el NK/rank ya medido (23-35) sin cambiar la sonda.
