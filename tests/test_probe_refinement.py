@@ -325,6 +325,107 @@ def test_disabled_transaction_does_not_collect_per_batch_losses(monkeypatch) -> 
     assert result.probe_mismatch is None
 
 
+class _ShuffledLoader:
+    """A loader that yields a different order every pass, as shuffle=True does."""
+
+    def __init__(self, batches: list[tuple[torch.Tensor, torch.Tensor]]) -> None:
+        self._batches = batches
+        self._pass = 0
+
+    def __iter__(self):
+        order = self._pass % len(self._batches)
+        self._pass += 1
+        return iter(self._batches[order:] + self._batches[:order])
+
+
+def test_base_resample_redraws_the_base_and_keeps_the_counterexamples() -> None:
+    """The bias is in the BASE; the discovered contradictions must survive it.
+
+    A base fixed for the run is the sample the certified steps are fitted on,
+    so it is interpolated and stops standing for the population -- MEASURED on
+    full MNIST at 14.2x easier per image by transaction ~50. Redrawing fixes
+    that, but it must not throw away the counterexamples, which are the whole
+    point of the refinement.
+    """
+    batches = [_batch(float(index)) for index in range(6)]
+    loader = _ShuffledLoader(batches)
+    state = pipeline._new_adaptive_certification_probe(loader, 2)
+    original_base = list(state.base_batches)
+    model = torch.nn.Linear(1, 1)
+    assert (
+        pipeline._refine_adaptive_certification_probe(
+            state=state,
+            mismatch=_mismatch((4, 2.0)),
+            frozen_train_batches=batches,
+            config=_config(),
+            model=model,
+            device=torch.device("cpu"),
+            progress=None,
+        )
+        is not None
+    )
+
+    pipeline._resample_adaptive_probe_base(state, loader, 2)
+
+    assert len(state.base_batches) == 2
+    assert not any(
+        torch.equal(drawn[0], previous[0])
+        for drawn, previous in zip(state.base_batches, original_base)
+    ), "the base was not actually redrawn"
+    assert [item.batch_index for item in state.counterexamples] == [4]
+    # The fingerprint set still covers BOTH halves, so the duplicate-free
+    # guarantee the refinement relies on survives the redraw.
+    assert state.fingerprints == {
+        pipeline._probe_batch_fingerprint(batch) for batch in state.base_batches
+    } | {item.fingerprint for item in state.counterexamples}
+
+
+def test_base_resample_never_double_counts_a_counterexample_batch() -> None:
+    """A batch already held as a counterexample must not re-enter as base."""
+    batches = [_batch(float(index)) for index in range(3)]
+    state = pipeline._new_adaptive_certification_probe(batches, 1)
+    model = torch.nn.Linear(1, 1)
+    assert (
+        pipeline._refine_adaptive_certification_probe(
+            state=state,
+            mismatch=_mismatch((1, 2.0)),
+            frozen_train_batches=batches,
+            config=_config(),
+            model=model,
+            device=torch.device("cpu"),
+            progress=None,
+        )
+        is not None
+    )
+
+    pipeline._resample_adaptive_probe_base(state, batches, 3)
+
+    held = state.counterexamples[0].fingerprint
+    assert held not in {
+        pipeline._probe_batch_fingerprint(batch) for batch in state.base_batches
+    }
+    probe = pipeline._compose_adaptive_certification_probe(
+        state, _config(), torch.device("cpu")
+    )
+    # Two distinct base batches plus the one counterexample: three rows, no
+    # duplicate, so nothing is silently weighted twice in the least squares.
+    assert probe[0].shape[0] == 3
+
+
+def test_base_resample_is_rejected_without_the_counterexample_memory() -> None:
+    from fgdlib.tangent import validate_probe_refinement
+
+    validate_probe_refinement(_config(certify_probe_base_resample=True))
+    with pytest.raises(ValueError, match="certify_probe_base_resample requires"):
+        validate_probe_refinement(
+            _config(
+                certify_probe_refine_on_transaction_mismatch=False,
+                certify_probe_refine_max_rounds=0,
+                certify_probe_base_resample=True,
+            )
+        )
+
+
 def test_refinement_limit_logs_explicit_exhaustion() -> None:
     batches = [_batch(float(index)) for index in range(4)]
     state = pipeline._new_adaptive_certification_probe(batches[:1], 1)

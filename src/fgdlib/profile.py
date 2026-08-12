@@ -58,6 +58,17 @@ PROFILE_FIELDS = (
     "family_transaction_accepted",
     "family_transaction_backtracks",
     "family_transaction_rejected",
+    # The adaptive certification probe. A base held fixed for the whole run is
+    # interpolated by the very steps it certifies -- MEASURED at 14.2x easier
+    # per image than the population by transaction ~50 -- so these say whether
+    # the base is actually being redrawn and how much counterexample memory the
+    # row bound is evicting to stay affordable.
+    "probe_base_resamples",
+    "probe_counterexample_evictions",
+    # The realizable-progress criterion abstaining rather than refusing, which
+    # is the only thing standing between "no eta realizes a step" and a frozen
+    # run: MEASURED at 35 epochs of exact no-op before it existed.
+    "certify_realizable_abstentions",
     "where_scans",
     "where_candidates",
     "where_base_system_reuses",
@@ -209,6 +220,9 @@ _COUNTER_FIELDS = {
     "family_transaction_accepted",
     "family_transaction_backtracks",
     "family_transaction_rejected",
+    "probe_base_resamples",
+    "probe_counterexample_evictions",
+    "certify_realizable_abstentions",
     "where_scans",
     "where_candidates",
     "where_base_system_reuses",

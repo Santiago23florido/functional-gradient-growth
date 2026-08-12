@@ -1019,6 +1019,51 @@ def _extend_adaptive_probe_base(
             break
 
 
+def _resample_adaptive_probe_base(
+    state: _AdaptiveCertificationProbe,
+    loader: torch.utils.data.DataLoader,
+    target_base_batches: int,
+) -> None:
+    """Redraw the base from the shuffled loader, keeping the counterexamples.
+
+    A base held fixed for the whole run is the sample the certified steps are
+    FITTED on, so they interpolate it and it stops standing for the population:
+    MEASURED on full MNIST at 0.1859 probe functional per image against 2.6388
+    on full train, a factor of 14.2 reached by transaction ~50, after which
+    every certificate reads that biased sample and the run freezes. The train
+    loader is ``shuffle=True``, so reading its first batches already yields a
+    fresh draw -- no separate sampler exists or is needed.
+
+    The counterexamples are deliberately untouched. They are the discovered
+    contradictions, and the monotone union the refinement relies on is over
+    THEM, not over the base; the fingerprint set is rebuilt as the union so
+    the duplicate-free guarantee still holds against both halves.
+    """
+    wanted = max(1, int(target_base_batches))
+    counterexample_fingerprints = {
+        counterexample.fingerprint for counterexample in state.counterexamples
+    }
+    drawn: list[tuple[torch.Tensor, torch.Tensor]] = []
+    drawn_fingerprints: set[str] = set()
+    for batch in loader:
+        fingerprint = _probe_batch_fingerprint(batch)
+        if fingerprint in counterexample_fingerprints:
+            # Already carried by the counterexample half; drawing it again
+            # would double-weight it in the union.
+            continue
+        if fingerprint in drawn_fingerprints:
+            continue
+        drawn.append(batch)
+        drawn_fingerprints.add(fingerprint)
+        if len(drawn) == wanted:
+            break
+    if not drawn:
+        raise ValueError("Cannot resample a probe base from an empty data loader.")
+    state.base_batches = drawn
+    state.fingerprints = drawn_fingerprints | counterexample_fingerprints
+    increment("probe_base_resamples")
+
+
 def _refine_adaptive_certification_probe(
     *,
     state: _AdaptiveCertificationProbe,
@@ -7028,14 +7073,34 @@ def run_pipeline(
                                 config, model, train_loader, device,
                                 current_batches=_probe_batches,
                             )
-                            if _needed > _probe_batches:
-                                _probe_batches = _needed
+                            # ...and, when asked for, a base that is REDRAWN every
+                            # outer step. Size alone is not enough: a base fixed
+                            # across the run is the sample the certified steps are
+                            # fitted on, so they interpolate it (MEASURED: 14.2x
+                            # easier per image than the population) and eps, the
+                            # growth argmin and the endpoint transaction all end up
+                            # reading it. The counterexamples survive the redraw.
+                            _resample_base = (
+                                adaptive_probe_state is not None
+                                and config.fgd_approx.certify_probe_base_resample
+                            )
+                            _probe_grew = _needed > _probe_batches
+                            if _probe_grew or _resample_base:
+                                if _probe_grew:
+                                    _probe_batches = _needed
                                 if adaptive_probe_state is not None:
-                                    _extend_adaptive_probe_base(
-                                        adaptive_probe_state,
-                                        train_loader,
-                                        _probe_batches,
-                                    )
+                                    if _resample_base:
+                                        _resample_adaptive_probe_base(
+                                            adaptive_probe_state,
+                                            train_loader,
+                                            _probe_batches,
+                                        )
+                                    else:
+                                        _extend_adaptive_probe_base(
+                                            adaptive_probe_state,
+                                            train_loader,
+                                            _probe_batches,
+                                        )
                                     fgd_train_probe = (
                                         _compose_adaptive_certification_probe(
                                             adaptive_probe_state,
@@ -7050,6 +7115,7 @@ def run_pipeline(
                                         ),
                                         config.fgd_approx,
                                     )
+                            if _probe_grew:
                                 fgd_validation_probe = _functional_tikhonov_probe(
                                     build_projection_probe(
                                         validation_loader,

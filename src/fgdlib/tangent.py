@@ -1030,6 +1030,33 @@ class FGDApproxConfig:
     # Hard limit on refinements of one run.  Zero is the disabled default; an
     # enabled configuration must choose a positive, explicit budget.
     certify_probe_refine_max_rounds: int = 0
+    # Redraw the BASE of the adaptive probe every outer step, keeping the
+    # discovered counterexamples. A base fixed for the whole run turns the
+    # method into Newton's method on one subsample: the certified steps are
+    # fitted ON that base, drive its residual to zero, and it stops
+    # representing the population. MEASURED on full MNIST (run 2kbo8rf4, the
+    # base is 448 of 50000 images): the probe functional per image falls to
+    # 0.1859 while the full-train one sits at 2.6388, a factor of 14.2, reached
+    # by transaction ~50. Every certificate downstream then reads that biased
+    # sample -- eps, the growth argmin and the endpoint transaction alike --
+    # and the run freezes with train_loss identical to the last digit for 35
+    # epochs. Redrawing makes the functional gradient an unbiased estimate of
+    # the population one, which is the object the theory is about; the
+    # monotone union the refinement needs is over the COUNTEREXAMPLES, which
+    # this leaves untouched. Off by default so every existing probe is
+    # byte-identical.
+    certify_probe_base_resample: bool = False
+    # Bound the counterexample memory by ROWS instead of terminating on a round
+    # count. certify_probe_refine_max_rounds is a terminal cap: once spent the
+    # mechanism is off for the rest of the run and the probe drifts back into
+    # the bias above (MEASURED, run yqfvy8l7: "stop_reason=
+    # probe_refinement_exhausted round=16 max_rounds=16" at epoch 6 with
+    # mismatches still firing every outer step). What actually costs is the
+    # probe SIZE -- the matrix-free dual is O((NK)^2) -- so the honest budget
+    # is a row bound with eviction of the least-violating counterexample, which
+    # keeps the mechanism alive forever at bounded cost. Zero keeps the
+    # round-terminated behaviour byte-identical.
+    certify_probe_refine_max_rows: int = 0
     # Adaptive growth COUNT. The grow-to-certify loop adds a FIXED
     # tiny_maximum_added_neurons per growth, so on a hard task (CIFAR) reaching a
     # certifying width takes hundreds of full location scans -- one neuron at a
@@ -1393,12 +1420,31 @@ def validate_probe_refinement(config: FGDApproxConfig) -> None:
             "fgd_approx.certify_probe_refine_max_rounds must be a non-negative "
             "integer."
         )
+    rows = config.certify_probe_refine_max_rows
+    if isinstance(rows, bool) or not isinstance(rows, int) or rows < 0:
+        raise ValueError(
+            "fgd_approx.certify_probe_refine_max_rows must be a non-negative "
+            "integer."
+        )
     if not config.certify_probe_refine_on_transaction_mismatch:
+        if config.certify_probe_base_resample:
+            raise ValueError(
+                "fgd_approx.certify_probe_base_resample requires "
+                "certify_probe_refine_on_transaction_mismatch: the resampled "
+                "base is only meaningful alongside the monotone counterexample "
+                "memory that keeps the discovered contradictions."
+            )
+        if rows:
+            raise ValueError(
+                "fgd_approx.certify_probe_refine_max_rows requires "
+                "certify_probe_refine_on_transaction_mismatch."
+            )
         return
-    if rounds < 1:
+    if rounds < 1 and rows < 1:
         raise ValueError(
             "fgd_approx.certify_probe_refine_max_rounds must be positive when "
-            "adaptive probe refinement is enabled."
+            "adaptive probe refinement is enabled, unless "
+            "certify_probe_refine_max_rows bounds the memory instead."
         )
     if tuple(config.family_order) != ("matrix_free_tangent",):
         raise ValueError(
@@ -1417,10 +1463,16 @@ def validate_probe_refinement(config: FGDApproxConfig) -> None:
             "before structural growth."
         )
     if config.probe_resample:
+        # probe_resample rebuilds the WHOLE probe and would drop the
+        # counterexamples with it. The adaptive path owns its probe, so
+        # redrawing is expressed by certify_probe_base_resample instead: it
+        # redraws the base and keeps the counterexample memory, which is where
+        # the monotonicity actually has to hold.
         raise ValueError(
             "fgd_approx.certify_probe_refine_on_transaction_mismatch requires "
             "probe_resample: false so discovered counterexamples remain in a "
-            "monotone probe union."
+            "monotone probe union; use certify_probe_base_resample to redraw "
+            "the base without discarding them."
         )
 
 
