@@ -1064,6 +1064,48 @@ def _resample_adaptive_probe_base(
     increment("probe_base_resamples")
 
 
+def _counterexample_rows(state: _AdaptiveCertificationProbe) -> int:
+    """Output coordinates the counterexample memory contributes to the probe."""
+    return sum(int(item.targets.numel()) for item in state.counterexamples)
+
+
+def _evict_weakest_counterexamples(
+    state: _AdaptiveCertificationProbe,
+    max_rows: int,
+) -> list[_ProbeCounterexample]:
+    """Drop the least-violating counterexamples until the memory fits max_rows.
+
+    What the refinement actually costs is the probe SIZE -- the matrix-free
+    dual is O((NK)^2) -- so bounding the memory by rows is what keeps it
+    affordable, and it is strictly better than the round cap it replaces: a
+    round cap ends the mechanism for the rest of the run, while this keeps it
+    alive forever and simply holds the strongest evidence found so far.
+
+    The strongest counterexample is never evicted, so a budget smaller than one
+    batch degrades to "keep the single worst contradiction" rather than to an
+    empty memory.
+    """
+    evicted: list[_ProbeCounterexample] = []
+    while (
+        len(state.counterexamples) > 1 and _counterexample_rows(state) > max_rows
+    ):
+        weakest = min(
+            range(len(state.counterexamples)),
+            key=lambda index: (
+                state.counterexamples[index].functional_delta,
+                state.counterexamples[index].batch_index,
+            ),
+        )
+        dropped = state.counterexamples.pop(weakest)
+        # The fingerprint goes with it, so a batch evicted as weak can be
+        # rediscovered later if it ever contradicts the probe more strongly.
+        state.fingerprints.discard(dropped.fingerprint)
+        evicted.append(dropped)
+    if evicted:
+        increment("probe_counterexample_evictions", len(evicted))
+    return evicted
+
+
 def _refine_adaptive_certification_probe(
     *,
     state: _AdaptiveCertificationProbe,
@@ -1077,7 +1119,14 @@ def _refine_adaptive_certification_probe(
     """Append unseen empirical counterexamples and return the enlarged probe."""
     state.mismatch_count += 1
     max_rounds = config.certify_probe_refine_max_rounds
-    if state.refinement_rounds >= max_rounds:
+    max_rows = config.certify_probe_refine_max_rows
+    # A round cap TERMINATES the mechanism -- MEASURED on run yqfvy8l7:
+    # "stop_reason=probe_refinement_exhausted round=16 max_rounds=16" at epoch
+    # 6, with mismatches still firing every outer step and the probe left to
+    # drift back into the bias the refinement existed to correct. When a row
+    # budget is configured it takes over: the memory is bounded by eviction
+    # instead, so the mechanism never turns itself off.
+    if max_rows < 1 and state.refinement_rounds >= max_rounds:
         state.exhausted = True
         if progress is not None:
             progress(
@@ -1118,16 +1167,39 @@ def _refine_adaptive_certification_probe(
             )
         return None
 
+    evicted = (
+        _evict_weakest_counterexamples(state, max_rows) if max_rows > 0 else []
+    )
+    surviving = {item.fingerprint for item in state.counterexamples}
+    if not any(item.fingerprint in surviving for item in added):
+        # Everything just discovered was weaker than what the memory already
+        # holds, so the probe came out unchanged. Say so and do NOT restart the
+        # outer step on an identical probe; the mechanism is saturated, not
+        # exhausted, and the next mismatch gets its chance.
+        if progress is not None:
+            progress(
+                "[PROBE-REFINE] stop_reason=probe_memory_saturated "
+                f"max_rows={max_rows} rows={_counterexample_rows(state)} "
+                f"evicted={len(evicted)}"
+            )
+        return None
+
     state.refinement_rounds += 1
     _CERTIFICATION_RANK_CACHE.pop(id(model), None)
     new_batches = len(state.base_batches) + len(state.counterexamples)
     if progress is not None:
+        budget = (
+            f"max_rows={max_rows} rows={_counterexample_rows(state)} "
+            f"evicted={len(evicted)}"
+            if max_rows > 0
+            else f"max_rounds={max_rounds}"
+        )
         progress(
             f"[PROBE-REFINE] round={state.refinement_rounds} "
             f"old_batches={old_batches} added_batches={len(added)} "
             f"new_batches={new_batches} "
             f"worst_batch_delta={added[0].functional_delta:.6e} "
-            f"max_rounds={max_rounds}"
+            f"{budget}"
         )
     return _compose_adaptive_certification_probe(state, config, device)
 

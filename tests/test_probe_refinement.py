@@ -426,6 +426,80 @@ def test_base_resample_is_rejected_without_the_counterexample_memory() -> None:
         )
 
 
+def _refine(state, config, batches, model, *, index, delta, progress=None):
+    return pipeline._refine_adaptive_certification_probe(
+        state=state,
+        mismatch=_mismatch((index, delta)),
+        frozen_train_batches=batches,
+        config=config,
+        model=model,
+        device=torch.device("cpu"),
+        progress=progress,
+    )
+
+
+def test_row_budget_evicts_the_weakest_instead_of_terminating() -> None:
+    """The round cap ends the mechanism; the row cap keeps it alive bounded.
+
+    MEASURED on run yqfvy8l7: max_rounds 16 was spent at epoch 6 with
+    mismatches still firing every outer step, after which the probe drifts back
+    into the bias the refinement exists to correct.
+    """
+    batches = [_batch(float(index)) for index in range(6)]
+    state = pipeline._new_adaptive_certification_probe(batches[:1], 1)
+    model = torch.nn.Linear(1, 1)
+    # Two rows of memory, one output coordinate per batch, and a round cap of 1
+    # that must NOT terminate anything now that rows govern.
+    config = _config(certify_probe_refine_max_rounds=1, certify_probe_refine_max_rows=2)
+
+    assert _refine(state, config, batches, model, index=1, delta=5.0) is not None
+    assert _refine(state, config, batches, model, index=2, delta=9.0) is not None
+    assert _refine(state, config, batches, model, index=3, delta=7.0) is not None
+
+    assert state.exhausted is False, "a row budget must never exhaust the mechanism"
+    assert pipeline._counterexample_rows(state) <= 2
+    # The two strongest survived; the 5.0 was evicted for the 7.0.
+    assert sorted(item.functional_delta for item in state.counterexamples) == [7.0, 9.0]
+    # And the evicted batch may be rediscovered, so its fingerprint went too.
+    assert pipeline._probe_batch_fingerprint(batches[1]) not in state.fingerprints
+
+
+def test_a_counterexample_weaker_than_the_memory_leaves_the_probe_unchanged() -> None:
+    batches = [_batch(float(index)) for index in range(5)]
+    state = pipeline._new_adaptive_certification_probe(batches[:1], 1)
+    model = torch.nn.Linear(1, 1)
+    config = _config(certify_probe_refine_max_rounds=8, certify_probe_refine_max_rows=1)
+    messages: list[str] = []
+
+    assert _refine(state, config, batches, model, index=1, delta=9.0) is not None
+    rounds = state.refinement_rounds
+    # Weaker than what is held, and the memory is full: nothing changes, so the
+    # outer step must not be restarted on an identical probe.
+    assert (
+        _refine(
+            state, config, batches, model, index=2, delta=1.0, progress=messages.append
+        )
+        is None
+    )
+    assert state.refinement_rounds == rounds
+    assert state.exhausted is False
+    assert any("probe_memory_saturated" in message for message in messages)
+    assert [item.functional_delta for item in state.counterexamples] == [9.0]
+
+
+def test_round_cap_behaviour_is_byte_identical_when_no_row_budget_is_set() -> None:
+    batches = [_batch(float(index)) for index in range(4)]
+    state = pipeline._new_adaptive_certification_probe(batches[:1], 1)
+    model = torch.nn.Linear(1, 1)
+    config = _config(certify_probe_refine_max_rounds=1, certify_probe_refine_max_rows=0)
+
+    assert _refine(state, config, batches, model, index=1, delta=1.0) is not None
+    assert _refine(state, config, batches, model, index=2, delta=9.0) is None
+    assert state.exhausted is True
+    # Nothing was evicted: the weak counterexample is still the only one held.
+    assert [item.functional_delta for item in state.counterexamples] == [1.0]
+
+
 def test_refinement_limit_logs_explicit_exhaustion() -> None:
     batches = [_batch(float(index)) for index in range(4)]
     state = pipeline._new_adaptive_certification_probe(batches[:1], 1)
