@@ -279,6 +279,116 @@ def test_probe_diagnostic_flag_does_not_change_kappa_sizing(monkeypatch) -> None
     assert rows / rank >= config.fgd_approx.certify_probe_kappa
 
 
+def _sized_batches(config, rank: int, parameters: int, monkeypatch) -> int:
+    """Rows the sizer REQUESTS for a net of ``parameters`` at measured ``rank``."""
+    monkeypatch.setattr(pipeline, "_estimate_certification_rank", lambda *args: rank)
+    pipeline._CERTIFICATION_RANK_CACHE.clear()
+    model = torch.nn.Linear(parameters - 1, 1)  # (P-1) weights + 1 bias = P
+    assert sum(p.numel() for p in model.parameters()) == parameters
+    return pipeline._bounded_probe_batches(
+        config, model, [None] * 1000, torch.device("cpu")
+    ) * config.data.batch_size * config.data.out_features
+
+
+def test_the_parameter_floor_leaves_the_healthy_phase_identical(monkeypatch) -> None:
+    """The measured trajectory of run unguzxkq, replayed through the sizer.
+
+    The floor exists because sizing by rank alone has a FIXED POINT: rank(J) <=
+    NK by construction and the rank is measured ON the probe, so a small probe
+    reports a small rank, which reports that no more rows are needed. MEASURED
+    closing while P triples -- rank 1249 -> 161, NK frozen at 5760, NK/P 0.45,
+    eps collapsing 0.44 -> 0.009 with the validation relative error at 1.02.
+
+    The user's constraint is that the phase which WAS working must not move, so
+    that is what this pins: while the probe already clears the floor, the floor
+    is inactive and the sizing is identical.
+    """
+    config = load_pipeline_config("configs/experiments/mnist_full.yaml")
+    without = dataclasses.replace(
+        config,
+        fgd_approx=dataclasses.replace(
+            config.fgd_approx, certify_probe_parameter_floor=0.0
+        ),
+    )
+    assert config.fgd_approx.certify_probe_parameter_floor == 1.25
+
+    # (P, rank) from the run, over the phase whose NK/P stayed >= 1.51.
+    for parameters, rank in ((1612, 624), (2425, 646), (2503, 854), (3383, 1249)):
+        assert _sized_batches(config, rank, parameters, monkeypatch) == _sized_batches(
+            without, rank, parameters, monkeypatch
+        ), (parameters, rank)
+
+
+def test_the_parameter_floor_binds_exactly_where_the_run_degraded(monkeypatch) -> None:
+    config = load_pipeline_config("configs/experiments/mnist_full.yaml")
+    without = dataclasses.replace(
+        config,
+        fgd_approx=dataclasses.replace(
+            config.fgd_approx, certify_probe_parameter_floor=0.0
+        ),
+    )
+    floor = config.fgd_approx.certify_probe_parameter_floor
+
+    # Past the healthy phase the rank-only sizer does not merely stop growing,
+    # it COLLAPSES -- 640 rows requested at P=14487, against 18560 with the
+    # floor. Only the monotone ratchet on the probe size held it at 5760, which
+    # is how a certificate came to be read off 0.40 rows per parameter.
+    for parameters, rank in ((5992, 862), (9383, 602), (12869, 161), (14487, 132)):
+        with_floor = _sized_batches(config, rank, parameters, monkeypatch)
+        rank_only = _sized_batches(without, rank, parameters, monkeypatch)
+        assert with_floor > rank_only, (parameters, rank)
+        # The invariant the floor exists to hold: rank(J) <= min(NK, P), so
+        # NK > P forbids interpolation outright.
+        assert with_floor >= floor * parameters, (parameters, with_floor)
+    assert _sized_batches(without, 132, 14487, monkeypatch) < 14487
+
+
+def test_the_parameter_floor_still_respects_the_dataset_cap(monkeypatch) -> None:
+    """A floor cannot conjure rows the loader does not have."""
+    config = load_pipeline_config("configs/experiments/mnist_full.yaml")
+    monkeypatch.setattr(pipeline, "_estimate_certification_rank", lambda *args: 100)
+    pipeline._CERTIFICATION_RANK_CACHE.clear()
+    model = torch.nn.Linear(999_999, 1)
+    batches = pipeline._bounded_probe_batches(
+        config, model, [None] * 7, torch.device("cpu")
+    )
+    assert batches == 7
+
+
+def test_probe_diagnostic_reports_the_true_rows_not_the_surrogate() -> None:
+    """NK must be the probe's rows even when the system is a surrogate.
+
+    Under certify_stream_gram the system carries a (rank+1) x P surrogate, so
+    reading NK off system.target would silently report the surrogate's height
+    in the very diagnostic that exists to catch NK falling below P.
+    """
+    system = SimpleNamespace(
+        factors=(torch.eye(3), torch.eye(3)),
+        target=torch.zeros(4),  # a surrogate height, not the probe's rows
+    )
+    messages: list[str] = []
+    pipeline._log_certification_probe(
+        torch.nn.Linear(4, 1), system, 0.5, messages.append, probe_rows=120
+    )
+    assert "NK=120" in messages[0]
+    assert "NK=4" not in messages[0]
+    # P = 4 weights + 1 bias = 5, so NK/P = 24 and the floor is comfortably met.
+    assert "NK/P=24.0000" in messages[0]
+    assert "BELOW INTERPOLATION FLOOR" not in messages[0]
+
+
+def test_probe_diagnostic_shouts_when_the_probe_falls_below_the_floor() -> None:
+    system = SimpleNamespace(factors=(torch.eye(2), torch.eye(2)), target=torch.zeros(2))
+    messages: list[str] = []
+    # P = 100*4 + 4 = 404 parameters against 120 probe rows: NK/P = 0.30, the
+    # regime where run unguzxkq read eps 0.0131 while validation said 1.02.
+    pipeline._log_certification_probe(
+        torch.nn.Linear(100, 4), system, 0.0131, messages.append, probe_rows=120
+    )
+    assert "NK/P=0.2970" in messages[0]
+    assert "BELOW INTERPOLATION FLOOR" in messages[0]
+
+
 def test_realizable_progress_reuses_transaction_and_theorem_score(monkeypatch) -> None:
     """Only a transaction-approved rate contributes structural value."""
     model = torch.nn.Linear(1, 1)

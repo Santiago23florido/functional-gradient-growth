@@ -1046,6 +1046,32 @@ class FGDApproxConfig:
     # this leaves untouched. Off by default so every existing probe is
     # byte-identical.
     certify_probe_base_resample: bool = False
+    # FLOOR on the certification probe expressed against the PARAMETER count,
+    # as a companion to certify_probe_kappa's rank-based sizing.
+    #
+    # Sizing by rank alone has a fixed point, because rank(J) <= NK by
+    # construction and the rank is MEASURED on the current probe: a small probe
+    # yields a small rank, which reports "no more rows are needed", which keeps
+    # the probe small. MEASURED on full MNIST (run unguzxkq), the fixed point
+    # closing while P triples:
+    #
+    #   P=1612   NK=3840  rank=624   NK/P=2.38  eps=0.441
+    #   P=4283   NK=5120  rank=1107  NK/P=1.20  eps=0.398
+    #   P=9383   NK=5760  rank=602   NK/P=0.61  eps=0.0131
+    #   P=12869  NK=5760  rank=161   NK/P=0.45  eps=0.0410
+    #
+    # The rank falls from 1249 to 161 as P triples, so the criterion asks for
+    # FEWER rows exactly when more are needed; NK freezes at 5760 while P
+    # reaches 14487. eps collapses from 0.44 to 0.009 as NK/P crosses 1 while
+    # the validation relative error stays at 1.02 -- the spurious zero the
+    # config comments describe in terms of NK/P, not NK/rank.
+    #
+    # rank(J) <= min(NK, P), so NK > P forbids interpolation outright. A value
+    # slightly above 1 buys margin; MEASURED against the trajectory above, 1.25
+    # leaves every step with NK/P >= 1.51 byte-identical and first intervenes
+    # at P=4283 by 4.6% more rows. Zero keeps the rank-only sizing exactly as
+    # it is, which is what CIFAR wants (there rank << P genuinely).
+    certify_probe_parameter_floor: float = 0.0
     # Bound the counterexample memory by ROWS instead of terminating on a round
     # count. certify_probe_refine_max_rounds is a terminal cap: once spent the
     # mechanism is off for the rest of the run and the probe drifts back into

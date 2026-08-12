@@ -65,6 +65,12 @@ PROFILE_FIELDS = (
     # row bound is evicting to stay affordable.
     "probe_base_resamples",
     "probe_counterexample_evictions",
+    # Certification probes observed BELOW the interpolation floor NK > P, where
+    # rank(J) <= min(NK, P) lets eps read a spurious zero. MEASURED on run
+    # unguzxkq: NK/P fell to 0.45 and eps collapsed 0.44 -> 0.009 while the
+    # validation relative error stayed at 1.02. Non-zero here invalidates every
+    # eps in the run, so it must be countable rather than eyeballed.
+    "probe_below_parameter_floor",
     # The realizable-progress criterion abstaining rather than refusing, which
     # is the only thing standing between "no eta realizes a step" and a frozen
     # run: MEASURED at 35 epochs of exact no-op before it existed.
@@ -222,6 +228,7 @@ _COUNTER_FIELDS = {
     "family_transaction_rejected",
     "probe_base_resamples",
     "probe_counterexample_evictions",
+    "probe_below_parameter_floor",
     "certify_realizable_abstentions",
     "where_scans",
     "where_candidates",

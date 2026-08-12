@@ -575,17 +575,71 @@ fgd_approx:
   # is the principled version and comes next.
   # kappa = 4: size the probe so NK = 4 * rank(J) as the net grows, instead of
   # trusting a hand-picked probe to stay above the floor. probe_batches above is
-  # only the starting point; this keeps the invariant NK > P holding after every
-  # growth. [4, 8] is the range the field documents as tested.
+  # only the starting point. [4, 8] is the range the field documents as tested.
+  #
+  # This line used to claim it "keeps the invariant NK > P holding after every
+  # growth". MEASURED, it does NOT, because rank(J) <= NK by construction and
+  # the rank is measured ON the probe -- a small probe reports a small rank,
+  # which reports that no more rows are needed. Run unguzxkq, the fixed point
+  # closing while P triples:
+  #
+  #   P=1612   NK=3840  rank=624   NK/P=2.38  eps=0.441
+  #   P=4283   NK=5120  rank=1107  NK/P=1.20  eps=0.398
+  #   P=9383   NK=5760  rank=602   NK/P=0.61  eps=0.0131
+  #   P=12869  NK=5760  rank=161   NK/P=0.45  eps=0.0410
+  #
+  # eps collapses from 0.44 to 0.009 as NK/P crosses 1 while the validation
+  # relative error stays at 1.02 -- the spurious zero, exactly as the NK/P
+  # table further up this file describes it.
   certify_probe_kappa: 4.0
+  # The floor that makes the claim above true. rank(J) <= min(NK, P), so NK > P
+  # forbids interpolation outright; 1.25 buys margin.
+  #
+  # REPLAYED through the sizing arithmetic on that exact trajectory, rows the
+  # sizer REQUESTS with and without it:
+  #
+  #   P=1612..3383  NK/P 2.38..1.51   2560..5120 -> unchanged   IDENTICAL
+  #   P=4283        NK/P 1.20         4480 -> 5760   (+12.5% over the 5120 used)
+  #   P=9383        NK/P 0.61         2560 -> 12160
+  #   P=14487       NK/P 0.40          640 -> 18560
+  #
+  # Two things to read there. The healthy phase is BYTE-IDENTICAL: the floor is
+  # inactive while the probe already clears it, so nothing that was working is
+  # disturbed. And without it the request COLLAPSES to 640 rows at P=14487 --
+  # only the monotone ratchet on the probe size kept it at 5760 at all, which
+  # is how a certificate ended up being read off 0.40 rows per parameter.
+  certify_probe_parameter_floor: 1.25
+  # Bound the range finder's vmap block. It asks for rank + oversampling
+  # directions -- of order P -- and vmap holds every direction's full forward
+  # activations at once, so unchunked (0, the default this config was silently
+  # using) the block grows with BOTH the net and the probe. That is what killed
+  # the biased arm: MEASURED, GPU memory 1.3 -> 6.6 -> 12.8 -> 40.1 GB (93.4%
+  # of an A100 40G) and a reproducible death at epoch 6, three runs, identical
+  # to the digit (yqfvy8l7, uesf9xgb, euepsdrk). The arm whose probe stayed
+  # small peaked at 10.6 GB and did not OOM.
+  #
+  # Raising the probe floor above makes the block grow faster, so this is not
+  # optional alongside it. 256 is the value the conv launcher already uses on
+  # A100. Chunking cannot change the result -- the directions in a block are
+  # independent, so it is a loop -- beyond one ulp of reduction order.
+  matrix_free_block_chunk: 256
   # Scalar evidence for the live interpolation-floor invariant. This does not
   # resize or redraw the probe; it reads the exact system certification already
   # built and logs P, NK, numerical rank(J), NK/rank(J), and eps.
   certify_probe_diagnostics: true
-  # 5000, not 30000. With kappa = 4 a P of 30000 would demand NK = 120000 rows
-  # = 12000 images, and this config only loads mnist_train_samples: 10000. The
-  # budget and the probe are now coupled quantities; 5000 needs NK = 20000 rows
-  # = 2000 images, which fits.
+  # The budget and the probe are COUPLED, and the coupling is now the parameter
+  # floor rather than kappa: at floor 1.25 a P of 100000 demands NK = 125000
+  # rows = 12500 images, and this config loads 50000, so it fits with room.
+  # (Under kappa 4 against P it would need 40000 images -- also inside 50000,
+  # but 3.2x the cost for no theoretical gain, since the interpolation floor is
+  # NK > P and 1.25 already clears it.)
+  #
+  # Left at 100000 deliberately. An earlier revision of this plan lowered it to
+  # 35000 on a memory argument that VERIFICATION refuted: the matrix-free
+  # system is factored, (NK x r) + (P x r), not the dense NK x P, so memory was
+  # never the wall -- the unbounded range-finder block was. With
+  # matrix_free_block_chunk set above, the binding constraint is the CLOCK, and
+  # a budget cap would only stop the search before the clock does.
   max_total_parameters: 100000
   growth_preservation_tolerance: 1.0e-6
   # Ordered ladder of approximation families, evaluated top to bottom.

@@ -1242,17 +1242,45 @@ def _log_certification_probe(
     system: ExactTangentSystem | None,
     epsilon: float,
     progress: ProgressFn,
+    probe_rows: int | None = None,
 ) -> None:
-    """Emit scalar evidence that the live probe is above interpolation."""
+    """Emit scalar evidence that the live probe is above interpolation.
+
+    ``probe_rows`` is the TRUE row count NK of the probe, which the caller
+    knows and the system does not always carry: under ``certify_stream_gram``
+    the system holds a ``(rank+1) x P`` surrogate, so ``system.target.numel()``
+    is the surrogate's height and reading NK off it would silently report a
+    different quantity -- in the very diagnostic that exists to catch the probe
+    falling below the interpolation floor.
+    """
     parameter_count = count_parameters(model)
-    rows = int(system.target.numel()) if system is not None else 0
+    surrogate_rows = int(system.target.numel()) if system is not None else 0
+    rows = int(probe_rows) if probe_rows is not None else surrogate_rows
     rank = _certification_system_numerical_rank(system)
     ratio = rows / rank if rank is not None and rank > 0 else None
+    # NK/P is the ratio the interpolation floor is actually stated in -- see
+    # certify_probe_parameter_floor. It took two full cluster runs to see the
+    # collapse (0.45 at the end) because it had to be divided out by hand.
+    parameter_ratio = rows / parameter_count if parameter_count > 0 else None
+    below_floor = parameter_ratio is not None and parameter_ratio < 1.0
+    if below_floor:
+        increment("probe_below_parameter_floor")
     progress(
         f"[CERTIFY-PROBE] P={parameter_count} NK={rows} "
         + (f"rank={rank} " if rank is not None else "rank=n/a ")
         + (f"NK/rank={ratio:.4f} " if ratio is not None else "NK/rank=n/a ")
+        + (
+            f"NK/P={parameter_ratio:.4f} "
+            if parameter_ratio is not None
+            else "NK/P=n/a "
+        )
         + f"eps={epsilon:.6g}"
+        + (
+            "  BELOW INTERPOLATION FLOOR: rank(J) <= min(NK, P) so eps can "
+            "read a spurious zero here"
+            if below_floor
+            else ""
+        )
     )
 
 
@@ -1339,6 +1367,17 @@ def _bounded_probe_batches(
         return min(max_batches, max(sizing_batches + 1, math.ceil(1.7 * sizing_batches)))
 
     target_rows = max(kappa, 2.0) * float(rank)   # NK > rank, no interpolation
+    # ...and a FLOOR against P, because the line above has a fixed point: rank
+    # is measured ON the probe and rank(J) <= NK, so a small probe reports a
+    # small rank, which reports that no more rows are needed. MEASURED closing
+    # on full MNIST (run unguzxkq): rank fell 1249 -> 161 while P tripled to
+    # 14487, NK froze at 5760, NK/P reached 0.45 and eps collapsed 0.44 ->
+    # 0.009 with the validation relative error still at 1.02. Since
+    # rank(J) <= min(NK, P), asking for NK > P forbids interpolation outright.
+    # Off (0.0) keeps the rank-only sizing byte-identical.
+    floor = float(getattr(fa, "certify_probe_parameter_floor", 0.0) or 0.0)
+    if floor > 0.0:
+        target_rows = max(target_rows, floor * float(n_params))
     batches = math.ceil(target_rows / out_features / batch_size)
     return max(1, min(batches, max_batches))
 
@@ -7290,7 +7329,14 @@ def run_pipeline(
                             def _probe_diagnostic(candidate_model, system, epsilon):
                                 assert progress is not None
                                 _log_certification_probe(
-                                    candidate_model, system, epsilon, progress
+                                    candidate_model,
+                                    system,
+                                    epsilon,
+                                    progress,
+                                    # The live probe's own row count, not the
+                                    # system's: under certify_stream_gram the
+                                    # system is a (rank+1) x P surrogate.
+                                    probe_rows=int(fgd_train_probe[1].numel()),
                                 )
 
                             _family_step = None
