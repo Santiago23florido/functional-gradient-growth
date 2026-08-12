@@ -71,6 +71,11 @@ PROFILE_FIELDS = (
     # validation relative error stayed at 1.02. Non-zero here invalidates every
     # eps in the run, so it must be countable rather than eyeballed.
     "probe_below_parameter_floor",
+    # Releases of the caching allocator's pool at the points where the probe
+    # changes shape. MEASURED at the cluster's NK: 0.232 GB live against
+    # 2.359 GB reserved, and three jobs died of a pool that ratcheted while the
+    # live footprint stayed small.
+    "probe_allocator_cache_releases",
     # The realizable-progress criterion abstaining rather than refusing, which
     # is the only thing standing between "no eta realizes a step" and a frozen
     # run: MEASURED at 35 epochs of exact no-op before it existed.
@@ -229,6 +234,7 @@ _COUNTER_FIELDS = {
     "probe_base_resamples",
     "probe_counterexample_evictions",
     "probe_below_parameter_floor",
+    "probe_allocator_cache_releases",
     "certify_realizable_abstentions",
     "where_scans",
     "where_candidates",

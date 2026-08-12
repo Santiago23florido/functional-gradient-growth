@@ -345,6 +345,53 @@ def test_the_parameter_floor_still_respects_the_dataset_cap(monkeypatch) -> None
     assert batches == 7
 
 
+def test_releasing_the_allocator_pool_is_a_harmless_no_op_off_cuda() -> None:
+    """It must never raise or matter where there is no caching allocator."""
+    pipeline._release_probe_allocator_cache(None)
+    pipeline._release_probe_allocator_cache(torch.device("cpu"))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_the_allocator_pool_stops_ratcheting_when_the_probe_changes_shape() -> None:
+    """The measured cause of three consecutive out-of-memory deaths.
+
+    Torch's caching allocator keeps every freed block for a future tensor of the
+    same size class. The probe is redrawn each outer step and grows with P, so
+    almost every allocation asks for a size the pool has never held, nothing is
+    reused, and the reserved pool ratchets until the card is full. MEASURED at
+    the NK the cluster reached (15360 rows): 0.232 GB live against 2.359 GB
+    reserved, and the peak across runs tracked how much NK VARIED rather than
+    how large it got -- 10.6 GB frozen, 37.7 and 40.1 GB growing.
+    """
+    from fgdlib.tangent import exact_tangent_system
+    from stable_tiny.pipeline import build_model
+
+    config = load_pipeline_config("configs/experiments/mnist_full.yaml")
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    model = build_model(config, device)
+    generator = torch.Generator().manual_seed(0)
+
+    def sweep(release: bool) -> float:
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        peak = 0.0
+        for samples in (128, 192, 256, 384, 512):
+            x = torch.rand(samples, 784, generator=generator).to(device)
+            y = torch.zeros(samples, 10)
+            y[torch.arange(samples), torch.randint(0, 10, (samples,), generator=generator)] = 1.0
+            system = exact_tangent_system(model, x, y.to(device), config.fgd_approx)
+            del system, x, y
+            if release:
+                pipeline._release_probe_allocator_cache(device)
+            peak = max(peak, torch.cuda.memory_reserved())
+        return peak
+
+    ratcheted = sweep(release=False)
+    released = sweep(release=True)
+    assert released < ratcheted, (released, ratcheted)
+
+
 def test_probe_diagnostic_reports_the_true_rows_not_the_surrogate() -> None:
     """NK must be the probe's rows even when the system is a surrogate.
 

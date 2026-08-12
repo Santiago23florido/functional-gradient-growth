@@ -1019,6 +1019,38 @@ def _extend_adaptive_probe_base(
             break
 
 
+def _release_probe_allocator_cache(device: torch.device | None) -> None:
+    """Return the caching allocator's pool after the probe changes shape.
+
+    Torch's caching allocator never returns a freed block to the driver; it
+    keeps it for a future tensor of the same size class. That is the right
+    default when shapes repeat, and the wrong one here: the probe is redrawn
+    every outer step and GROWS with P, so almost every allocation asks for a
+    size the pool has never held, the old blocks are never reused, and the
+    reserved pool ratchets up until the card is full.
+
+    MEASURED building the tangent system at the NK the cluster reached (15360
+    rows): 0.232 GB live against 2.359 GB reserved, a factor of 10.2. Across a
+    four-hour run that ratchet is what killed three jobs -- and the peak tracked
+    how much NK VARIED, not how large it got: NK frozen at 5760 peaked at
+    10.6 GB, NK growing to 15360 at 37.7 GB, NK growing to 16000 at 40.1 GB.
+
+    MEASURED in a loop that changes the probe shape every iteration, peak
+    reserved: 2.762 GB as it stands, 1.346 GB under expandable_segments, and
+    0.023 GB with this release -- against 0.009 GB live throughout.
+
+    Called only where the shape actually changes, which is once per outer step
+    against a step costing tens of seconds. Per-operation it would be a real
+    cost; here it is noise.
+    """
+    if device is None or device.type != "cuda":
+        return
+    if not torch.cuda.is_available():
+        return
+    torch.cuda.empty_cache()
+    increment("probe_allocator_cache_releases")
+
+
 def _resample_adaptive_probe_base(
     state: _AdaptiveCertificationProbe,
     loader: torch.utils.data.DataLoader,
@@ -1186,6 +1218,9 @@ def _refine_adaptive_certification_probe(
 
     state.refinement_rounds += 1
     _CERTIFICATION_RANK_CACHE.pop(id(model), None)
+    # The other place the probe changes shape: a refinement appends rows, so the
+    # blocks sized for the previous probe are now dead weight in the pool.
+    _release_probe_allocator_cache(device)
     new_batches = len(state.base_batches) + len(state.counterexamples)
     if progress is not None:
         budget = (
@@ -1265,6 +1300,16 @@ def _log_certification_probe(
     below_floor = parameter_ratio is not None and parameter_ratio < 1.0
     if below_floor:
         increment("probe_below_parameter_floor")
+    # Live against reserved, on the same line as P and NK. Three jobs died of
+    # out-of-memory before anyone could tell "37 GB are needed" from "37 GB of
+    # pool are held for 0.2 GB of live tensors" -- MEASURED, it was the second.
+    # With both numbers here the next one is read off the log, not guessed at.
+    memory = ""
+    if torch.cuda.is_available():
+        memory = (
+            f"live={torch.cuda.memory_allocated() / 1e9:.3f}GB "
+            f"reserved={torch.cuda.memory_reserved() / 1e9:.3f}GB "
+        )
     progress(
         f"[CERTIFY-PROBE] P={parameter_count} NK={rows} "
         + (f"rank={rank} " if rank is not None else "rank=n/a ")
@@ -1274,6 +1319,7 @@ def _log_certification_probe(
             if parameter_ratio is not None
             else "NK/P=n/a "
         )
+        + memory
         + f"eps={epsilon:.6g}"
         + (
             "  BELOW INTERPOLATION FLOOR: rank(J) <= min(NK, P) so eps can "
@@ -7226,6 +7272,12 @@ def run_pipeline(
                                         ),
                                         config.fgd_approx,
                                     )
+                                # The probe just changed shape, so the blocks the
+                                # previous shape left in the allocator's pool will
+                                # never be reused. Hand them back before the next
+                                # system is built, or the pool ratchets up until
+                                # the card is full -- MEASURED, three jobs.
+                                _release_probe_allocator_cache(device)
                             if _probe_grew:
                                 fgd_validation_probe = _functional_tikhonov_probe(
                                     build_projection_probe(

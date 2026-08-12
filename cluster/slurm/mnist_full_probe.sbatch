@@ -107,6 +107,14 @@ mkdir -p "${WANDB_DIR}" "${WANDB_CACHE_DIR}"
 WANDB_RUN_MODE="${WANDB_MODE:-online}"
 
 export FGD_PROFILE=1
+# La sonda cambia de forma en CADA outer step (se remuestrea y crece con P), asi
+# que el asignador de torch pide un tamaño nuevo casi siempre y nunca reutiliza
+# los bloques viejos: el pool sube en trinquete hasta llenar la tarjeta. MEDIDO
+# al NK que alcanzo el cluster: 0.232 GB vivos contra 2.359 GB reservados. En un
+# bucle que cambia la forma cada iteracion, el pico reservado va de 2.762 GB a
+# 1.346 GB solo con esto. El codigo ademas devuelve el pool en los puntos de
+# cambio de forma; esta variable cubre lo que no pasa por ahi.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 # print() va a un fichero, no a un tty, asi que python lo bufferiza por bloques
 # y el log parece congelado durante minutos. Sin esto no se puede vigilar nada.
 export PYTHONUNBUFFERED=1
