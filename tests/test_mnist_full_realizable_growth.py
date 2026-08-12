@@ -32,54 +32,79 @@ def _differing_paths(left, right, prefix: str = "") -> set[str]:
     return differences
 
 
-def _render_launcher_config(source: str, guard: bool) -> str:
+def _render_launcher_config(source: str, resample: bool, max_rows: int) -> str:
+    """Reproduce the launcher's sed exactly, so the test measures what runs."""
     rendered = re.sub(
         r"^  data_dir:.*$",
         "  data_dir: /tmp/mnist-full-ab-test",
         source,
         flags=re.MULTILINE,
     )
+    rendered = re.sub(
+        r"^  certify_probe_base_resample:.*$",
+        f"  certify_probe_base_resample: {str(resample).lower()}",
+        rendered,
+        flags=re.MULTILINE,
+    )
     return re.sub(
-        r"^  transactional_realized_descent:.*$",
-        "  transactional_realized_descent: true\n"
-        f"  transactional_family_step: {str(guard).lower()}",
+        r"^  certify_probe_refine_max_rows:.*$",
+        f"  certify_probe_refine_max_rows: {max_rows}",
         rendered,
         flags=re.MULTILINE,
     )
 
 
-def test_guard_arms_differ_only_in_family_transaction(tmp_path: Path) -> None:
-    """Pin the effective YAML produced by the existing two-arm launcher."""
+def test_probe_arms_differ_only_in_the_probe(tmp_path: Path) -> None:
+    """Pin the effective YAML produced by the two-arm launcher.
+
+    The A/B measures the SONDA, because that is what the diagnosis names: with
+    a base fixed for the run the certified steps interpolate it and it stops
+    representing the population (MEASURED, run 2kbo8rf4: 14.2x easier per image
+    by transaction ~50). Both arms carry the realizable-progress abstention,
+    which is not optional -- without it the biased arm simply freezes for 35
+    epochs and measures nothing.
+
+    The previous A/B on this launcher was transactional_family_step and is
+    MEASURED as vacuous under probe refinement: the ON and OFF arms produced
+    byte-identical logs with zero [FAMILY] lines, because eps sits at 0.23-0.25
+    and the family ladder is never invoked.
+    """
     source = Path("configs/experiments/mnist_full.yaml").read_text(encoding="utf-8")
-    paths = []
-    for guard in (True, False):
-        path = tmp_path / f"guard-{str(guard).lower()}.yaml"
-        path.write_text(_render_launcher_config(source, guard), encoding="utf-8")
-        paths.append(path)
+    arms = []
+    for resample, max_rows in ((True, 6400), (False, 0)):
+        path = tmp_path / f"probe-{str(resample).lower()}.yaml"
+        path.write_text(
+            _render_launcher_config(source, resample, max_rows), encoding="utf-8"
+        )
+        arms.append(load_pipeline_config(path))
 
-    guard_on = load_pipeline_config(paths[0])
-    guard_off = load_pipeline_config(paths[1])
-    assert _differing_paths(guard_on, guard_off) == {
-        "fgd_approx.transactional_family_step"
+    fixed, biased = arms
+    assert _differing_paths(fixed, biased) == {
+        "fgd_approx.certify_probe_base_resample",
+        "fgd_approx.certify_probe_refine_max_rows",
     }
-    assert guard_on.fgd_approx.transactional_realized_descent is True
-    assert guard_off.fgd_approx.transactional_realized_descent is True
-    assert guard_on.fgd_approx.certify_realizable_progress_growth is True
-    assert guard_off.fgd_approx.certify_realizable_progress_growth is True
-    assert (
-        guard_on.fgd_approx.certify_probe_refine_on_transaction_mismatch is True
-    )
-    assert (
-        guard_off.fgd_approx.certify_probe_refine_on_transaction_mismatch is True
-    )
+    assert fixed.fgd_approx.certify_probe_base_resample is True
+    assert fixed.fgd_approx.certify_probe_refine_max_rows == 6400
+    assert biased.fgd_approx.certify_probe_base_resample is False
+    assert biased.fgd_approx.certify_probe_refine_max_rows == 0
+    # Everything the comparison holds fixed.
+    for arm in arms:
+        assert arm.fgd_approx.transactional_realized_descent is True
+        assert arm.fgd_approx.certify_realizable_progress_growth is True
+        assert arm.fgd_approx.certify_probe_refine_on_transaction_mismatch is True
+        assert arm.fgd_approx.probe_resample is False
 
-    launcher = Path("cluster/slurm/mnist_full_family_guard_ab.sbatch").read_text(
+    launcher = Path("cluster/slurm/mnist_full_probe_ab.sbatch").read_text(
         encoding="utf-8"
     )
-    assert "0) GUARD=true;  ARM=guard-on" in launcher
-    assert "1) GUARD=false; ARM=guard-off" in launcher
+    assert "0) RESAMPLE=true;  MAX_ROWS=6400; ARM=probe-fixed" in launcher
+    assert "1) RESAMPLE=false; MAX_ROWS=0;    ARM=probe-biased" in launcher
     assert "--gpus=1" in launcher
     assert 'RUN_SUFFIX="${RUN_SUFFIX:-}"' in launcher
+    # The launcher must verify its own patch, or an arm silently runs the other
+    # arm's config -- which is how the previous A/B could have gone unnoticed.
+    assert "certify_probe_base_resample no se parcheo" in launcher
+    assert "certify_probe_refine_max_rows no se parcheo" in launcher
 
 
 def test_only_deadlocked_mnist_matrix_free_runs_enable_new_options() -> None:
@@ -97,6 +122,14 @@ def test_only_deadlocked_mnist_matrix_free_runs_enable_new_options() -> None:
     assert conv.certify_probe_refine_max_rounds == 16
     validate_probe_refinement(conv)
 
+    # The unbiased base and the row budget are the full-MNIST answer to the
+    # MEASURED 14.2x probe/population gap. They are confined to that one
+    # experiment: nothing under configs/fgd may reach them, conv included.
+    assert full.certify_probe_base_resample is True
+    assert full.certify_probe_refine_max_rows == 6400
+    assert conv.certify_probe_base_resample is False
+    assert conv.certify_probe_refine_max_rows == 0
+
     for path in Path("configs/fgd").glob("*.yaml"):
         config = load_pipeline_config(path).fgd_approx
         expected = path.name == "mnist_conv_matrix_free.yaml"
@@ -105,6 +138,8 @@ def test_only_deadlocked_mnist_matrix_free_runs_enable_new_options() -> None:
         assert config.certify_probe_refine_on_transaction_mismatch is expected, path
         assert config.certify_probe_refine_batches_per_round == 1, path
         assert config.certify_probe_refine_max_rounds == (16 if expected else 0), path
+        assert config.certify_probe_base_resample is False, path
+        assert config.certify_probe_refine_max_rows == 0, path
 
 
 @pytest.mark.parametrize(
@@ -131,6 +166,8 @@ def test_n1024_growth_settings_remain_at_their_defaults(
     assert config.certify_probe_refine_on_transaction_mismatch is False
     assert config.certify_probe_refine_batches_per_round == 1
     assert config.certify_probe_refine_max_rounds == 0
+    assert config.certify_probe_base_resample is False
+    assert config.certify_probe_refine_max_rows == 0
     assert config.transactional_realized_descent is transactional
 
 
@@ -156,9 +193,22 @@ def test_probe_refinement_validation_is_matrix_free_and_bounded() -> None:
     config = load_pipeline_config("configs/experiments/mnist_full.yaml").fgd_approx
     validate_probe_refinement(config)
 
+    # A row budget IS a budget, so dropping the round cap while it is set is
+    # legal -- that is the point of it. Dropping BOTH is not.
+    validate_probe_refinement(
+        dataclasses.replace(config, certify_probe_refine_max_rounds=0)
+    )
     with pytest.raises(ValueError, match="max_rounds"):
         validate_probe_refinement(
-            dataclasses.replace(config, certify_probe_refine_max_rounds=0)
+            dataclasses.replace(
+                config,
+                certify_probe_refine_max_rounds=0,
+                certify_probe_refine_max_rows=0,
+            )
+        )
+    with pytest.raises(ValueError, match="max_rows must be a non-negative"):
+        validate_probe_refinement(
+            dataclasses.replace(config, certify_probe_refine_max_rows=-1)
         )
     with pytest.raises(ValueError, match="positive integer"):
         validate_probe_refinement(
@@ -166,6 +216,17 @@ def test_probe_refinement_validation_is_matrix_free_and_bounded() -> None:
         )
     with pytest.raises(ValueError, match="probe_resample"):
         validate_probe_refinement(dataclasses.replace(config, probe_resample=True))
+    # The unbiased base is meaningless without the counterexample memory it is
+    # designed to coexist with, and it must not leak onto the exact-tangent
+    # path: the refinement it requires is already matrix-free only.
+    with pytest.raises(ValueError, match="certify_probe_base_resample requires"):
+        validate_probe_refinement(
+            dataclasses.replace(
+                config,
+                certify_probe_refine_on_transaction_mismatch=False,
+                certify_probe_refine_max_rows=0,
+            )
+        )
 
 
 def test_probe_diagnostic_reports_rank_ratio_without_mutation() -> None:

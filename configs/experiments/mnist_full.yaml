@@ -303,9 +303,30 @@ fgd_approx:
   # shrinks only 10 % per step. MEASURED with the full step delivered: 0.95
   # sent train_loss 0.0917 -> 0.3991 and validation accuracy 0.248 -> 0.123.
   certify_optimal_rate: true
-  # Nothing to resample: probe_batches covers the entire training set, so the
-  # certificate is exact over all of it rather than over a draw from it.
+  # This comment used to read "nothing to resample: probe_batches covers the
+  # entire training set". It was inherited from configs/fgd/mnist_matrix_free
+  # .yaml and it is FALSE here: probe_batches 11 * batch_size 64 = 704 of
+  # 50000 images, 1.4%. The base is the sample the certified steps are fitted
+  # on, so with it fixed they interpolate it and it stops standing for the
+  # population. MEASURED (run 2kbo8rf4), probe functional per image against
+  # full-train functional per image:
+  #
+  #   transaccion   1     1.0x
+  #   transaccion  25     3.6x
+  #   transaccion  50    14.1x
+  #   en regimen         14.2x    (0.1859 contra 2.6388)
+  #
+  # Everything computed on the probe then reads a biased sample: eps, the
+  # growth argmin and the endpoint transaction. The run froze with train_loss
+  # identical to the last digit for 35 epochs at test 0.350, with a 784->6
+  # first layer that cannot represent MNIST.
+  #
+  # probe_resample stays false because it rebuilds the WHOLE probe and would
+  # discard the counterexamples with it. certify_probe_base_resample redraws
+  # the BASE every outer step and keeps the counterexample memory, which is
+  # where the monotonicity the refinement relies on actually has to hold.
   probe_resample: false
+  certify_probe_base_resample: true
   certify_realize_path: true
   # Adaptive early stop: 138 of ~200 steps ran the full 40 inner solves without
   # reaching tolerance, but the late iterations barely move the residual. Stop
@@ -404,10 +425,20 @@ fgd_approx:
   # MEASURED in the first counterexample-guided full-MNIST run: all 8 rounds
   # found distinct violating batches while full-train loss and accuracy were
   # still improving, so the safety cap -- not the 100000-parameter budget --
-  # stopped the run at epoch 5 and P~=9293. Double the finite allowance; this
-  # can retain at most 16 counterexample batches and still stops cleanly if
-  # the empirical mismatch persists.
+  # stopped the run at epoch 5 and P~=9293. Doubling it to 16 only postponed
+  # the same ending: run yqfvy8l7 printed "stop_reason=
+  # probe_refinement_exhausted round=16 max_rounds=16" at epoch 6 with
+  # mismatches still firing every outer step, after which the mechanism is
+  # OFF and the probe drifts back into the bias below. A round count is the
+  # wrong budget: what costs is the probe SIZE, because the matrix-free dual
+  # is O((NK)^2). max_rows takes over and bounds the counterexample memory by
+  # eviction of the least-violating batch, so the mechanism never turns
+  # itself off. 6400 = 10 batches * 64 images * K 10, about the size of the
+  # rank-sized base at the measured operating point, which keeps the total
+  # probe inside the NK ~ 16000 that yqfvy8l7 showed is affordable
+  # (~23 min/epoch on one A100).
   certify_probe_refine_max_rounds: 16
+  certify_probe_refine_max_rows: 6400
   # El lookahead ya existia pero solo sabia VETAR: un "si" caia al
   # `while epsilon >= target`, que excluye justo la banda en la que se
   # pregunta. MEDIDO aqui: eps se aparca en 0.4975 contra una barra de 0.5,

@@ -1,47 +1,60 @@
 #!/usr/bin/env bash
-# MNIST COMPLETO, A/B del guardian del paso de familia. Dos brazos:
+# MNIST COMPLETO, A/B de la SONDA. Dos brazos:
 #
-#   0  guard=on   transactional_family_step: true   (el default)
-#   1  guard=off  transactional_family_step: false  (el comportamiento medido
-#                 como defectuoso: x3.97 / x6.21 / x15.44 del funcional real)
+#   0  probe-fixed   certify_probe_base_resample: true   max_rows: 6400
+#   1  probe-biased  certify_probe_base_resample: false  max_rows: 0
 #
-# Los dos brazos son IDENTICOS en todo lo demas -- misma semilla, mismos datos,
-# mismo tope, mismo lookahead, mismo K-fold -- asi que cualquier diferencia es
-# causal. El guardian del TANGENTE queda encendido en los dos: apagarlo para
-# probar este compararia otra cosa.
+# El brazo 1 es la sonda de hoy: base fija para toda la corrida y refinamiento
+# con tope terminal de rondas. MEDIDO en run 2kbo8rf4, funcional por imagen en
+# la sonda contra el de train completo: 1.0x -> 3.6x -> 14.1x en 50
+# transacciones, y de ahi en adelante congelado en 14.2x. La sonda es la muestra
+# sobre la que se AJUSTAN los pasos certificados, asi que la interpolan y deja
+# de representar a la poblacion; eps, el argmin de crecimiento y la transaccion
+# del endpoint leen todos esa muestra sesgada.
+#
+# Los dos brazos son IDENTICOS en todo lo demas. En particular los DOS llevan la
+# abstencion del criterio realizable (comparar dos ceros no es rechazar), que no
+# es opcional: restaura una invariante que el propio repo afirma y sin ella el
+# brazo 1 simplemente se congela 35 epochs y no mide nada. La comparacion aisla
+# entonces exactamente la sonda.
+#
+# El A/B anterior de este fichero era transactional_family_step, y esta MEDIDO
+# como vacio en este regimen: los brazos ON y OFF de probe-refine dieron logs
+# identicos byte a byte y cero lineas [FAMILY], porque con eps en 0.23-0.25 el
+# ladder de familia no se invoca nunca.
 #
 # NO WALLTIME. --time=0 pide el maximo de la particion; si el MaxTime es finito
-# sbatch lo rechaza y hay que nombrarlo (`sinfo -p gpu -o "%P %l"`).
+# sbatch lo rechaza y hay que nombrarlo (`sinfo -p tau -o "%P %l"`).
 #
 # NODO Y PARTICION TIENEN QUE CASAR o sbatch responde "Requested nodes not in
 # this partition" antes de ejecutar nada:
-#   scontrol show node margpu010 | grep -i -E "NodeName|Partitions|Gres"
+#   scontrol show node margpu008 | grep -i -E "NodeName|Partitions|Gres"
 # Los dos se pisan desde la linea de comandos sin tocar este fichero.
 #
-#SBATCH --job-name=mnist-full-ab
-#SBATCH --partition=gpu
-#SBATCH --nodelist=margpu010
+#SBATCH --job-name=mnist-full-probe-ab
+#SBATCH --partition=tau
+#SBATCH --nodelist=margpu008
 #SBATCH --gpus=1
 #SBATCH --cpus-per-gpu=8
 #SBATCH --time=0
 #SBATCH --array=0-1
-#SBATCH --output=slurm_logs/mnist_full_ab_%A_%a.out
-#SBATCH --error=slurm_logs/mnist_full_ab_%A_%a.err
+#SBATCH --output=slurm_logs/mnist_full_probe_ab_%A_%a.out
+#SBATCH --error=slurm_logs/mnist_full_probe_ab_%A_%a.err
 
 set -euo pipefail
 
 REPO_ROOT="${REPO_ROOT:-$HOME/dev/functional-gradient-growth}"
 DATASET_ROOT="${DATASET_ROOT:-$HOME/datasets}"
 CONDA_ENV="${CONDA_ENV:-cct}"
-WANDB_GROUP="${WANDB_GROUP:-mnist-full-family-guard-ab}"
+WANDB_GROUP="${WANDB_GROUP:-mnist-full-probe-ab}"
 MODEL_SEED="${MODEL_SEED:-0}"
 # Optional metadata-only suffix for reruns. Empty preserves every historical
-# run name and results path; e.g. RUN_SUFFIX=probe-refine-r2 isolates a rerun.
+# run name and results path; e.g. RUN_SUFFIX=r2 isolates a rerun.
 RUN_SUFFIX="${RUN_SUFFIX:-}"
 
 case "${SLURM_ARRAY_TASK_ID:-0}" in
-  0) GUARD=true;  ARM=guard-on ;;
-  1) GUARD=false; ARM=guard-off ;;
+  0) RESAMPLE=true;  MAX_ROWS=6400; ARM=probe-fixed ;;
+  1) RESAMPLE=false; MAX_ROWS=0;    ARM=probe-biased ;;
   *) echo "[FATAL] array index fuera de 0-1"; exit 1 ;;
 esac
 
@@ -96,17 +109,20 @@ RUN_NAME="mnist-full-${ARM}-seed-${MODEL_SEED}"
 # el fichero versionado sigue siendo exactamente lo que dice el repo.
 RUN_CONFIG="${LOCAL_ROOT}/mnist_full_${ARM}.run.yaml"
 sed -e "s#^  data_dir:.*#  data_dir: ${LOCAL_ROOT}#" \
-    -e "s#^  transactional_realized_descent:.*#  transactional_realized_descent: true\n  transactional_family_step: ${GUARD}#" \
+    -e "s#^  certify_probe_base_resample:.*#  certify_probe_base_resample: ${RESAMPLE}#" \
+    -e "s#^  certify_probe_refine_max_rows:.*#  certify_probe_refine_max_rows: ${MAX_ROWS}#" \
     "${CONFIG}" > "${RUN_CONFIG}"
 grep -q "^  data_dir: ${LOCAL_ROOT}$" "${RUN_CONFIG}" \
   || { echo "[FATAL] data_dir no se parcheo"; exit 1; }
-grep -q "^  transactional_family_step: ${GUARD}$" "${RUN_CONFIG}" \
-  || { echo "[FATAL] transactional_family_step no se parcheo"; exit 1; }
+grep -q "^  certify_probe_base_resample: ${RESAMPLE}$" "${RUN_CONFIG}" \
+  || { echo "[FATAL] certify_probe_base_resample no se parcheo"; exit 1; }
+grep -q "^  certify_probe_refine_max_rows: ${MAX_ROWS}$" "${RUN_CONFIG}" \
+  || { echo "[FATAL] certify_probe_refine_max_rows no se parcheo"; exit 1; }
 
 RESULTS_DIR="${LOCAL_ROOT}/results/${RUN_NAME}"
 mkdir -p "${RESULTS_DIR}"
 
-echo "[RUN] node=$(hostname) arm=${ARM} family_guard=${GUARD}"
+echo "[RUN] node=$(hostname) arm=${ARM} base_resample=${RESAMPLE} max_rows=${MAX_ROWS}"
 echo "[RUN] config=${RUN_CONFIG} seed=${MODEL_SEED} wandb=${WANDB_RUN_MODE}"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
@@ -118,6 +134,6 @@ srun python -m stable_tiny \
   --wandb --wandb-mode "${WANDB_RUN_MODE}" --wandb-group "${WANDB_GROUP}" \
   --no-plot
 
-mkdir -p "${REPO_ROOT}/results/mnist_full_ab"
-cp -r "${RESULTS_DIR}" "${REPO_ROOT}/results/mnist_full_ab/" || true
+mkdir -p "${REPO_ROOT}/results/mnist_full_probe_ab"
+cp -r "${RESULTS_DIR}" "${REPO_ROOT}/results/mnist_full_probe_ab/" || true
 echo "[RUN] done: ${RUN_NAME}"
