@@ -462,6 +462,16 @@ fgd_approx:
   # finite functional progress it can actually execute. This is not a forced
   # growth and does not alter the convolutional architecture or its WHERE rule.
   certify_realizable_progress_growth: true
+  # The live seed-0 Conv run measured the same finite contradiction as full
+  # MNIST: the bounded probe fell while the frozen 10000-example objective
+  # rose for every transactional rate. At P=3080, NK/rank remained healthy
+  # (~5.03), so this is statistical probe bias rather than algebraic
+  # interpolation. Retain the worst unseen full-train batch, rebuild the
+  # tangent system at the unchanged theta, and retry the same logical step.
+  # The finite 16-round cap matches full MNIST and prevents a retry deadlock.
+  certify_probe_refine_on_transaction_mismatch: true
+  certify_probe_refine_batches_per_round: 1
+  certify_probe_refine_max_rounds: 16
   # Let a NEW LAYER compete with the widenings, in the same measured
   # bottleneck per parameter. This is the B arm; false is the A arm and runs
   # the width-only branch exactly as before.

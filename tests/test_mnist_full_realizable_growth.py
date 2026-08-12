@@ -92,14 +92,19 @@ def test_only_deadlocked_mnist_matrix_free_runs_enable_new_options() -> None:
     assert full.certify_probe_refine_on_transaction_mismatch is True
     assert full.certify_probe_refine_batches_per_round == 1
     assert full.certify_probe_refine_max_rounds == 16
-    assert conv.certify_probe_refine_on_transaction_mismatch is False
+    assert conv.certify_probe_refine_on_transaction_mismatch is True
+    assert conv.certify_probe_refine_batches_per_round == 1
+    assert conv.certify_probe_refine_max_rounds == 16
+    validate_probe_refinement(conv)
 
     for path in Path("configs/fgd").glob("*.yaml"):
         config = load_pipeline_config(path).fgd_approx
         expected = path.name == "mnist_conv_matrix_free.yaml"
         assert config.certify_probe_diagnostics is expected, path
         assert config.certify_realizable_progress_growth is expected, path
-        assert config.certify_probe_refine_on_transaction_mismatch is False, path
+        assert config.certify_probe_refine_on_transaction_mismatch is expected, path
+        assert config.certify_probe_refine_batches_per_round == 1, path
+        assert config.certify_probe_refine_max_rounds == (16 if expected else 0), path
 
 
 @pytest.mark.parametrize(

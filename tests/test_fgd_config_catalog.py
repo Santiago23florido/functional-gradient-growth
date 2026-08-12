@@ -118,8 +118,8 @@ def test_mnist_conv_inherits_config_2s_optimisation_set() -> None:
     recurring: it left the conv run with nothing comparable to measure
     against.
 
-    Six fgd_approx fields may differ. Three are forced by convolution, two
-    realizability diagnostics respond to the measured finite-step deadlock,
+    Eight fgd_approx fields may differ. Three are forced by convolution, four
+    realizability/probe controls respond to the measured finite-step deadlock,
     and one permits measured float32/cuDNN roundoff. The linear config remains
     unchanged.
     """
@@ -144,6 +144,11 @@ def test_mnist_conv_inherits_config_2s_optimisation_set() -> None:
         # by certified finite progress; they do not change config 2.
         "certify_probe_diagnostics",
         "certify_realizable_progress_growth",
+        # The live Conv run measured probe-down/full-train-up contradictions
+        # at every transactional rate. Retain those counterexamples exactly
+        # as full MNIST does; config 2 remains the unmodified reference.
+        "certify_probe_refine_on_transaction_mismatch",
+        "certify_probe_refine_max_rounds",
         # A zero-output-weight Conv extension is algebraically exact, but
         # changing channel shape changes float32/cuDNN reduction order. Keep
         # its measured roundoff allowance local to Conv.
@@ -164,6 +169,11 @@ def test_mnist_conv_inherits_config_2s_optimisation_set() -> None:
     assert config_2.fgd_approx.certify_realizable_progress_growth is False
     assert conv.fgd_approx.certify_probe_diagnostics is True
     assert conv.fgd_approx.certify_realizable_progress_growth is True
+    assert config_2.fgd_approx.certify_probe_refine_on_transaction_mismatch is False
+    assert config_2.fgd_approx.certify_probe_refine_max_rounds == 0
+    assert conv.fgd_approx.certify_probe_refine_on_transaction_mismatch is True
+    assert conv.fgd_approx.certify_probe_refine_batches_per_round == 1
+    assert conv.fgd_approx.certify_probe_refine_max_rounds == 16
     assert config_2.fgd_approx.growth_preservation_tolerance == 1e-6
     assert conv.fgd_approx.growth_preservation_tolerance == 1e-5
     # The certified core is untouched.
