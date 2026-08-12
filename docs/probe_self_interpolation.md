@@ -165,9 +165,22 @@ estricta. El tope de parámetros sigue acotando por encima.
 
 ## 6. Qué mira el A/B
 
-`cluster/slurm/mnist_full_probe_ab.sbatch`, brazo 0 arreglado contra brazo 1 con
-la sonda de hoy. Los dos llevan la abstención, que no es opcional: sin ella el
-brazo sesgado se congela 35 epochs y no mide nada.
+**El A/B ya se corrió y está cerrado**, con el brazo arreglado ganando de
+lejos:
+
+| brazo | run | epochs | test | tiempo |
+|---|---|---|---|---|
+| `probe-fixed` | `unguzxkq` | 8 | **0.7741** | 1.58 h |
+| `probe-biased` | `euepsdrk` | 6 | 0.4337 | 2.31 h |
+
+El brazo sesgado **no se relanza**: muere de OOM de GPU de forma reproducible
+—`yqfvy8l7`, `uesf9xgb` y `euepsdrk` en la misma epoch 6, mismo `acc 0.4337`,
+mismo `P=9443`, mismas 2.31 h— con la memoria subiendo 1.3 → 6.6 → 12.8 →
+**40.1 GB (93.4% de una A100 40G)**.
+
+El lanzador es ahora `cluster/slurm/mnist_full_probe.sbatch`, de un solo brazo.
+Lo que mide está en [`probe_parameter_floor.md`](probe_parameter_floor.md): el
+defecto siguiente, que la sonda dejó de crecer cuando P creció.
 
 El instrumento nuevo es la razón sonda/población:
 

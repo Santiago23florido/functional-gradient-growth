@@ -32,79 +32,59 @@ def _differing_paths(left, right, prefix: str = "") -> set[str]:
     return differences
 
 
-def _render_launcher_config(source: str, resample: bool, max_rows: int) -> str:
-    """Reproduce the launcher's sed exactly, so the test measures what runs."""
+def test_the_launcher_runs_the_repo_config_and_checks_it_by_value(
+    tmp_path: Path,
+) -> None:
+    """One arm, data_dir the only patch, and the settings verified by VALUE.
+
+    The two-arm A/B this launcher used to carry is CLOSED: probe-fixed reached
+    acc 0.7741 in 8 epochs against probe-biased's 0.4337 in 6, and the biased
+    arm dies of GPU OOM reproducibly -- yqfvy8l7, uesf9xgb and euepsdrk all at
+    epoch 6, acc 0.4337, P=9443, 2.31 h, with W&B telemetry showing GPU memory
+    climb 1.3 -> 6.6 -> 12.8 -> 40.1 GB (93.4% of an A100 40G). Relaunching it
+    would spend a GPU reproducing a known crash.
+
+    Checking by VALUE and not by presence is the point: a `grep -q "^  key: "`
+    passes whichever value is there, which is how a conv array ran with the
+    8 GB card's chunks on an A100 without anyone noticing.
+    """
+    source = Path("configs/experiments/mnist_full.yaml").read_text(encoding="utf-8")
     rendered = re.sub(
         r"^  data_dir:.*$",
-        "  data_dir: /tmp/mnist-full-ab-test",
+        "  data_dir: /tmp/mnist-full-probe-test",
         source,
         flags=re.MULTILINE,
     )
-    rendered = re.sub(
-        r"^  certify_probe_base_resample:.*$",
-        f"  certify_probe_base_resample: {str(resample).lower()}",
-        rendered,
-        flags=re.MULTILINE,
-    )
-    return re.sub(
-        r"^  certify_probe_refine_max_rows:.*$",
-        f"  certify_probe_refine_max_rows: {max_rows}",
-        rendered,
-        flags=re.MULTILINE,
-    )
+    path = tmp_path / "probe-floor.yaml"
+    path.write_text(rendered, encoding="utf-8")
+    config = load_pipeline_config(path)
 
+    # What the run exists to exercise.
+    assert config.fgd_approx.certify_probe_base_resample is True
+    assert config.fgd_approx.certify_probe_parameter_floor == 1.25
+    assert config.fgd_approx.matrix_free_block_chunk == 256
+    # What it holds fixed.
+    assert config.fgd_approx.transactional_realized_descent is True
+    assert config.fgd_approx.certify_realizable_progress_growth is True
+    assert config.fgd_approx.certify_probe_refine_on_transaction_mismatch is True
+    assert config.fgd_approx.probe_resample is False
 
-def test_probe_arms_differ_only_in_the_probe(tmp_path: Path) -> None:
-    """Pin the effective YAML produced by the two-arm launcher.
-
-    The A/B measures the SONDA, because that is what the diagnosis names: with
-    a base fixed for the run the certified steps interpolate it and it stops
-    representing the population (MEASURED, run 2kbo8rf4: 14.2x easier per image
-    by transaction ~50). Both arms carry the realizable-progress abstention,
-    which is not optional -- without it the biased arm simply freezes for 35
-    epochs and measures nothing.
-
-    The previous A/B on this launcher was transactional_family_step and is
-    MEASURED as vacuous under probe refinement: the ON and OFF arms produced
-    byte-identical logs with zero [FAMILY] lines, because eps sits at 0.23-0.25
-    and the family ladder is never invoked.
-    """
-    source = Path("configs/experiments/mnist_full.yaml").read_text(encoding="utf-8")
-    arms = []
-    for resample, max_rows in ((True, 6400), (False, 0)):
-        path = tmp_path / f"probe-{str(resample).lower()}.yaml"
-        path.write_text(
-            _render_launcher_config(source, resample, max_rows), encoding="utf-8"
-        )
-        arms.append(load_pipeline_config(path))
-
-    fixed, biased = arms
-    assert _differing_paths(fixed, biased) == {
-        "fgd_approx.certify_probe_base_resample",
-        "fgd_approx.certify_probe_refine_max_rows",
-    }
-    assert fixed.fgd_approx.certify_probe_base_resample is True
-    assert fixed.fgd_approx.certify_probe_refine_max_rows == 6400
-    assert biased.fgd_approx.certify_probe_base_resample is False
-    assert biased.fgd_approx.certify_probe_refine_max_rows == 0
-    # Everything the comparison holds fixed.
-    for arm in arms:
-        assert arm.fgd_approx.transactional_realized_descent is True
-        assert arm.fgd_approx.certify_realizable_progress_growth is True
-        assert arm.fgd_approx.certify_probe_refine_on_transaction_mismatch is True
-        assert arm.fgd_approx.probe_resample is False
-
-    launcher = Path("cluster/slurm/mnist_full_probe_ab.sbatch").read_text(
-        encoding="utf-8"
-    )
-    assert "0) RESAMPLE=true;  MAX_ROWS=6400; ARM=probe-fixed" in launcher
-    assert "1) RESAMPLE=false; MAX_ROWS=0;    ARM=probe-biased" in launcher
+    launcher = Path("cluster/slurm/mnist_full_probe.sbatch").read_text(encoding="utf-8")
+    assert "--array" not in launcher, "the A/B is closed; one arm only"
+    for key, value in (
+        ("certify_probe_base_resample", "true"),
+        ("certify_probe_parameter_floor", "1.25"),
+        ("matrix_free_block_chunk", "256"),
+    ):
+        assert f'"{key}:{value}"' in launcher, key
+    assert 'grep -q "^  ${key}: ${want}$"' in launcher
+    # The previous death could not be attributed because nothing recorded the
+    # exit state: GPU at 24.7% of 40 GB, host RSS 2.4 GB of 480, no traceback.
+    assert "sacct -j" in launcher
+    assert "trap finish EXIT" in launcher
+    assert "--mem=" in launcher
     assert "--gpus=1" in launcher
     assert 'RUN_SUFFIX="${RUN_SUFFIX:-}"' in launcher
-    # The launcher must verify its own patch, or an arm silently runs the other
-    # arm's config -- which is how the previous A/B could have gone unnoticed.
-    assert "certify_probe_base_resample no se parcheo" in launcher
-    assert "certify_probe_refine_max_rows no se parcheo" in launcher
 
 
 def test_only_deadlocked_mnist_matrix_free_runs_enable_new_options() -> None:

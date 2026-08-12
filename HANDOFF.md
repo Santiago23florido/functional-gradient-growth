@@ -159,11 +159,53 @@ Tres arreglos, ninguno con criterio nuevo: `certify_probe_base_resample`
 dos campos nacen desactivados; N1024 verificado exacto
 (`0.9352 / 529 / (10,18,14) / 23`).
 
-Mide `cluster/slurm/mnist_full_probe_ab.sbatch`: brazo 0 arreglado, brazo 1 con
-la sonda de hoy. El A/B anterior de ese fichero era `transactional_family_step`
-y esta MEDIDO como vacio en este regimen — los brazos ON/OFF de probe-refine
-dieron logs identicos byte a byte y cero lineas `[FAMILY]`, porque con eps en
-0.23-0.25 el ladder no se invoca nunca.
+**El A/B se corrio y esta CERRADO**, el arreglo gana de lejos:
+
+| brazo | run | epochs | test | tiempo |
+|---|---|---|---|---|
+| `probe-fixed` | `unguzxkq` | 8 | **0.7741** | 1.58 h |
+| `probe-biased` | `euepsdrk` | 6 | 0.4337 | 2.31 h |
+
+### RESUELTA: el segundo defecto de la sonda (ver `docs/probe_parameter_floor.md`)
+
+Ninguno de los dos brazos termino, y las causas NO eran desalojo por la conv,
+que fue la primera lectura por coincidencia horaria. Telemetria de W&B:
+
+| | memoria GPU | final |
+|---|---|---|
+| sesgado (`euepsdrk`) | 1.3 → 6.6 → 12.8 → **40.1 GB (93.4%)** | **OOM reproducible** |
+| arreglado (`unguzxkq`) | 1.3 → 3.4 → 4.5 → 7.3 → **10.6 GB (24.7%)** | sin agotar nada |
+
+El sesgado muere identico tres veces (`yqfvy8l7`, `uesf9xgb`, `euepsdrk`: epoch
+6, `acc 0.4337`, `P=9443`, 2.31 h). El arreglado no se puede atribuir con la
+telemetria disponible, y por eso el lanzador ahora registra `sacct` en un
+`trap EXIT`.
+
+**El defecto de fondo: la sonda dejo de crecer cuando P crecio.**
+`rank(J) <= NK` por construccion y el rango se MIDE sobre la sonda, asi que
+sonda pequeña da rango pequeño, que reporta que no hacen falta mas filas. Punto
+fijo. MEDIDO en `unguzxkq`: el rango cae de 1249 a 161 mientras P triplica a
+14487, `NK/P` llega a **0.45** y eps se desploma de 0.44 a **0.009** con el
+`rel_err` de validacion todavia en 1.02. Reproducido por el dimensionador, sin
+suelo la peticion COLAPSA a 640 filas en P=14487; solo el trinquete monotono la
+mantenia en 5760.
+
+`certify_probe_parameter_floor: 1.25` lo arregla, y **no toca lo que iba bien**:
+verificado replicando el dimensionador, de P=1612 a 3383 el resultado es
+IDENTICO y la primera intervencion cae en P=4283, justo donde empezaba a
+degradarse. `matrix_free_block_chunk: 256` acota el bloque del range finder,
+que es el culpable real de los 40 GB — estaba en 0 (sin acotar) aqui y en 32 en
+la conv.
+
+**Descartado al verificarlo**: `certify_stream_gram` es un NO-OP en esta ruta.
+`exact_tangent_system` corta en su primera linea con
+`family_order == matrix_free_tangent`; eps con ON y OFF es bit-identico
+(`0.9158695992197211`). Y con el cae su argumento de memoria: el sistema
+matrix-free es factorizado `(NK x r) + (P x r)`, no el denso `NK x P`, asi que
+el presupuesto de 100000 se MANTIENE y el limite pasa a ser el reloj.
+
+Mide `cluster/slurm/mnist_full_probe.sbatch`, un solo brazo: el sesgado no se
+relanza porque su OOM esta fijado tres veces.
 
 ## LO QUE FUNCIONA HOY (`fe4c88d`) — leer esto primero
 
