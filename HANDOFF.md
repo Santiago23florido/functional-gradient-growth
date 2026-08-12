@@ -113,6 +113,58 @@ idéntica a la de s0 con el mismo presupuesto. Las otras tres semillas promedian
 0.93, así que **todo el déficit contra el objetivo es esta semilla**.
 
 
+### RESUELTA: por que MNIST completo se congelaba (ver `docs/probe_self_interpolation.md`)
+
+`mnist-full-guard-off-seed-0` (`2kbo8rf4`) tenia `train_loss=0.2639` y
+`test=0.350` **identicos digito a digito de la epoch 5 a la 40**: 35 epochs de
+no-op exacto, no convergencia lenta.
+
+**El crecimiento NO es patologico.** El argmin de eps es el criterio del
+teorema; lo que leia estaba corrupto. La prueba es que al reparar la medicion el
+WHERE se recoloco solo, sin tocar el criterio: L0 (la capa de 784 entradas) paso
+de **0 a 9** crecimientos y la primera capa de 6 a 11 neuronas.
+
+**Una causa raiz.** La base de la sonda son 704 imagenes de 50000 (1.4%) fijadas
+para toda la corrida, y los pasos certificados se AJUSTAN sobre ella. Funcional
+por imagen, sonda contra poblacion:
+
+| transaccion | sonda fija | con refine |
+|---|---|---|
+| 1 | 1.0x | 1.0x |
+| 50 | **14.1x** | 1.2x |
+| en regimen | **14.2x congelado** | 1.1-1.3x |
+
+De ahi salen las tres averias: el certificado miente (`eps=0.288` contra
+`rel_err=1.02`), el WHERE se desvia y produce un `784->6` que es el techo de
+0.35, y el paro. El repo ya tenia escrito el diagnostico en el comentario de
+`probe_resample` de `pipeline.py`, y la config lo desactivaba con una
+justificacion heredada que es FALSA a esta escala.
+
+**El paro es un punto fijo** con las tres puertas cerradas: `eps=0.288<0.5`
+certifica y el bucle no corre; `rel_err=0.356<0.5` es admisible y el `[GRO]` no
+dispara; y `certify_realizable_progress_growth`, la unica ruta viva, se
+auto-bloquea porque exige que el clon +1 neurona realice un paso que el base
+tampoco puede realizar — y entonces RETORNA en vez de ceder el turno, violando
+la invariante que la ruta ordinaria ya afirma doce lineas mas abajo.
+
+**Reinicializacion de pesos: descartada con medicion.** Los pesos son correctos
+sobre lo que se les mostro (`0.186`/imagen). El problema es que se les mostro el
+0.9% de los datos. Reinicializar rompe la preservacion de funcion y vuelve al
+mismo pozo en ~50 transacciones.
+
+Tres arreglos, ninguno con criterio nuevo: `certify_probe_base_resample`
+(redibuja la base, conserva los contraejemplos), `certify_probe_refine_max_rows`
+(acota por filas con desalojo en vez del tope terminal de rondas) y la
+**abstencion** del criterio realizable cuando ambos extremos puntuan cero. Los
+dos campos nacen desactivados; N1024 verificado exacto
+(`0.9352 / 529 / (10,18,14) / 23`).
+
+Mide `cluster/slurm/mnist_full_probe_ab.sbatch`: brazo 0 arreglado, brazo 1 con
+la sonda de hoy. El A/B anterior de ese fichero era `transactional_family_step`
+y esta MEDIDO como vacio en este regimen — los brazos ON/OFF de probe-refine
+dieron logs identicos byte a byte y cero lineas `[FAMILY]`, porque con eps en
+0.23-0.25 el ladder no se invoca nunca.
+
 ## LO QUE FUNCIONA HOY (`fe4c88d`) — leer esto primero
 
 `growth_where: expressivity_bottleneck` en los tres configs de `configs/fgd/`.
