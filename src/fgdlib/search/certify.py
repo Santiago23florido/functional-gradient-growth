@@ -636,7 +636,7 @@ def _select_realizable_progress_growth(
                 "[REALIZABLE-GROWTH] no positive expressivity bottleneck; "
                 "no structural candidate"
             )
-        return None, current_epsilon, None, None, current_progress, False
+        return None, current_epsilon, None, None, current_progress, False, False
 
     location = measured.index(max(measured))
     candidate = _grow_clone(
@@ -648,7 +648,7 @@ def _select_realizable_progress_growth(
         function_preserving,
     )
     if candidate is None:
-        return None, current_epsilon, None, None, current_progress, False
+        return None, current_epsilon, None, None, current_progress, False, False
 
     delta_parameters = count_parameters(candidate) - count_parameters(model)
     if parameter_budget is not None and count_parameters(candidate) > parameter_budget:
@@ -658,7 +658,7 @@ def _select_realizable_progress_growth(
                 f"[REALIZABLE-GROWTH] location={location} rejected by parameter "
                 f"budget; delta_params={delta_parameters}"
             )
-        return None, current_epsilon, None, None, current_progress, True
+        return None, current_epsilon, None, None, current_progress, True, False
 
     candidate_epsilon, candidate_system = _relative_error_and_system(
         candidate, x, y, config.fgd_approx
@@ -704,14 +704,35 @@ def _select_realizable_progress_growth(
         )
 
     improvement_floor = float(config.fgd_approx.eps)
+    if not finite and not current_progress.certified_progress > 0.0:
+        # ABSTAIN, which is not the same as refusing. Both endpoints score
+        # zero, so the comparison that authorises growth carries no
+        # information: it is comparing two zeros, and `delta_progress` is a
+        # signed -0.0 that only looks like a verdict. Treating that as a
+        # refusal is what froze full MNIST -- MEASURED on run 2kbo8rf4,
+        # train_loss identical to the last digit for 35 consecutive epochs,
+        # with eps 0.288 certifying, rel_err 0.356 admissible, and every eta
+        # rejected by the endpoint transaction. Refusing growth while no step
+        # can certify is the deadlock the ordinary path already asserts
+        # against below; this criterion must not be the one that reintroduces
+        # it. Hand the turn to the eps argmin instead of ending the search.
+        increment("certify_realizable_abstentions")
+        if progress is not None:
+            progress(
+                "[REALIZABLE-GROWTH] abstained: neither the current model nor "
+                "the candidate realizes certified progress, so the comparison "
+                "is uninformative; deferring to the epsilon argmin"
+            )
+        return None, current_epsilon, None, None, current_progress, False, True
     if not finite or not delta_progress > improvement_floor:
-        return None, current_epsilon, None, None, current_progress, False
+        return None, current_epsilon, None, None, current_progress, False, False
     return (
         candidate,
         candidate_epsilon,
         location,
         candidate_system,
         candidate_progress,
+        False,
         False,
     )
 
@@ -937,7 +958,8 @@ def grow_until_certified(
             parameter_budget=parameter_budget,
             progress=progress,
         )
-        if selected[0] is None:
+        abstained = selected[6]
+        if selected[0] is None and not abstained:
             reason = (
                 "parameter_budget"
                 if selected[5]
@@ -952,10 +974,32 @@ def grow_until_certified(
                 stop_reason=reason,
                 growth_target=target,
             )
-        realizable_entry = True
-        warranted_entry = True
-        entered_voluntarily = True
-        realizable_candidate = selected
+        if abstained:
+            # The criterion had no opinion, so it must not be the one that
+            # ends the search. Fall through with the SAME forced-entry
+            # machinery the lookahead already uses and let the exhaustive eps
+            # argmin decide -- exactly the behaviour that predates this
+            # criterion. It cannot run away: this state is only reachable when
+            # no eta realizes a step at all, and the moment one does
+            # current_progress.certified_progress is positive and the strict
+            # comparison above governs again. The parameter budget still caps
+            # it from above.
+            #
+            # The invariant this restores, stated the same way the ordinary
+            # path states it below: refusing growth while no step can certify
+            # is the deadlock this whole design exists to avoid. An abstention
+            # that stopped the search would be exactly that refusal.
+            assert not realizable_entry and realizable_candidate is None, (
+                "an abstention must reach the epsilon argmin, not commit a "
+                "realizable candidate"
+            )
+            warranted_entry = True
+            entered_voluntarily = True
+        else:
+            realizable_entry = True
+            warranted_entry = True
+            entered_voluntarily = True
+            realizable_candidate = selected
 
     while (
         epsilon >= target or forced_remaining > 0 or warranted_entry
@@ -1075,6 +1119,7 @@ def grow_until_certified(
                 best_system,
                 _,
                 budget_exhausted,
+                _,
             ) = realizable_candidate
             realizable_candidate = None
         else:
