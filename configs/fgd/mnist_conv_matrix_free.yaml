@@ -384,9 +384,22 @@ fgd_approx:
   # shrinks only 10 % per step. MEASURED with the full step delivered: 0.95
   # sent train_loss 0.0917 -> 0.3991 and validation accuracy 0.248 -> 0.123.
   certify_optimal_rate: true
-  # Nothing to resample: probe_batches covers the entire training set, so the
-  # certificate is exact over all of it rather than over a draw from it.
+  # This comment used to read "nothing to resample: probe_batches covers the
+  # entire training set". It is FALSE here too: probe_batches 11 * batch_size
+  # 64 = 704 of mnist_train_samples 10000, i.e. 7%. The base is the sample the
+  # certified steps are FITTED on, so with it fixed they interpolate it and it
+  # stops standing for the population. MEASURED on this very config
+  # (runs/log/convA.log), probe functional per image against full-train
+  # functional per image: 3.72x at the first transaction, 9.40x by the 25%
+  # mark, and 9.74x at the end. The linear config reached 14.2x at 1.4%
+  # coverage, so the two agree: the smaller the fraction, the worse the bias.
+  #
+  # probe_resample stays false because it rebuilds the WHOLE probe and would
+  # discard the counterexamples with it. certify_probe_base_resample redraws
+  # the base and keeps the counterexample memory, which is where the
+  # monotonicity the refinement relies on actually has to hold.
   probe_resample: false
+  certify_probe_base_resample: true
   certify_realize_path: true
   # Adaptive early stop: 138 of ~200 steps ran the full 40 inner solves without
   # reaching tolerance, but the late iterations barely move the residual. Stop
@@ -472,6 +485,22 @@ fgd_approx:
   certify_probe_refine_on_transaction_mismatch: true
   certify_probe_refine_batches_per_round: 1
   certify_probe_refine_max_rounds: 16
+  # ...and a ROW budget, because the round cap is TERMINAL: once spent the
+  # mechanism is off for the rest of the run and the probe drifts back into the
+  # 9.74x bias above. MEASURED on the linear sibling (yqfvy8l7):
+  # "stop_reason=probe_refinement_exhausted round=16 max_rounds=16" at epoch 6
+  # with mismatches still firing every outer step. What costs is the probe SIZE,
+  # so the honest budget bounds the memory by rows and evicts the least
+  # violating counterexample instead of terminating. 2560 = 4 batches * 64
+  # images * K 10, scaled to this config's smaller probe and 5000-parameter
+  # budget rather than copied from the linear one.
+  certify_probe_refine_max_rows: 2560
+  # Insurance, not a fix here. rank(J) <= min(NK, P), so NK > P forbids the
+  # spurious eps; the linear config crossed that floor and read eps 0.009 while
+  # validation said 1.02. This config does not cross it TODAY -- P is capped at
+  # 5000 and NK starts at 7040 -- but the sizing that let it happen there is the
+  # same sizing running here, so the floor goes in before the budget ever moves.
+  certify_probe_parameter_floor: 1.25
   # Let a NEW LAYER compete with the widenings, in the same measured
   # bottleneck per parameter. This is the B arm; false is the A arm and runs
   # the width-only branch exactly as before.

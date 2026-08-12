@@ -7326,17 +7326,25 @@ def run_pipeline(
                                     relative_error=_epsilon,
                                 )
 
-                            def _probe_diagnostic(candidate_model, system, epsilon):
+                            # The live probe's own row count, not the system's:
+                            # a system may carry a (rank+1) x P surrogate, and
+                            # reading NK off it would report the surrogate's
+                            # height in the very diagnostic that exists to catch
+                            # NK falling below P. Bound as a default argument so
+                            # the closure captures THIS outer step's probe.
+                            def _probe_diagnostic(
+                                candidate_model,
+                                system,
+                                epsilon,
+                                _probe_rows=int(fgd_train_probe[1].numel()),
+                            ):
                                 assert progress is not None
                                 _log_certification_probe(
                                     candidate_model,
                                     system,
                                     epsilon,
                                     progress,
-                                    # The live probe's own row count, not the
-                                    # system's: under certify_stream_gram the
-                                    # system is a (rank+1) x P surrogate.
-                                    probe_rows=int(fgd_train_probe[1].numel()),
+                                    probe_rows=_probe_rows,
                                 )
 
                             _family_step = None

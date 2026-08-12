@@ -149,6 +149,23 @@ def test_mnist_conv_inherits_config_2s_optimisation_set() -> None:
         # as full MNIST does; config 2 remains the unmodified reference.
         "certify_probe_refine_on_transaction_mismatch",
         "certify_probe_refine_max_rounds",
+        # The probe's two failure modes, both MEASURED, both answered here and
+        # not in config 2.
+        #
+        # A base fixed for the whole run is the sample the certified steps are
+        # FITTED on, so they interpolate it. MEASURED on this config
+        # (runs/log/convA.log): probe functional per image against full-train
+        # went 3.72x -> 9.74x, on a probe covering 7% of the data.
+        "certify_probe_base_resample",
+        # The round cap is TERMINAL -- once spent the refinement is off for the
+        # rest of the run. A row budget with eviction bounds the cost without
+        # ever switching the mechanism off.
+        "certify_probe_refine_max_rows",
+        # Sizing by rank alone has a fixed point (rank(J) <= NK, and the rank is
+        # measured ON the probe). MEASURED on the linear sibling: NK/P fell to
+        # 0.45 and eps collapsed 0.44 -> 0.009 with validation still at 1.02.
+        # Insurance here, since P is capped at 5000 and NK starts at 7040.
+        "certify_probe_parameter_floor",
         # A zero-output-weight Conv extension is algebraically exact, but
         # changing channel shape changes float32/cuDNN reduction order. Keep
         # its measured roundoff allowance local to Conv.

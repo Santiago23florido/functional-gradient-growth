@@ -122,13 +122,18 @@ def test_only_deadlocked_mnist_matrix_free_runs_enable_new_options() -> None:
     assert conv.certify_probe_refine_max_rounds == 16
     validate_probe_refinement(conv)
 
-    # The unbiased base and the row budget are the full-MNIST answer to the
-    # MEASURED 14.2x probe/population gap. They are confined to that one
-    # experiment: nothing under configs/fgd may reach them, conv included.
+    # The unbiased base answers a defect MEASURED on BOTH: 14.2x probe/
+    # population on full MNIST at 1.4% coverage, 9.74x on the conv at 7%. The
+    # row budgets differ because the probes and the parameter budgets do
+    # (100000 against 5000), not because the two disagree about the defect.
     assert full.certify_probe_base_resample is True
+    assert conv.certify_probe_base_resample is True
     assert full.certify_probe_refine_max_rows == 6400
-    assert conv.certify_probe_base_resample is False
-    assert conv.certify_probe_refine_max_rows == 0
+    assert conv.certify_probe_refine_max_rows == 2560
+    # The parameter floor is a live fix on full MNIST (NK/P reached 0.45 there)
+    # and insurance on the conv, whose 5000-parameter cap keeps NK/P above 1.
+    assert full.certify_probe_parameter_floor == 1.25
+    assert conv.certify_probe_parameter_floor == 1.25
 
     for path in Path("configs/fgd").glob("*.yaml"):
         config = load_pipeline_config(path).fgd_approx
@@ -138,8 +143,11 @@ def test_only_deadlocked_mnist_matrix_free_runs_enable_new_options() -> None:
         assert config.certify_probe_refine_on_transaction_mismatch is expected, path
         assert config.certify_probe_refine_batches_per_round == 1, path
         assert config.certify_probe_refine_max_rounds == (16 if expected else 0), path
-        assert config.certify_probe_base_resample is False, path
-        assert config.certify_probe_refine_max_rows == 0, path
+        # Only the conv opts in; every other catalog config keeps the defaults,
+        # which is what keeps N1024 and CIFAR byte-identical.
+        assert config.certify_probe_base_resample is expected, path
+        assert config.certify_probe_refine_max_rows == (2560 if expected else 0), path
+        assert config.certify_probe_parameter_floor == (1.25 if expected else 0.0), path
 
 
 @pytest.mark.parametrize(
@@ -168,6 +176,8 @@ def test_n1024_growth_settings_remain_at_their_defaults(
     assert config.certify_probe_refine_max_rounds == 0
     assert config.certify_probe_base_resample is False
     assert config.certify_probe_refine_max_rows == 0
+    assert config.certify_probe_parameter_floor == 0.0
+    assert config.matrix_free_block_chunk == 0
     assert config.transactional_realized_descent is transactional
 
 
