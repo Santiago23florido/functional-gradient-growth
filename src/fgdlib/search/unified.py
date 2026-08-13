@@ -51,6 +51,7 @@ __all__ = [
     "Candidate",
     "expansion_value",
     "rank_candidates",
+    "rank_candidates_by_bottleneck_per_parameter",
     "rank_candidates_by_certified_gain",
 ]
 
@@ -239,6 +240,64 @@ def rank_candidates(
     reference = min(statistical_threshold, best)
     admitted = [item for item in scored if item[0] >= reference]
     admitted.sort(key=lambda item: (-item[0], item[1].kind, item[1].index))
+    return [candidate for _, candidate in admitted]
+
+
+def rank_candidates_by_bottleneck_per_parameter(
+    candidates: list[Candidate],
+    *,
+    bottlenecks: dict[tuple[str, int], float],
+    min_gain_fraction: float = 0.25,
+    cost_exponent: float = 1.0,
+) -> list[Candidate]:
+    """Arbitrate WIDENING against INSERTING A LAYER, in one measured quantity.
+
+    Both kinds are scored by the same thing: TINY's extension term
+    ``activation_gradient * sum(s_i**2)``, measured AT the candidate's own
+    location, on the model that candidate produces.
+
+    That the two are comparable is not an analogy, it is a consequence of
+    function preservation. A width extension enters with ``omega = 0`` and an
+    inserted layer enters as an identity weight with ``alpha = 0``, so neither
+    moves ``f``. The residual ``r`` is therefore IDENTICAL for every candidate,
+    and the bottleneck at each location means the same sentence in both cases:
+    the mass of the desired functional change that the absent capacity there
+    would capture. Nothing is being converted between units.
+
+    Two guards, in this order, and the order is the point -- it is the same
+    argument :func:`rank_candidates_by_certified_gain` makes at :274:
+
+    * the RAW bottleneck must reach ``min_gain_fraction`` of the best on
+      offer, checked BEFORE dividing by cost, so cheap-and-nearly-useless is
+      eliminated before ``1/cost`` can rescue it;
+    * only then does ``raw / cost**cost_exponent`` decide, so the cheaper of
+      two genuinely comparable buys still wins. ``cost_exponent = 0`` collapses
+      this to a pure argmax over the admitted, which is the natural
+      "balance on, price off" arm of an A/B.
+
+    Both knobs already exist and are already justified, so this criterion
+    introduces no new constant. A candidate with no measurement, or one whose
+    location expresses everything asked of it, scores zero and is never
+    admitted; if none is admitted the list is empty and the caller buys
+    nothing, exactly as the width-only rule does when every bottleneck is 0.
+    """
+    scored: list[tuple[float, Candidate]] = []
+    for candidate in candidates:
+        raw = float(bottlenecks.get((candidate.kind, candidate.index), 0.0))
+        if raw > 0.0 and math.isfinite(raw):
+            scored.append((raw, candidate))
+    if not scored:
+        return []
+
+    best = max(raw for raw, _ in scored)
+    floor = min_gain_fraction * best
+    admitted = [item for item in scored if item[0] >= floor]
+
+    def _rate(item: tuple[float, Candidate]) -> float:
+        raw, candidate = item
+        return raw / max(float(candidate.cost), 1.0) ** cost_exponent
+
+    admitted.sort(key=lambda item: (-_rate(item), item[1].kind, item[1].index))
     return [candidate for _, candidate in admitted]
 
 

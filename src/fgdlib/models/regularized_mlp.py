@@ -34,15 +34,66 @@ from fgdlib.gromo_setup import ensure_gromo_importable
 
 ensure_gromo_importable()
 
-from gromo.modules.growing_dropout import GrowingDropout
+from gromo.modules.growing_dropout import (
+    GrowingDropout,
+    GrowingDropout1d,
+    GrowingDropout2d,
+)
 
-from gromo.modules.growing_normalisation import GrowingBatchNorm1d
+from gromo.modules.growing_normalisation import (
+    GrowingBatchNorm,
+    GrowingBatchNorm1d,
+    GrowingBatchNorm2d,
+)
+from gromo.utils.utils import known_activations_zero_plus_gradient
 
 __all__ = [
+    "GrowingDropoutFlat",
+    "make_conv_post_function",
     "make_hidden_post_function",
     "make_post_layer_function",
     "sync_normalization",
 ]
+
+
+class GrowingDropoutFlat(GrowingDropout, nn.Dropout):
+    """Element-wise growth-safe dropout for a flat ``(N, features)`` activation.
+
+    GroMo's ``GrowingDropout`` is an ABSTRACT base: it derives from
+    ``nn.modules.dropout._DropoutNd``, which supplies no ``forward``, and
+    contributes only ``extended_forward`` (pass the extension through
+    unchanged, so dropout never zeroes the growth). The concrete classes it
+    ships are ``GrowingDropout1d`` and ``GrowingDropout2d``, both CHANNEL
+    dropout: ``nn.Dropout1d`` reads a 2-D tensor as ``(C, L)``, not
+    ``(N, features)``, so neither is the element-wise dropout a hidden MLP
+    layer wants.
+
+    This composes the mixin with ``nn.Dropout`` exactly the way GroMo composes
+    its own two, which is the smallest thing that is both concrete and
+    correct here.
+    """
+
+
+# Declare dropout's derivative at 0+ instead of letting GroMo estimate it.
+#
+# ``GrowingModule.activation_gradient`` walks the post-function Sequential,
+# looks each entry up in this table, skips ``_BatchNorm``, and for anything
+# else warns and computes ``torch.func.grad(module)(eps)`` on a 0-D scalar.
+# For dropout that estimate is a COIN FLIP: measured on a conv stack, eval
+# gives 1.0507 (dropout is the identity there) but train gives 0.0 whenever
+# the single probed element is the one dropped -- and the result is MEMOISED
+# in ``_activation_gradient_previous_module``. Since the ``where`` rule is
+# ``activation_gradient * sum(s_i**2)``, a cached 0.0 silently removes a layer
+# from consideration for the rest of the run.
+#
+# Dropout is the identity in expectation and exactly the identity in eval,
+# which is where every certificate and every statistics pass runs, so 1.0 is
+# the honest constant. Registering it also removes the warning, which matters:
+# a warning that fires routinely is a warning nobody reads.
+known_activations_zero_plus_gradient.setdefault(GrowingDropoutFlat, 1.0)
+known_activations_zero_plus_gradient.setdefault(GrowingDropout2d, 1.0)
+known_activations_zero_plus_gradient.setdefault(GrowingDropout1d, 1.0)
+
 
 
 def make_hidden_post_function(
@@ -63,21 +114,30 @@ def make_hidden_post_function(
         activation,
     ]
     if dropout_rate > 0.0:
-        modules.append(GrowingDropout(dropout_rate=dropout_rate))
+        modules.append(GrowingDropoutFlat(dropout_rate=dropout_rate))
     return nn.Sequential(*modules)
 
 
-def _hidden_norm(post_function: nn.Module | None) -> GrowingBatchNorm1d | None:
+def _hidden_norm(post_function: nn.Module | None) -> GrowingBatchNorm | None:
     """The growable batch-norm inside a hidden post-function, if any.
 
     Handles both a bare batch-norm and the ``Sequential`` post-function
-    :func:`make_hidden_post_function` builds.
+    :func:`make_hidden_post_function` / :func:`make_conv_post_function` build.
+    Matches the shared ``GrowingBatchNorm`` base so the 1-D and 2-D variants
+    are found by the same walk -- the conv stack needs the 2-D one, and it
+    normalises channels exactly as the 1-D one normalises features.
+
+    ``GrowingGroupNorm`` is deliberately NOT matched: no stack token builds
+    one, its channel count lives under a different attribute, and its
+    ``grow`` additionally requires the new total to stay divisible by the
+    group count. Adding untested support for an unreachable case would be
+    speculation.
     """
-    if isinstance(post_function, GrowingBatchNorm1d):
+    if isinstance(post_function, GrowingBatchNorm):
         return post_function
     if isinstance(post_function, nn.Sequential):
         for module in post_function:
-            if isinstance(module, GrowingBatchNorm1d):
+            if isinstance(module, GrowingBatchNorm):
                 return module
     return None
 
@@ -98,14 +158,39 @@ def sync_normalization(model: nn.Module) -> None:
         norm = _hidden_norm(getattr(layer, "post_layer_function", None))
         if norm is None:
             continue
+        _check_norm_rank(layer, norm)
+        # ``out_features`` is ``out_channels`` on a Conv2dGrowingModule, which
+        # is exactly the norm's ``num_features``; no conv special case needed.
         width = int(layer.out_features)
         current = int(norm.num_features)
         if width > current:
             norm.grow(width - current)
 
 
+def _check_norm_rank(layer: nn.Module, norm: GrowingBatchNorm) -> None:
+    """Refuse a 1-D norm on a conv layer, or a 2-D one on a linear layer.
+
+    Both would grow to the right WIDTH and then fail, or worse not fail, at
+    forward time on the wrong tensor rank. Silence here would surface far
+    away from the cause.
+    """
+    from gromo.modules.conv2d_growing_module import Conv2dGrowingModule
+
+    spatial = isinstance(layer, Conv2dGrowingModule)
+    if spatial and not isinstance(norm, GrowingBatchNorm2d):
+        raise TypeError(
+            f"{type(layer).__name__} '{getattr(layer, 'name', '?')}' carries a "
+            f"{type(norm).__name__}; a conv layer needs GrowingBatchNorm2d."
+        )
+    if not spatial and isinstance(norm, GrowingBatchNorm2d):
+        raise TypeError(
+            f"{type(layer).__name__} '{getattr(layer, 'name', '?')}' carries a "
+            "GrowingBatchNorm2d; a linear layer needs GrowingBatchNorm1d."
+        )
+
+
 def make_post_layer_function(
-    activation: nn.Module, dropout_rate: float
+    activation: nn.Module, dropout_rate: float, spatial: bool = False
 ) -> nn.Module:
     """Return the hidden-layer post-function: activation, plus dropout if asked.
 
@@ -115,7 +200,34 @@ def make_post_layer_function(
     for the same reason :func:`make_hidden_post_function` is: GroMo reads a
     Sequential's activation gradient correctly (the activation's known
     derivative), where a custom module forces a numerical fallback.
+
+    ``spatial`` picks channel dropout (``GrowingDropout2d``) for a conv layer,
+    where dropping individual pixels is nearly a no-op because neighbours are
+    correlated. It changes nothing when ``dropout_rate == 0``.
     """
     if dropout_rate <= 0.0:
         return activation
-    return nn.Sequential(activation, GrowingDropout(dropout_rate=dropout_rate))
+    dropout_type = GrowingDropout2d if spatial else GrowingDropoutFlat
+    return nn.Sequential(activation, dropout_type(dropout_rate=dropout_rate))
+
+
+def make_conv_post_function(
+    num_features: int,
+    activation: nn.Module,
+    dropout_rate: float,
+    device: torch.device | None = None,
+) -> nn.Sequential:
+    """``Sequential(BatchNorm2d, activation[, Dropout2d])`` for a conv layer.
+
+    The 2-D counterpart of :func:`make_hidden_post_function`, and a Sequential
+    for the same reason: GroMo walks a Sequential looking up each entry's
+    derivative at 0+ and skipping ``_BatchNorm``, so the arrangement keeps the
+    exact SELU constant instead of a numerical estimate.
+    """
+    modules: list[nn.Module] = [
+        GrowingBatchNorm2d(num_features, device=device),
+        activation,
+    ]
+    if dropout_rate > 0.0:
+        modules.append(GrowingDropout2d(dropout_rate=dropout_rate))
+    return nn.Sequential(*modules)

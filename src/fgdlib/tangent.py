@@ -23,6 +23,7 @@ import torch
 from torch.func import functional_call, jacrev, jvp
 
 from gromo.containers.growing_mlp import GrowingMLP
+from gromo.containers.sequential_growing_container import SequentialGrowingModel
 from gromo.modules.linear_growing_module import LinearGrowingModule
 from gromo.utils.training_utils import compute_statistics
 
@@ -740,6 +741,20 @@ class FGDApproxConfig:
     #: three-hidden-layer family the reference and the exhaustive architecture
     #: search both live in.
     growth_where_allow_depth: bool = False
+    #: Let a DEPTH proposal compete with the width proposals under
+    #: ``growth_where: expressivity_bottleneck``, ranked by the same measured
+    #: bottleneck per parameter (``unified.rank_candidates_by_bottleneck_per_
+    #: parameter``). Off by default, and when off the branch runs exactly as
+    #: before -- the depth trials are still built and still discarded, which
+    #: is deliberate: constructing them consumes the global RNG, so skipping
+    #: the construction would shift every later draw and break the pin.
+    #:
+    #: Why this needs to exist at all: GroMo's topology pins some widths
+    #: outright. A conv whose consumer sits behind a pool, or a linear layer
+    #: behind a flatten, can never be widened however badly it is the
+    #: bottleneck -- the only relief is a new layer. A width-only rule cannot
+    #: express that trade, so it silently spends elsewhere forever.
+    growth_where_balance: bool = False
     #: Keep buying at the chosen location while each increment still pays.
     #: This is the HOW MUCH replacement; without it growth is one neuron per
     #: epoch and cannot reach the reference's widths in its epoch budget.
@@ -902,6 +917,19 @@ class FGDApproxConfig:
     # statement about the training loss and a statement about 256 points.
     # 0 disables chunking.
     jacobian_row_chunk: int = 0
+    #: How many directions ride through ONE ``vmap`` on the matrix-free path.
+    #: 0 keeps the unchunked call, so every existing run is byte-identical.
+    #:
+    #: The range finder asks for a block of ``rank + oversampling`` directions
+    #: -- of order ``P`` -- and ``vmap`` holds the full forward activations for
+    #: all of them at once. On an MLP an activation is ``(N, width)``; on a
+    #: conv it is ``(N, C, H, W)``, larger by the spatial extent. MEASURED on
+    #: the N=1024 MNIST conv stack that is 12.8 MB PER DIRECTION PER LAYER, so
+    #: the block at the 2500-parameter budget asks for tens of GB and takes the
+    #: machine down. The directions in a block are independent, so chunking is
+    #: a loop and cannot change the result mathematically; in floating point it
+    #: moves by one ulp, because the reduction order depends on the batch size.
+    matrix_free_block_chunk: int = 0
     certify_realize_path: bool = False
     certify_realize_max_iterations: int = 40
     certify_realize_tolerance: float = 0.05
@@ -976,6 +1004,113 @@ class FGDApproxConfig:
     # instead holds the probe above the interpolation floor by construction and
     # leaves the eps formula -- and every synthetic certificate -- untouched.
     certify_probe_kappa: float = 0.0
+    # Scalar-only observability for the rank-sized certification probe. The
+    # pipeline logs P, NK, numerical rank(J), NK/rank(J), and eps from the
+    # exact system already built for certification. Off by default, so neither
+    # probe sizing nor any existing experiment pays for the diagnostic SVD.
+    certify_probe_diagnostics: bool = False
+    # Value a function-preserving structural increment by the certified
+    # functional decrease it can REALISE, rather than requiring eps to fall.
+    # This is deliberately an opt-in deadlock gate for the isolated
+    # matrix-free tangent path: after a finite step failure it compares the
+    # current model with the expressivity-bottleneck growth using the existing
+    # damping, linearisation, realization, and full-train transaction. The
+    # default leaves grow_until_certified's exact eps argmin byte-identical.
+    certify_realizable_progress_growth: bool = False
+    # Counterexample-guided refinement of the matrix-free certification probe.
+    # A rejected realized endpoint may expose a genuine sample contradiction:
+    # the endpoint lowers the probe functional while increasing the frozen
+    # full-training functional.  When enabled, the worst offending full-train
+    # batches are appended to the probe and the direction is re-certified from
+    # the unchanged parameter state.  Off by default so every existing probe,
+    # tangent system and growth decision remains byte-identical.
+    certify_probe_refine_on_transaction_mismatch: bool = False
+    # Number of new, distinct violating batches appended per refinement.
+    certify_probe_refine_batches_per_round: int = 1
+    # Hard limit on refinements of one run.  Zero is the disabled default; an
+    # enabled configuration must choose a positive, explicit budget.
+    certify_probe_refine_max_rounds: int = 0
+    # Redraw the BASE of the adaptive probe every outer step, keeping the
+    # discovered counterexamples. A base fixed for the whole run turns the
+    # method into Newton's method on one subsample: the certified steps are
+    # fitted ON that base, drive its residual to zero, and it stops
+    # representing the population. MEASURED on full MNIST (run 2kbo8rf4, the
+    # base is 448 of 50000 images): the probe functional per image falls to
+    # 0.1859 while the full-train one sits at 2.6388, a factor of 14.2, reached
+    # by transaction ~50. Every certificate downstream then reads that biased
+    # sample -- eps, the growth argmin and the endpoint transaction alike --
+    # and the run freezes with train_loss identical to the last digit for 35
+    # epochs. Redrawing makes the functional gradient an unbiased estimate of
+    # the population one, which is the object the theory is about; the
+    # monotone union the refinement needs is over the COUNTEREXAMPLES, which
+    # this leaves untouched. Off by default so every existing probe is
+    # byte-identical.
+    certify_probe_base_resample: bool = False
+    # FLOOR on the certification probe expressed against the PARAMETER count,
+    # as a companion to certify_probe_kappa's rank-based sizing.
+    #
+    # Sizing by rank alone has a fixed point, because rank(J) <= NK by
+    # construction and the rank is MEASURED on the current probe: a small probe
+    # yields a small rank, which reports "no more rows are needed", which keeps
+    # the probe small. MEASURED on full MNIST (run unguzxkq), the fixed point
+    # closing while P triples:
+    #
+    #   P=1612   NK=3840  rank=624   NK/P=2.38  eps=0.441
+    #   P=4283   NK=5120  rank=1107  NK/P=1.20  eps=0.398
+    #   P=9383   NK=5760  rank=602   NK/P=0.61  eps=0.0131
+    #   P=12869  NK=5760  rank=161   NK/P=0.45  eps=0.0410
+    #
+    # The rank falls from 1249 to 161 as P triples, so the criterion asks for
+    # FEWER rows exactly when more are needed; NK freezes at 5760 while P
+    # reaches 14487. eps collapses from 0.44 to 0.009 as NK/P crosses 1 while
+    # the validation relative error stays at 1.02 -- the spurious zero the
+    # config comments describe in terms of NK/P, not NK/rank.
+    #
+    # rank(J) <= min(NK, P), so NK > P forbids interpolation outright. A value
+    # slightly above 1 buys margin; MEASURED against the trajectory above, 1.25
+    # leaves every step with NK/P >= 1.51 byte-identical and first intervenes
+    # at P=4283 by 4.6% more rows. Zero keeps the rank-only sizing exactly as
+    # it is, which is what CIFAR wants (there rank << P genuinely).
+    certify_probe_parameter_floor: float = 0.0
+    # Let the VALIDATION certificate honour ``family_order`` too.
+    #
+    # ``evaluate_fgd_validation_certificate`` calls
+    # ``_compute_tangent_projection_step``, which dispatches on
+    # ``projection_solver`` and NEVER on ``family_order``. So a config whose
+    # whole point is the matrix-free route still materialises a dense
+    # ``NK x P`` Jacobian for its validation certificate and runs an SVD on it.
+    #
+    # MEASURED on run 1g0895r3: ``tangent_projection_solve_seconds`` was
+    # 12129 of 12135 total -- 99.95% of a four-hour run -- over 123 calls at
+    # ~98.6 s each, on a 14080 x 10841 Jacobian. And it is where the run DIED:
+    # that SVD runs in float32 (``projection_fast_factorization``), cusolver
+    # failed to converge, and the non-finite update killed the job at epoch 6.
+    #
+    # ``factored_projection_solve`` answers the same question from the factors
+    # the matrix-free system already produces, at ``k x k`` instead of a dense
+    # SVD. MEASURED against the dense route with the SAME
+    # ``_output_relative_error_from_tensors`` on both sides:
+    #
+    #   P= 3230  dense 8.7s eps 0.536476 | factored 1.8s eps 0.536129  4.80x
+    #   P= 4864  dense19.2s eps 0.480861 | factored 4.9s eps 0.480447  3.87x
+    #   P= 6514  dense36.7s eps 0.387405 | factored12.3s eps 0.386774  2.98x
+    #
+    # eps agrees to 3-6e-04 against a 0.5 bar, and the directional cosine is
+    # identical to four decimals. Off by default, so every existing
+    # certificate is byte-identical, and it only takes effect on
+    # ``family_order: [matrix_free_tangent]`` where the factors exist at all.
+    certify_validation_factored: bool = False
+    # Bound the counterexample memory by ROWS instead of terminating on a round
+    # count. certify_probe_refine_max_rounds is a terminal cap: once spent the
+    # mechanism is off for the rest of the run and the probe drifts back into
+    # the bias above (MEASURED, run yqfvy8l7: "stop_reason=
+    # probe_refinement_exhausted round=16 max_rounds=16" at epoch 6 with
+    # mismatches still firing every outer step). What actually costs is the
+    # probe SIZE -- the matrix-free dual is O((NK)^2) -- so the honest budget
+    # is a row bound with eviction of the least-violating counterexample, which
+    # keeps the mechanism alive forever at bounded cost. Zero keeps the
+    # round-terminated behaviour byte-identical.
+    certify_probe_refine_max_rows: int = 0
     # Adaptive growth COUNT. The grow-to-certify loop adds a FIXED
     # tiny_maximum_added_neurons per growth, so on a hard task (CIFAR) reaching a
     # certifying width takes hundreds of full location scans -- one neuron at a
@@ -1290,6 +1425,108 @@ def validate_growth_lookahead_entry(config: FGDApproxConfig) -> None:
             "fgd_approx.certify_growth_lookahead_entry requires "
             "certify_growth_lookahead: true -- it authorises the SAME "
             "predicate, so without it there is nothing to authorise."
+        )
+
+
+def validate_realizable_progress_growth(config: FGDApproxConfig) -> None:
+    """Confine realizability-aware growth to its matrix-free experiment."""
+    if not config.certify_realizable_progress_growth:
+        return
+    if tuple(config.family_order) != ("matrix_free_tangent",):
+        raise ValueError(
+            "fgd_approx.certify_realizable_progress_growth is restricted to "
+            "family_order: [matrix_free_tangent]."
+        )
+    if config.growth_where != "expressivity_bottleneck":
+        raise ValueError(
+            "fgd_approx.certify_realizable_progress_growth requires "
+            "growth_where: expressivity_bottleneck."
+        )
+    if not config.grow_to_certify or not config.certify_function_preserving:
+        raise ValueError(
+            "fgd_approx.certify_realizable_progress_growth requires "
+            "grow_to_certify and certify_function_preserving to be true."
+        )
+    if not config.certify_realize_path or not config.transactional_realized_descent:
+        raise ValueError(
+            "fgd_approx.certify_realizable_progress_growth requires "
+            "certify_realize_path and transactional_realized_descent to be true."
+        )
+    if config.certify_force_growth_on_finite_step_failure:
+        raise ValueError(
+            "fgd_approx.certify_realizable_progress_growth cannot be combined "
+            "with certify_force_growth_on_finite_step_failure: growth must be "
+            "authorised by measured certified realizable progress."
+        )
+
+
+def validate_probe_refinement(config: FGDApproxConfig) -> None:
+    """Confine adaptive probe refinement to the protected matrix-free path."""
+    batches = config.certify_probe_refine_batches_per_round
+    if isinstance(batches, bool) or not isinstance(batches, int) or batches < 1:
+        raise ValueError(
+            "fgd_approx.certify_probe_refine_batches_per_round must be a "
+            "positive integer."
+        )
+    rounds = config.certify_probe_refine_max_rounds
+    if isinstance(rounds, bool) or not isinstance(rounds, int) or rounds < 0:
+        raise ValueError(
+            "fgd_approx.certify_probe_refine_max_rounds must be a non-negative "
+            "integer."
+        )
+    rows = config.certify_probe_refine_max_rows
+    if isinstance(rows, bool) or not isinstance(rows, int) or rows < 0:
+        raise ValueError(
+            "fgd_approx.certify_probe_refine_max_rows must be a non-negative "
+            "integer."
+        )
+    if not config.certify_probe_refine_on_transaction_mismatch:
+        if config.certify_probe_base_resample:
+            raise ValueError(
+                "fgd_approx.certify_probe_base_resample requires "
+                "certify_probe_refine_on_transaction_mismatch: the resampled "
+                "base is only meaningful alongside the monotone counterexample "
+                "memory that keeps the discovered contradictions."
+            )
+        if rows:
+            raise ValueError(
+                "fgd_approx.certify_probe_refine_max_rows requires "
+                "certify_probe_refine_on_transaction_mismatch."
+            )
+        return
+    if rounds < 1 and rows < 1:
+        raise ValueError(
+            "fgd_approx.certify_probe_refine_max_rounds must be positive when "
+            "adaptive probe refinement is enabled, unless "
+            "certify_probe_refine_max_rows bounds the memory instead."
+        )
+    if tuple(config.family_order) != ("matrix_free_tangent",):
+        raise ValueError(
+            "fgd_approx.certify_probe_refine_on_transaction_mismatch is "
+            "restricted to family_order: [matrix_free_tangent]."
+        )
+    if not config.transactional_realized_descent or not config.certify_realize_path:
+        raise ValueError(
+            "fgd_approx.certify_probe_refine_on_transaction_mismatch requires "
+            "certify_realize_path and transactional_realized_descent to be true."
+        )
+    if not config.certify_realizable_progress_growth:
+        raise ValueError(
+            "fgd_approx.certify_probe_refine_on_transaction_mismatch requires "
+            "certify_realizable_progress_growth so a consistent probe is valued "
+            "before structural growth."
+        )
+    if config.probe_resample:
+        # probe_resample rebuilds the WHOLE probe and would drop the
+        # counterexamples with it. The adaptive path owns its probe, so
+        # redrawing is expressed by certify_probe_base_resample instead: it
+        # redraws the base and keeps the counterexample memory, which is where
+        # the monotonicity actually has to hold.
+        raise ValueError(
+            "fgd_approx.certify_probe_refine_on_transaction_mismatch requires "
+            "probe_resample: false so discovered counterexamples remain in a "
+            "monotone probe union; use certify_probe_base_resample to redraw "
+            "the base without discarding them."
         )
 
 
@@ -1958,7 +2195,7 @@ def tiny_optimal_update_kwargs(
     }
 
 
-def _cleanup_tiny_update(model: GrowingMLP) -> None:
+def _cleanup_tiny_update(model: SequentialGrowingModel) -> None:
     model.reset_computation()
     for layer in getattr(model, "_growing_layers", []):
         if hasattr(layer, "delete_update"):
@@ -1968,7 +2205,7 @@ def _cleanup_tiny_update(model: GrowingMLP) -> None:
 
 
 def _forward_with_tiny_update(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     x: torch.Tensor,
 ) -> torch.Tensor:
     """Forward the temporary layer delta all the way to the network output."""
@@ -3378,7 +3615,7 @@ def _factored_relative_error_estimate(
 
 
 @contextmanager
-def _suspended_module_capture(model: GrowingMLP):
+def _suspended_module_capture(model: SequentialGrowingModel):
     """``paused_computation`` for a gromo that does not have it.
 
     The method landed on a branch, so whether the protection exists at all
@@ -3407,7 +3644,7 @@ def _suspended_module_capture(model: GrowingMLP):
 
 def _matrix_free_tangent_system(
     *,
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     x: torch.Tensor,
     y: torch.Tensor,
     config: FGDApproxConfig,
@@ -3513,7 +3750,13 @@ def _matrix_free_tangent_system(
                     "gromo_without_paused_computation",
                 )
                 vmap_capture.enter_context(_suspended_module_capture(model))
-            operators = vmap_operators(model, x, parameters, parameter_names)
+            operators = vmap_operators(
+                model,
+                x,
+                parameters,
+                parameter_names,
+                chunk=int(getattr(config, "matrix_free_block_chunk", 0) or 0),
+            )
 
         columns = sum(p.numel() for p in parameters)
 
@@ -3621,7 +3864,7 @@ def _matrix_free_tangent_system(
 
 
 def exact_tangent_system(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     x: torch.Tensor,
     y: torch.Tensor,
     config: FGDApproxConfig,
@@ -3654,7 +3897,7 @@ def exact_tangent_system(
 
 
 def _compute_exact_tangent_projection_step(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     x: torch.Tensor,
     y: torch.Tensor,
     config: FGDApproxConfig,
@@ -4072,7 +4315,7 @@ def _compute_exact_tangent_projection_step(
 
 
 def _compute_cg_tangent_projection_step(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     x: torch.Tensor,
     y: torch.Tensor,
     config: FGDApproxConfig,
@@ -4283,7 +4526,7 @@ def build_projection_probe(
 
 
 def _compute_tangent_projection_step(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     x: torch.Tensor,
     y: torch.Tensor,
     config: FGDApproxConfig,
@@ -4312,7 +4555,7 @@ def _compute_tangent_projection_step(
 
 
 def _apply_tangent_projection_step(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     x: torch.Tensor,
     y: torch.Tensor,
     step: _TangentProjectionStep,
@@ -4439,7 +4682,7 @@ def _apply_tangent_projection_step(
 
 @torch.no_grad()
 def _layer_functional_error(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     layer_index: int,
     device: torch.device,
@@ -4630,7 +4873,7 @@ def _held_out_bottleneck_cosine(
 
 
 def crossfold_bottleneck_significance(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     layer_index: int,
     inputs: torch.Tensor,
     targets: torch.Tensor,
@@ -4734,7 +4977,7 @@ def crossfold_bottleneck_significance(
 
 
 def compute_expressivity_bottlenecks(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     device: torch.device,
     config: FGDApproxConfig,
@@ -4815,7 +5058,11 @@ def compute_expressivity_bottlenecks(
                     bottlenecks.append(0.0)
                     continue
                 eigenvalues = eigenvalues[:kept]
-            gradient = float(layer.activation_gradient)
+            # ``.detach()``: for an inserted layer the derivative is computed
+            # from the homotopy's trainable ``alpha``, so the tensor carries a
+            # grad history that ``float()`` would warn about. The number is
+            # all this rule wants.
+            gradient = float(layer.activation_gradient.detach())
             value = gradient * float(torch.sum(eigenvalues.double() ** 2))
             bottlenecks.append(value if math.isfinite(value) else 0.0)
         finally:
@@ -4863,7 +5110,7 @@ def compute_expressivity_bottlenecks(
 
 
 def compute_tiny_layer_relative_errors(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     device: torch.device,
     config: FGDApproxConfig,
@@ -4903,7 +5150,7 @@ def compute_tiny_layer_relative_errors(
 
 
 def apply_fgd_parameter_update(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     selected_layer: FGDLayerRelError,
     device: torch.device,
@@ -4959,7 +5206,7 @@ def _output_error_from_layer_error(
 
 
 def train_one_epoch_gromo_layer_proxy(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     test_loader: torch.utils.data.DataLoader,
     loss_function: torch.nn.Module,
@@ -5046,7 +5293,7 @@ def train_one_epoch_gromo_layer_proxy(
 
 
 def select_tiny_growth_layer_index(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     device: torch.device,
     config: FGDApproxConfig,
@@ -5069,8 +5316,18 @@ def select_tiny_growth_layer_index(
                 compute_delta=config.growth_compute_delta,
             )
         )
+        # ``update_value`` is a float on ``SequentialGrowingModel``
+        # (``update_information`` calls ``.item()``) and a tensor on the
+        # containers that predate it. Only the number is wanted either way;
+        # assuming the tensor crashed the conv path with "'float' object has
+        # no attribute 'detach'" the first time growth was refused by the
+        # parameter budget, which is the one route that reaches this call.
         scores = {
-            int(index): float(info["update_value"].detach().cpu())
+            int(index): float(
+                value.detach().cpu()
+                if isinstance(value := info["update_value"], torch.Tensor)
+                else value
+            )
             for index, info in model.update_information().items()
         }
         if not scores:
@@ -5081,7 +5338,7 @@ def select_tiny_growth_layer_index(
 
 
 def compute_tangent_projection_error(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     data_loader: torch.utils.data.DataLoader,
     device: torch.device,
     config: FGDApproxConfig,
@@ -5104,7 +5361,7 @@ def _count_all_parameters(model: torch.nn.Module) -> int:
 
 
 def select_certifying_growth_layer_index(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     validation_loader: torch.utils.data.DataLoader,
     device: torch.device,
@@ -5345,7 +5602,7 @@ def certificate_from_projection_stats(
 
 
 def measure_direction_projection(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     parameter_updates: tuple[torch.Tensor, ...],
     x: torch.Tensor,
     y: torch.Tensor,
@@ -5407,8 +5664,59 @@ def measure_direction_projection(
     )
 
 
+def _factored_validation_stats(
+    model: SequentialGrowingModel,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    config: FGDApproxConfig,
+) -> _FunctionalStepStats | None:
+    """Validation stats from the matrix-free factors, or ``None`` to fall back.
+
+    The dense route builds an ``NK x P`` Jacobian and SVDs it even when
+    ``family_order`` is ``[matrix_free_tangent]``, because
+    ``_compute_tangent_projection_step`` dispatches on ``projection_solver``
+    alone. That is 99.95% of the runtime on full MNIST and the line the run
+    dies on -- see ``certify_validation_factored``.
+
+    Every early return here hands control back to the dense path unchanged, so
+    a config that cannot use this path is not merely unaffected, it is
+    byte-identical.
+    """
+    if not getattr(config, "certify_validation_factored", False):
+        return None
+    if tuple(config.family_order) != ("matrix_free_tangent",):
+        # The factors only exist on the matrix-free route.
+        return None
+    system = exact_tangent_system(model, x, y, config)
+    if system is None or system.factors is None:
+        return None
+
+    from fgdlib.search.mffactored import factored_projection_solve
+
+    solved = factored_projection_solve(
+        system, system.target, config.projection_damping
+    )
+    if solved is None:
+        return None
+    _, approximation = solved
+    if not torch.isfinite(approximation).all():
+        # The dense route RAISES here. Falling back instead keeps the caller's
+        # contract: this helper only ever returns stats it trusts.
+        fallback("validation_factored_fallbacks", "non_finite_approximation")
+        return None
+    increment("validation_factored_certificates")
+    # The SAME function the dense route uses, so the two are comparable by
+    # construction rather than by a reimplemented formula -- MEASURED to agree
+    # on eps to 3-6e-04 and on the directional cosine to four decimals.
+    return _output_relative_error_from_tensors(
+        approximation=approximation,
+        target=system.target.reshape(-1).to(approximation.dtype),
+        eps=config.eps,
+    )
+
+
 def evaluate_fgd_validation_certificate(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     data_loader: torch.utils.data.DataLoader,
     device: torch.device,
     config: FGDApproxConfig,
@@ -5441,18 +5749,20 @@ def evaluate_fgd_validation_certificate(
     x, y = probe
     x = x.to(device)
     y = y.to(device)
-    projection_step = _compute_tangent_projection_step(
-        model=model,
-        x=x,
-        y=y,
-        config=config,
-    )
-    stats = _FunctionalStepStats(
-        output_error=projection_step.output_error,
-        dot_product=projection_step.dot_product,
-        approximation_sq_norm=projection_step.approximation_sq_norm,
-        target_sq_norm=projection_step.target_sq_norm,
-    )
+    stats = _factored_validation_stats(model, x, y, config)
+    if stats is None:
+        projection_step = _compute_tangent_projection_step(
+            model=model,
+            x=x,
+            y=y,
+            config=config,
+        )
+        stats = _FunctionalStepStats(
+            output_error=projection_step.output_error,
+            dot_product=projection_step.dot_product,
+            approximation_sq_norm=projection_step.approximation_sq_norm,
+            target_sq_norm=projection_step.target_sq_norm,
+        )
     return certificate_from_projection_stats(
         stats=stats,
         learning_rate=learning_rate,
@@ -5461,8 +5771,8 @@ def evaluate_fgd_validation_certificate(
 
 
 def evaluate_secant_validation_certificate(
-    base_model: GrowingMLP,
-    candidate_model: GrowingMLP,
+    base_model: SequentialGrowingModel,
+    candidate_model: SequentialGrowingModel,
     data_loader: torch.utils.data.DataLoader,
     device: torch.device,
     config: FGDApproxConfig,
@@ -5521,7 +5831,7 @@ def evaluate_secant_validation_certificate(
 
 
 def train_one_epoch_fgd_approx(
-    model: GrowingMLP,
+    model: SequentialGrowingModel,
     train_loader: torch.utils.data.DataLoader,
     test_loader: torch.utils.data.DataLoader,
     loss_function: torch.nn.Module,

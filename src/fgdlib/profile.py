@@ -58,6 +58,42 @@ PROFILE_FIELDS = (
     "family_transaction_accepted",
     "family_transaction_backtracks",
     "family_transaction_rejected",
+    # The adaptive certification probe. A base held fixed for the whole run is
+    # interpolated by the very steps it certifies -- MEASURED at 14.2x easier
+    # per image than the population by transaction ~50 -- so these say whether
+    # the base is actually being redrawn and how much counterexample memory the
+    # row bound is evicting to stay affordable.
+    "probe_base_resamples",
+    "probe_counterexample_evictions",
+    # Certification probes observed BELOW the interpolation floor NK > P, where
+    # rank(J) <= min(NK, P) lets eps read a spurious zero. MEASURED on run
+    # unguzxkq: NK/P fell to 0.45 and eps collapsed 0.44 -> 0.009 while the
+    # validation relative error stayed at 1.02. Non-zero here invalidates every
+    # eps in the run, so it must be countable rather than eyeballed.
+    "probe_below_parameter_floor",
+    # Releases of the caching allocator's pool at the points where the probe
+    # changes shape. MEASURED at the cluster's NK: 0.232 GB live against
+    # 2.359 GB reserved, and three jobs died of a pool that ratcheted while the
+    # live footprint stayed small.
+    "probe_allocator_cache_releases",
+    # The growth lookahead declining to answer because the certificate on its
+    # throwaway clone could not be computed. The lookahead is ADVISORY, so the
+    # honest answer is "no opinion" -- but a high count means the dense float32
+    # SVD it runs is failing often, which is a real defect to attack rather than
+    # tolerate. MEASURED: run 1g0895r3 (job 457944) died at epoch 6 after
+    # 4h01m because this path raised instead of abstaining, with the GPU at 41%
+    # and MaxRSS at 2.6 GB of 64 G -- nothing exhausted, a hint killed the run.
+    "growth_lookahead_non_finite_abstentions",
+    # Validation certificates answered from the matrix-free factors instead of
+    # a dense NK x P SVD. MEASURED: that SVD was 99.95% of run 1g0895r3 and the
+    # line it died on. The fallback counter is the one to watch -- if it is
+    # high the factors are not usable and the dense cost is back.
+    "validation_factored_certificates",
+    "validation_factored_fallbacks",
+    # The realizable-progress criterion abstaining rather than refusing, which
+    # is the only thing standing between "no eta realizes a step" and a frozen
+    # run: MEASURED at 35 epochs of exact no-op before it existed.
+    "certify_realizable_abstentions",
     "where_scans",
     "where_candidates",
     "where_base_system_reuses",
@@ -209,6 +245,14 @@ _COUNTER_FIELDS = {
     "family_transaction_accepted",
     "family_transaction_backtracks",
     "family_transaction_rejected",
+    "probe_base_resamples",
+    "probe_counterexample_evictions",
+    "probe_below_parameter_floor",
+    "probe_allocator_cache_releases",
+    "growth_lookahead_non_finite_abstentions",
+    "validation_factored_certificates",
+    "validation_factored_fallbacks",
+    "certify_realizable_abstentions",
     "where_scans",
     "where_candidates",
     "where_base_system_reuses",

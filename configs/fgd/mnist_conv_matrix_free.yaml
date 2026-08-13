@@ -1,50 +1,128 @@
-# MNIST COMPLETO, arrancando en 2-2-2. Derivado de
-# configs/fgd/mnist_matrix_free.yaml; SOLO cambian el tamaño de los splits,
-# el tope de parametros y las epochs.
+# The family_ladder_N1024 base ladder, with J built matrix-free.
 #
-# 50000 train + 10000 validation son exactamente el conjunto de train de
-# MNIST, y test son sus 10000 completos. El presupuesto va ACOPLADO a eso:
-# certify_probe_kappa 4 con K = 10 salidas pide NK = 4P filas, asi que
-# 50000 imagenes admiten P <= 125000; se fija 100000 para dejar holgura al
-# desbordamiento de una neurona (785 params en la capa de 784 entradas).
-# Subir uno sin el otro deja eps bajo el suelo de interpolacion (abe380a).
+# Derived from configs/fgd/family_ladder_N1024.yaml. The dense/exact file is
+# untouched; this file explicitly opts into the matrix-free operator plus its
+# own rate grid, cap and realized-endpoint transaction. Shared defaults remain
+# off, so running family_ladder_N1024.yaml is unaffected.
 #
-# Referencia de lo que 0.98 pide en esta familia: 784-100-10 son 79510
-# parametros, asi que el tope esta en el orden correcto para el objetivo.
+# The point is MNIST, not this task: the exact route forms the O(P^2) Gram,
+# which at MNIST width is ~40 GB and simply cannot run. This one never
+# materialises it.
 #
-# transactional_family_step se deja en su default (true) y el sbatch lo
-# apaga en el brazo B del A/B.
-# MNIST with the same family ladder as mnist_streaming.yaml, replacing only
-# the dense tangent construction by the matrix-free factored route and its
-# opt-in endpoint transaction. The exact MNIST config remains unchanged.
+# It IS an approximation and the bias is one-sided -- while k < rank(J) the
+# retained subspace cannot see the directions outside it, so eps looks better
+# than it is. MEASURED at P=25, k=24: 0.8104 against the true 0.8779. k is
+# therefore driven to the numerical rank, where the two agree.
+
+# Grow-to-certify on the SMALLEST honest instance of the task.
 #
-# The matrix-free path never materialises J or the P x P streamed Gram. Its
-# exact dual is O((N*K)^2), so the probe is deliberately 2 batches:
-# 2 * 64 * 10 = 1280 output coordinates, the documented operating scale for
-# the dual implementation. The 30,000-parameter architecture budget is kept
-# from mnist_streaming.yaml. All other modelling/growth settings are copied
-# from that config; the explicit differences are pinned by tests.
+# Same method, same exactness, sized so a step costs seconds: the point is
+# to see whether computing EVERYTHING exactly -- full Jacobian over the
+# whole training set, exact projection, certified rate, step integrated to
+# completion -- actually improves accuracy, before paying for that at
+# scale.
+#
+# One output and 256 training samples give a 256 x P Jacobian, so:
+#   * probe_batches covers the ENTIRE training set (no subsample, and hence
+#     none of the interpolate-your-own-probe failure),
+#   * no row-chunking is needed at all,
+#   * the certificate eps < 1/2 is a statement about 256 equations, which
+#     the network must satisfy honestly rather than by having more
+#     parameters than there are constraints.
+#
+# Same method as certify_mnist.yaml: grow until the relative-error
+# criterion holds, then train with the tangent family alone at
+# eta = 0.95 * eta_bar(eps), assuming the remaining condition rather than
+# verifying it, until eps stops satisfying the criterion -- then grow again.
+#
+# smooth_sin is the right place to see whether that CYCLE works at all: the
+# target is a known smooth function, sum-MSE gives an exact function-space
+# PL constant (mu = 2, L* = 0) where cross-entropy has none, and an epoch
+# costs seconds instead of minutes.
 run:
-  name: mnist_family_ladder_matrix_free
+  name: mnist_conv_matrix_free
   results_dir: results
   save_plot: false
   show_plot: false
 
 data:
-  kind: mnist
+  # MNIST as IMAGES. `mnist2d` is a separate kind from `mnist`, not a flag on
+  # it, so the flat runs stay provably untouched -- and it is the same loader
+  # with a reshape at the end, after the per-pixel normalisation and every
+  # split draw, so the two emit the same examples in the same order with the
+  # same labels and x_2d.flatten(1) == x_flat exactly. That identity is what
+  # makes the linear ladder on these images a fair reference arm.
+  kind: mnist2d
   in_features: 784
+  input_shape: [1, 28, 28]
   out_features: 10
+  # Kept explicit because the Slurm launcher replaces it with node-local
+  # storage before starting the run.
   data_dir:
   batch_size: 64
+  # N = 1024, the regime this whole line of work is calibrated in.
+  # 10000, config 2's value. This config is the CONV COUNTERPART of
+  # mnist_matrix_free.yaml, so the data has to match or the comparison against
+  # it is not a comparison. An earlier version used 1024 and would have needed
+  # its own linear arm run separately just to have something to measure
+  # against.
+  #
+  # It costs less than it looks: the probe is not sized by the dataset but by
+  # certify_probe_kappa from rank(J), and on conv rank sits at 200-300 and
+  # FALLS as the net grows, so the probe settles near 192 images either way.
+  # What grows is the full-train evaluation, which is the cheap part.
+  mnist_train_samples: 10000
+  mnist_validation_samples: 2000
+  mnist_test_samples: 2000
   train_seed: 0
   validation_seed: 2
   test_seed: 1
-  mnist_train_samples: 50000
-  mnist_validation_samples: 10000
-  mnist_test_samples: 10000
+
 model:
-  hidden_size: 2
-  number_hidden_layers: 3
+  # 498 parameters, three growable locations -- the same count the linear
+  # reference starts with (hidden_size 2, number_hidden_layers 3).
+  #
+  # WHY SOME WIDTHS ARE CONFIGURED AND NOT SEARCHED. Growing a layer widens
+  # its INPUT, i.e. its predecessor's output. So a width is reachable by the
+  # search only if some growable layer consumes it -- and the last conv before
+  # any shape change has no such consumer, because a pool or a flatten sits
+  # between it and the next layer. In this stack that is B.out and D.out.
+  # They are configuration, not search, and the first attempt left both at 2:
+  # MEASURED, three epochs bought 290 parameters and every one of them went to
+  # the head, the trunk stayed 2->2->2->2, and train_loss stalled at 0.147 --
+  # ABOVE the 0.09 that predicting the class mean gives. The criterion was not
+  # malfunctioning; it was correctly reporting that the head was the only
+  # place with anything to buy, because 2 channels through an avgpool is 18
+  # numbers and no amount of head width invents information the trunk did not
+  # pass. So the two pinned widths are chosen (4 and 8) and everything the
+  # search CAN reach still starts at 2.
+  #
+  # WHICH layers are growable is GroMo's topology, not a choice here: a layer
+  # grows only when its immediate predecessor is a module of the same kind
+  # with no shape change in between. So the growable set is conv B, conv D
+  # and the output fc; conv A has no predecessor, conv C sits behind a pool,
+  # and fc E sits behind the flatten with a conv before it (which
+  # LinearGrowingModule refuses outright).
+  #
+  # And it is what makes the width/depth balance real rather than decorative:
+  # inserting a conv between B and the pool gives B.out a growable consumer,
+  # which is the ONLY way the search can ever touch it. With the balance off
+  # those two widths stay exactly as configured for the whole run.
+  stack:
+    - {conv: [2, 3]}      # A  1 -> 2  @28    A.out is GROWABLE (via B)
+    - {conv: [4, 3]}      # B  2 -> 4  @28    B.out is PINNED by the pool
+    - maxpool             #    28x28 -> 14x14
+    - {conv: [2, 3]}      # C  4 -> 2  @14    C.out is GROWABLE (via D)
+    - {conv: [8, 3]}      # D  2 -> 8  @14    D.out is PINNED by the avgpool
+    - {avgpool: [3, 3]}   #    -> 3x3, so the head sees 8*9 = 72
+    - flatten
+    - {mlp: [2, 1]}       # E 72 -> 2         E.out is GROWABLE (via F)
+    #                       F  2 -> 10 appended
+  # RestrictedConv2dGrowingModule (Conv -> 1x1) is GroMo's own default, what
+  # VGG and ResNet use, and by far the better tested. "full" (Conv -> Conv)
+  # is available for the A/B; it does not support tiny_use_fisher, which is
+  # already false below.
+  conv_growth_scheme: restricted
   model_seed: 0
 
 training:
@@ -71,33 +149,7 @@ lr_scheduler:
   restart_on_growth: true
 
 fgd_approx:
-  # The STEP certificate, back at 1/2. At 0.3 it was also the growth goal, and
-  # the two jobs are incompatible: every step site reads Lemma 3.5 as eps <
-  # min(rel_error_threshold, 1/2), so with eps at 0.457 no damping certified,
-  # no rate was admissible, and lr was 0 in every epoch -- the tangent step was
-  # dead by construction. What kept moving the model was the family ladder at
-  # functional_lr 1.0, i.e. full functional steps with no size control, which
-  # is why accuracy oscillated 0.33 <-> 0.74 while the functional loss barely
-  # moved (0.2393 -> 0.2382) and growth ran away to P ~ 31000 without finishing
-  # one outer step in 39 minutes.
   rel_error_threshold: 0.5
-  # The GROWTH goal keeps the 0.3 that was wanted. The loop now aspires to it
-  # while the step commits at 0.457, and stops chasing it when a growth stops
-  # paying: MEASURED here, eps falls 0.0007 per growth against a gap of 0.157,
-  # a ratio of 0.0045 against the certify_growth_min_gain floor of 0.1 -- 22x
-  # below, so the cut is not a close call. (N1024, for contrast, gains 0.00707
-  # on a gap of 0.0267, ratio 0.265, and keeps growing.)
-  # UNIFICADO con los otros dos configs: el bucle persigue el mismo
-  # certificado que certifica el paso, min(rel_error_threshold, 0.5).
-  # Antes 0.3 solo aqui. SIN RE-MEDIR en MNIST.
-  certify_growth_target:
-  # 0 disables the eps-fraction refusal: on MNIST every growth buys
-  # ~1e-3 of eps, so any fraction of the gap rejects all of them and
-  # nothing ever grows. The cost is bounded by max_total_parameters
-  # instead, which is the quantity actually at stake.
-  # UNIFICADO: 0.1 por defecto, como los otros dos. Antes 0.0 solo aqui.
-  # SIN RE-MEDIR en MNIST.
-  certify_growth_min_gain: 0.1
   rel_error_mode: tangent_projection
   layer_selection: certifying
   projection_solver: exact
@@ -114,9 +166,26 @@ fgd_approx:
   theory_lr_initial: 0.01
   theory_lr_min: 1.0e-5
   theory_lr_follow_bound: false
-  # Same denser measured-rate grid and ceiling as the canonical matrix-free
-  # ladder; these prevent a coarse high-rate rung from dominating a step.
+  # 16, not the base config's 8. When eps > 1/2 the Lemma 3.5 interval is
+  # invalid -- both ladders get there, eps peaks at 1.96 exact and 1.66 here --
+  # and the rate comes from the measured-descent sweep instead. That sweep is a
+  # geometric grid from tangent_measured_max_lr down to theory_lr_min, so 8
+  # points across FIVE orders of magnitude puts consecutive rungs 5.18x apart:
+  # 1.0, 0.193, 0.037, nothing in between.
+  #
+  # MEASURED consequence on seed 0: epoch 23 took lr=0.2192 -- the second rung,
+  # and 4x the largest step the exact ladder ever takes in 25 epochs (0.0556).
+  # Accuracy fell 0.859 -> 0.766 and that single step is the WHOLE final gap
+  # (0.9188 here against 0.935 exact); this run was AHEAD by up to +0.104 at
+  # epoch 11. 16 rungs are 2.15x apart, so the sweep can land between 0.037 and
+  # 0.193 instead of being forced onto one of them.
+  #
+  # Not a defect in the base config: it carries the same defaults and regresses
+  # the same way (epoch 5 +0.0030, epoch 18 +0.0047, 0.756 -> 0.637). It simply
+  # never hit a state where the high rung won. Fixed here only.
   theory_lr_search_steps: 16
+  # Belt to the above. The exact ladder never exceeded 0.0556, so a 0.1 ceiling
+  # costs nothing observed and removes the rung that produced the outlier.
   tangent_measured_max_lr: 0.1
   theory_lr_search_refinements: 4
   sufficient_descent_c: 0.1
@@ -143,34 +212,21 @@ fgd_approx:
   # gradient energy, and the exact solver materialises a (N*K) x P Jacobian
   # per candidate per growth. At 4 x 512 = 6144 rows the run died of CUDA
   # OOM after 23 growths, with eps still at 0.545.
-  # Do NOT enable certify_stream_gram here: that is the exact P x P path.
-  # family_order: [matrix_free_tangent] selects the factored operator before
-  # the streamed-Gram branch can run. Two batches keep its exact dual at
-  # 1280 x 1280 while the parameter-side representation remains factored.
-  certify_stream_gram: false
-  certify_stream_chunk: 1024
-  # 11, not 2. THE ROOT CAUSE FIX.
+  # THE WHOLE TRAINING SET, not a subsample. The probe exists only because
+  # materialising the exact Jacobian over all the data is usually intractable
+  # -- here it is not: 10 batches x 128 = 1280 samples x 3 outputs = 3840
+  # rows, so J is 3840 x P, about 61 MB in float64 at P ~ 2000.
   #
-  # eps is an R^2-like ratio and least squares OVERFITS a finite probe: with
-  # more parameters than rows it interpolates, and eps collapses to a spurious
-  # near-zero. tangent.py:897 already names this the interpolation floor.
-  #
-  # The MNIST net is 1612 parameters BEFORE any growth (784 in, 10 out), and it
-  # cannot be made smaller -- a first attempt capped max_total_parameters at 300
-  # and only got "growth suppressed (parameter budget 300 reached: 1612
-  # params)". P is not the lever here; NK is.
-  #
-  #   probe_batches  2 -> NK  1280 -> NK/P 0.79   interpolates
-  #   probe_batches 11 -> NK  7040 -> NK/P 4.37   above the floor
-  #
-  # MEASURED at probe_batches 2 (run-20260806_144333): "[CERTIFY] eps -> 0.0179
-  # (certified)" and every transaction improved the PROBE while worsening the
-  # real loss -- functional 37.75 -> 24.27, full_train 14213 -> 14382. 20 of 30
-  # epochs committed nothing, lr was exactly 0, rel_err sat frozen at 0.339 for
-  # 17 epochs. Without the full_train guard the same config diverges instead
-  # (rel_err 102449): one failure, two faces.
-  #
-  # N1024 never had this: 1024 rows against ~620 parameters, NK/P = 1.65.
+  # Using a SUBSAMPLE was the bug. Once the certified step is delivered in
+  # full it becomes Newton's method on those points and interpolates them:
+  # MEASURED train accuracy 0.320 against validation 0.150, with the tangent
+  # relative error diverging to 1077 because RelErr = ||g - r||/||g|| blows up
+  # exactly when no residual is left on the probe to approximate. With the
+  # full set there is no sampling at all and the certificate is a statement
+  # about the training loss itself, which is what the theory is about.
+  # 11, config 2's value, not config 1's 16. This is an MNIST-scale knob and
+  # this config runs on MNIST: NK = 11 * 64 * 10 = 7040 rows instead of 10240,
+  # which is a third off every factor and every probe forward.
   probe_batches: 11
   # Assemble that Jacobian in row-blocks. jacrev vmaps one backward pass per
   # output row and holds the batched activations for all of them at once, so
@@ -180,7 +236,32 @@ fgd_approx:
   # the identical matrix (tests/test_jacobian_chunking.py) at a bounded peak,
   # for one extra forward per block. This is what makes certifying over the
   # whole dataset affordable rather than over a subsample.
-  jacobian_row_chunk: 256
+  # 32, and the value is MEASURED AT THE PROBE THE RUN ACTUALLY USES, which
+  # is the mistake the first attempt made. certify_probe_kappa shrinks the
+  # probe at run time -- NK settles at 1920, not the 7040 that probe_batches
+  # would give -- so calibrating the chunks against the full probe made both
+  # of them ~4x tighter than necessary and cost 4.5x on every certificate.
+  #
+  # At NK = 1920, P = 544: rows 8 -> 4.5 s, rows 32 -> 1.0 s, rows 64 -> 1.0 s
+  # at twice the memory, rows 128 -> OOM. 32 is where the curve flattens.
+  jacobian_row_chunk: 32
+  # Bound how many directions ride through ONE vmap on the matrix-free path.
+  # The range finder asks for rank + oversampling of them, which is of order
+  # P, and vmap holds every direction's FULL forward activations at once. On
+  # an MLP an activation is (N, width); on a conv it is (N, C, H, W) -- larger
+  # by the spatial extent. MEASURED here: 1024 images x 2 channels x 28 x 28 x
+  # 8 bytes is 12.8 MB PER DIRECTION PER LAYER, so the block at the 2500
+  # parameter budget asks for tens of GB and takes the machine down. That is a
+  # defect of the approximation, not a cost of the problem: 1024 tiny images
+  # and 2500 parameters do not need that memory.
+  #
+  # Chunking is EXACTLY equivalent -- the directions in a block are
+  # independent -- so this changes the footprint and nothing else.
+  # 32, measured at the same real probe. Unlike the row chunk this one barely
+  # affects time (the solve is 5.8 s at chunk 8 and 4.2 s at 32), so raising
+  # it buys little and only costs memory -- 1.11 GB at 32 against 2.15 GB at
+  # 64 for the same speed, and 128 OOMs on the 8 GB card.
+  matrix_free_block_chunk: 32
   # A rejected fallback family is skipped until this many ACCEPTED outer
   # steps have been committed since the rejection (weight updates change the
   # tangent space, so rejection is never permanent at a fixed architecture).
@@ -304,27 +385,19 @@ fgd_approx:
   # sent train_loss 0.0917 -> 0.3991 and validation accuracy 0.248 -> 0.123.
   certify_optimal_rate: true
   # This comment used to read "nothing to resample: probe_batches covers the
-  # entire training set". It was inherited from configs/fgd/mnist_matrix_free
-  # .yaml and it is FALSE here: probe_batches 11 * batch_size 64 = 704 of
-  # 50000 images, 1.4%. The base is the sample the certified steps are fitted
-  # on, so with it fixed they interpolate it and it stops standing for the
-  # population. MEASURED (run 2kbo8rf4), probe functional per image against
-  # full-train functional per image:
-  #
-  #   transaccion   1     1.0x
-  #   transaccion  25     3.6x
-  #   transaccion  50    14.1x
-  #   en regimen         14.2x    (0.1859 contra 2.6388)
-  #
-  # Everything computed on the probe then reads a biased sample: eps, the
-  # growth argmin and the endpoint transaction. The run froze with train_loss
-  # identical to the last digit for 35 epochs at test 0.350, with a 784->6
-  # first layer that cannot represent MNIST.
+  # entire training set". It is FALSE here too: probe_batches 11 * batch_size
+  # 64 = 704 of mnist_train_samples 10000, i.e. 7%. The base is the sample the
+  # certified steps are FITTED on, so with it fixed they interpolate it and it
+  # stops standing for the population. MEASURED on this very config
+  # (runs/log/convA.log), probe functional per image against full-train
+  # functional per image: 3.72x at the first transaction, 9.40x by the 25%
+  # mark, and 9.74x at the end. The linear config reached 14.2x at 1.4%
+  # coverage, so the two agree: the smaller the fraction, the worse the bias.
   #
   # probe_resample stays false because it rebuilds the WHOLE probe and would
   # discard the counterexamples with it. certify_probe_base_resample redraws
-  # the BASE every outer step and keeps the counterexample memory, which is
-  # where the monotonicity the refinement relies on actually has to hold.
+  # the base and keeps the counterexample memory, which is where the
+  # monotonicity the refinement relies on actually has to hold.
   probe_resample: false
   certify_probe_base_resample: true
   certify_realize_path: true
@@ -347,51 +420,31 @@ fgd_approx:
   # identica a antes y al mismo coste. MEDIDO: descendente pierde (0.8823),
   # ascendente gana (0.9230 contra 0.9000 del baseline).
   certify_family_functional_lrs: [1.0, 2.0, 4.0, 8.0]
-  # UNIFICADO a false: la corrida que valido el criterio (media 0.9435) no
-  # lo llevaba, y estos ficheros deben ser esa corrida.
-  certify_family_plateau_stop: false
-  # Commit the family step at its OWN Lemma 3.5 rate, not whole.
-  # MEASURED: eps 0.292 allows eta_bar 0.263 at L_s = 2, so a full
-  # step overshoots the descent bound by 3.8x. Certifying the
-  # direction never licensed the distance.
-  # UNIFICADO a false. MEDIDO en smooth_sin: true SIN min_gain colapsa la
-  # corrida (25 certificaciones, 0 crecimientos, acc 0.15). Antes true
-  # solo aqui, apoyado en certify_family_min_gain. SIN RE-MEDIR en MNIST.
-  certify_family_lemma35_rate: false
-  # Let the ladder work in the band between the growth target and the
-  # certificate, where growth alone buys 0.0007 of eps per 800 params
-  # while the clone reaches 22 degrees against a 30 degree bar. Safe
-  # only because the step above is now bounded by its own Lemma 3.5
-  # rate; unbounded it diverged held-out loss 9.37 -> 44.53.
-  # UNIFICADO a false. Su propio comentario dice que solo es seguro junto
-  # a certify_family_lemma35_rate, que ahora esta en false.
-  certify_family_in_target_band: false
-  # The ladder DEFERS growth, so it must earn the deferral: close this
-  # fraction of the gap to the target or hand the turn to growth.
-  # MEASURED at 0.0 the ladder certified 20/20 epochs and the net never
-  # grew (GRO=0), plateauing at 0.113 from epoch 9.
-  # UNIFICADO a 0.0. Vigilaba el aplazamiento del crecimiento por pasos de
-  # familia que certifican sin progresar; con lemma35_rate en false el paso
-  # se compromete entero y ese fallo no aparece. SIN RE-MEDIR en MNIST.
-  certify_family_min_gain: 0.0
   certify_realize_max_iterations: 40
   certify_realize_tolerance: 0.05
-  # Freeze the Gauss-Newton Gram across the inner realise iterations (modified-
-  # Newton / chord): build J^T J once, then each iteration is one VJP instead of
-  # a full streamed all-data Jacobian. This is the dominant CIFAR cost -- the
-  # realise loop ran ~5 inner Jacobians/step, each O(NK*P); the freeze turns
-  # them into 1 Jacobian + VJPs. Same certified direction/rate/target and the
-  # same residual-reducing line search. VALIDATED on family_ladder_N1024 (test
-  # 0.936/0.934 vs 0.935/0.932, iters 5.34 vs 5.47, 0 NaN). Estimated ~2.4x
-  # faster per epoch on CIFAR (realise ~42 -> ~8 jacrev-equivalents/epoch).
+  # Freeze the Gauss-Newton Gram across the inner realise iterations: build
+  # J^T J once (first inner iteration) and recompute only J^T shortfall (one
+  # VJP) each iteration -- the modified-Newton (chord) method. Same certified
+  # direction/rate/target and the same residual-reducing line search; only the
+  # preconditioner is held fixed. VALIDATED on this config: test 0.936/0.934 vs
+  # baseline 0.935/0.932 (parity), realise iters 5.34 vs 5.47, 0 NaN, and 28%
+  # faster wall-clock even here where the Jacobian is cheap (far more on CIFAR,
+  # where the per-iteration full Jacobian dominates).
   certify_realize_freeze_gram: true
-  # Matrix-free-only endpoint transaction, matching the canonical synthetic
-  # matrix-free ladder. Disabled defaults keep both exact configs unchanged.
+  # Matrix-free-only transaction: verify the nonlinear endpoint on the SAME
+  # full training probe before it can commit. Rejected endpoints are restored
+  # to the one pre-step checkpoint and retried from there at half the rate.
   transactional_realized_descent: true
   transactional_max_retries: 3
   transactional_backtrack_factor: 0.5
   transactional_descent_atol: 1.0e-10
+  # Start with strict observed descent. The stronger predicted-decrease
+  # fraction remains available, but is deliberately not imposed until the
+  # scalar diagnostics from the validation run have calibrated it.
   transactional_min_predicted_decrease_fraction: 0.0
+  # Applied in select_projection_damping_factored: the certificate's proposal
+  # is still logged unchanged, while only the attempted/committed rate is
+  # capped. The dense exact selector never reads this field.
   certify_functional_lr_cap: 0.1
   tangent_measured_descent: false
   # ===================== CRITERIO DE CRECIMIENTO =====================
@@ -407,50 +460,64 @@ fgd_approx:
   #   certified_gain          0.9230   formas 15-16-15 en 3 de 4 semillas
   #   expressivity_bottleneck 0.9435   4 formas distintas, ratios 1.46-2.44
   # Las cuatro semillas superan 0.925 individualmente.
-  growth_where: expressivity_bottleneck
-  # WHERE remains the expressivity bottleneck above. After a finite tangent
-  # step failure, this opt-in WHEN/value gate compares the current structure
-  # with that one function-preserving growth by the certified functional
-  # decrease each can actually realize through the existing damping,
-  # realization and full-train transaction. It may buy capacity when eps is
-  # already ~0, but never merely because a step failed and never when the
-  # candidate's certified realizable progress does not improve.
-  certify_realizable_progress_growth: true
-  # The full-train transaction is also a counterexample oracle for the bounded
-  # certification sample. Refine only on the finite contradiction probe-down /
-  # full-train-up, retain every discovered batch, and re-solve from the same
-  # theta before realizability-aware growth sees the probe again.
-  certify_probe_refine_on_transaction_mismatch: true
-  certify_probe_refine_batches_per_round: 1
-  # MEASURED in the first counterexample-guided full-MNIST run: all 8 rounds
-  # found distinct violating batches while full-train loss and accuracy were
-  # still improving, so the safety cap -- not the 100000-parameter budget --
-  # stopped the run at epoch 5 and P~=9293. Doubling it to 16 only postponed
-  # the same ending: run yqfvy8l7 printed "stop_reason=
-  # probe_refinement_exhausted round=16 max_rounds=16" at epoch 6 with
-  # mismatches still firing every outer step, after which the mechanism is
-  # OFF and the probe drifts back into the bias below. A round count is the
-  # wrong budget: what costs is the probe SIZE, because the matrix-free dual
-  # is O((NK)^2). max_rows takes over and bounds the counterexample memory by
-  # eviction of the least-violating batch, so the mechanism never turns
-  # itself off. 6400 = 10 batches * 64 images * K 10, about the size of the
-  # rank-sized base at the measured operating point, which keeps the total
-  # probe inside the NK ~ 16000 that yqfvy8l7 showed is affordable
-  # (~23 min/epoch on one A100).
-  certify_probe_refine_max_rounds: 16
-  certify_probe_refine_max_rows: 6400
-  # El lookahead ya existia pero solo sabia VETAR: un "si" caia al
-  # `while epsilon >= target`, que excluye justo la banda en la que se
-  # pregunta. MEDIDO aqui: eps se aparca en 0.4975 contra una barra de 0.5,
-  # el bucle no corre nunca, y 150 epochs dan 2 crecimientos y accuracy 0.109
-  # con todos los certificados sanos. Restringido por el validador a
-  # family_order: [matrix_free_tangent], asi que la ruta del tangente y
-  # family_ladder_N1024.yaml no pueden alcanzarlo.
+  # Both from config 2, and both absent from config 1 (so they defaulted off).
+  # certify.py's while-loop reads only `epsilon >= target`, and the lookahead
+  # that DOES look at the band could previously only return "no": a brake with
+  # no accelerator. The entry flag lets the same predicate authorise growth,
+  # bounded by construction to one neuron per outer step.
   certify_growth_lookahead: true
   certify_growth_lookahead_entry: true
-  # El freno independiente: pone a cero el cuello de botella cuando la
-  # direccion no sobrevive fuera de muestra. Ver docs/budget_free_stopping.md.
-  growth_bottleneck_crossfold_folds: 5
+  growth_where: expressivity_bottleneck
+  # WHERE remains the Conv expressivity bottleneck. The live convA run reached
+  # eps ~= 9e-4, then repeated rejected full-train transactions, LINEAR -> none
+  # (or eta ~= 4e-5), and no-growth-reduced-eps while epochs 4-8 were identical.
+  # Value the one function-preserving bottleneck growth by the certified
+  # finite functional progress it can actually execute. This is not a forced
+  # growth and does not alter the convolutional architecture or its WHERE rule.
+  certify_realizable_progress_growth: true
+  # The live seed-0 Conv run measured the same finite contradiction as full
+  # MNIST: the bounded probe fell while the frozen 10000-example objective
+  # rose for every transactional rate. At P=3080, NK/rank remained healthy
+  # (~5.03), so this is statistical probe bias rather than algebraic
+  # interpolation. Retain the worst unseen full-train batch, rebuild the
+  # tangent system at the unchanged theta, and retry the same logical step.
+  # The finite 16-round cap matches full MNIST and prevents a retry deadlock.
+  certify_probe_refine_on_transaction_mismatch: true
+  certify_probe_refine_batches_per_round: 1
+  certify_probe_refine_max_rounds: 16
+  # ...and a ROW budget, because the round cap is TERMINAL: once spent the
+  # mechanism is off for the rest of the run and the probe drifts back into the
+  # 9.74x bias above. MEASURED on the linear sibling (yqfvy8l7):
+  # "stop_reason=probe_refinement_exhausted round=16 max_rounds=16" at epoch 6
+  # with mismatches still firing every outer step. What costs is the probe SIZE,
+  # so the honest budget bounds the memory by rows and evicts the least
+  # violating counterexample instead of terminating. 2560 = 4 batches * 64
+  # images * K 10, scaled to this config's smaller probe and 5000-parameter
+  # budget rather than copied from the linear one.
+  certify_probe_refine_max_rows: 2560
+  # Insurance, not a fix here. rank(J) <= min(NK, P), so NK > P forbids the
+  # spurious eps; the linear config crossed that floor and read eps 0.009 while
+  # validation said 1.02. This config does not cross it TODAY -- P is capped at
+  # 5000 and NK starts at 7040 -- but the sizing that let it happen there is the
+  # same sizing running here, so the floor goes in before the budget ever moves.
+  certify_probe_parameter_floor: 1.25
+  # Mismo defecto y misma cura que en el lineal: el certificado de validacion
+  # despacha por projection_solver y nunca por family_order, asi que construye
+  # un Jacobiano denso y lo descompone aunque esta config sea matrix-free. En
+  # el lineal eso era el 99.95% del tiempo y la linea donde el run moria.
+  # MEDIDO alli: 3-4.8x mas rapido con eps coincidiendo a 3-6e-04 y el coseno
+  # direccional identico a cuatro decimales.
+  #
+  # Aqui P esta topado en 5000, asi que el ahorro absoluto es menor, pero la
+  # ruta densa es la misma y el fallo numerico que provoca tambien. Si los
+  # factores no sirven para una geometria conv concreta, el helper devuelve
+  # None y se cae a la ruta densa de siempre; el contador
+  # validation_factored_fallbacks lo dice.
+  certify_validation_factored: true
+  # Let a NEW LAYER compete with the widenings, in the same measured
+  # bottleneck per parameter. This is the B arm; false is the A arm and runs
+  # the width-only branch exactly as before.
+  growth_where_balance: false
   # NO INERTE, verificado por medicion: quitarla movio s0 y s3 (s3 de 0.958 a
   # 0.896). Se lee en DOS sitios y solo uno depende del modo:
   #   pipeline.py  la rafaga del bloque de crecimiento por epoch -- APAGADA
@@ -479,33 +546,25 @@ fgd_approx:
   # Only pays its cost in the tail (eps<1/2), and reuses tiny_statistical_
   # threshold as the margin -- no new constant.
   growth_lookahead_adequacy: true
-  # 2, no 10, y la razon es aritmetica del bucle de _train_parametric_gd_
-  # candidate: `for _ in range(steps): for x, y in train_batches`. Con
-  # train_batches = list(train_loader) eso son 157 lotes en MNIST, asi que
-  # cada consulta al lookahead cuesta steps * 157 * 2 clones pasadas
-  # forward/backward -- 3140 a steps=10, y hay ~8 consultas por epoch.
-  # MEDIDO: la epoch paso de ~11 a ~42 minutos al encender la entrada
-  # voluntaria, y ese es el unico termino que crecio.
-  #
-  # Bajarlo NO sesga la comparacion. El lookahead enfrenta "crecer y entrenar
-  # N pasos" contra "quedarse y entrenar N pasos", y es justa con cualquier N
-  # porque los dos lados reciben el mismo. Lo unico que cambia es el horizonte
-  # de la pregunta, que se vuelve mas corto y por tanto mas conservador.
+  # 2, config 2's value. At 10 the lookahead trains 3140 passes per question,
+  # which commit aa53ca4 measured as 75% of the epoch. That cost is what makes
+  # it unaffordable at MNIST scale, and this config is at MNIST scale.
   growth_lookahead_steps: 2
   # The fallback families must stay available once the structure becomes
   # adequate (eps < 1/2): otherwise growth correctly stops and the flow is
   # left with the tangent alone, which freezes it.
   families_available_without_growth: true
-  # REMOVED (was true). It forced a growth after a finite failed step to break
-  # the "eps=0.485 certifies but eta=8.80e-6 < theory_lr_min" deadlock. That
-  # deadlock is a SYMPTOM: eps only reads 0.485 because the probe carries 1280
-  # rows against a 30000-parameter budget, so least squares interpolates it and
-  # eps is biased down. Forcing growth spends parameters to chase a number that
-  # is wrong. The floor is fixed below instead; if the deadlock returns with a
-  # correctly sized probe, that is new information and not this knob's job.
   local_acceptance_conditions: true
   eps: 1.0e-12
-  # Full numerical rank of the selected probe; no user rank truncation.
+  # SUPERSEDED, kept at 0. The construction is no longer a low-rank sketch:
+  # J J^T = A S^2 A^T gives J's EXACT spectrum from an NK x NK object, where
+  # the primal J^T J is P x P. MEASURED at P=19201: 8.4 MB / 0.020 s against
+  # 2949 MB / 0.235 s, exact to 2.4e-16.
+  #
+  # Low rank was tried first and cannot work on this problem: r is spread
+  # across the whole spectrum, so at P=1345 the exact eps is 1e-06 while a
+  # rank-512 sketch reported 0.21. Nothing is truncated now beyond
+  # numerically-zero singular values, which carry nothing by definition.
   matrixfree_rank: 0
   tiny_use_covariance: true
   tiny_alpha_zero: false
@@ -551,133 +610,56 @@ fgd_approx:
   # misleading inheritance).
   growth_function_preserving: true
   growth_requires_admissibility_failure: true
-  # 300, not 30000. THE ROOT CAUSE FIX, stage 1.
-  #
-  # eps is an R^2-like ratio and least squares OVERFITS a finite probe, so with
-  # more parameters than rows it interpolates and eps collapses to a spurious
-  # near-zero. The probe here is probe_batches 2 * batch_size 64 * K 10 = 1280
-  # rows. Against 30000 parameters that is 23 parameters per equation, and the
-  # certificate stops meaning anything.
-  #
-  # MEASURED in run-20260806_144333: "[CERTIFY] growth 1: eps -> 0.0179
-  # (certified)" and then every transaction improves the PROBE and worsens the
-  # real loss -- functional 37.75 -> 24.27 while full_train 14213 -> 14382.
-  # 20 of 30 epochs committed nothing, lr was exactly 0, and rel_err sat frozen
-  # at 0.339 for 17 consecutive epochs. Without the full_train guard the same
-  # config diverges instead (rel_err 102449, train_loss 0.17 -> 90.4): the two
-  # are one failure, not two.
-  #
-  # N1024 does not have this because its probe is 1024 rows against ~620
-  # parameters -- NK/P = 1.65, above the floor -- and it trains to 0.953.
-  #
-  # 300 keeps NK/P > 4 with the current probe. It caps capacity, which is why
-  # it is a diagnostic operating point and not the endpoint; certify_probe_kappa
-  # is the principled version and comes next.
-  # kappa = 4: size the probe so NK = 4 * rank(J) as the net grows, instead of
-  # trusting a hand-picked probe to stay above the floor. probe_batches above is
-  # only the starting point. [4, 8] is the range the field documents as tested.
-  #
-  # This line used to claim it "keeps the invariant NK > P holding after every
-  # growth". MEASURED, it does NOT, because rank(J) <= NK by construction and
-  # the rank is measured ON the probe -- a small probe reports a small rank,
-  # which reports that no more rows are needed. Run unguzxkq, the fixed point
-  # closing while P triples:
-  #
-  #   P=1612   NK=3840  rank=624   NK/P=2.38  eps=0.441
-  #   P=4283   NK=5120  rank=1107  NK/P=1.20  eps=0.398
-  #   P=9383   NK=5760  rank=602   NK/P=0.61  eps=0.0131
-  #   P=12869  NK=5760  rank=161   NK/P=0.45  eps=0.0410
-  #
-  # eps collapses from 0.44 to 0.009 as NK/P crosses 1 while the validation
-  # relative error stays at 1.02 -- the spurious zero, exactly as the NK/P
-  # table further up this file describes it.
+  # kappa = 4: size the probe so NK = 4 * rank(J) AS THE NET GROWS, instead
+  # of trusting a hand-picked probe to stay above the interpolation floor.
+  # Below that floor eps collapses to a spurious 0 and the certificate is
+  # vacuous. probe_batches above is only the starting point. [4, 8] is the
+  # documented range. From config 2 (mnist_matrix_free.yaml) -- it is a
+  # data-size knob, and this config runs on the same data.
   certify_probe_kappa: 4.0
-  # The floor that makes the claim above true. rank(J) <= min(NK, P), so NK > P
-  # forbids interpolation outright; 1.25 buys margin.
-  #
-  # REPLAYED through the sizing arithmetic on that exact trajectory, rows the
-  # sizer REQUESTS with and without it:
-  #
-  #   P=1612..3383  NK/P 2.38..1.51   2560..5120 -> unchanged   IDENTICAL
-  #   P=4283        NK/P 1.20         4480 -> 5760   (+12.5% over the 5120 used)
-  #   P=9383        NK/P 0.61         2560 -> 12160
-  #   P=14487       NK/P 0.40          640 -> 18560
-  #
-  # Two things to read there. The healthy phase is BYTE-IDENTICAL: the floor is
-  # inactive while the probe already clears it, so nothing that was working is
-  # disturbed. And without it the request COLLAPSES to 640 rows at P=14487 --
-  # only the monotone ratchet on the probe size kept it at 5760 at all, which
-  # is how a certificate ended up being read off 0.40 rows per parameter.
-  certify_probe_parameter_floor: 1.25
-  # El certificado de VALIDACION tambien honra family_order.
-  #
-  # evaluate_fgd_validation_certificate llama a _compute_tangent_projection_step,
-  # que despacha por projection_solver y NUNCA por family_order. Asi que esta
-  # config, cuyo proposito entero es la ruta matrix-free, construia un Jacobiano
-  # denso NK x P y le hacia un SVD. MEDIDO en el run 1g0895r3:
-  # tangent_projection_solve_seconds = 12129 de 12135 -- el 99.95% de cuatro
-  # horas -- en 123 llamadas de ~98.6 s sobre una matriz 14080 x 10841.
-  #
-  # Y es la linea donde el run MURIO: ese SVD corre en float32
-  # (projection_fast_factorization), cusolver no convergio, y el update no
-  # finito mato el job en la epoch 6.
-  #
-  # MEDIDO contra la ruta densa con la MISMA funcion de error en los dos lados:
-  #
-  #   P=3230  densa  8.7s eps 0.536476 | factorizada 1.8s eps 0.536129  4.80x
-  #   P=4864  densa 19.2s eps 0.480861 | factorizada 4.9s eps 0.480447  3.87x
-  #   P=6514  densa 36.7s eps 0.387405 | factorizada 12.3s eps 0.386774 2.98x
-  #
-  # Y el certificado completo end-to-end a P=4864: rel_err 0.48086 contra
-  # 0.48045 (4.1e-04 frente a una barra de 0.5), gradient_sq_norm identico a
-  # siete cifras, relative_error_condition_valid identico, 3.53x mas rapido.
-  # La dinamica por epoch se conserva; lo que cambia es cuantas epochs caben.
-  certify_validation_factored: true
-  # Bound the range finder's vmap block. It asks for rank + oversampling
-  # directions -- of order P -- and vmap holds every direction's full forward
-  # activations at once, so unchunked (0, the default this config was silently
-  # using) the block grows with BOTH the net and the probe. That is what killed
-  # the biased arm: MEASURED, GPU memory 1.3 -> 6.6 -> 12.8 -> 40.1 GB (93.4%
-  # of an A100 40G) and a reproducible death at epoch 6, three runs, identical
-  # to the digit (yqfvy8l7, uesf9xgb, euepsdrk). The arm whose probe stayed
-  # small peaked at 10.6 GB and did not OOM.
-  #
-  # Raising the probe floor above makes the block grow faster, so this is not
-  # optional alongside it. 256 is the value the conv launcher already uses on
-  # A100. Chunking cannot change the result -- the directions in a block are
-  # independent, so it is a loop -- beyond one ulp of reduction order.
-  matrix_free_block_chunk: 256
-  # Scalar evidence for the live interpolation-floor invariant. This does not
-  # resize or redraw the probe; it reads the exact system certification already
-  # built and logs P, NK, numerical rank(J), NK/rank(J), and eps.
+  # Observe the already-built matrix-free system without changing probe
+  # sizing. The previous measurements put NK/rank at 23-35 for Conv; keep that
+  # invariant visible beside eps in the cluster run.
   certify_probe_diagnostics: true
-  # THE CARD'S CEILING, MEASURED. Memory scales as O(P^2), and the constant is
-  # tight: building the tangent system at the floor's NK = 1.25 P,
+  # An INSTRUMENT, not a solution. The kappa floor turns out NOT to be what
+  # binds here, and the reason is worth recording because it is the opposite
+  # of the linear case: MEASURED on this stack, rank(J) FALLS as the net
+  # grows -- 307 at P=498, 236 at P=974, 199 at P=1450 -- because a
+  # convolution shares its weights, so the Jacobian's rank is limited by the
+  # data and the spatial structure rather than by the parameter count. In the
+  # linear ladder rank tracks P and the probe has to chase it; here NK = 7040
+  # against rank ~200-300 leaves NK/rank at 23-35, far above the floor of 4.
   #
-  #   P= 4864   live 0.33 GB   peak  1.80 GB
-  #   P= 8180   live 1.20 GB   peak  5.05 GB
-  #   P=10709   live 2.07 GB   peak  8.63 GB
+  # What binds is TIME, not the certificate: one tangent solve costs 4.2 s at
+  # P=544 and 25.5 s at P=1450, six times over, and an epoch spends about 24
+  # of them.
   #
-  # peak/P^2 is 7.53e-8 across all three (and live/P^2 is 1.80e-8), so
+  # 5000, config 2's value, for the same reason the sample count is.
   #
-  #   P= 20000  ->  peak 30.1 GB     fits an A100 40G with room
-  #   P= 23000  ->  peak 39.8 GB     the hard limit
-  #   P=100000  ->  peak  753 GB     impossible by two orders of magnitude
-  #
-  # An earlier revision of this file kept 100000, arguing the factored system
-  # (NK x r) + (P x r) avoided the dense NK x P. That was WRONG: at these sizes
-  # r ~= P, the factorisation is not low-rank, and NK x r with NK ~= 1.25 P is
-  # exactly O(P^2). The measurement above is what settles it.
-  #
-  # The probe stays inside the data either way: at floor 1.25 a P of 20000 asks
-  # for NK = 25000 rows = 2500 images of the 50000 loaded.
-  #
-  # What this costs: a dense 784-20-...-10 reaches about 0.94-0.96, so 0.98 is
-  # NOT reachable at this budget. A grown architecture buying more per parameter
-  # is this branch's whole thesis, so 0.95-0.97 is the honest expectation.
-  # Raising it needs the cost per parameter to come down, which is separate work.
-  max_total_parameters: 20000
-  growth_preservation_tolerance: 1.0e-6
+  # A tighter cap was tried and it was the WRONG TRADE, measured: at 1000 the
+  # run reached 996 parameters by epoch 2 and then spent every epoch unable to
+  # grow, eps parked at 0.4997-0.5000 -- the same stall a cap produces in the
+  # linear ladder -- and accuracy froze at 0.349 against the 0.673 the same
+  # flow reached with room. A budget that changes the ANSWER is not an
+  # instrument, whatever it saves in wall clock.
+  max_total_parameters: 5000
+  # Also from config 2: the streamed Gram is for the flat-MNIST widths.
+  certify_stream_gram: false
+  # GroMo's crossfold bottleneck test CANNOT MEASURE on conv: its fitted
+  # extension matrix assumes two linear layers, and with 4-D alpha/omega the
+  # guard returns None, the significance comes back inf, and inf > 1 approves
+  # every candidate. It would look live while being a no-op, which is worse
+  # than being off. 0 disables it, and a test pins the inf so the fact is
+  # recorded rather than rediscovered.
+  growth_bottleneck_crossfold_folds: 0
+  # Conv-specific float32 roundoff floor. Widening installs exactly-zero
+  # outgoing weights, so the represented function is unchanged algebraically,
+  # but changing a convolution's channel shape can change cuDNN's reduction
+  # order. MEASURED on margpu008: relative drift 1.281e-6
+  # (4.888e-6 / output scale 3.815) tripped the MLP-oriented 1e-6 guard and
+  # aborted seed 0. 1e-5 is still a strict five-significant-digit invariant
+  # and matches the Conv insertion tests; linear and N1024 retain 1e-6.
+  growth_preservation_tolerance: 1.0e-5
   # Ordered ladder of approximation families, evaluated top to bottom.
   # "tangent" must come first (it is the epoch's main transactional
   # search). Each following family is consulted only after every family
@@ -717,11 +699,6 @@ parametric_gd:
   min_cosine: 0.9           # mathematical floor for Crel<0.5 is 0.866
   parameter_penalty: 1.0e-6
   gradient_clip_norm: 1.0
-  # Matrix-free accumulation knobs. These are pure execution settings and do
-  # not alter the sums defining Jv/J^Tw. A 128-example group equals the whole
-  # two-batch certification probe.
-  cg_tolerance: 1.0e-10
-  matrixfree_batch_size: 128
 
 # Measured-descent parametric family. Only consulted when
 # "parametric_descent" is listed in fgd_approx.family_order. Same candidate
@@ -810,10 +787,19 @@ wandb:
   project: stable-tiny
   entity:
   run_name:
-  group: mnist-family-ladder-matrix-free
+  group: mftangent-ladder-N1024
   job_type: train
-  tags: [fgd_approx, certified_growth, mnist, from_3x2, mse, lemma35_cycle, matrix_free, transactional, exact_dual_spectrum]
-  notes: MNIST family ladder with factored matrix-free tangent, bounded exact dual probe, fast analytic operators and transactional endpoint descent
+  tags: [fgd_approx, certified_growth, smooth_sin_tiny, from_3x2, mse, lemma35_cycle, matrix_free, transactional, exact_dual_spectrum]
+  notes: Matrix-free tangent with exact dual spectrum and transactional realized-training-functional descent; the dense exact ladder remains untouched.
   mode: online
   dir: results
   log_code: false
+
+# --- Matrix-free operator solver knobs ---
+parametric_gd:
+  cg_tolerance: 1.0e-10
+  # Accumulate this many examples per autograd call. NOT a hyperparameter:
+  # J and r are sums over examples. MEASURED at N=1024, eps agreed to 6
+  # significant figures across 64/128/256/512/1024 while the solve went
+  # 0.62s -> 0.06s -- pure call overhead, since Krylov is sequential.
+  matrixfree_batch_size: 256
