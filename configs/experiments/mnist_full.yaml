@@ -609,6 +609,30 @@ fgd_approx:
   # only the monotone ratchet on the probe size kept it at 5760 at all, which
   # is how a certificate ended up being read off 0.40 rows per parameter.
   certify_probe_parameter_floor: 1.25
+  # El certificado de VALIDACION tambien honra family_order.
+  #
+  # evaluate_fgd_validation_certificate llama a _compute_tangent_projection_step,
+  # que despacha por projection_solver y NUNCA por family_order. Asi que esta
+  # config, cuyo proposito entero es la ruta matrix-free, construia un Jacobiano
+  # denso NK x P y le hacia un SVD. MEDIDO en el run 1g0895r3:
+  # tangent_projection_solve_seconds = 12129 de 12135 -- el 99.95% de cuatro
+  # horas -- en 123 llamadas de ~98.6 s sobre una matriz 14080 x 10841.
+  #
+  # Y es la linea donde el run MURIO: ese SVD corre en float32
+  # (projection_fast_factorization), cusolver no convergio, y el update no
+  # finito mato el job en la epoch 6.
+  #
+  # MEDIDO contra la ruta densa con la MISMA funcion de error en los dos lados:
+  #
+  #   P=3230  densa  8.7s eps 0.536476 | factorizada 1.8s eps 0.536129  4.80x
+  #   P=4864  densa 19.2s eps 0.480861 | factorizada 4.9s eps 0.480447  3.87x
+  #   P=6514  densa 36.7s eps 0.387405 | factorizada 12.3s eps 0.386774 2.98x
+  #
+  # Y el certificado completo end-to-end a P=4864: rel_err 0.48086 contra
+  # 0.48045 (4.1e-04 frente a una barra de 0.5), gradient_sq_norm identico a
+  # siete cifras, relative_error_condition_valid identico, 3.53x mas rapido.
+  # La dinamica por epoch se conserva; lo que cambia es cuantas epochs caben.
+  certify_validation_factored: true
   # Bound the range finder's vmap block. It asks for rank + oversampling
   # directions -- of order P -- and vmap holds every direction's full forward
   # activations at once, so unchunked (0, the default this config was silently

@@ -3102,14 +3102,32 @@ def _growth_reduces_lookahead_epsilon(
         )
         if trained is None:
             return None
-        certificate = evaluate_fgd_validation_certificate(
-            model=trained,
-            data_loader=validation_loader,
-            device=device,
-            config=config.fgd_approx,
-            learning_rate=None,
-            probe=probe,
-        )
+        try:
+            certificate = evaluate_fgd_validation_certificate(
+                model=trained,
+                data_loader=validation_loader,
+                device=device,
+                config=config.fgd_approx,
+                learning_rate=None,
+                probe=probe,
+            )
+        except RuntimeError:
+            # This whole function is ADVISORY -- it asks "would training beat
+            # growing here?" on throwaway clones and its answer is a hint, not
+            # a certificate. A speculative what-if that cannot be computed must
+            # answer "no opinion", exactly as the grow_layer call below already
+            # does with the same `except RuntimeError: return False`.
+            #
+            # MEASURED, and it is why this exists: run 1g0895r3 (job 457944)
+            # died after 4h01m at epoch 6 with
+            # "RuntimeError: Non-finite FGD tangent projection update detected."
+            # raised HERE, inside the lookahead, after cusolver failed to
+            # converge on the dense SVD. sacct: FAILED 1:0, MaxRSS 2.6 GB of
+            # 64 G, GPU at 41% of 40 GB -- nothing was exhausted, a hint simply
+            # killed a four-hour run. The identical death at the identical
+            # epoch in 9okhgeta is the same line.
+            increment("growth_lookahead_non_finite_abstentions")
+            return None
         return certificate.relative_error
 
     # Stay: the current structure, trained the same number of steps.

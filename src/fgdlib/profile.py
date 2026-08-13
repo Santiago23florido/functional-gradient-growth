@@ -76,6 +76,20 @@ PROFILE_FIELDS = (
     # 2.359 GB reserved, and three jobs died of a pool that ratcheted while the
     # live footprint stayed small.
     "probe_allocator_cache_releases",
+    # The growth lookahead declining to answer because the certificate on its
+    # throwaway clone could not be computed. The lookahead is ADVISORY, so the
+    # honest answer is "no opinion" -- but a high count means the dense float32
+    # SVD it runs is failing often, which is a real defect to attack rather than
+    # tolerate. MEASURED: run 1g0895r3 (job 457944) died at epoch 6 after
+    # 4h01m because this path raised instead of abstaining, with the GPU at 41%
+    # and MaxRSS at 2.6 GB of 64 G -- nothing exhausted, a hint killed the run.
+    "growth_lookahead_non_finite_abstentions",
+    # Validation certificates answered from the matrix-free factors instead of
+    # a dense NK x P SVD. MEASURED: that SVD was 99.95% of run 1g0895r3 and the
+    # line it died on. The fallback counter is the one to watch -- if it is
+    # high the factors are not usable and the dense cost is back.
+    "validation_factored_certificates",
+    "validation_factored_fallbacks",
     # The realizable-progress criterion abstaining rather than refusing, which
     # is the only thing standing between "no eta realizes a step" and a frozen
     # run: MEASURED at 35 epochs of exact no-op before it existed.
@@ -235,6 +249,9 @@ _COUNTER_FIELDS = {
     "probe_counterexample_evictions",
     "probe_below_parameter_floor",
     "probe_allocator_cache_releases",
+    "growth_lookahead_non_finite_abstentions",
+    "validation_factored_certificates",
+    "validation_factored_fallbacks",
     "certify_realizable_abstentions",
     "where_scans",
     "where_candidates",

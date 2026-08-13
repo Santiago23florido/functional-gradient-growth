@@ -392,6 +392,94 @@ def test_the_allocator_pool_stops_ratcheting_when_the_probe_changes_shape() -> N
     assert released < ratcheted, (released, ratcheted)
 
 
+def test_the_factored_validation_route_is_off_by_default_and_matrix_free_only() -> None:
+    """It must be unreachable for every config that does not opt in.
+
+    The dense route is what every existing certificate measured, so anything
+    that cannot use the factors has to keep it byte-identical.
+    """
+    from fgdlib.tangent import FGDApproxConfig, _factored_validation_stats
+
+    assert FGDApproxConfig().certify_validation_factored is False
+    model = torch.nn.Linear(3, 2)
+    x = torch.ones(4, 3)
+    y = torch.zeros(4, 2)
+    # Off: never even looks at the family.
+    assert (
+        _factored_validation_stats(
+            model, x, y, dataclasses.replace(FGDApproxConfig(), family_order=("matrix_free_tangent",))
+        )
+        is None
+    )
+    # On, but the exact-tangent family has no factors to read.
+    assert (
+        _factored_validation_stats(
+            model,
+            x,
+            y,
+            dataclasses.replace(
+                FGDApproxConfig(),
+                certify_validation_factored=True,
+                family_order=("tangent",),
+            ),
+        )
+        is None
+    )
+
+    for path in Path("configs/fgd").glob("*.yaml"):
+        config = load_pipeline_config(path).fgd_approx
+        expected = path.name == "mnist_conv_matrix_free.yaml"
+        assert config.certify_validation_factored is expected, path
+
+
+def test_the_two_validation_routes_agree_on_the_certificate() -> None:
+    """The parity that authorises replacing a dense NK x P SVD.
+
+    MEASURED at P=4864 / NK=6080 on this config: rel_err 0.48086 dense against
+    0.48044657 factored -- 4.1e-04 against a 0.5 bar -- with
+    gradient_sq_norm identical to seven figures and
+    relative_error_condition_valid identical, at 3.53x the speed. On the
+    cluster that dense solve was 99.95% of a four-hour run and the line it
+    died on.
+    """
+    from fgdlib.tangent import evaluate_fgd_validation_certificate
+
+    from stable_tiny.pipeline import build_model
+
+    config = load_pipeline_config("configs/experiments/mnist_full.yaml")
+    device = torch.device("cpu")
+    torch.manual_seed(0)
+    model = build_model(config, device)
+    generator = torch.Generator().manual_seed(0)
+    samples = 48
+    x = torch.rand(samples, 784, generator=generator)
+    y = torch.zeros(samples, 10)
+    y[torch.arange(samples), torch.randint(0, 10, (samples,), generator=generator)] = 1.0
+
+    certificates = {}
+    for factored in (False, True):
+        certificates[factored] = evaluate_fgd_validation_certificate(
+            model=model,
+            data_loader=[],
+            device=device,
+            config=dataclasses.replace(
+                config.fgd_approx, certify_validation_factored=factored
+            ),
+            learning_rate=None,
+            probe=(x, y),
+        )
+
+    dense, factored = certificates[False], certificates[True]
+    assert factored.relative_error == pytest.approx(dense.relative_error, abs=5e-3)
+    assert factored.gradient_sq_norm == pytest.approx(
+        dense.gradient_sq_norm, rel=1e-6
+    )
+    assert (
+        factored.relative_error_condition_valid
+        is dense.relative_error_condition_valid
+    )
+
+
 def test_probe_diagnostic_reports_the_true_rows_not_the_surrogate() -> None:
     """NK must be the probe's rows even when the system is a surrogate.
 

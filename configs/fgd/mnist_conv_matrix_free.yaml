@@ -501,6 +501,19 @@ fgd_approx:
   # 5000 and NK starts at 7040 -- but the sizing that let it happen there is the
   # same sizing running here, so the floor goes in before the budget ever moves.
   certify_probe_parameter_floor: 1.25
+  # Mismo defecto y misma cura que en el lineal: el certificado de validacion
+  # despacha por projection_solver y nunca por family_order, asi que construye
+  # un Jacobiano denso y lo descompone aunque esta config sea matrix-free. En
+  # el lineal eso era el 99.95% del tiempo y la linea donde el run moria.
+  # MEDIDO alli: 3-4.8x mas rapido con eps coincidiendo a 3-6e-04 y el coseno
+  # direccional identico a cuatro decimales.
+  #
+  # Aqui P esta topado en 5000, asi que el ahorro absoluto es menor, pero la
+  # ruta densa es la misma y el fallo numerico que provoca tambien. Si los
+  # factores no sirven para una geometria conv concreta, el helper devuelve
+  # None y se cae a la ruta densa de siempre; el contador
+  # validation_factored_fallbacks lo dice.
+  certify_validation_factored: true
   # Let a NEW LAYER compete with the widenings, in the same measured
   # bottleneck per parameter. This is the B arm; false is the A arm and runs
   # the width-only branch exactly as before.

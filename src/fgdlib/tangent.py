@@ -1072,6 +1072,34 @@ class FGDApproxConfig:
     # at P=4283 by 4.6% more rows. Zero keeps the rank-only sizing exactly as
     # it is, which is what CIFAR wants (there rank << P genuinely).
     certify_probe_parameter_floor: float = 0.0
+    # Let the VALIDATION certificate honour ``family_order`` too.
+    #
+    # ``evaluate_fgd_validation_certificate`` calls
+    # ``_compute_tangent_projection_step``, which dispatches on
+    # ``projection_solver`` and NEVER on ``family_order``. So a config whose
+    # whole point is the matrix-free route still materialises a dense
+    # ``NK x P`` Jacobian for its validation certificate and runs an SVD on it.
+    #
+    # MEASURED on run 1g0895r3: ``tangent_projection_solve_seconds`` was
+    # 12129 of 12135 total -- 99.95% of a four-hour run -- over 123 calls at
+    # ~98.6 s each, on a 14080 x 10841 Jacobian. And it is where the run DIED:
+    # that SVD runs in float32 (``projection_fast_factorization``), cusolver
+    # failed to converge, and the non-finite update killed the job at epoch 6.
+    #
+    # ``factored_projection_solve`` answers the same question from the factors
+    # the matrix-free system already produces, at ``k x k`` instead of a dense
+    # SVD. MEASURED against the dense route with the SAME
+    # ``_output_relative_error_from_tensors`` on both sides:
+    #
+    #   P= 3230  dense 8.7s eps 0.536476 | factored 1.8s eps 0.536129  4.80x
+    #   P= 4864  dense19.2s eps 0.480861 | factored 4.9s eps 0.480447  3.87x
+    #   P= 6514  dense36.7s eps 0.387405 | factored12.3s eps 0.386774  2.98x
+    #
+    # eps agrees to 3-6e-04 against a 0.5 bar, and the directional cosine is
+    # identical to four decimals. Off by default, so every existing
+    # certificate is byte-identical, and it only takes effect on
+    # ``family_order: [matrix_free_tangent]`` where the factors exist at all.
+    certify_validation_factored: bool = False
     # Bound the counterexample memory by ROWS instead of terminating on a round
     # count. certify_probe_refine_max_rounds is a terminal cap: once spent the
     # mechanism is off for the rest of the run and the probe drifts back into
@@ -5636,6 +5664,57 @@ def measure_direction_projection(
     )
 
 
+def _factored_validation_stats(
+    model: SequentialGrowingModel,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    config: FGDApproxConfig,
+) -> _FunctionalStepStats | None:
+    """Validation stats from the matrix-free factors, or ``None`` to fall back.
+
+    The dense route builds an ``NK x P`` Jacobian and SVDs it even when
+    ``family_order`` is ``[matrix_free_tangent]``, because
+    ``_compute_tangent_projection_step`` dispatches on ``projection_solver``
+    alone. That is 99.95% of the runtime on full MNIST and the line the run
+    dies on -- see ``certify_validation_factored``.
+
+    Every early return here hands control back to the dense path unchanged, so
+    a config that cannot use this path is not merely unaffected, it is
+    byte-identical.
+    """
+    if not getattr(config, "certify_validation_factored", False):
+        return None
+    if tuple(config.family_order) != ("matrix_free_tangent",):
+        # The factors only exist on the matrix-free route.
+        return None
+    system = exact_tangent_system(model, x, y, config)
+    if system is None or system.factors is None:
+        return None
+
+    from fgdlib.search.mffactored import factored_projection_solve
+
+    solved = factored_projection_solve(
+        system, system.target, config.projection_damping
+    )
+    if solved is None:
+        return None
+    _, approximation = solved
+    if not torch.isfinite(approximation).all():
+        # The dense route RAISES here. Falling back instead keeps the caller's
+        # contract: this helper only ever returns stats it trusts.
+        fallback("validation_factored_fallbacks", "non_finite_approximation")
+        return None
+    increment("validation_factored_certificates")
+    # The SAME function the dense route uses, so the two are comparable by
+    # construction rather than by a reimplemented formula -- MEASURED to agree
+    # on eps to 3-6e-04 and on the directional cosine to four decimals.
+    return _output_relative_error_from_tensors(
+        approximation=approximation,
+        target=system.target.reshape(-1).to(approximation.dtype),
+        eps=config.eps,
+    )
+
+
 def evaluate_fgd_validation_certificate(
     model: SequentialGrowingModel,
     data_loader: torch.utils.data.DataLoader,
@@ -5670,18 +5749,20 @@ def evaluate_fgd_validation_certificate(
     x, y = probe
     x = x.to(device)
     y = y.to(device)
-    projection_step = _compute_tangent_projection_step(
-        model=model,
-        x=x,
-        y=y,
-        config=config,
-    )
-    stats = _FunctionalStepStats(
-        output_error=projection_step.output_error,
-        dot_product=projection_step.dot_product,
-        approximation_sq_norm=projection_step.approximation_sq_norm,
-        target_sq_norm=projection_step.target_sq_norm,
-    )
+    stats = _factored_validation_stats(model, x, y, config)
+    if stats is None:
+        projection_step = _compute_tangent_projection_step(
+            model=model,
+            x=x,
+            y=y,
+            config=config,
+        )
+        stats = _FunctionalStepStats(
+            output_error=projection_step.output_error,
+            dot_product=projection_step.dot_product,
+            approximation_sq_norm=projection_step.approximation_sq_norm,
+            target_sq_norm=projection_step.target_sq_norm,
+        )
     return certificate_from_projection_stats(
         stats=stats,
         learning_rate=learning_rate,

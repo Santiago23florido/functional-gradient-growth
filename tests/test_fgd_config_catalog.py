@@ -166,6 +166,12 @@ def test_mnist_conv_inherits_config_2s_optimisation_set() -> None:
         # 0.45 and eps collapsed 0.44 -> 0.009 with validation still at 1.02.
         # Insurance here, since P is capped at 5000 and NK starts at 7040.
         "certify_probe_parameter_floor",
+        # The validation certificate dispatches on projection_solver and never
+        # on family_order, so a matrix-free config still built a dense NK x P
+        # Jacobian and SVD'd it. MEASURED on the linear sibling: 99.95% of a
+        # four-hour run, and the line that run died on. Answering from the
+        # factors instead agrees on eps to 3-6e-04 at 3-4.8x the speed.
+        "certify_validation_factored",
         # A zero-output-weight Conv extension is algebraically exact, but
         # changing channel shape changes float32/cuDNN reduction order. Keep
         # its measured roundoff allowance local to Conv.

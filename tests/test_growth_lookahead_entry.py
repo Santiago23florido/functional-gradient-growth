@@ -280,3 +280,72 @@ def test_both_lookahead_counters_are_registered() -> None:
 
     assert "certify_growth_not_warranted" in PROFILE_FIELDS
     assert "certify_growth_warranted_entries" in PROFILE_FIELDS
+    # An unregistered counter is a KeyError under FGD_PROFILE=1, which is how
+    # growth_where_no_bottleneck once took a cluster run down.
+    assert "growth_lookahead_non_finite_abstentions" in PROFILE_FIELDS
+
+
+def test_a_lookahead_that_cannot_certify_abstains_instead_of_killing_the_run(
+    monkeypatch,
+) -> None:
+    """The measured death of run 1g0895r3, turned into a regression.
+
+    Job 457944 ran 4h01m and died at epoch 6 with
+
+        RuntimeError: Non-finite FGD tangent projection update detected.
+
+    raised from evaluate_fgd_validation_certificate INSIDE this lookahead,
+    after cusolver failed to converge on the dense float32 SVD of a
+    14080 x 10841 Jacobian. sacct: FAILED 1:0, MaxRSS 2.6 GB of 64 G, GPU at
+    41% of 40 GB -- nothing was exhausted. Run 9okhgeta died at the identical
+    epoch on the identical line.
+
+    The lookahead is ADVISORY: it asks "would training beat growing here?" on
+    throwaway clones. When it cannot compute the answer the honest reply is
+    "no opinion", which is what the grow_layer call in the same function has
+    always done with its own `except RuntimeError: return False`.
+    """
+    import torch
+
+    from fgdlib import profile
+    from stable_tiny import pipeline
+
+    class _Layer:
+        in_neurons = 4
+
+    class _Model(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(1))
+            self._growable_layers = [_Layer(), _Layer()]
+
+    def _raises(*args, **kwargs):
+        raise RuntimeError("Non-finite FGD tangent projection update detected.")
+
+    monkeypatch.setattr(
+        pipeline, "_train_parametric_gd_candidate", lambda **kw: _Model()
+    )
+    monkeypatch.setattr(
+        pipeline, "evaluate_fgd_validation_certificate", _raises
+    )
+
+    config = load_pipeline_config("configs/experiments/mnist_full.yaml")
+    monkeypatch.setenv("FGD_PROFILE", "1")
+    before = profile.snapshot().get("growth_lookahead_non_finite_abstentions", 0)
+    # Must return a verdict, not propagate. False is "growth not warranted",
+    # which leaves the run training exactly as it would without an opinion.
+    assert (
+        pipeline._growth_reduces_lookahead_epsilon(
+            model=_Model(),
+            train_batches=[],
+            train_loader=[],
+            validation_loader=[],
+            device=torch.device("cpu"),
+            config=config,
+            probe=None,
+        )
+        is False
+    )
+    assert (
+        profile.snapshot().get("growth_lookahead_non_finite_abstentions", 0) > before
+    )
