@@ -392,6 +392,39 @@ def test_the_allocator_pool_stops_ratcheting_when_the_probe_changes_shape() -> N
     assert released < ratcheted, (released, ratcheted)
 
 
+def test_only_full_mnist_raises_the_outer_step_count_and_lowers_the_budget() -> None:
+    """The under-training fix, confined to the one experiment that measured it.
+
+    MEASURED on run tn73ly2u, the branch's best MNIST: train_acc 0.9003 against
+    test_acc 0.8963, a gap of +0.004. No overfitting -- the model does not even
+    fit the training set, so capacity is not the constraint. Counting
+    [FGD-STEP] lines gives 8 optimisation steps per epoch against the
+    50000/64 = 781 minibatch steps AdamW takes on the same data: 98x less
+    work. That 8 was the shared catalog default, identical in all seven
+    configs including N1024's.
+
+    The budget goes DOWN, not up: at P=20291 the GPU reached 42.2 GB of 40
+    (98.3%) and the run was about to die. Growth had already stopped at epoch
+    10, so what is missing is epochs, not parameters.
+    """
+    full = load_pipeline_config("configs/experiments/mnist_full.yaml").fgd_approx
+    assert full.outer_steps_per_epoch == 24
+    assert full.max_total_parameters == 16000
+
+    # Every catalog config keeps the shared default. This is the guarantee the
+    # user asked for: the change touches MNIST and nothing else.
+    for path in Path("configs/fgd").glob("*.yaml"):
+        config = load_pipeline_config(path).fgd_approx
+        assert config.outer_steps_per_epoch == 8, path
+
+    # And measured descent stays off, because VERIFIED it would be a no-op
+    # here: certify_apply_in_interval wins the branch above it, so the
+    # measured-descent path is never reached. Reaching it would mean turning
+    # off the realize path that currently works.
+    assert full.tangent_measured_descent is False
+    assert full.certify_apply_in_interval is True
+
+
 def test_the_factored_validation_route_is_off_by_default_and_matrix_free_only() -> None:
     """It must be unreachable for every config that does not opt in.
 

@@ -192,7 +192,45 @@ fgd_approx:
   # the stationary/global bounds are computed and logged as trajectory
   # diagnostics. false (default): legacy behavior — non-strict descent and
   # Cstat/Cglob as acceptance gates.
-  outer_steps_per_epoch: 8
+  # 24, no 8. EL METODO ENTRENA DEMASIADO POCO, y esto es lo que lo mide.
+  #
+  # MEDIDO en el run tn73ly2u, el mejor MNIST de la rama:
+  #
+  #   train_acc 0.9003   test_acc 0.8963   gap +0.004
+  #
+  # Un gap de +0.004 dice que NO hay sobreajuste: el modelo ni siquiera ajusta
+  # el train. Con 20291 parametros la capacidad esta y no se usa. Y el
+  # crecimiento paro en la epoch 10 al agotar el presupuesto, tras lo cual diez
+  # epochs mas compraron +0.008: el crecimiento hacia todo el trabajo y el
+  # entrenamiento casi nada.
+  #
+  # La causa, contando [FGD-STEP] en el log: **8 pasos de optimizacion por
+  # epoch**, contra los 50000/64 = 781 pasos de minibatch que da AdamW sobre
+  # los mismos datos. 98x menos. En 20 epochs son 160 actualizaciones contra
+  # 15620.
+  #
+  # Y ese 8 no estaba ajustado a nada: es el mismo valor en las SIETE configs
+  # del catalogo, incluida la de N1024, que resuelve un problema 50 veces
+  # menor.
+  #
+  # Subirlo no relaja ningun certificado. El campo son "k aplicaciones del
+  # mismo teorema por paso", cada intento se certifica independientemente
+  # sobre el modelo ACTUAL, y "la epoch para en el primer intento rechazado",
+  # asi que se auto-limita. Lo unico que cambia es cuantas veces se permite
+  # intentar.
+  #
+  # El presupuesto de coste lo libero certify_validation_factored: el
+  # certificado de validacion era el 99.95% del tiempo y ahora va 3-4.8x mas
+  # rapido. 24 y no mas porque el coste hay que MEDIRLO en la primera epoch
+  # antes de comprometer 40.
+  #
+  # DESCARTADO por el camino: tangent_measured_descent, que promete un paso 8x
+  # mas largo (optimo medido ~0.5 contra eta_max ~0.06). VERIFICADO que aqui
+  # seria un NO-OP: certify_apply_in_interval es true y gana el `if` anterior,
+  # asi que la rama del descenso medido no se alcanza nunca. Usarlo exigiria
+  # apagar la ruta de realizacion que hoy funciona, que es lo contrario de
+  # conservar lo que ya rinde.
+  outer_steps_per_epoch: 24
   growth_patience: 1
   # Certified functional: cross-entropy keeps convexity (global optimality)
   # and is 4x smoother than MSE (wider admissible interval), but has NO
@@ -676,7 +714,19 @@ fgd_approx:
   # NOT reachable at this budget. A grown architecture buying more per parameter
   # is this branch's whole thesis, so 0.95-0.97 is the honest expectation.
   # Raising it needs the cost per parameter to come down, which is separate work.
-  max_total_parameters: 20000
+  # 16000, no 20000, y NO es para ganar accuracy: es para que la corrida
+  # TERMINE. MEDIDO en tn73ly2u, memoria GPU a lo largo del run:
+  #
+  #   1.1 -> 17.4 -> 32.1 -> 36.4 -> 39.5 -> 42.2 GB   (98.3% de una A100 40G)
+  #
+  # A P=20291 el modelo peak = 7.53e-8 * P^2 predecia 31.0 GB y la realidad
+  # fueron 42.2: lo infravaloraba un 36%. Asi que 20000 no se queda corto, se
+  # queda LARGO, y la corrida muere antes de gastar sus 40 epochs.
+  #
+  # No cuesta accuracy. El crecimiento ya estaba parado desde la epoch 10 por
+  # el propio tope, asi que lo que falta son epochs, no parametros -- y con
+  # outer_steps_per_epoch arriba el mismo presupuesto se aprovecha mas.
+  max_total_parameters: 16000
   growth_preservation_tolerance: 1.0e-6
   # Ordered ladder of approximation families, evaluated top to bottom.
   # "tangent" must come first (it is the epoch's main transactional
