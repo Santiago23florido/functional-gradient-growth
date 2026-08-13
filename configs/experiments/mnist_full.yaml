@@ -627,20 +627,32 @@ fgd_approx:
   # resize or redraw the probe; it reads the exact system certification already
   # built and logs P, NK, numerical rank(J), NK/rank(J), and eps.
   certify_probe_diagnostics: true
-  # The budget and the probe are COUPLED, and the coupling is now the parameter
-  # floor rather than kappa: at floor 1.25 a P of 100000 demands NK = 125000
-  # rows = 12500 images, and this config loads 50000, so it fits with room.
-  # (Under kappa 4 against P it would need 40000 images -- also inside 50000,
-  # but 3.2x the cost for no theoretical gain, since the interpolation floor is
-  # NK > P and 1.25 already clears it.)
+  # THE CARD'S CEILING, MEASURED. Memory scales as O(P^2), and the constant is
+  # tight: building the tangent system at the floor's NK = 1.25 P,
   #
-  # Left at 100000 deliberately. An earlier revision of this plan lowered it to
-  # 35000 on a memory argument that VERIFICATION refuted: the matrix-free
-  # system is factored, (NK x r) + (P x r), not the dense NK x P, so memory was
-  # never the wall -- the unbounded range-finder block was. With
-  # matrix_free_block_chunk set above, the binding constraint is the CLOCK, and
-  # a budget cap would only stop the search before the clock does.
-  max_total_parameters: 100000
+  #   P= 4864   live 0.33 GB   peak  1.80 GB
+  #   P= 8180   live 1.20 GB   peak  5.05 GB
+  #   P=10709   live 2.07 GB   peak  8.63 GB
+  #
+  # peak/P^2 is 7.53e-8 across all three (and live/P^2 is 1.80e-8), so
+  #
+  #   P= 20000  ->  peak 30.1 GB     fits an A100 40G with room
+  #   P= 23000  ->  peak 39.8 GB     the hard limit
+  #   P=100000  ->  peak  753 GB     impossible by two orders of magnitude
+  #
+  # An earlier revision of this file kept 100000, arguing the factored system
+  # (NK x r) + (P x r) avoided the dense NK x P. That was WRONG: at these sizes
+  # r ~= P, the factorisation is not low-rank, and NK x r with NK ~= 1.25 P is
+  # exactly O(P^2). The measurement above is what settles it.
+  #
+  # The probe stays inside the data either way: at floor 1.25 a P of 20000 asks
+  # for NK = 25000 rows = 2500 images of the 50000 loaded.
+  #
+  # What this costs: a dense 784-20-...-10 reaches about 0.94-0.96, so 0.98 is
+  # NOT reachable at this budget. A grown architecture buying more per parameter
+  # is this branch's whole thesis, so 0.95-0.97 is the honest expectation.
+  # Raising it needs the cost per parameter to come down, which is separate work.
+  max_total_parameters: 20000
   growth_preservation_tolerance: 1.0e-6
   # Ordered ladder of approximation families, evaluated top to bottom.
   # "tangent" must come first (it is the epoch's main transactional

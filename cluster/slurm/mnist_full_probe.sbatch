@@ -38,6 +38,12 @@
 #SBATCH --gpus=1
 #SBATCH --cpus-per-gpu=8
 #SBATCH --mem=64G
+# Nodo entero. Cuesta GPUs ociosas, y se paga a proposito: dos corridas conv
+# arrancaron con 21.2 GB YA ocupados en su propia tarjeta -- identico en dos
+# jobs que no se solapan, asi que no era su propia asignacion -- y murieron a
+# 1.4 h en vez de a 4. Con el techo de esta corrida en 30 GB de pico, no hay
+# margen para compartir con nadie.
+#SBATCH --exclusive
 #SBATCH --time=0
 #SBATCH --output=slurm_logs/mnist_full_probe_%j.out
 #SBATCH --error=slurm_logs/mnist_full_probe_%j.err
@@ -150,6 +156,20 @@ mkdir -p "${RESULTS_DIR}"
 echo "[RUN] node=$(hostname) arm=${ARM}"
 echo "[RUN] config=${RUN_CONFIG} seed=${MODEL_SEED} wandb=${WANDB_RUN_MODE}"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
+
+# ABORTAR SI LA TARJETA VIENE SUCIA. MEDIDO: el pico de esta corrida es ~30 GB
+# a P=20000 (peak = 7.53e-8 * P^2), asi que arrancar con varios GB ya ocupados
+# es arrancar condenado. Dos corridas conv empezaron con 21.2 GB ocupados y
+# murieron en 1.4 h; nadie lo vio porque nada lo comprobaba.
+USED_MB=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)
+echo "[GPU] ocupado al arrancar: ${USED_MB} MiB"
+nvidia-smi --query-compute-apps=pid,used_memory,process_name --format=csv || true
+if [[ "${USED_MB:-0}" -gt 2048 ]]; then
+  echo "[FATAL] la GPU ya tiene ${USED_MB} MiB ocupados antes de empezar."
+  echo "[FATAL] con un pico esperado de ~30 GB esto muere a mitad. Revisa:"
+  echo "[FATAL]   nvidia-smi --query-compute-apps=pid,used_memory,process_name --format=csv"
+  exit 1
+fi
 
 srun python -m stable_tiny \
   --config "${RUN_CONFIG}" \
