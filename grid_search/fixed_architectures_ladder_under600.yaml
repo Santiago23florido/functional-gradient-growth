@@ -1,0 +1,76 @@
+# Fresh fixed-network retraining of the architectures observed immediately
+# below 600 parameters in the family-ladder trajectories. These references
+# are retrospective snapshots, not final runs trained with a hard 600-P cap.
+base_config: configs/fgd/family_ladder_N1024.yaml
+results_dir: results/grid_search_fixed_architectures_ladder_under600
+
+architectures:
+  - [16, 19, 9]
+  - [9, 18, 18]
+  - [13, 16, 15]
+  - [11, 17, 17]
+
+# Cross every architecture with every initialization seed. The primary paired
+# report subsequently restricts seed s to the architecture observed at seed s.
+model_seeds: [0, 1, 2, 3]
+
+# Identical to the completed fixed_grid_extended_lr_v1 search: 4 architectures
+# x 4 seeds x 10 LRs x 3 weight decays x 2 schedulers = 960 trials.
+search_spaces:
+  - optimizer.name: [adamw]
+    optimizer.learning_rate:
+      - 0.0075
+      - 0.01
+      - 0.015
+      - 0.02
+      - 0.03
+      - 0.04
+      - 0.05
+      - 0.06
+      - 0.08
+      - 0.1
+    optimizer.weight_decay: [0.0, 0.001, 0.01]
+    lr_scheduler.name: [none, cosineannealing]
+
+fixed_overrides:
+  training.epochs: 400
+  training.gradient_clip_norm: null
+  lr_scheduler.t_max: 400
+  lr_scheduler.eta_min: 0.0
+  lr_scheduler.restart_on_growth: false
+
+paired_same_seed_evaluation:
+  protocol: same_seed_retraining
+  reference_kind: last_observed_state_below_600_parameters
+  reference_note: >-
+    Retrospective boundary snapshots from unconstrained family-ladder runs;
+    they are not final results from training with max_total_parameters=600.
+  growth_runs:
+    0:
+      architecture: [16, 19, 9]
+      expected_parameters: 593
+      source_epoch: 28
+      source_run: 70_epochs
+      validation_accuracy: 0.9580078125
+      test_accuracy: 0.9522705078125
+    1:
+      architecture: [9, 18, 18]
+      expected_parameters: 586
+      source_epoch: 47
+      source_run: 70_epochs
+      validation_accuracy: 0.9580078125
+      test_accuracy: 0.9573974609375
+    2:
+      architecture: [13, 16, 15]
+      expected_parameters: 560
+      source_epoch: 34
+      source_run: 200_epochs
+      validation_accuracy: 0.966796875
+      test_accuracy: 0.96142578125
+    3:
+      architecture: [11, 17, 17]
+      expected_parameters: 583
+      source_epoch: 56
+      source_run: 70_epochs
+      validation_accuracy: 0.962890625
+      test_accuracy: 0.958740234375
