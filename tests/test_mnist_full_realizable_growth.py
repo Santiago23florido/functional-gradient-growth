@@ -408,7 +408,16 @@ def test_only_full_mnist_raises_the_outer_step_count_and_lowers_the_budget() -> 
     10, so what is missing is epochs, not parameters.
     """
     full = load_pipeline_config("configs/experiments/mnist_full.yaml").fgd_approx
-    assert full.outer_steps_per_epoch == 24
+    # 48 after a SECOND raise, on the same evidence as the first: the quota cut
+    # the epoch while the method was still certifying. fgd/outer_step_index only
+    # advances on an ACCEPTED step, and it reached 23 -- the full 24 -- in all
+    # four epochs of run 6l24gwpw without a single rejection, against a contract
+    # that says "the epoch stops at the first rejected attempt".
+    #
+    # The first raise is what made this measurable: 8 -> 24 took train_acc from
+    # a 25-epoch plateau at 0.89 to 0.9073 by epoch 4, reaching in 4 epochs what
+    # the 8-step run needed 20 for, with 16304 parameters against 20291.
+    assert full.outer_steps_per_epoch == 48
     assert full.max_total_parameters == 16000
 
     # Every catalog config keeps the shared default. This is the guarantee the

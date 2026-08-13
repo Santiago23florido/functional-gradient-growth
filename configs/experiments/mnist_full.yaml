@@ -230,7 +230,36 @@ fgd_approx:
   # asi que la rama del descenso medido no se alcanza nunca. Usarlo exigiria
   # apagar la ruta de realizacion que hoy funciona, que es lo contrario de
   # conservar lo que ya rinde.
-  outer_steps_per_epoch: 24
+  # 48, no 24. SEGUNDA subida, y por la misma evidencia que la primera: la cuota
+  # vuelve a cortar mientras el metodo sigue certificando.
+  #
+  # El 8 -> 24 funciono, MEDIDO en el run 6l24gwpw contra tn73ly2u:
+  #
+  #   ep   24 pasos train/test      8 pasos train/test
+  #    2   0.7299 / 0.7310          0.1097 / 0.1087
+  #    3   0.8746 / 0.8742          0.1537 / 0.1500
+  #    4   0.9073 / 0.9025          0.3080 / 0.3093
+  #
+  # Alcanza en la epoch 4 lo que la vieja tardo 20 en alcanzar, y train_acc
+  # ROMPIO el 0.90 (0.9073) donde la vieja se quedo clavada 25 epochs entre
+  # 0.8903 y 0.8999. Ademas con menos capacidad: 0.9025 con 16304 parametros
+  # contra 0.8963 con 20291.
+  #
+  # Y sigue cortando la cuota, no la teoria. fgd/outer_step_index solo avanza
+  # cuando un paso se ACEPTA, y llego al indice 23 -- los 24 completos -- en las
+  # CUATRO epochs, sin un solo rechazo. El contrato del campo es "la epoch para
+  # en el primer intento rechazado"; como no hubo ninguno, el metodo queria
+  # seguir y lo corto este numero.
+  #
+  # Doblar y no mas: a ~0.6 h/epoch actuales, 48 pasos dejan la epoch en ~1.2 h
+  # y las 40 epochs en ~48 h, dentro de la reserva de 7 dias. 96 no cabria sin
+  # bajar tambien `epochs`.
+  #
+  # Estos pasos extra son ENTRENAMIENTO PURO: el presupuesto se agoto en la
+  # epoch 3 y growth/count lleva congelado en 62 desde entonces. Que es
+  # justamente lo que falta, porque el gap train-test es de +0.004 (no hay
+  # sobreajuste: el modelo ni siquiera ajusta el train).
+  outer_steps_per_epoch: 48
   growth_patience: 1
   # Certified functional: cross-entropy keeps convexity (global optimality)
   # and is 4x smoother than MSE (wider admissible interval), but has NO
