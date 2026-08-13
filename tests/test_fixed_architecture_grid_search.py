@@ -118,6 +118,66 @@ def test_stage2_follows_epoch_and_learning_rate_boundaries() -> None:
     assert config.data.test_batches * config.data.batch_size == 8192
 
 
+def test_under600_snapshot_grid_reuses_the_extended_search_protocol() -> None:
+    grid = load_grid(Path("grid_search/fixed_architectures_ladder_under600.yaml"))
+    trials = enumerate_trials(grid)
+
+    assert len(trials) == 960
+    assert {trial.architecture for trial in trials} == {
+        (16, 19, 9),
+        (9, 18, 18),
+        (13, 16, 15),
+        (11, 17, 17),
+    }
+    assert {trial.overrides["optimizer.learning_rate"] for trial in trials} == {
+        0.0075,
+        0.01,
+        0.015,
+        0.02,
+        0.03,
+        0.04,
+        0.05,
+        0.06,
+        0.08,
+        0.1,
+    }
+    assert {trial.overrides["optimizer.weight_decay"] for trial in trials} == {
+        0.0,
+        0.001,
+        0.01,
+    }
+    assert {trial.overrides["lr_scheduler.name"] for trial in trials} == {
+        "none",
+        "cosineannealing",
+    }
+
+    paired = grid["paired_same_seed_evaluation"]
+    assert paired["reference_kind"] == "last_observed_state_below_600_parameters"
+    expected = {
+        0: ((16, 19, 9), 593, 28, 0.9522705078125),
+        1: ((9, 18, 18), 586, 47, 0.9573974609375),
+        2: ((13, 16, 15), 560, 34, 0.96142578125),
+        3: ((11, 17, 17), 583, 56, 0.958740234375),
+    }
+    for seed, (architecture, parameters, epoch, test_accuracy) in expected.items():
+        reference = paired["growth_runs"][seed]
+        assert tuple(reference["architecture"]) == architecture
+        assert parameter_count(architecture) == parameters
+        assert reference["expected_parameters"] == parameters
+        assert reference["source_epoch"] == epoch
+        assert reference["test_accuracy"] == test_accuracy
+
+    config = build_trial_config(grid, trials[0])
+    assert config.training.epochs == 400
+    assert config.lr_scheduler.t_max == 400
+    assert config.data.train_batches * config.data.batch_size == 1024
+    assert config.data.validation_batches * config.data.batch_size == 1024
+    assert config.data.test_batches * config.data.batch_size == 8192
+    assert config.data.train_seed == 0
+    assert config.training.method == "normal"
+    assert config.growth_schedule.enabled is False
+
+
 def test_retraining_builds_a_fresh_deterministic_model_without_growth() -> None:
     grid = load_grid(Path("grid_search/fixed_architectures_stage2.yaml"))
     trial = enumerate_trials(grid)[0]
