@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
+from itertools import chain
 from typing import Any, Literal
 
 from fgdlib.gromo_setup import ensure_gromo_importable
@@ -13,11 +14,13 @@ from fgdlib.gromo_setup import ensure_gromo_importable
 ensure_gromo_importable()
 
 import torch
+from torch.func import functional_call
 
 from gromo.containers.sequential_growing_container import SequentialGrowingModel
 from gromo.utils.training_utils import compute_statistics, evaluate_model
 
 from fgdlib.models.regularized_mlp import sync_normalization
+from fgdlib.profile import fallback
 
 
 ProgressFn = Callable[[str], None]
@@ -26,6 +29,92 @@ LineSearchMethod = Literal["golden_section"]
 # Sample cap for the function-preservation drift check; inputs are cached
 # before growth so a shuffling loader cannot invalidate the comparison.
 _PRESERVATION_CHECK_SAMPLES = 4096
+
+
+def _supports_float64_check(model: SequentialGrowingModel) -> bool:
+    """Whether reparametrising this model round-trips its dtypes.
+
+    An ALIASED tensor -- one reachable under two names, as a growing conv
+    layer's ``extended_post_layer_function`` normalisation is -- does not
+    restore cleanly, and leaves the module in a dtype the next float32 forward
+    cannot use. Deduplicated and raw name counts agreeing is exactly the
+    absence of that aliasing, and it is a structural test, not a heuristic.
+    """
+    for named in (model.named_parameters, model.named_buffers):
+        if len(list(named())) != len(list(named(remove_duplicate=False))):
+            return False
+    return True
+
+
+def _preservation_forward(
+    model: SequentialGrowingModel, batch_x: torch.Tensor
+) -> torch.Tensor:
+    """Forward in float64, without mutating the model or its caches.
+
+    The drift check exists to certify the ALGEBRA of the extension: the new
+    neurons carry exactly zero outgoing weights, so the represented function
+    is unchanged and the only thing a float32 comparison can measure is
+    rounding. And rounding is precisely what changes here -- widening a layer
+    changes the GEMM's shape, the backend picks a different tile/split-K
+    reduction, and floating-point addition is not associative, so the SAME
+    mathematical sum comes back with different low bits.
+
+    MEASURED on the real path (784 inputs, 3-5 hidden layers, widths 16-128):
+
+        drift float32   1.2e-07 .. 3.0e-07     drift float64   0.0 .. 4.4e-16
+
+    a ratio of 2.7e8 to 8.1e8, which is the ratio of the two machine epsilons
+    and nothing else. On the cluster's A100 the float32 figure reached
+    1.93e-5, 65x the CPU one, because cuBLAS splits the reduction far more
+    aggressively than a sequential CPU sum -- same mechanism, larger constant.
+    That is what killed job 461736 at epoch 4 with P=19481: not a broken
+    growth, a tolerance that measured the backend instead of the algebra.
+
+    In float64 the drift is 0 or one ULP, so the unchanged 1e-6 tolerance now
+    has nine orders of margin and tests what it was written to test. The check
+    gets STRICTER, not looser: a genuinely non-preserving growth of order 1e-5
+    was inside the float32 noise on the A100 and is nine orders outside this.
+
+    ``functional_call`` rather than ``model.double()``: casting in place would
+    mutate the live parameters mid-growth, and a deepcopy of a GroMo model
+    holding update state is exactly what has crashed this pipeline before
+    ("Cannot access storage of TensorWrapper"). This binds a float64 copy of
+    the state for one forward and leaves the module untouched.
+
+    Three details of that binding are load-bearing, each found by a test:
+
+    * ``is_floating_point()`` -- ``num_batches_tracked`` is ``int64``, and
+      casting it to float64 makes ``F.batch_norm`` reject the call.
+    * ``_supports_float64_check`` -- a GROWING CONV layer aliases its
+      ``extended_post_layer_function`` normalisation onto the
+      ``post_layer_function`` one. Reparametrising an aliased module does not
+      round-trip: MEASURED, the float64 pass itself completes, and then the
+      NEXT float32 forward inside ``compute_statistics`` dies on "mixed dtype
+      (CPU): expect parameter to have scalar type of Float" because the
+      normalisation buffers were left in float64. Neither ``tie_weights``
+      setting fixes it -- with ties on the alias keeps float32, with ties off
+      the restore is incomplete.
+
+      So the float64 check is applied only where it round-trips, and the
+      aliased models keep EXACTLY the check they have today. That is not a
+      compromise on the bug being fixed: the run that died is the linear
+      MNIST MLP, which has no aliases, and the conv path was already passing
+      at its own tolerance.
+    """
+    if not _supports_float64_check(model):
+        fallback(
+            "preservation_float64_fallbacks", "aliased_parameters_do_not_round_trip"
+        )
+        return model(batch_x)
+    state = {
+        name: (
+            tensor.detach().to(torch.float64)
+            if tensor.is_floating_point()
+            else tensor.detach()
+        )
+        for name, tensor in chain(model.named_parameters(), model.named_buffers())
+    }
+    return functional_call(model, state, (batch_x.to(torch.float64),))
 
 
 @dataclass(frozen=True)
@@ -198,7 +287,9 @@ def _function_preserving_growth(
     with torch.no_grad():
         for batch_x, _ in train_loader:
             batch_x = batch_x.to(device)
-            reference.append((batch_x, model(batch_x).detach().clone()))
+            reference.append(
+                (batch_x, _preservation_forward(model, batch_x).detach().clone())
+            )
             cached_samples += batch_x.shape[0]
             if cached_samples >= _PRESERVATION_CHECK_SAMPLES:
                 break
@@ -240,7 +331,9 @@ def _function_preserving_growth(
     with torch.no_grad():
         for batch_x, output_before in reference:
             batch_drift = float(
-                torch.max(torch.abs(model(batch_x) - output_before)).item()
+                torch.max(
+                    torch.abs(_preservation_forward(model, batch_x) - output_before)
+                ).item()
             )
             drift = max(drift, batch_drift)
             scale = max(scale, float(torch.max(torch.abs(output_before)).item()))

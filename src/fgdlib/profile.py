@@ -208,6 +208,12 @@ PROFILE_FIELDS = (
     # it down a route that cannot serve it".
     "matrix_free_dual_unavailable",
     "matrix_free_capture_pause_missing",
+    # Function-preservation drift checks that could NOT run in float64 because
+    # the model aliases parameters or buffers under two names (a growing conv
+    # layer's extended normalisation). Those keep the native-dtype check they
+    # have always had; non-zero here is a reminder that on those models the
+    # tolerance still measures the BLAS reduction order, not the algebra.
+    "preservation_float64_fallbacks",
     "tangent_forward_target_seconds",
     "tangent_jacrev_seconds",
     "tangent_jacobian_flatten_seconds",
@@ -307,6 +313,7 @@ _COUNTER_FIELDS = {
     "tangent_output_row_count",
     "matrix_free_tangent_calls",
     "matrix_free_vmap_fallbacks",
+    "preservation_float64_fallbacks",
 }
 _VALUES: dict[str, float] = {field: 0.0 for field in PROFILE_FIELDS}
 _REASONS: dict[str, set[str]] = {}
