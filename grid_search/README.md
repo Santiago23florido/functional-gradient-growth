@@ -111,6 +111,51 @@ fresh AdamW training can extract more performance from each architecture under
 the same initialization seed that produced it, rather than estimating a
 hyperparameter choice transferred across seeds.
 
+## Fixed retraining of the last states below 600 parameters
+
+`fixed_architectures_ladder_under600.yaml` evaluates the four architectures
+observed immediately before the unconstrained family-ladder trajectories
+crossed 600 parameters:
+
+| seed | source run | epoch | architecture | parameters | validation | test |
+|---:|:---:|---:|:---:|---:|---:|---:|
+| 0 | 70 epochs | 28 | `16-19-9` | 593 | 0.9580 | 0.9523 |
+| 1 | 70 epochs | 47 | `9-18-18` | 586 | 0.9580 | 0.9574 |
+| 2 | 200 epochs | 34 | `13-16-15` | 560 | 0.9668 | 0.9614 |
+| 3 | 70 epochs | 56 | `11-17-17` | 583 | 0.9629 | 0.9587 |
+
+These are retrospective snapshots from runs that were allowed to keep
+growing. They must not be described as the final result of training with a
+hard 600-parameter cap: such a cap can change every subsequent growth choice
+and optimization step.
+
+The fixed retraining uses the same completed extended-LR protocol: 400 epochs,
+AdamW, ten rates from 0.0075 through 0.1, three weight decays and either no
+scheduler or cosine annealing. Crossing four architectures, four model seeds
+and 60 hyperparameter combinations gives 960 trials. As before, the primary
+report pairs seed `s` only with the architecture observed at seed `s`, selects
+hyperparameters and epoch by validation, and reads test afterward.
+
+Submit the CPU array from the cluster checkout. Results and logs are redirected
+to scratch, and the dependent summary job runs only after all 960 trials
+succeed:
+
+```bash
+REPO_ROOT="$HOME/dev/functional-gradient-growth" \
+FGG_SCRATCH_ROOT="$HOME/datasets" \
+RUN_NAME="fixed_grid_ladder_under600_v1" \
+MAX_CONCURRENT=30 CONDA_ENV=cct CONFIRM_SUBMIT=1 \
+bash cluster/slurm/submit_fixed_architecture_grid.sh
+```
+
+The submission is restart-safe because completed trial JSON files are skipped.
+Use a new `RUN_NAME` when changing the grid config. A dry run prepares and
+validates the scratch config without submitting jobs:
+
+```bash
+DRY_RUN=1 bash cluster/slurm/submit_fixed_architecture_grid.sh
+```
+
 ## Search for strictly smaller architectures (scratch + SLURM)
 
 This independent experiment asks, for each growth seed, whether a freshly
@@ -247,3 +292,35 @@ the idealized times are about 42.6 hours and 6.8 hours respectively (49.4
 hours total). Real runtime can be longer; inspect the first completed shards
 and adjust time limits based on measured throughput before relying on this
 estimate.
+
+### Plot the complete accuracy landscape
+
+After stage 1 has completed, generate a distribution plot and a
+parameter-versus-accuracy density map. Stage 1 is the default because every
+admissible architecture occurs once under the same screening recipe; using
+stage 2 would overweight its preselected top-50 architectures.
+
+```bash
+RUN_ROOT="$(readlink -f ~/datasets)/functional-gradient-growth/smaller_architectures_400_v1"
+PYTHONPATH=src python -m grid_search.plot_budget_landscape --run-root "$RUN_ROOT"
+```
+
+The command writes `test_accuracy_distribution.png`,
+`parameter_accuracy_landscape.png`, and `accuracy_position_summary.json` under
+`$RUN_ROOT/summaries/figures/`. The red star is the train-and-grow result. The
+JSON reports its empirical percentile and the fraction of screened fixed
+architectures above it. This is a descriptive test-set visualization only;
+model selection must continue to use validation accuracy.
+
+To place the four newer below-600 snapshots in the already completed general
+stage-1 population, replace only the reference markers and write to a separate
+directory. This reads existing shard JSONL files and does not launch or repeat
+any training:
+
+```bash
+PYTHONPATH=src python -m grid_search.plot_budget_landscape \
+  --run-root "$RUN_ROOT" \
+  --stage stage1 \
+  --reference-config grid_search/fixed_architectures_ladder_under600.yaml \
+  --output-dir "$RUN_ROOT/summaries/figures_ladder_under600"
+```

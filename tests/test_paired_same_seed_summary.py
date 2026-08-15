@@ -268,6 +268,7 @@ def test_legacy_summary_still_writes_only_exploratory_output(tmp_path: Path) -> 
 
     assert output == tmp_path / "summary.json"
     assert output.exists()
+    assert json.loads(output.read_text())["paired_reference_mean_test_accuracy"] is None
     assert not (tmp_path / "paired_same_seed_retraining_summary.json").exists()
 
 
@@ -283,6 +284,10 @@ def test_summarize_writes_exploratory_and_same_seed_outputs(tmp_path: Path) -> N
 
     assert exploratory_output.exists()
     assert paired_output.exists()
+    exploratory = json.loads(exploratory_output.read_text())
+    assert exploratory["paired_reference_mean_test_accuracy"] == pytest.approx(
+        statistics.mean(GROWTH_TESTS)
+    )
     paired = json.loads(paired_output.read_text())
     assert paired["aggregate"]["number_of_pairs"] == 4
     assert len(paired["pairs"]) == 4

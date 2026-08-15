@@ -392,6 +392,53 @@ def test_the_allocator_pool_stops_ratcheting_when_the_probe_changes_shape() -> N
     assert released < ratcheted, (released, ratcheted)
 
 
+def test_only_full_mnist_departs_from_the_shared_step_and_budget_defaults() -> None:
+    """The under-training fix, confined to the one experiment that measured it.
+
+    MEASURED on run tn73ly2u, the branch's best MNIST at the time: train_acc
+    0.9003 against test_acc 0.8963, a gap of +0.004. No overfitting -- the
+    model does not even fit the training set, so capacity is not the
+    constraint. Counting [FGD-STEP] lines gives 8 optimisation steps per epoch
+    against the 50000/64 = 781 minibatch steps AdamW takes on the same data:
+    98x less work. That 8 was the shared catalog default, identical in all
+    seven configs including N1024's.
+
+    This test used to also assert the budget went DOWN to 16000, on the reading
+    that tn73ly2u "was about to die" at 42.2 GB of 42.4 (98.3%). That reading
+    was WRONG and the run reached epoch 34. Those 42.2 GB are the caching
+    allocator's RESERVED pool, which grows to its high-water mark and then
+    recycles; a stable 98.3% is a plateau, not a cliff. See the comment on
+    max_total_parameters in the .yaml for the sweep that measured the real
+    ceiling and for why it lands on 20000 rather than the extrapolated ~22200.
+    """
+    full = load_pipeline_config("configs/experiments/mnist_full.yaml").fgd_approx
+    # 24, not 48: the second raise is reverted so this launch spends its budget
+    # on PARAMETERS instead. Per-step cost goes as P^2, so doubling the steps
+    # AND raising P by 23% would multiply the epoch by ~3.
+    #
+    # The first raise is what made this measurable: 8 -> 24 took train_acc from
+    # a 25-epoch plateau at 0.89 to 0.9073 by epoch 4, reaching in 4 epochs what
+    # the 8-step run needed 20 for, with 16304 parameters against 20291. And it
+    # was still the quota cutting, not the theory: fgd/outer_step_index only
+    # advances on an ACCEPTED step and reached 23 -- the full 24 -- in all four
+    # epochs of run 6l24gwpw without a single rejection.
+    assert full.outer_steps_per_epoch == 24
+    assert full.max_total_parameters == 20000
+
+    # Every catalog config keeps the shared default. This is the guarantee the
+    # user asked for: the change touches MNIST and nothing else.
+    for path in Path("configs/fgd").glob("*.yaml"):
+        config = load_pipeline_config(path).fgd_approx
+        assert config.outer_steps_per_epoch == 8, path
+
+    # And measured descent stays off, because VERIFIED it would be a no-op
+    # here: certify_apply_in_interval wins the branch above it, so the
+    # measured-descent path is never reached. Reaching it would mean turning
+    # off the realize path that currently works.
+    assert full.tangent_measured_descent is False
+    assert full.certify_apply_in_interval is True
+
+
 def test_the_factored_validation_route_is_off_by_default_and_matrix_free_only() -> None:
     """It must be unreachable for every config that does not opt in.
 

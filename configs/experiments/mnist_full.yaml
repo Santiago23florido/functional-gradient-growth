@@ -192,7 +192,81 @@ fgd_approx:
   # the stationary/global bounds are computed and logged as trajectory
   # diagnostics. false (default): legacy behavior — non-strict descent and
   # Cstat/Cglob as acceptance gates.
-  outer_steps_per_epoch: 8
+  # 24, no 8. EL METODO ENTRENA DEMASIADO POCO, y esto es lo que lo mide.
+  #
+  # MEDIDO en el run tn73ly2u, el mejor MNIST de la rama:
+  #
+  #   train_acc 0.9003   test_acc 0.8963   gap +0.004
+  #
+  # Un gap de +0.004 dice que NO hay sobreajuste: el modelo ni siquiera ajusta
+  # el train. Con 20291 parametros la capacidad esta y no se usa. Y el
+  # crecimiento paro en la epoch 10 al agotar el presupuesto, tras lo cual diez
+  # epochs mas compraron +0.008: el crecimiento hacia todo el trabajo y el
+  # entrenamiento casi nada.
+  #
+  # La causa, contando [FGD-STEP] en el log: **8 pasos de optimizacion por
+  # epoch**, contra los 50000/64 = 781 pasos de minibatch que da AdamW sobre
+  # los mismos datos. 98x menos. En 20 epochs son 160 actualizaciones contra
+  # 15620.
+  #
+  # Y ese 8 no estaba ajustado a nada: es el mismo valor en las SIETE configs
+  # del catalogo, incluida la de N1024, que resuelve un problema 50 veces
+  # menor.
+  #
+  # Subirlo no relaja ningun certificado. El campo son "k aplicaciones del
+  # mismo teorema por paso", cada intento se certifica independientemente
+  # sobre el modelo ACTUAL, y "la epoch para en el primer intento rechazado",
+  # asi que se auto-limita. Lo unico que cambia es cuantas veces se permite
+  # intentar.
+  #
+  # El presupuesto de coste lo libero certify_validation_factored: el
+  # certificado de validacion era el 99.95% del tiempo y ahora va 3-4.8x mas
+  # rapido. 24 y no mas porque el coste hay que MEDIRLO en la primera epoch
+  # antes de comprometer 40.
+  #
+  # DESCARTADO por el camino: tangent_measured_descent, que promete un paso 8x
+  # mas largo (optimo medido ~0.5 contra eta_max ~0.06). VERIFICADO que aqui
+  # seria un NO-OP: certify_apply_in_interval es true y gana el `if` anterior,
+  # asi que la rama del descenso medido no se alcanza nunca. Usarlo exigiria
+  # apagar la ruta de realizacion que hoy funciona, que es lo contrario de
+  # conservar lo que ya rinde.
+  # 24, no 48. La segunda subida se REVIERTE, y no porque estuviera mal
+  # razonada: este lanzamiento gasta el presupuesto en PARAMETROS (16000 ->
+  # 20000, ver max_total_parameters) y las dos subidas a la vez no caben. El
+  # coste por paso va con P^2, asi que doblar los pasos Y subir P un 23% es
+  # multiplicar la epoch por ~3.
+  #
+  # 24 es ademas la unica de las dos cifras con resultado medido de punta a
+  # punta. 48 nunca llego a correr.
+  #
+  # El 8 -> 24 funciono, MEDIDO en el run 6l24gwpw contra tn73ly2u:
+  #
+  #   ep   24 pasos train/test      8 pasos train/test
+  #    2   0.7299 / 0.7310          0.1097 / 0.1087
+  #    3   0.8746 / 0.8742          0.1537 / 0.1500
+  #    4   0.9073 / 0.9025          0.3080 / 0.3093
+  #
+  # Alcanza en la epoch 4 lo que la vieja tardo 20 en alcanzar, y train_acc
+  # ROMPIO el 0.90 (0.9073) donde la vieja se quedo clavada 25 epochs entre
+  # 0.8903 y 0.8999. Ademas con menos capacidad: 0.9025 con 16304 parametros
+  # contra 0.8963 con 20291.
+  #
+  # Y sigue cortando la cuota, no la teoria. fgd/outer_step_index solo avanza
+  # cuando un paso se ACEPTA, y llego al indice 23 -- los 24 completos -- en las
+  # CUATRO epochs, sin un solo rechazo. El contrato del campo es "la epoch para
+  # en el primer intento rechazado"; como no hubo ninguno, el metodo queria
+  # seguir y lo corto este numero.
+  #
+  # Presupuesto de tiempo con P = 20000: a ~0.6 h/epoch medidas a P=16304, el
+  # coste por paso va con P^2, asi que (20000/16304)^2 = 1.5x deja la epoch en
+  # ~0.9 h y las 40 epochs en ~36 h, dentro de la reserva de 7 dias. Con 48
+  # pasos serian ~72 h y ya no cabria junto al resto de la cola.
+  #
+  # Estos pasos extra son ENTRENAMIENTO PURO: el presupuesto se agoto en la
+  # epoch 3 y growth/count lleva congelado en 62 desde entonces. Que es
+  # justamente lo que falta, porque el gap train-test es de +0.004 (no hay
+  # sobreajuste: el modelo ni siquiera ajusta el train).
+  outer_steps_per_epoch: 24
   growth_patience: 1
   # Certified functional: cross-entropy keeps convexity (global optimality)
   # and is 4x smoother than MSE (wider admissible interval), but has NO
@@ -676,6 +750,40 @@ fgd_approx:
   # NOT reachable at this budget. A grown architecture buying more per parameter
   # is this branch's whole thesis, so 0.95-0.97 is the honest expectation.
   # Raising it needs the cost per parameter to come down, which is separate work.
+  # 20000. El 16000 anterior se puso sobre una lectura EQUIVOCADA de tn73ly2u:
+  # "a 42.2 GB de 42.4 (98.3%) la corrida muere antes de gastar sus 40 epochs".
+  # No murio. Llego a la epoch 34.
+  #
+  # El error fue confundir dos metricas. Esos 42.2 son el POOL RESERVADO del
+  # caching allocator, no una peticion pendiente: el pool crece hasta su marca
+  # de agua y despues RECICLA. Estar al 98.3% de forma estable es una meseta,
+  # no un precipicio; solo se muere si una asignacion NUEVA no cabe en lo libre
+  # (que es lo que si paso en la P100 de 16 GB: "Tried to allocate 9.79 GiB").
+  #
+  # El techo real, MEDIDO barriendo hidden_size en una A100 40G construyendo un
+  # sistema con otro ya residente -- el peor instante, que es el del
+  # crecimiento en certify.py:1294:
+  #
+  #       P      NK   pico(alloc)   reserved
+  #   11560   14450       10.13 G     12.82 G
+  #   15004   18750       17.27 G     22.36 G
+  #   18512   23140       26.51 G     41.71 G   (98.4%)
+  #   ~20300              OOM
+  #
+  # Manda `reserved`, no `pico`, y esto lo demuestra: en el OOM de P~20300 el
+  # modelo de pico (7.74e-8 * P^2) predecia 31.9 GB -- habria cabido, FALLA --
+  # y el de reserved (1.217e-7 * P^2) predecia 50.2 GB, que es el OOM. Acierta.
+  #
+  # Pero ese barrido corrio SIN expandable_segments, que el .sbatch si exporta
+  # (linea 123) y que ataca exactamente el hueco reserved-pico. La comprobacion
+  # cruzada es directa: a P~20300 la sonda SIN la variable revienta, y la
+  # corrida real a P=20291 CON ella sobrevivio hasta la epoch 34. Mismo P,
+  # resultado opuesto; la variable es el asignador.
+  #
+  # Por eso 20000 y no 22000: 20000 esta respaldado por una corrida completa,
+  # mientras que los ~22200 salen de extrapolar el modelo de `pico`, que es
+  # justo el que NO predijo el OOM. Y encima hay margen que tn73ly2u no tenia:
+  # 1a068fb quito ~10.8 GB de transitorio en dual_gram a P=16750.
   max_total_parameters: 20000
   growth_preservation_tolerance: 1.0e-6
   # Ordered ladder of approximation families, evaluated top to bottom.

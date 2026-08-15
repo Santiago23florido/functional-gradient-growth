@@ -7,6 +7,7 @@ from grid_search.budget_search import GrowthReference
 from grid_search.plot_budget_landscape import (
     accuracy_summary,
     load_completed_records,
+    load_fixed_grid_references,
     plot_landscape,
 )
 
@@ -54,8 +55,7 @@ def test_duplicate_trial_is_rejected(tmp_path: Path) -> None:
 def test_plot_outputs(tmp_path: Path) -> None:
     pytest.importorskip("matplotlib")
     references = [
-        GrowthReference(seed, (4, 4, 4), 65, 0.85 + seed * 0.01)
-        for seed in range(4)
+        GrowthReference(seed, (4, 4, 4), 65, 0.85 + seed * 0.01) for seed in range(4)
     ]
     records = [
         _record(f"{seed}-{index}", seed, 0.70 + index * 0.01, 40 + index)
@@ -65,3 +65,24 @@ def test_plot_outputs(tmp_path: Path) -> None:
     distribution, landscape = plot_landscape(records, references, tmp_path)
     assert distribution.stat().st_size > 0
     assert landscape.stat().st_size > 0
+
+
+def test_load_under600_fixed_grid_references() -> None:
+    references = load_fixed_grid_references(
+        Path("grid_search/fixed_architectures_ladder_under600.yaml")
+    )
+
+    assert [reference.seed for reference in references] == [0, 1, 2, 3]
+    assert [reference.architecture for reference in references] == [
+        (16, 19, 9),
+        (9, 18, 18),
+        (13, 16, 15),
+        (11, 17, 17),
+    ]
+    assert [reference.parameters for reference in references] == [593, 586, 560, 583]
+    assert [reference.test_accuracy for reference in references] == [
+        0.9522705078125,
+        0.9573974609375,
+        0.96142578125,
+        0.958740234375,
+    ]

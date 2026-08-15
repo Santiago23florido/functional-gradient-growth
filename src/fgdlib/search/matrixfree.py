@@ -587,19 +587,38 @@ def dual_gram(operators: AnalyticOperators) -> torch.Tensor:
     """
     rows = operators.rows
     outputs = operators.sensitivities[0].shape[1]
+    samples = rows // outputs
     total = None
     for sensitivity, inputs, uses_bias in zip(
         operators.sensitivities, operators.activations, operators.use_bias
     ):
         flat = sensitivity.reshape(rows, -1)
-        sensitivity_gram = flat @ flat.t()
-        activation_gram = (inputs @ inputs.t()).repeat_interleave(
-            outputs, dim=0
-        ).repeat_interleave(outputs, dim=1)
-        block = sensitivity_gram * activation_gram
+        # The ONE (NK, NK) this layer needs. Everything below stays in place on
+        # it, because the naive spelling kept FIVE of them alive at once --
+        # MEASURED at P=16750 / NK=20930: the Gram is 3.55 GB and building it
+        # peaked at 17.92 GB, 5x its own result, which is the single largest
+        # allocation in the whole run.
+        block = flat @ flat.t()
+        # ``expand(a a^T)`` repeats each (n, n') entry ``outputs`` times along
+        # both axes to match the row layout ``n*K + k``. Materialising that
+        # repeat is an (NK, NK) tensor holding an (n, n) matrix's worth of
+        # information; viewing the block as (n, K, n, K) and broadcasting the
+        # small Gram over the two K axes is the same product with nothing built.
+        activation_gram = inputs @ inputs.t()
         if uses_bias:
-            block = block + sensitivity_gram
-        total = block if total is None else total + block
+            # The bias columns carry no activation factor, so the block is
+            # ``S * A + S``. Factorising it as ``S * (A + 1)`` moves the extra
+            # term onto the SMALL (n, n) matrix and removes one (NK, NK)
+            # temporary; identical arithmetic, one tensor instead of two.
+            activation_gram = activation_gram + 1.0
+        block.view(samples, outputs, samples, outputs).mul_(
+            activation_gram[:, None, :, None]
+        )
+        if total is None:
+            total = block
+        else:
+            total.add_(block)
+            del block
     return total
 
 

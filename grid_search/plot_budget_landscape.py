@@ -8,7 +8,49 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from grid_search.budget_search import DEFAULT_CONFIG, load_search_config, load_settings
+import yaml
+
+from grid_search.budget_search import (
+    DEFAULT_CONFIG,
+    GrowthReference,
+    load_search_config,
+    load_settings,
+)
+from grid_search.run import parameter_count
+
+
+def load_fixed_grid_references(path: Path) -> list[GrowthReference]:
+    """Load paired family-ladder references from a fixed-grid config."""
+    payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    paired = payload.get("paired_same_seed_evaluation")
+    if not isinstance(paired, Mapping):
+        raise TypeError(f"{path} has no paired_same_seed_evaluation mapping")
+    growth_runs = paired.get("growth_runs")
+    if not isinstance(growth_runs, Mapping) or not growth_runs:
+        raise ValueError(f"{path} has no paired growth_runs mapping")
+
+    references: list[GrowthReference] = []
+    for raw_seed, run in sorted(growth_runs.items(), key=lambda item: int(item[0])):
+        if not isinstance(run, Mapping):
+            raise TypeError(f"growth_runs[{raw_seed}] must be a mapping")
+        seed = int(raw_seed)
+        architecture = tuple(int(width) for width in run["architecture"])
+        parameters = parameter_count(architecture)
+        expected = run.get("expected_parameters")
+        if expected is not None and int(expected) != parameters:
+            raise ValueError(
+                f"growth_runs[{seed}] expected {expected} parameters, "
+                f"but architecture {architecture} has {parameters}"
+            )
+        references.append(
+            GrowthReference(
+                seed=seed,
+                architecture=architecture,
+                parameters=parameters,
+                test_accuracy=float(run["test_accuracy"]),
+            )
+        )
+    return references
 
 
 def load_completed_records(run_root: Path, stage: str) -> list[dict[str, Any]]:
@@ -150,7 +192,7 @@ def plot_landscape(
         edgecolor="white",
         linewidth=0.8,
         zorder=5,
-        label="Train-and-grow",
+        label="Family-ladder reference",
     )
     for position, score in zip(positions, growth_scores):
         ax.annotate(
@@ -163,7 +205,7 @@ def plot_landscape(
         )
     ax.set_xticks(positions, [f"Seed {reference.seed}" for reference in references])
     ax.set_ylabel("Test accuracy")
-    ax.set_title("Train-and-grow within the distribution of smaller fixed MLPs")
+    ax.set_title("Family-ladder reference within screened fixed-MLP accuracy")
     ax.grid(axis="y", alpha=0.22)
     ax.legend(loc="lower right")
     fig.tight_layout()
@@ -194,7 +236,7 @@ def plot_landscape(
             edgecolor="white",
             linewidth=0.9,
             zorder=5,
-            label="Train-and-grow",
+            label="Family-ladder reference",
         )
         ax.set_title(
             f"Seed {reference.seed}: {reference.architecture[0]}-"
@@ -219,6 +261,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument(
+        "--reference-config",
+        type=Path,
+        help=(
+            "optional fixed-grid YAML whose paired_same_seed_evaluation "
+            "replaces the original growth reference markers"
+        ),
+    )
     parser.add_argument("--stage", choices=("stage1", "stage2"), default="stage1")
     parser.add_argument("--output-dir", type=Path)
     return parser
@@ -228,14 +278,15 @@ def main() -> int:
     args = build_parser().parse_args()
     run_root = args.run_root.expanduser().resolve()
     output_dir = args.output_dir or run_root / "summaries" / "figures"
-    settings = load_settings(load_search_config(args.config))
+    if args.reference_config is None:
+        references = load_settings(load_search_config(args.config)).references
+    else:
+        references = load_fixed_grid_references(args.reference_config)
     records = load_completed_records(run_root, args.stage)
-    rows = accuracy_summary(records, settings.references)
+    rows = accuracy_summary(records, references)
     summary_path = output_dir / "accuracy_position_summary.json"
     write_summary(summary_path, rows, args.stage)
-    distribution_path, map_path = plot_landscape(
-        records, settings.references, output_dir
-    )
+    distribution_path, map_path = plot_landscape(records, references, output_dir)
     for row in rows:
         print(
             f"seed={row['seed']} n={row['completed_candidates']} "

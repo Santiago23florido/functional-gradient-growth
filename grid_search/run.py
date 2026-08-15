@@ -527,9 +527,20 @@ def summarize(grid: Mapping[str, Any]) -> Path:
             }
         )
     rankings.sort(key=lambda item: item["mean_validation_accuracy"], reverse=True)
+    paired = grid.get("paired_same_seed_evaluation")
+    paired_references = (
+        paired.get("growth_runs") if isinstance(paired, Mapping) else None
+    )
+    paired_reference_mean = None
+    if isinstance(paired_references, Mapping) and paired_references:
+        paired_reference_mean = statistics.mean(
+            float(reference["test_accuracy"])
+            for reference in paired_references.values()
+        )
     summary = {
         "selection": "groups ranked by mean validation accuracy across completed model seeds",
         "headline_reference_mean_test_accuracy": 0.9435,
+        "paired_reference_mean_test_accuracy": paired_reference_mean,
         "completed_trials": len(completed),
         "failed_trials": failed,
         "expected_trials": len(enumerate_trials(grid)),
