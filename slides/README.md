@@ -30,3 +30,13 @@ not modified.
 
 `assets/demeter_cosine_similarity.png` is an unchanged copy of Figure 4 from
 the internship report (`docs/internship-santiago/figures/cosinesim.png`).
+
+## Sections
+
+- `sections/00_title.tex`: project title page.
+- `sections/10_demeter_alignment.tex`: concise explanation of DEMETER's
+  parametric/function-space misalignment, with Figure 4 from the report.
+- `sections/20_adaptive_representations.tex`: summary of Section 2.4,
+  including the approximate functional-gradient update and its descent and
+  convergence conditions.
+- `sections/99_references.tex`: all references from the internship report.

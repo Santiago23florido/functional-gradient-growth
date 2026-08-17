@@ -1,0 +1,94 @@
+\section{Adaptive Representations for Function-Space Optimization}
+
+\begin{frame}[t]{Adaptive Representations for Function-Space Optimization}
+  \vspace{-0.10cm}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.585\textwidth}
+      {\color{EnstaBlue}\bfseries\scriptsize FROM THE IDEAL STEP TO A REALIZABLE UPDATE}
+      \vspace{0.03cm}
+
+      \begin{beamercolorbox}[rounded=true,sep=0.10cm,wd=\linewidth]{demeter takeaway}
+        \centering
+        \fontsize{7.3}{8.6}\selectfont
+        \(\displaystyle
+          \begin{gathered}
+            \min_{f\in\mathcal H}\mathcal L(f),
+            \qquad f_{t+1}=f_t-\eta\nabla\mathcal L(f_t),\\[3pt]
+            \text{finite approximation:}\quad
+            f_{t+1}=f_t-\eta g_t,\quad g_t\in\mathcal B.
+          \end{gathered}
+        \)
+      \end{beamercolorbox}
+
+      \vspace{0.10cm}
+      {\color{EnstaBlue}\bfseries\scriptsize APPROXIMATION CERTIFICATE}
+      \vspace{0.03cm}
+
+      \begin{beamercolorbox}[rounded=true,sep=0.10cm,wd=\linewidth]{demeter takeaway}
+        \centering
+        \fontsize{7.0}{8.3}\selectfont
+        \(\displaystyle
+          \begin{gathered}
+            \varepsilon_t
+            =\frac{\lVert g_t-\nabla\mathcal L(f_t)\rVert_{\mathcal B}}
+                   {\lVert g_t\rVert_{\mathcal B}},\\[4pt]
+            \mathcal L(f_{t+1})\leq \mathcal L(f_t)
+            -\eta q_t\lVert\nabla\mathcal L(f_t)\rVert_{\mathcal B}^{2},\\[4pt]
+            q_t:=\alpha-\frac{K\eta}{2}
+            -\left(\beta+\frac{3K\eta}{2}\right)
+             \frac{\varepsilon_t}{1-\varepsilon_t}.
+          \end{gathered}
+        \)
+      \end{beamercolorbox}
+
+      \vspace{0.09cm}
+      {\fontsize{7.35}{8.8}\selectfont
+      With $K$-smoothness, verifiable descent, and compatibility, $q_t>0$
+      certifies loss decrease despite the approximation.}
+    \end{column}
+
+    \begin{column}{0.385\textwidth}
+      {\color{EnstaBlue}\bfseries\scriptsize WHY ADAPT THE REPRESENTATION?}
+      \vspace{0.03cm}
+
+      {\fontsize{7.35}{8.8}\selectfont
+      \begin{itemize}
+        \setlength{\itemsep}{0.08cm}
+        \item $\mathcal H$ can be infinite-dimensional, but updates are
+              finite; growth enriches the representation and reduces
+              $\varepsilon_t$.
+        \item Once $q_t>0$, training and growth follow the same certified
+              function-space descent.
+      \end{itemize}}
+
+      \vspace{0.03cm}
+      {\color{EnstaBlue}\bfseries\scriptsize SUFFICIENT CONDITIONS}
+      \vspace{0.03cm}
+
+      \begin{beamercolorbox}[rounded=true,sep=0.10cm,wd=\linewidth]{demeter takeaway}
+        \centering
+        \fontsize{6.6}{8.0}\selectfont
+        \(\displaystyle
+          \begin{gathered}
+            \eta<\frac{2\,[\alpha-(\alpha+\beta)\varepsilon]}
+                         {K(2\varepsilon+1)},\qquad \varepsilon_t\leq\varepsilon,\\[4pt]
+            \mathcal L(f)-\mathcal L^*
+            \leq \frac{1}{2\mu}
+            \lVert D\mathcal L(f;\cdot)\rVert_{\mathcal B^*}^{2}.
+          \end{gathered}
+        \)
+      \end{beamercolorbox}
+
+      \vspace{0.09cm}
+      \begin{beamercolorbox}[rounded=true,sep=0.10cm,wd=\linewidth]{demeter takeaway}
+        {\fontsize{7.15}{8.5}\selectfont\bfseries\color{LisnNavy}
+        With PL (or convex MSE), certified descent converges globally;
+        approximation quality determines when the model must grow.}
+      \end{beamercolorbox}
+
+      \vspace{0.04cm}
+      {\color{MutedText}\fontsize{6.2}{7.3}\selectfont
+      Framework summarized from Csillag et al. (2026).}
+    \end{column}
+  \end{columns}
+\end{frame}
