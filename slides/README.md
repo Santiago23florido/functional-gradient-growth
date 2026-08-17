@@ -43,4 +43,6 @@ the internship report (`docs/internship-santiago/figures/cosinesim.png`).
   control flow and architecture-search rule.
 - `sections/31_damped_tangent_family.tex`: regularized tangent projection,
   spectral filtering, and relative-error certification.
+- `sections/32_nonlinear_displacement_family.tex`: finite curved trajectory,
+  angular certification, and ray-optimal scaling for the nonlinear family.
 - `sections/99_references.tex`: all references from the internship report.
