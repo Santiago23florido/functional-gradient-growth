@@ -57,4 +57,6 @@ and MNIST result figures from the same report.
   the discovered fixed architectures.
 - `sections/43_results_scalability.tex`: MNIST behavior and the Jacobian
   memory/computation bottleneck.
+- `sections/90_conclusions.tex`: final conclusions, contributions, and research
+  perspectives from the internship report.
 - `sections/99_references.tex`: all references from the internship report.

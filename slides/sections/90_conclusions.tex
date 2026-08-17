@@ -1,0 +1,80 @@
+\section{Conclusions}
+
+\begin{frame}[t]{Conclusions and Research Perspectives}
+  \vspace{-0.13cm}
+  {\fontsize{7.45}{8.9}\selectfont
+  Adaptive growth allocates capacity only when the current learning dynamics require it.}
+
+  \vspace{0.10cm}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.315\textwidth}
+      {\color{EnstaBlue}\bfseries\scriptsize LESSONS FROM GROWTH}
+      \vspace{0.04cm}
+
+      \begin{beamercolorbox}[rounded=true,sep=0.11cm,wd=\linewidth]{demeter takeaway}
+        {\fontsize{6.85}{8.2}\selectfont
+        \begin{itemize}
+          \setlength{\itemsep}{0.10cm}
+          \item DEMETER shows that a locally optimized growth direction can
+                conflict with subsequent parametric training.
+          \item Complete function preservation substantially reduces
+                post-growth loss discontinuities.
+          \item Growable Compact Transformers indicate that adaptive capacity
+                can extend beyond conventional MLP and DAG architectures.
+        \end{itemize}}
+      \end{beamercolorbox}
+    \end{column}
+
+    \begin{column}{0.335\textwidth}
+      {\color{EnstaBlue}\bfseries\scriptsize WHAT CAGE-NAS ESTABLISHES}
+      \vspace{0.04cm}
+
+      \begin{beamercolorbox}[rounded=true,sep=0.11cm,wd=\linewidth]{certified card}
+        {\fontsize{6.85}{8.2}\selectfont
+        \begin{itemize}
+          \setlength{\itemsep}{0.09cm}
+          \item Training and growth form one certified function-space process,
+                without an external schedule.
+          \item Approximation quality decides whether the architecture is
+                adequate or must grow.
+        \end{itemize}}
+
+        \vspace{0.05cm}
+        \centering
+        {\color{CertifiedGreen}\fontsize{10.5}{12.5}\selectfont\bfseries
+        $0.9575\pm0.0038$}
+
+        {\fontsize{6.25}{7.5}\selectfont mean test accuracy}\\[0.06cm]
+        {\fontsize{6.55}{7.8}\selectfont
+        99.83rd--100.00th percentiles; no systematic gain from fixed retraining.}
+      \end{beamercolorbox}
+    \end{column}
+
+    \begin{column}{0.315\textwidth}
+      {\color{EnstaBlue}\bfseries\scriptsize WHAT REMAINS OPEN}
+      \vspace{0.04cm}
+
+      \begin{beamercolorbox}[rounded=true,sep=0.11cm,wd=\linewidth]{growth card}
+        {\fontsize{6.8}{8.1}\selectfont
+        \begin{itemize}
+          \setlength{\itemsep}{0.09cm}
+          \item Add parameters, FLOPs, memory, and energy to a multi-objective
+                growth certificate.
+          \item Reduce initialization sensitivity and connect probe-level
+                certification with generalization.
+          \item Lower the cost of tangent representations and candidate
+                evaluation at scale.
+          \item Extend evaluation to CNNs, DAGs, CIFAR-10/100, and NAS Unseen.
+        \end{itemize}}
+      \end{beamercolorbox}
+    \end{column}
+  \end{columns}
+
+  \vspace{0.12cm}
+  \begin{beamercolorbox}[rounded=true,sep=0.09cm,wd=\linewidth]{demeter takeaway}
+    \centering
+    {\fontsize{7.0}{8.4}\selectfont\bfseries
+    Certified functional descent is a promising basis for constructive NAS;
+    efficiency, generalization, and scalability remain complementary objectives.}
+  \end{beamercolorbox}
+\end{frame}
