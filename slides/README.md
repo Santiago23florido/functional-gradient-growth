@@ -45,4 +45,6 @@ the internship report (`docs/internship-santiago/figures/cosinesim.png`).
   spectral filtering, and relative-error certification.
 - `sections/32_nonlinear_displacement_family.tex`: finite curved trajectory,
   angular certification, and ray-optimal scaling for the nonlinear family.
+- `sections/33_where_to_grow.tex`: counterfactual certificate comparison and
+  expressivity-bottleneck fallback for selecting the growth location.
 - `sections/99_references.tex`: all references from the internship report.
