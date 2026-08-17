@@ -34,20 +34,21 @@
         {\fontsize{6.85}{8.2}\selectfont
         \begin{itemize}
           \setlength{\itemsep}{0.09cm}
-          \item Exact synthetic experiments produce stable certified
-                train-and-grow trajectories across four seeds.
-          \item The scalable MNIST path preserves decreasing training loss and
-                improving accuracy as capacity is introduced.
+          \item Synthetic $N=1024$ runs produce stable certified trajectories
+                across four seeds.
+          \item On MNIST, loss decreases and accuracy rises as capacity grows.
         \end{itemize}}
 
         \vspace{0.05cm}
         \centering
+        {\fontsize{6.35}{7.6}\selectfont\bfseries
+        Controlled synthetic $N=1024$ only}\\[0.04cm]
         {\color{CertifiedGreen}\fontsize{10.5}{12.5}\selectfont\bfseries
         $0.9575\pm0.0038$}
 
-        {\fontsize{6.25}{7.5}\selectfont mean test accuracy}\\[0.06cm]
+        {\fontsize{6.25}{7.5}\selectfont four-seed mean test accuracy}\\[0.06cm]
         {\fontsize{6.55}{7.8}\selectfont
-        99.83rd--100.00th percentiles; no systematic gain from fixed retraining.}
+        99.83rd--100.00th percentiles; fixed retraining gives no systematic gain.}
       \end{beamercolorbox}
     \end{column}
 
