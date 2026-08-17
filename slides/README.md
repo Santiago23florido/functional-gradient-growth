@@ -4,6 +4,10 @@ This directory contains the English Beamer presentation for the CAGE-NAS
 research project. The deck is intentionally modular: each section is stored in
 `sections/` and included from `main.tex`.
 
+The bibliography in `sections/99_references.tex` reproduces all 17 references
+from `docs/internship-santiago/neurips_2026.tex` in the parent StageFrugal
+workspace.
+
 ## Build
 
 From this directory, run:
