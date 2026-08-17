@@ -27,9 +27,19 @@
 \setbeamercolor{demeter takeaway}{fg=LisnNavy,bg=SoftBlue}
 \setbeamercolor{certified card}{fg=LisnNavy,bg=SoftGreen}
 \setbeamercolor{growth card}{fg=LisnNavy,bg=SoftOrange}
+\setbeamercolor{page number in head/foot}{fg=MutedText,bg=white}
 \setbeamerfont{normal text}{family=\sffamily}
 \setbeamerfont{frametitle}{series=\bfseries,size=\large}
 \setbeamertemplate{bibliography item}[text]
+\setbeamertemplate{footline}{%
+  \hbox to \paperwidth{%
+    \hfill
+    {\usebeamercolor[fg]{page number in head/foot}%
+     \fontsize{5.8}{7}\selectfont
+     \insertframenumber\,/\,\inserttotalframenumber}%
+    \hspace*{0.42cm}}%
+  \vskip0.08cm
+}
 
 \graphicspath{{assets/}}
 
