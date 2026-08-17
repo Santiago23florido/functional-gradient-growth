@@ -1,0 +1,69 @@
+\subsection{Search Quality}
+
+\begin{frame}[t]{Near-Best Architectures Without Exhaustive Search}
+  \vspace{-0.13cm}
+  {\fontsize{7.4}{8.8}\selectfont
+  CAGE-NAS was compared with tens of thousands of smaller fixed MLPs evaluated
+  under the same parameter budget.}
+
+  \vspace{0.08cm}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.64\textwidth}
+      \centering
+      \includegraphics[width=0.94\linewidth]{cage_accuracy_distribution.png}
+      \vspace{-0.13cm}
+
+      {\centering\color{MutedText}\fontsize{6.0}{7.2}\selectfont
+      Fixed-architecture test-accuracy distributions; red stars are the
+      corresponding CAGE-NAS runs.\par}
+
+      \vspace{0.05cm}
+      \begin{beamercolorbox}[rounded=true,sep=0.07cm,wd=\linewidth]{demeter takeaway}
+        {\fontsize{6.8}{8.1}\selectfont\bfseries
+        The result does not prove recovery of the global optimum, but every
+        discovered architecture lies in the extreme upper tail.}
+      \end{beamercolorbox}
+    \end{column}
+
+    \begin{column}{0.33\textwidth}
+      {\color{EnstaBlue}\bfseries\scriptsize POSITION IN THE SEARCH SPACE}
+      \vspace{0.04cm}
+
+      {\centering
+      \fontsize{6.65}{7.9}\selectfont
+      \setlength{\tabcolsep}{3.0pt}
+      \renewcommand{\arraystretch}{1.25}
+      \begin{tabular}{c|r|c}
+        \textbf{Seed} & \textbf{Evaluated} & \textbf{Percentile} \\
+        \hline
+        0 & 19,360 & 99.83 \\
+        1 & 19,850 & 99.97 \\
+        2 & 20,023 & 100.00 \\
+        3 & 17,413 & 99.99
+      \end{tabular}\par}
+
+      \vspace{0.10cm}
+      \begin{beamercolorbox}[rounded=true,sep=0.08cm,wd=\linewidth]{certified card}
+        \centering
+        {\color{CertifiedGreen}\fontsize{9.5}{11.3}\selectfont\bfseries
+        Top $0.2\%$ across all seeds}
+      \end{beamercolorbox}
+
+      \vspace{0.10cm}
+      {\color{EnstaBlue}\bfseries\scriptsize COMPUTATIONAL COMPARISON}
+      \vspace{0.04cm}
+
+      \begin{beamercolorbox}[rounded=true,sep=0.09cm,wd=\linewidth]{growth card}
+        {\fontsize{6.6}{7.9}\selectfont
+        \textbf{Grid search:} 76,646 architectures screened; 12,240
+        architecture--hyperparameter pairs fine-tuned for 400 epochs.}
+      \end{beamercolorbox}
+
+      \vspace{0.07cm}
+      \begin{beamercolorbox}[rounded=true,sep=0.09cm,wd=\linewidth]{certified card}
+        {\fontsize{6.6}{7.9}\selectfont
+        \textbf{CAGE-NAS:} one 70-epoch train-and-grow trajectory per seed.}
+      \end{beamercolorbox}
+    \end{column}
+  \end{columns}
+\end{frame}

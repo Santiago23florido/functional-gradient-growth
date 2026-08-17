@@ -30,6 +30,8 @@ not modified.
 
 `assets/demeter_cosine_similarity.png` is an unchanged copy of Figure 4 from
 the internship report (`docs/internship-santiago/figures/cosinesim.png`).
+The `assets/cage_*.png` plots are unchanged copies of the CAGE-NAS synthetic
+and MNIST result figures from the same report.
 
 ## Sections
 
@@ -47,4 +49,12 @@ the internship report (`docs/internship-santiago/figures/cosinesim.png`).
   angular certification, and ray-optimal scaling for the nonlinear family.
 - `sections/33_where_to_grow.tex`: counterfactual certificate comparison and
   expressivity-bottleneck fallback for selecting the growth location.
+- `sections/40_results_controlled_benchmark.tex`: controlled synthetic
+  train-and-grow behavior and final seed results.
+- `sections/41_results_search_quality.tex`: percentile comparison against the
+  fixed-architecture search space.
+- `sections/42_results_fixed_retraining.tex`: paired comparison with retraining
+  the discovered fixed architectures.
+- `sections/43_results_scalability.tex`: MNIST behavior and the Jacobian
+  memory/computation bottleneck.
 - `sections/99_references.tex`: all references from the internship report.
