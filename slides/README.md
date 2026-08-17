@@ -27,3 +27,6 @@ The compiled presentation is written to `build/main.pdf`.
 
 Both images were whitespace-trimmed for layout purposes; the logo artwork was
 not modified.
+
+`assets/demeter_cosine_similarity.png` is an unchanged copy of Figure 4 from
+the internship report (`docs/internship-santiago/figures/cosinesim.png`).
