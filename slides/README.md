@@ -41,4 +41,6 @@ the internship report (`docs/internship-santiago/figures/cosinesim.png`).
   convergence conditions.
 - `sections/30_cage_nas_overview.tex`: certified CAGE-NAS train-and-grow
   control flow and architecture-search rule.
+- `sections/31_damped_tangent_family.tex`: regularized tangent projection,
+  spectral filtering, and relative-error certification.
 - `sections/99_references.tex`: all references from the internship report.
