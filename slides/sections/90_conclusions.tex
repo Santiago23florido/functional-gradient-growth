@@ -1,42 +1,43 @@
 \section{Conclusions}
 
-\begin{frame}[t]{Conclusions and Research Perspectives}
+\begin{frame}[t]{CAGE-NAS: Conclusions and Research Perspectives}
   \vspace{-0.13cm}
   {\fontsize{7.45}{8.9}\selectfont
-  Adaptive growth allocates capacity only when the current learning dynamics require it.}
+  CAGE-NAS turns architecture growth into a sequence of certified decisions
+  aligned with functional-gradient descent.}
 
   \vspace{0.10cm}
   \begin{columns}[T,onlytextwidth]
     \begin{column}{0.315\textwidth}
-      {\color{EnstaBlue}\bfseries\scriptsize LESSONS FROM GROWTH}
+      {\color{EnstaBlue}\bfseries\scriptsize CORE CONTRIBUTION}
       \vspace{0.04cm}
 
       \begin{beamercolorbox}[rounded=true,sep=0.11cm,wd=\linewidth]{demeter takeaway}
         {\fontsize{6.85}{8.2}\selectfont
         \begin{itemize}
-          \setlength{\itemsep}{0.10cm}
-          \item DEMETER shows that a locally optimized growth direction can
-                conflict with subsequent parametric training.
-          \item Complete function preservation substantially reduces
-                post-growth loss discontinuities.
-          \item Growable Compact Transformers indicate that adaptive capacity
-                can extend beyond conventional MLP and DAG architectures.
+          \setlength{\itemsep}{0.08cm}
+          \item Begin with a small network and add capacity only when the
+                current functional representation fails certification.
+          \item Try damped tangent and nonlinear families first; if both fail,
+                function-preserving growth expands the reachable directions.
+          \item Use the same functional-gradient objective for training and
+                for deciding \emph{when} and \emph{where} to grow.
         \end{itemize}}
       \end{beamercolorbox}
     \end{column}
 
     \begin{column}{0.335\textwidth}
-      {\color{EnstaBlue}\bfseries\scriptsize WHAT CAGE-NAS ESTABLISHES}
+      {\color{EnstaBlue}\bfseries\scriptsize EMPIRICAL CONCLUSION}
       \vspace{0.04cm}
 
       \begin{beamercolorbox}[rounded=true,sep=0.11cm,wd=\linewidth]{certified card}
         {\fontsize{6.85}{8.2}\selectfont
         \begin{itemize}
           \setlength{\itemsep}{0.09cm}
-          \item Training and growth form one certified function-space process,
-                without an external schedule.
-          \item Approximation quality decides whether the architecture is
-                adequate or must grow.
+          \item Exact synthetic experiments produce stable certified
+                train-and-grow trajectories across four seeds.
+          \item The scalable MNIST path preserves decreasing training loss and
+                improving accuracy as capacity is introduced.
         \end{itemize}}
 
         \vspace{0.05cm}
@@ -51,7 +52,7 @@
     \end{column}
 
     \begin{column}{0.315\textwidth}
-      {\color{EnstaBlue}\bfseries\scriptsize WHAT REMAINS OPEN}
+      {\color{EnstaBlue}\bfseries\scriptsize LIMITATIONS AND NEXT STEPS}
       \vspace{0.04cm}
 
       \begin{beamercolorbox}[rounded=true,sep=0.11cm,wd=\linewidth]{growth card}
@@ -64,7 +65,8 @@
                 certification with generalization.
           \item Lower the cost of tangent representations and candidate
                 evaluation at scale.
-          \item Extend evaluation to CNNs, DAGs, CIFAR-10/100, and NAS Unseen.
+          \item Extend CAGE-NAS to CNNs and DAGs, then evaluate on CIFAR-10/100
+                and NAS Unseen under consistent budgets.
         \end{itemize}}
       \end{beamercolorbox}
     \end{column}
@@ -74,7 +76,7 @@
   \begin{beamercolorbox}[rounded=true,sep=0.09cm,wd=\linewidth]{demeter takeaway}
     \centering
     {\fontsize{7.0}{8.4}\selectfont\bfseries
-    Certified functional descent is a promising basis for constructive NAS;
-    efficiency, generalization, and scalability remain complementary objectives.}
+    Certified functional descent can discover near-best architectures without
+    exhaustive enumeration; efficiency, generalization, and scalability remain open.}
   \end{beamercolorbox}
 \end{frame}
