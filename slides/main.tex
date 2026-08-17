@@ -1,0 +1,27 @@
+\documentclass[aspectratio=169,11pt]{beamer}
+
+\usepackage[T1]{fontenc}
+\usepackage[sfdefault]{FiraSans}
+\usepackage{graphicx}
+\usepackage{microtype}
+\usepackage{tikz}
+
+\definecolor{EnstaBlue}{HTML}{3645FE}
+\definecolor{LisnNavy}{HTML}{202044}
+\definecolor{AccentOrange}{HTML}{F47521}
+\definecolor{MutedText}{HTML}{667085}
+\definecolor{SoftBlue}{HTML}{F4F6FF}
+
+\setbeamertemplate{navigation symbols}{}
+\setbeamercolor{normal text}{fg=LisnNavy,bg=white}
+\setbeamerfont{normal text}{family=\sffamily}
+
+\graphicspath{{assets/}}
+
+\begin{document}
+
+% Each presentation section lives in its own file so that the deck can grow
+% without turning this entry point into a monolithic document.
+\input{sections/00_title}
+
+\end{document}
