@@ -1,0 +1,93 @@
+\section{CAGE-NAS}
+
+\begin{frame}[t]{CAGE-NAS: Certified Train-and-Grow Search}
+  \vspace{-0.08cm}
+  {\fontsize{8.0}{9.5}\selectfont
+  Starting from a deliberately small network, CAGE-NAS expands capacity only
+  when the current architecture cannot realize a certified approximation of
+  the functional gradient.}
+
+  \vspace{0.12cm}
+  \begin{center}
+    \begin{tikzpicture}[
+      node distance=0.50cm,
+      stage/.style={draw=EnstaBlue, rounded corners=2pt, very thick,
+        fill=SoftBlue, align=center, inner sep=5pt,
+        text width=2.65cm, minimum height=1.18cm,
+        font=\fontsize{7.1}{8.4}\selectfont},
+      growthstage/.style={draw=AccentOrange, rounded corners=2pt, very thick,
+        fill=SoftOrange, align=center, inner sep=5pt,
+        text width=2.65cm, minimum height=1.18cm,
+        font=\fontsize{7.1}{8.4}\selectfont},
+      signal/.style={draw=LisnNavy, circle, thick, fill=white,
+        align=center, inner sep=3pt, minimum size=1.08cm,
+        font=\fontsize{7.0}{8.2}\selectfont},
+      flow/.style={-{Latex[length=2mm]}, thick, color=LisnNavy}
+    ]
+      \node[signal] (grad) {$r=\nabla_F$\\$\mathcal L(F)$};
+      \node[stage, right=0.55cm of grad] (tangent)
+        {\textbf{Damped tangent}\\Approximate $r$ in $\operatorname{range}(J)$};
+      \node[stage, right=0.55cm of tangent] (nonlinear)
+        {\textbf{Nonlinear family}\\Search a finite curved displacement};
+      \node[growthstage, right=0.55cm of nonlinear] (growth)
+        {\textbf{Structural growth}\\Add capacity while preserving $F$};
+
+      \draw[flow] (grad) -- (tangent);
+      \draw[flow] (tangent) -- node[above, font=\fontsize{6.2}{7.2}\selectfont]
+        {fails} (nonlinear);
+      \draw[flow] (nonlinear) -- node[above, font=\fontsize{6.2}{7.2}\selectfont]
+        {fails} (growth);
+
+      \node[below=0.18cm of tangent, text=CertifiedGreen,
+        font=\fontsize{6.5}{7.7}\selectfont\bfseries, align=center]
+        {passes: commit a\\certified tangent step};
+      \node[below=0.18cm of nonlinear, text=CertifiedGreen,
+        font=\fontsize{6.5}{7.7}\selectfont\bfseries, align=center]
+        {passes: commit the\\certified clone};
+
+      \draw[-{Latex[length=2mm]}, thick, color=AccentOrange]
+        (growth.south) -- ++(0,-0.94cm) -| node[pos=0.28,below,
+        font=\fontsize{6.2}{7.2}\selectfont] {recompute and retry}
+        (tangent.south west);
+    \end{tikzpicture}
+  \end{center}
+
+  \vspace{-0.06cm}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.49\textwidth}
+      {\color{EnstaBlue}\bfseries\scriptsize ONE CERTIFICATE FOR BOTH FAMILIES}
+      \vspace{0.03cm}
+
+      \begin{beamercolorbox}[rounded=true,sep=0.11cm,wd=\linewidth]{certified card}
+        \centering
+        \fontsize{7.0}{8.3}\selectfont
+        \(\displaystyle
+          \operatorname{RelErr}(g,r)
+          =\frac{\lVert g-r\rVert_2}{\lVert g\rVert_2}
+          <\frac12
+        \)
+      \end{beamercolorbox}
+    \end{column}
+
+    \begin{column}{0.49\textwidth}
+      {\color{EnstaBlue}\bfseries\scriptsize CONSTRUCTIVE ARCHITECTURE SEARCH}
+      \vspace{0.03cm}
+
+      \begin{beamercolorbox}[rounded=true,sep=0.11cm,wd=\linewidth]{growth card}
+        \centering
+        \fontsize{6.9}{8.2}\selectfont
+        \(\displaystyle
+          A_0\prec A_1\prec\cdots,
+          \qquad F_{A^+,\theta^+}=F_{A,\theta}
+        \)
+      \end{beamercolorbox}
+    \end{column}
+  \end{columns}
+
+  \vspace{0.10cm}
+  \begin{beamercolorbox}[rounded=true,sep=0.10cm,wd=\linewidth]{demeter takeaway}
+    {\fontsize{7.3}{8.7}\selectfont\bfseries
+    Certification answers \emph{when} growth is necessary; counterfactual
+    candidate certificates determine \emph{where} capacity should be added.}
+  \end{beamercolorbox}
+\end{frame}

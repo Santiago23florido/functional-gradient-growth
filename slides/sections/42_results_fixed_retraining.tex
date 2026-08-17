@@ -1,0 +1,79 @@
+\subsection{Fixed Retraining}
+
+\begin{frame}[t]{Train-and-Grow vs. Fixed-Architecture Retraining}
+  \vspace{-0.13cm}
+  {\fontsize{7.45}{8.9}\selectfont
+  Each discovered architecture was reinitialized with the same seed and
+  retrained using a hyperparameter grid search.}
+
+  \vspace{0.11cm}
+  {\centering
+  \fontsize{7.15}{8.6}\selectfont
+  \setlength{\tabcolsep}{8.5pt}
+  \renewcommand{\arraystretch}{1.30}
+  \begin{tabular}{c|c|c|c|c}
+    \textbf{Seed} & \textbf{Architecture} & \textbf{Fixed} & \textbf{Growth}
+    & $\Delta$ \textbf{(fixed $-$ growth)} \\
+    \hline
+    0 & $16$--$19$--$9$  & 0.9531 & 0.9523 & $+0.0009$ \\
+    1 & $9$--$18$--$18$  & 0.9602 & 0.9574 & $+0.0028$ \\
+    2 & $13$--$16$--$15$ & 0.9596 & 0.9614 & $-0.0018$ \\
+    3 & $11$--$17$--$17$ & 0.9434 & 0.9587 & $-0.0154$
+  \end{tabular}\par}
+
+  \vspace{0.15cm}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.315\textwidth}
+      \begin{beamercolorbox}[rounded=true,sep=0.12cm,wd=\linewidth]{demeter takeaway}
+        \centering
+        {\color{LisnNavy}\fontsize{11.5}{13.5}\selectfont\bfseries
+        $0.9541\pm0.0078$}
+
+        {\fontsize{6.5}{7.8}\selectfont fixed retraining}
+      \end{beamercolorbox}
+    \end{column}
+    \begin{column}{0.315\textwidth}
+      \begin{beamercolorbox}[rounded=true,sep=0.12cm,wd=\linewidth]{certified card}
+        \centering
+        {\color{CertifiedGreen}\fontsize{11.5}{13.5}\selectfont\bfseries
+        $0.9575\pm0.0038$}
+
+        {\fontsize{6.5}{7.8}\selectfont train-and-grow}
+      \end{beamercolorbox}
+    \end{column}
+    \begin{column}{0.315\textwidth}
+      \begin{beamercolorbox}[rounded=true,sep=0.12cm,wd=\linewidth]{growth card}
+        \centering
+        {\color{AccentOrange}\fontsize{11.5}{13.5}\selectfont\bfseries
+        $-0.0034\pm0.0082$}
+
+        {\fontsize{6.5}{7.8}\selectfont paired difference}
+      \end{beamercolorbox}
+    \end{column}
+  \end{columns}
+
+  \vspace{0.15cm}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.49\textwidth}
+      {\color{EnstaBlue}\bfseries\scriptsize WHAT THE COMPARISON SHOWS}
+      \vspace{0.03cm}
+
+      {\fontsize{7.15}{8.6}\selectfont
+      \begin{itemize}
+        \setlength{\itemsep}{0.07cm}
+        \item Fixed retraining wins for seeds 0 and 1; growth wins for 2 and 3.
+        \item Growth is slightly better on average and less variable.
+      \end{itemize}}
+    \end{column}
+    \begin{column}{0.49\textwidth}
+      {\color{EnstaBlue}\bfseries\scriptsize INTERPRETATION}
+      \vspace{0.03cm}
+
+      \begin{beamercolorbox}[rounded=true,sep=0.10cm,wd=\linewidth]{demeter takeaway}
+        {\fontsize{7.0}{8.4}\selectfont\bfseries
+        Retraining does not systematically improve the discovered model: the
+        architecture and its certified training trajectory are jointly useful.}
+      \end{beamercolorbox}
+    \end{column}
+  \end{columns}
+\end{frame}

@@ -1,0 +1,92 @@
+\begin{frame}
+  \begin{tikzpicture}[remember picture,overlay]
+    % A restrained institutional accent at the top of the slide.
+    \fill[EnstaBlue]
+      (current page.north west)
+      rectangle ([yshift=-0.07cm]current page.north east);
+
+    % Institutional logos from the source cover.
+    \node[anchor=north west,inner sep=0pt]
+      at ([xshift=0.62cm,yshift=-0.44cm]current page.north west)
+      {\includegraphics[width=3.15cm]{ensta.png}};
+    \node[anchor=north east,inner sep=0pt]
+      at ([xshift=-0.62cm,yshift=-0.30cm]current page.north east)
+      {\includegraphics[width=2.28cm]{lisn.png}};
+
+    % Programme and academic context.
+    \node[anchor=north,align=center,text=LisnNavy]
+      at ([yshift=-0.39cm]current page.north)
+      {\fontsize{8.7}{10.4}\selectfont\bfseries RESEARCH PROJECT (PRe)};
+    \node[anchor=north,align=center,text=MutedText]
+      at ([yshift=-0.82cm]current page.north)
+      {\fontsize{6.7}{8.2}\selectfont\bfseries ACADEMIC YEAR 2026--2027};
+    \node[anchor=north,align=center,text width=13.3cm,text=LisnNavy]
+      at ([yshift=-1.20cm]current page.north)
+      {\fontsize{7.1}{8.8}\selectfont
+       \textbf{Specialization:} Information and Communication Sciences and
+       Technologies (STIC)};
+
+    \draw[MutedText!28,line width=0.35pt]
+      ([xshift=1.15cm,yshift=-1.72cm]current page.north west) --
+      ([xshift=-1.15cm,yshift=-1.72cm]current page.north east);
+
+    % Project title and subtitle.
+    \node[anchor=north,align=center,text width=13.7cm,text=LisnNavy]
+      at ([yshift=-2.06cm]current page.north)
+      {\fontsize{17.2}{20.2}\selectfont\bfseries
+       \textcolor{EnstaBlue}{CAGE-NAS:} Certified Adaptive Growth\\[-0.01cm]
+       and Expansion\\[-0.01cm]
+       for Neural Architecture Search};
+    \node[anchor=north,align=center,text width=14.0cm,text=MutedText]
+      at ([yshift=-4.08cm]current page.north)
+      {\fontsize{8.7}{10.5}\selectfont
+       Toward Resource-Aware Deep Learning through Adaptive Capacity Allocation};
+
+    \fill[AccentOrange]
+      ([xshift=-0.40cm,yshift=-4.63cm]current page.north) rectangle
+      ([xshift=0.40cm,yshift=-4.57cm]current page.north);
+
+    % Project details: three balanced cards keep the dense cover information
+    % readable on a landscape presentation slide.
+    \node[anchor=north,rounded corners=2pt,fill=SoftBlue,
+          minimum width=4.45cm,minimum height=1.64cm,inner sep=0.18cm,
+          align=left,text width=3.92cm]
+      at ([xshift=-5.05cm,yshift=-4.89cm]current page.north)
+      {\fontsize{6.5}{8}\selectfont\bfseries\color{MutedText}AUTHOR\\[0.07cm]
+       \fontsize{9.2}{11}\selectfont\color{LisnNavy}Santiago Florido Gomez\\[0.16cm]
+       \fontsize{6.5}{8}\selectfont\bfseries\color{MutedText}CLASS\enspace
+       \fontsize{8.2}{10}\selectfont\color{LisnNavy}2027};
+
+    \node[anchor=north,rounded corners=2pt,fill=SoftBlue,
+          minimum width=4.45cm,minimum height=1.64cm,inner sep=0.18cm,
+          align=left,text width=3.92cm]
+      at ([yshift=-4.89cm]current page.north)
+      {\fontsize{6.5}{8}\selectfont\bfseries\color{MutedText}
+       ENSTA PARIS SUPERVISOR\\[0.12cm]
+       \fontsize{9.2}{11}\selectfont\color{EnstaBlue}Zhi Yan};
+
+    \node[anchor=north,rounded corners=2pt,fill=SoftBlue,
+          minimum width=4.45cm,minimum height=1.64cm,inner sep=0.18cm,
+          align=left,text width=3.92cm]
+      at ([xshift=5.05cm,yshift=-4.89cm]current page.north)
+      {\fontsize{6.5}{8}\selectfont\bfseries\color{MutedText}
+       HOST ORGANIZATION SUPERVISOR\\[0.12cm]
+       \fontsize{9.2}{11}\selectfont\color{EnstaBlue}St\'ephane Rivaud};
+
+    % Internship period and host organization.
+    \node[anchor=north,align=center,text width=14.0cm,text=LisnNavy]
+      at ([yshift=-6.89cm]current page.north)
+      {\fontsize{8.2}{10}\selectfont
+       \textbf{Internship carried out from May 18, 2026 to August 14, 2026}};
+    \node[anchor=north,align=center,text width=14.0cm,text=MutedText]
+      at ([yshift=-7.39cm]current page.north)
+      {\fontsize{7.8}{9.7}\selectfont
+       \textbf{Host Organization:} Interdisciplinary Laboratory of Digital
+       Sciences (LISN)};
+
+    % Bottom rule visually closes the cover without adding footer chrome.
+    \draw[EnstaBlue,line width=0.75pt]
+      ([xshift=0.62cm,yshift=0.40cm]current page.south west) --
+      ([xshift=-0.62cm,yshift=0.40cm]current page.south east);
+  \end{tikzpicture}
+\end{frame}

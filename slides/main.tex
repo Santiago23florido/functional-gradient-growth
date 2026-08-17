@@ -1,0 +1,64 @@
+\documentclass[aspectratio=169,11pt]{beamer}
+
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[sfdefault]{FiraSans}
+\usepackage{graphicx}
+\usepackage{microtype}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning}
+
+\definecolor{EnstaBlue}{HTML}{3645FE}
+\definecolor{LisnNavy}{HTML}{202044}
+\definecolor{AccentOrange}{HTML}{F47521}
+\definecolor{MutedText}{HTML}{667085}
+\definecolor{SoftBlue}{HTML}{F4F6FF}
+\definecolor{CertifiedGreen}{HTML}{168363}
+\definecolor{SoftGreen}{HTML}{ECF8F3}
+\definecolor{SoftOrange}{HTML}{FFF3EA}
+
+\setbeamertemplate{navigation symbols}{}
+\setbeamercolor{normal text}{fg=LisnNavy,bg=white}
+\setbeamercolor{frametitle}{fg=LisnNavy,bg=white}
+\setbeamercolor{bibliography entry author}{fg=LisnNavy}
+\setbeamercolor{bibliography entry title}{fg=LisnNavy}
+\setbeamercolor{bibliography entry location}{fg=MutedText}
+\setbeamercolor{bibliography entry note}{fg=MutedText}
+\setbeamercolor{demeter takeaway}{fg=LisnNavy,bg=SoftBlue}
+\setbeamercolor{certified card}{fg=LisnNavy,bg=SoftGreen}
+\setbeamercolor{growth card}{fg=LisnNavy,bg=SoftOrange}
+\setbeamercolor{page number in head/foot}{fg=MutedText,bg=white}
+\setbeamerfont{normal text}{family=\sffamily}
+\setbeamerfont{frametitle}{series=\bfseries,size=\large}
+\setbeamertemplate{bibliography item}[text]
+\setbeamertemplate{footline}{%
+  \hbox to \paperwidth{%
+    \hfill
+    {\usebeamercolor[fg]{page number in head/foot}%
+     \fontsize{5.8}{7}\selectfont
+     \insertframenumber\,/\,\inserttotalframenumber}%
+    \hspace*{0.42cm}}%
+  \vskip0.08cm
+}
+
+\graphicspath{{assets/}}
+
+\begin{document}
+
+% Each presentation section lives in its own file so that the deck can grow
+% without turning this entry point into a monolithic document.
+\input{sections/00_title}
+\input{sections/10_demeter_alignment}
+\input{sections/20_adaptive_representations}
+\input{sections/30_cage_nas_overview}
+\input{sections/31_damped_tangent_family}
+\input{sections/32_nonlinear_displacement_family}
+\input{sections/33_where_to_grow}
+\input{sections/40_results_controlled_benchmark}
+\input{sections/41_results_search_quality}
+\input{sections/42_results_fixed_retraining}
+\input{sections/43_results_scalability}
+\input{sections/90_conclusions}
+\input{sections/99_references}
+
+\end{document}

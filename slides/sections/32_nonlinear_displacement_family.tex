@@ -1,0 +1,107 @@
+\subsection{Nonlinear Parametric Displacement Family}
+
+\begin{frame}[t]{The Nonlinear Parametric Displacement Family}
+  \vspace{-0.18cm}
+  {\fontsize{7.5}{8.9}\selectfont
+  If tangent projection fails, a clone searches a finite curved trajectory
+  within the same architecture.}
+
+  \vspace{0.10cm}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.525\textwidth}
+      {\color{EnstaBlue}\bfseries\scriptsize ESCAPING THE INITIAL TANGENT PLANE}
+      \vspace{0.04cm}
+
+      \begin{beamercolorbox}[rounded=true,sep=0.11cm,wd=\linewidth]{demeter takeaway}
+        \centering
+        \fontsize{6.9}{8.2}\selectfont
+        \(\displaystyle
+          F(\theta(T))-F(\theta(0))
+          =\int_0^T J_{A,\theta(t)}\dot\theta(t)\,\mathrm dt
+        \)
+      \end{beamercolorbox}
+
+      \vspace{0.10cm}
+      {\color{EnstaBlue}\bfseries\scriptsize REFLECTED TRAINING TARGET}
+      \vspace{0.04cm}
+
+      \begin{beamercolorbox}[rounded=true,sep=0.11cm,wd=\linewidth]{demeter takeaway}
+        \centering
+        \fontsize{7.0}{8.3}\selectfont
+        \(\displaystyle
+          \begin{gathered}
+            r=2(F-Y),\qquad \eta_f=1,\\[4pt]
+            F_{\mathrm{target}}=F-r=2Y-F.
+          \end{gathered}
+        \)
+      \end{beamercolorbox}
+
+      \vspace{0.10cm}
+      {\color{EnstaBlue}\bfseries\scriptsize REALIZED NONLINEAR DIRECTION}
+      \vspace{0.04cm}
+
+      \begin{beamercolorbox}[rounded=true,sep=0.11cm,wd=\linewidth]{growth card}
+        \centering
+        \fontsize{7.0}{8.3}\selectfont
+        \(\displaystyle
+          \Delta=F(\theta)-F(\widetilde\theta)
+        \)
+      \end{beamercolorbox}
+
+      \vspace{0.08cm}
+      {\fontsize{6.9}{8.2}\selectfont
+      The reflected target lets $\Delta$ exploit higher-order effects beyond
+      the initial tangent plane.}
+    \end{column}
+
+    \begin{column}{0.445\textwidth}
+      {\color{EnstaBlue}\bfseries\scriptsize SCALE-FREE ANGULAR CERTIFICATE}
+      \vspace{0.04cm}
+
+      \begin{beamercolorbox}[rounded=true,sep=0.11cm,wd=\linewidth]{certified card}
+        \centering
+        \fontsize{6.8}{8.1}\selectfont
+        \(\displaystyle
+          \begin{gathered}
+            \chi=\frac{\langle\Delta,r\rangle}
+            {\lVert\Delta\rVert_2\lVert r\rVert_2},\\[5pt]
+            \varepsilon_{\mathrm{NL}}^\star
+            =\sqrt{1-\max\{\chi,0\}^2}.
+          \end{gathered}
+        \)
+      \end{beamercolorbox}
+
+      \vspace{0.10cm}
+      {\color{EnstaBlue}\bfseries\scriptsize ADMISSIBILITY}
+      \vspace{0.04cm}
+
+      \begin{beamercolorbox}[rounded=true,sep=0.11cm,wd=\linewidth]{certified card}
+        \centering
+        \fontsize{6.9}{8.2}\selectfont
+        \(\displaystyle
+          \chi>0,\quad \varepsilon_{\mathrm{NL}}^\star<\frac12
+          \quad\Longleftrightarrow\quad
+          \chi>\frac{\sqrt3}{2}
+        \)
+      \end{beamercolorbox}
+
+      \vspace{0.10cm}
+      {\color{EnstaBlue}\bfseries\scriptsize RAY-OPTIMAL SCALING}
+      \vspace{0.04cm}
+
+      \begin{beamercolorbox}[rounded=true,sep=0.11cm,wd=\linewidth]{growth card}
+        \centering
+        \fontsize{6.9}{8.2}\selectfont
+        \(\displaystyle
+          a^\star=\frac{\lVert r\rVert_2^2}{\langle\Delta,r\rangle},
+          \qquad g_{\mathrm{NL}}=a^\star\Delta\approx r
+        \)
+      \end{beamercolorbox}
+
+      \vspace{0.09cm}
+      {\fontsize{6.9}{8.2}\selectfont
+      $\chi$ certifies orientation; $a^\star$ corrects magnitude.}
+    \end{column}
+  \end{columns}
+
+\end{frame}

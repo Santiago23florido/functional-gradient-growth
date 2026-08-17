@@ -1,0 +1,51 @@
+\section{What DEMETER Reveals about Train-and-Grow Optimization}
+
+\begin{frame}[t]{What DEMETER Reveals about Train-and-Grow Optimization}
+  \vspace{-0.14cm}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.37\textwidth}
+      {\fontsize{7.4}{9}\selectfont\bfseries\color{EnstaBlue}
+       WHY ALIGNMENT BREAKS}
+
+      \vspace{0.15cm}
+      \begin{itemize}
+        \setlength\itemsep{0.08cm}
+        \fontsize{8.2}{10.2}\selectfont
+
+        \item \textbf{Growth is function-directed.}
+        New capacity is selected to align a local functional-gradient
+        projection.
+
+        \item \textbf{Training is parameter-directed.}
+        SGD moves in parameter space; its Jacobian-induced effect generally
+        follows a different function-space direction.
+
+        \item \textbf{The directions can conflict.}
+        Interleaving them can redirect progress; overtraining between growth
+        events may favor local minima \textcolor{MutedText}{(Douka et al., 2025)}.
+      \end{itemize}
+
+      \vspace{0.02cm}
+      \begin{beamercolorbox}[rounded=true,sep=0.14cm,wd=\linewidth]{demeter takeaway}
+        \fontsize{7.6}{9.5}\selectfont
+        \textbf{Key observation.} Alignment is episodic, not sustained.
+        Cosine peaks mark growth epochs; between them, parametric training
+        remains weakly aligned.
+      \end{beamercolorbox}
+    \end{column}
+
+    \begin{column}{0.60\textwidth}
+      \centering
+      \includegraphics[width=\linewidth]{demeter_cosine_similarity.png}
+
+      \vspace{0.05cm}
+      \parbox{0.96\linewidth}{%
+        \centering
+        \fontsize{6.5}{8.0}\selectfont\color{MutedText}
+        \textbf{Figure 4:} MultiNIST cosine similarity between the functional
+        gradient and the zeroth-order contribution during DEMETER training and
+        growth.%
+      }
+    \end{column}
+  \end{columns}
+\end{frame}

@@ -1,0 +1,103 @@
+\subsection{Damped Tangent Family}
+
+\begin{frame}[t]{The Damped Tangent Family}
+  \vspace{-0.08cm}
+  {\fontsize{7.6}{9.0}\selectfont
+  The first candidate approximates $r$ in the network tangent space while
+  penalizing unsafe parameter motion.}
+
+  \vspace{0.11cm}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.555\textwidth}
+      {\color{EnstaBlue}\bfseries\scriptsize REGULARIZED TANGENT PROJECTION}
+      \vspace{0.04cm}
+
+      \begin{beamercolorbox}[rounded=true,sep=0.12cm,wd=\linewidth]{demeter takeaway}
+        \centering
+        \fontsize{7.0}{8.3}\selectfont
+        \(\displaystyle
+          \begin{gathered}
+            u_\lambda=\operatorname*{arg\,min}_{u\in\mathbb R^{p_A}}
+            \left\{\lVert Ju-r\rVert_2^2+\lambda\lVert u\rVert_2^2\right\},\\[5pt]
+            g_\lambda=Ju_\lambda\in\operatorname{range}(J).
+          \end{gathered}
+        \)
+      \end{beamercolorbox}
+
+      \vspace{0.11cm}
+      {\color{EnstaBlue}\bfseries\scriptsize MODE-BY-MODE SOLUTION}
+      \vspace{0.04cm}
+
+      \begin{beamercolorbox}[rounded=true,sep=0.12cm,wd=\linewidth]{demeter takeaway}
+        \centering
+        \fontsize{6.8}{8.1}\selectfont
+        \(\displaystyle
+          \begin{gathered}
+            J=U\Sigma V^\top,\qquad a=U^\top r,\\[4pt]
+            u_\lambda
+            =V\operatorname{diag}\!\left(
+              \frac{\sigma_i}{\sigma_i^2+\lambda}
+            \right)a,\\[4pt]
+            g_\lambda
+            =U\operatorname{diag}\!\left(
+              \frac{\sigma_i^2}{\sigma_i^2+\lambda}
+            \right)a.
+          \end{gathered}
+        \)
+      \end{beamercolorbox}
+
+      \vspace{0.08cm}
+      {\fontsize{6.9}{8.2}\selectfont
+      Damping limits $\lVert u\rVert_2$, controlling nonlinear realization error.}
+    \end{column}
+
+    \begin{column}{0.415\textwidth}
+      {\color{EnstaBlue}\bfseries\scriptsize SPECTRAL FILTER}
+      \vspace{0.04cm}
+
+      \begin{beamercolorbox}[rounded=true,sep=0.10cm,wd=\linewidth]{certified card}
+        \centering
+        \fontsize{7.0}{8.3}\selectfont
+        \(\displaystyle
+          h_i(\lambda)=\frac{\sigma_i^2}{\sigma_i^2+\lambda}\in[0,1]
+        \)
+      \end{beamercolorbox}
+
+      \vspace{0.04cm}
+      {\fontsize{7.2}{8.6}\selectfont
+      \begin{itemize}
+        \setlength{\itemsep}{0.07cm}
+        \item $\sigma_i^2\gg\lambda$: transmit the reachable component.
+        \item $\sigma_i^2\ll\lambda$: suppress an ill-conditioned mode.
+        \item $\sigma_i=0$: the direction is structurally unreachable.
+      \end{itemize}}
+
+      \vspace{0.03cm}
+      {\color{EnstaBlue}\bfseries\scriptsize CERTIFICATE AND SCALE}
+      \vspace{0.04cm}
+
+      \begin{beamercolorbox}[rounded=true,sep=0.10cm,wd=\linewidth]{certified card}
+        \centering
+        \fontsize{6.8}{8.1}\selectfont
+        \(\displaystyle
+          \begin{gathered}
+            \varepsilon_\lambda
+            =\frac{\lVert g_\lambda-r\rVert_2}{\lVert g_\lambda\rVert_2}
+            <\frac12,\\[4pt]
+            \lambda=\rho\,\sigma_{\max}^2,\qquad
+            \rho\in[10^{-16},10^2].
+          \end{gathered}
+        \)
+      \end{beamercolorbox}
+
+      \vspace{0.08cm}
+      \begin{beamercolorbox}[rounded=true,sep=0.09cm,wd=\linewidth]{growth card}
+        \centering
+        {\fontsize{6.7}{8.0}\selectfont
+        \textbf{Undamped limit:}\quad
+        $\varepsilon<\tfrac12\Rightarrow
+        \lVert r_{\parallel}\rVert_2^2>0.8\lVert r\rVert_2^2$.}
+      \end{beamercolorbox}
+    \end{column}
+  \end{columns}
+\end{frame}

@@ -1,0 +1,87 @@
+\subsection{Where to Grow}
+
+\begin{frame}[t]{Where to Grow: Selecting the Expansion Location}
+  \vspace{-0.13cm}
+  {\fontsize{7.35}{8.7}\selectfont
+  Every growable location is tested from the same functional state, isolating
+  the value of the structural expansion itself.}
+
+  \vspace{0.09cm}
+  \begin{columns}[T,onlytextwidth]
+    \begin{column}{0.585\textwidth}
+      {\color{EnstaBlue}\bfseries\scriptsize FAIR COUNTERFACTUAL COMPARISON}
+      \vspace{0.03cm}
+
+      \begin{beamercolorbox}[rounded=true,sep=0.10cm,wd=\linewidth]{demeter takeaway}
+        \centering
+        \fontsize{6.65}{7.9}\selectfont
+        \(\displaystyle
+          \begin{gathered}
+            F_\ell^+=F,\quad r_\ell^+=r,\quad
+            \mathcal L(F_\ell^+)=\mathcal L(F),\\[5pt]
+            J_\ell^+=\begin{bmatrix}J_{A,\theta}&B_\ell\end{bmatrix},
+            \qquad T_\ell^+=\operatorname{range}(J_\ell^+).
+          \end{gathered}
+        \)
+      \end{beamercolorbox}
+
+      \vspace{0.09cm}
+      {\color{EnstaBlue}\bfseries\scriptsize SCORE AND SELECTION}
+      \vspace{0.03cm}
+
+      \begin{beamercolorbox}[rounded=true,sep=0.10cm,wd=\linewidth]{certified card}
+        \centering
+        \fontsize{6.75}{8.0}\selectfont
+        \(\displaystyle
+          \begin{gathered}
+            \varepsilon_{\lambda,\ell}^+
+            =\frac{\lVert g_{\lambda,\ell}^+-r\rVert_2}
+                   {\lVert g_{\lambda,\ell}^+\rVert_2},\\[5pt]
+            \ell^\star\in\operatorname*{arg\,min}_{\ell}
+            \varepsilon_{\min}
+            \!\left(A\oplus e_\ell,\theta_\ell^+\right).
+          \end{gathered}
+        \)
+      \end{beamercolorbox}
+
+      \vspace{0.07cm}
+      {\fontsize{6.75}{8.0}\selectfont
+      Lowest error wins; all scores are recomputed after every addition.}
+    \end{column}
+
+    \begin{column}{0.385\textwidth}
+      {\color{EnstaBlue}\bfseries\scriptsize CERTIFICATE-DRIVEN SEARCH}
+      \vspace{0.04cm}
+
+      {\fontsize{6.85}{8.2}\selectfont
+      \begin{enumerate}
+        \setlength{\itemsep}{0.07cm}
+        \item Clone each location and add one function-preserving neuron.
+        \item Evaluate its least-damped certificate $\varepsilon_{\min}$.
+        \item Commit the argmin candidate, then recompute.
+      \end{enumerate}}
+
+      \vspace{0.05cm}
+      {\color{EnstaBlue}\bfseries\scriptsize OUTER-STEP FALLBACK}
+      \vspace{0.03cm}
+
+      \begin{beamercolorbox}[rounded=true,sep=0.10cm,wd=\linewidth]{growth card}
+        \centering
+        \fontsize{6.6}{7.9}\selectfont
+        \(\displaystyle
+          \begin{gathered}
+            \mathcal B_\ell
+            =a_\ell\sum_i\left(\lambda_{\ell,i}^{\mathrm{ext}}\right)^2,\\[5pt]
+            \ell_{\mathcal B}^\star
+            \in\operatorname*{arg\,max}_{\ell}\mathcal B_\ell.
+          \end{gathered}
+        \)
+      \end{beamercolorbox}
+
+      \vspace{0.07cm}
+      {\fontsize{6.75}{8.0}\selectfont
+      After the outer steps, add one neuron at the largest expressivity
+      bottleneck to improve future reachable directions.}
+    \end{column}
+  \end{columns}
+\end{frame}
