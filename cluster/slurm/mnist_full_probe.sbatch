@@ -72,7 +72,9 @@ MODEL_SEED="${MODEL_SEED:-0}"
 # Optional metadata-only suffix for reruns. Empty preserves every historical
 # run name and results path; e.g. RUN_SUFFIX=r2 isolates a rerun.
 RUN_SUFFIX="${RUN_SUFFIX:-}"
-ARM="probe-floor"
+# Sobreescribible para lanzar una variante (p.ej. ARM=8x8) sin tocar
+# nada mas: solo cambia el nombre del run y el directorio de resultados.
+ARM="${ARM:-probe-floor}"
 
 # ---------------------------------------------------------------------------
 # Datos en el disco del nodo. $HOME es almacenamiento compartido y leer 50000
@@ -125,7 +127,10 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 # y el log parece congelado durante minutos. Sin esto no se puede vigilar nada.
 export PYTHONUNBUFFERED=1
 
-CONFIG="configs/experiments/mnist_full.yaml"
+# Sobreescribible por entorno. El default es EXACTAMENTE el de siempre, asi
+# que un lanzamiento sin CONFIG= corre lo que corria antes, byte a byte.
+CONFIG="${CONFIG:-configs/experiments/mnist_full.yaml}"
+[[ -f "${CONFIG}" ]] || { echo "[FATAL] no existe ${CONFIG}"; exit 1; }
 RUN_NAME="mnist-full-${ARM}-seed-${MODEL_SEED}"
 [[ -n "${RUN_SUFFIX}" ]] && RUN_NAME="${RUN_NAME}-${RUN_SUFFIX}"
 

@@ -304,6 +304,7 @@ def make_mnist_dataloaders(
     seed: int = 0,
     num_classes: int = 10,
     image_shape: tuple[int, ...] | None = None,
+    image_size: int | None = None,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """Return MNIST loaders with one-hot targets for the MSE FGD pipeline.
 
@@ -325,10 +326,11 @@ def make_mnist_dataloaders(
         expected = 1
         for extent in image_shape:
             expected *= int(extent)
-        if expected != 784:
+        pixels = 784 if image_size is None else int(image_size) ** 2
+        if expected != pixels:
             raise ValueError(
                 f"MNIST image_shape {tuple(image_shape)} has {expected} elements, "
-                "but an MNIST image has 784."
+                f"but the image has {pixels}."
             )
 
     required_files = (
@@ -357,6 +359,33 @@ def make_mnist_dataloaders(
     train_labels = _read_mnist_labels(root / "train-labels-idx1-ubyte.gz")
     test_x = _read_mnist_images(root / "t10k-images-idx3-ubyte.gz")
     test_labels = _read_mnist_labels(root / "t10k-labels-idx1-ubyte.gz")
+
+    if image_size is not None:
+        # DOWNSAMPLE BEFORE NORMALISING. The per-pixel mean/std must describe
+        # the pixels the model actually receives; standardising at 28x28 and
+        # pooling afterwards averages away part of the variance and leaves the
+        # inputs with std < 1, which silently rescales the functional gradient.
+        #
+        # adaptive_avg_pool2d rather than avg_pool2d: 28 -> 14 is an exact 2x2
+        # pool, but 28 -> 8 is not an integer factor and the adaptive form is
+        # the one that handles both without padding artefacts.
+        #
+        # The point of this knob is the PARAMETER BUDGET, not the data. MEASURED
+        # on the completed 20k run (job 463286, test 0.938): a 784-input MLP at
+        # P=20681 spends 18055 parameters -- 93% -- on the input layer alone,
+        # leaving 1344 for representation. At 8x8 the input layer is 27% and the
+        # same budget buys a width of 82 instead of 23.
+        side = int(image_size)
+        if side < 1 or side > 28:
+            raise ValueError(
+                f"MNIST image_size must be in [1, 28], got {image_size}."
+            )
+        pooled = []
+        for block in (train_x, test_x):
+            reshaped = block.reshape(-1, 1, 28, 28)
+            reshaped = torch.nn.functional.adaptive_avg_pool2d(reshaped, (side, side))
+            pooled.append(reshaped.reshape(block.shape[0], side * side))
+        train_x, test_x = pooled
 
     mean = train_x.mean(dim=0, keepdim=True)
     std = train_x.std(dim=0, keepdim=True).clamp_min(1e-6)

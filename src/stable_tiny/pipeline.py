@@ -177,6 +177,10 @@ class DataConfig:
     mnist_train_samples: int | None = 10_000
     mnist_validation_samples: int | None = 2_000
     mnist_test_samples: int | None = 2_000
+    # Side length MNIST is average-pooled to before it reaches the model, or
+    # None for the native 28x28. Opt-in and default-off, so every existing
+    # config keeps the 784-input problem it was measured on.
+    mnist_image_size: int | None = None
     # Shape of ONE example, excluding the batch axis, for the kinds that emit
     # images rather than vectors (``mnist2d``). ``None`` means flat.
     input_shape: tuple[int, ...] | None = None
@@ -821,8 +825,16 @@ def build_dataloaders(
             num_classes=data_config.out_features,
         )
     if data_config.kind == "mnist":
-        if data_config.in_features != 784:
-            raise ValueError("MNIST requires data.in_features=784.")
+        pixels = (
+            784
+            if data_config.mnist_image_size is None
+            else int(data_config.mnist_image_size) ** 2
+        )
+        if data_config.in_features != pixels:
+            raise ValueError(
+                f"MNIST at image_size={data_config.mnist_image_size} requires "
+                f"data.in_features={pixels}, got {data_config.in_features}."
+            )
         if data_config.out_features != 10:
             raise ValueError("MNIST requires data.out_features=10.")
         return make_mnist_dataloaders(
@@ -833,6 +845,7 @@ def build_dataloaders(
             batch_size=data_config.batch_size,
             seed=data_config.train_seed,
             num_classes=data_config.out_features,
+            image_size=data_config.mnist_image_size,
         )
 
     if data_config.kind == "mnist2d":
